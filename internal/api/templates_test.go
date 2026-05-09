@@ -26,7 +26,7 @@ func newSrvWithTmpl(t *testing.T) (*httptest.Server, string) {
 		}, Body: "kind: Pod\nname: x-{{.slug}}\n", Source: "x.yaml"},
 	}
 	svc := instance.NewService(fake.New(), nil, tmpls)
-	srv := httptest.NewServer(NewRouter(svc, keys))
+	srv := httptest.NewServer(NewRouter(svc, keys, nil, nil))
 	t.Cleanup(srv.Close)
 	return srv, tok
 }

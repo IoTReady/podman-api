@@ -23,7 +23,7 @@ func newServer(t *testing.T) (*httptest.Server, string) {
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	svc := instance.NewService(fake.New(), hosts, nil)
 
-	r := NewRouter(svc, keys)
+	r := NewRouter(svc, keys, nil, nil)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	return srv, tok

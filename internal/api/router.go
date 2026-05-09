@@ -9,9 +9,15 @@ import (
 )
 
 // NewRouter builds the full HTTP handler tree.
-func NewRouter(svc *instance.Service, keys []config.APIKey) http.Handler {
+// audit is an optional middleware applied around auth-guarded handlers; pass nil for no-op.
+// metricsHandler is an optional handler mounted at GET /metrics; pass nil to omit the endpoint.
+func NewRouter(svc *instance.Service, keys []config.APIKey, audit func(http.Handler) http.Handler, metricsHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	h := &handlers{svc: svc}
+
+	if audit == nil {
+		audit = func(h http.Handler) http.Handler { return h }
+	}
 
 	// Process endpoints (no auth).
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -19,8 +25,12 @@ func NewRouter(svc *instance.Service, keys []config.APIKey) http.Handler {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
+	if metricsHandler != nil {
+		mux.Handle("GET /metrics", metricsHandler)
+	}
+
 	guard := func(scope string, h http.Handler) http.Handler {
-		return auth.New(keys, scope)(h)
+		return audit(auth.New(keys, scope)(h))
 	}
 
 	// Hosts (read).
