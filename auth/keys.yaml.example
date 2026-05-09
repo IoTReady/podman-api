@@ -1,0 +1,8 @@
+# Real keys go in auth/keys.yaml (gitignored).
+# Generate a hash with:
+#   go run ./cmd/podman-api hash-token <plaintext>
+keys:
+  - id: cms-dev
+    secret_hash: $argon2id$v=19$m=65536,t=3,p=4$REPLACE_ME$REPLACE_ME
+    scopes: [hosts:read, instances:*, secrets:*]
+    description: "Local CMS dev"
