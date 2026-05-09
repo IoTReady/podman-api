@@ -3,10 +3,15 @@ package podman
 import (
 	"context"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 
 	"github.com/containers/podman/v5/pkg/bindings"
+	"github.com/containers/podman/v5/pkg/bindings/play"
+	"github.com/containers/podman/v5/pkg/bindings/pods"
 	"github.com/containers/podman/v5/pkg/bindings/system"
+	"github.com/containers/podman/v5/pkg/domain/entities"
 
 	"github.com/iotready/podman-api/internal/config"
 )
@@ -111,4 +116,169 @@ func (r *Real) Version(ctx context.Context, id string) (string, error) {
 		return "", err
 	}
 	return info.Version.Version, nil
+}
+
+func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp("", "play-kube-*.yaml")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err := tmp.WriteString(raw); err != nil {
+		return err
+	}
+	tmp.Close()
+
+	opts := &play.KubeOptions{}
+	if replace {
+		t := true
+		opts.Replace = &t
+	}
+	_, err = play.Kube(c, tmp.Name(), opts)
+	return err
+}
+
+func (r *Real) PodInspect(ctx context.Context, id, name string) (Pod, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return Pod{}, err
+	}
+	rep, err := pods.Inspect(c, name, &pods.InspectOptions{})
+	if err != nil {
+		if isNotFound(err) {
+			return Pod{}, ErrNotFound
+		}
+		return Pod{}, err
+	}
+	return podFromInspect(rep), nil
+}
+
+func (r *Real) PodList(ctx context.Context, id string, filters map[string]string) ([]Pod, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	opts := &pods.ListOptions{}
+	if len(filters) > 0 {
+		f := map[string][]string{}
+		for k, v := range filters {
+			f["label"] = append(f["label"], k+"="+v)
+		}
+		opts.Filters = f
+	}
+	reps, err := pods.List(c, opts)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Pod, 0, len(reps))
+	for _, rep := range reps {
+		out = append(out, podFromList(rep))
+	}
+	return out, nil
+}
+
+func (r *Real) PodStart(ctx context.Context, id, name string) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	_, err = pods.Start(c, name, &pods.StartOptions{})
+	return mapNotFound(err)
+}
+
+func (r *Real) PodStop(ctx context.Context, id, name string) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	_, err = pods.Stop(c, name, &pods.StopOptions{})
+	return mapNotFound(err)
+}
+
+func (r *Real) PodRestart(ctx context.Context, id, name string) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	_, err = pods.Restart(c, name, &pods.RestartOptions{})
+	return mapNotFound(err)
+}
+
+func (r *Real) PodRemove(ctx context.Context, id, name string, force bool) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	opts := &pods.RemoveOptions{}
+	if force {
+		t := true
+		opts.Force = &t
+	}
+	_, err = pods.Remove(c, name, opts)
+	return mapNotFound(err)
+}
+
+// --- helpers ---
+
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no such pod") ||
+		strings.Contains(msg, "no such container") ||
+		strings.Contains(msg, "no such secret") ||
+		strings.Contains(msg, "no such volume") ||
+		strings.Contains(msg, "not found")
+}
+
+func mapNotFound(err error) error {
+	if isNotFound(err) {
+		return ErrNotFound
+	}
+	return err
+}
+
+func podFromInspect(p *entities.PodInspectReport) Pod {
+	out := Pod{
+		ID:     p.ID,
+		Name:   p.Name,
+		Status: p.State,
+		Labels: p.Labels,
+	}
+	if !p.Created.IsZero() {
+		out.Created = p.Created
+	}
+	for _, c := range p.Containers {
+		out.Containers = append(out.Containers, Container{
+			ID:     c.ID,
+			Name:   c.Name,
+			Status: c.State,
+		})
+	}
+	return out
+}
+
+func podFromList(p *entities.ListPodsReport) Pod {
+	out := Pod{
+		ID:     p.Id,
+		Name:   p.Name,
+		Status: p.Status,
+		Labels: p.Labels,
+	}
+	if !p.Created.IsZero() {
+		out.Created = p.Created
+	}
+	for _, c := range p.Containers {
+		out.Containers = append(out.Containers, Container{
+			ID:     c.Id,
+			Name:   c.Names,
+			Status: c.Status,
+		})
+	}
+	return out
 }
