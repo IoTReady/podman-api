@@ -1,0 +1,5 @@
+id: local
+addr: unix
+socket: /run/user/1000/podman/podman.sock
+labels:
+  env: dev
