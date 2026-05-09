@@ -1,0 +1,93 @@
+# template-meta:
+#   id: lite-engine
+#   parameters:
+#     required: [slug, image, port, base_url, app_template, s3_bucket, s3_endpoint]
+#     optional: []
+#   secrets:
+#     per_instance: [auth_secret]
+#     per_host_referenced: [s3-access-key-id, s3-secret-access-key]
+#   volumes:
+#     - name: data
+#       backup: litestream
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: lite-engine-{{.slug}}-litestream
+data:
+  litestream.yml: |
+    # access-key-id and secret-access-key are read from the
+    # LITESTREAM_ACCESS_KEY_ID / LITESTREAM_SECRET_ACCESS_KEY env vars,
+    # which are injected from per-host podman secrets (see below).
+    dbs:
+      - path: /data/engine.db
+        replicas:
+          - type: s3
+            bucket: {{.s3_bucket}}
+            path: lite/engine/{{.slug}}/
+            endpoint: {{.s3_endpoint}}
+            retention: 720h
+            sync-interval: 10s
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: lite-engine-{{.slug}}
+  labels:
+    podman-api/template: lite-engine
+    podman-api/slug: {{.slug}}
+spec:
+  restartPolicy: Always
+  containers:
+    - name: app
+      image: {{.image}}
+      ports:
+        - containerPort: 30000
+          hostPort: {{.port}}
+          hostIP: 127.0.0.1
+      env:
+        - name: NODE_ENV
+          value: production
+        - name: PORT
+          value: "30000"
+        - name: BASE_URL
+          value: {{.base_url}}
+        - name: TRUSTED_ORIGINS
+          value: {{.base_url}}
+        - name: APP_TEMPLATE
+          value: {{.app_template}}
+        - name: AUTH_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: lite-engine-{{.slug}}-auth
+              key: lite-engine-{{.slug}}-auth
+      volumeMounts:
+        - name: data
+          mountPath: /app/data
+    - name: litestream
+      image: docker.io/litestream/litestream:latest
+      args: ["replicate"]
+      env:
+        - name: LITESTREAM_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: s3-access-key-id
+              key: s3-access-key-id
+        - name: LITESTREAM_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: s3-secret-access-key
+              key: s3-secret-access-key
+      volumeMounts:
+        - name: data
+          mountPath: /data
+        - name: litestream-config
+          mountPath: /etc/litestream.yml
+          subPath: litestream.yml
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: lite-engine-{{.slug}}-data
+    - name: litestream-config
+      configMap:
+        name: lite-engine-{{.slug}}-litestream
