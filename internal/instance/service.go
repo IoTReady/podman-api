@@ -232,7 +232,13 @@ func (s *Service) Upgrade(ctx context.Context, host string, req ApplyRequest, im
 	if err := s.client.ImagePull(ctx, host, image); err != nil {
 		return fmt.Errorf("pull %q: %w", image, err)
 	}
-	req.Parameters["image"] = image
+	// Shallow-copy parameters to avoid mutating the caller's map.
+	params := make(map[string]any, len(req.Parameters)+1)
+	for k, v := range req.Parameters {
+		params[k] = v
+	}
+	params["image"] = image
+	req.Parameters = params
 	return s.Apply(ctx, host, req, true)
 }
 

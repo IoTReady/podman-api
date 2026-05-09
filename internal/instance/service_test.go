@@ -127,5 +127,58 @@ func TestService_Lifecycle(t *testing.T) {
 	require.ErrorIs(t, err, ErrInstanceNotFound)
 }
 
+func TestService_Apply_ConflictWhenExists(t *testing.T) {
+	svc, _ := newSvc(t)
+	ctx := context.Background()
+	req := ApplyRequest{
+		Template: "lite-engine", Slug: "dup",
+		Parameters: map[string]any{
+			"slug": "dup", "image": "x:1", "port": 1,
+			"base_url": "x", "app_template": "crm", "s3_bucket": "b", "s3_endpoint": "e",
+		},
+		Secrets: map[string]string{"auth_secret": "v"},
+	}
+	// First apply with replace=true succeeds.
+	require.NoError(t, svc.Apply(ctx, "h1", req, true))
+
+	// Second apply with replace=false must return ErrInstanceExists.
+	err := svc.Apply(ctx, "h1", req, false)
+	require.ErrorIs(t, err, ErrInstanceExists)
+}
+
+func TestService_Upgrade_DoesNotMutateCallerMap(t *testing.T) {
+	svc, _ := newSvc(t)
+	ctx := context.Background()
+	apply := ApplyRequest{
+		Template: "lite-engine", Slug: "up",
+		Parameters: map[string]any{
+			"slug": "up", "image": "x:1", "port": 1,
+			"base_url": "x", "app_template": "crm", "s3_bucket": "b", "s3_endpoint": "e",
+		},
+		Secrets: map[string]string{"auth_secret": "v"},
+	}
+	require.NoError(t, svc.Apply(ctx, "h1", apply, true))
+
+	upgradeReq := ApplyRequest{
+		Template: "lite-engine", Slug: "up",
+		Parameters: map[string]any{
+			"slug": "up", "image": "x:1", "port": 1,
+			"base_url": "x", "app_template": "crm", "s3_bucket": "b", "s3_endpoint": "e",
+		},
+		Secrets: map[string]string{"auth_secret": "v"},
+	}
+	originalImage := upgradeReq.Parameters["image"]
+	require.NoError(t, svc.Upgrade(ctx, "h1", upgradeReq, "x:2"))
+
+	// Caller's map untouched.
+	assert.Equal(t, originalImage, upgradeReq.Parameters["image"], "Upgrade must not mutate caller's Parameters map")
+
+	// Pod actually has the new image (via observed).
+	obs, err := svc.Get(ctx, "h1", "lite-engine", "up")
+	require.NoError(t, err)
+	require.Len(t, obs.Containers, 1)
+	assert.Equal(t, "x:2", obs.Containers[0].Image)
+}
+
 // podman is imported but used only to satisfy reference in tests above.
 var _ = podman.ErrNotFound
