@@ -142,6 +142,22 @@ func (h *handlers) restartInstance(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (h *handlers) instanceVolumes(w http.ResponseWriter, r *http.Request) {
+	host := r.PathValue("host")
+	tmpl := r.PathValue("template")
+	slug := r.PathValue("slug")
+	vols, err := h.svc.InstanceVolumes(r.Context(), host, tmpl, slug)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	out := make([]map[string]any, 0, len(vols))
+	for _, v := range vols {
+		out = append(out, map[string]any{"name": v.Name, "size_bytes": v.SizeBytes})
+	}
+	WriteJSON(w, http.StatusOK, out)
+}
+
 func (h *handlers) upgradeInstance(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	tmpl := r.PathValue("template")

@@ -333,6 +333,35 @@ func (s *Service) DeleteHostSecret(ctx context.Context, host, name string) error
 	return err
 }
 
+// InstanceVolumes returns the named volumes the API believes belong to this instance.
+// Volumes that don't exist on the host are omitted (no error).
+func (s *Service) InstanceVolumes(ctx context.Context, host, tmpl, slug string) ([]podman.Volume, error) {
+	t, err := s.lookup(host, tmpl)
+	if err != nil {
+		return nil, err
+	}
+	var out []podman.Volume
+	for _, v := range t.Meta.Volumes {
+		name := tmpl + "-" + slug + "-" + v.Name
+		if vv, err := s.client.VolumeInspect(ctx, host, name); err == nil {
+			out = append(out, vv)
+		}
+	}
+	return out, nil
+}
+
+// DeleteVolume removes a named volume on a host. Idempotent.
+func (s *Service) DeleteVolume(ctx context.Context, host, name string, force bool) error {
+	if _, ok := s.hosts[host]; !ok {
+		return ErrUnknownHost
+	}
+	err := s.client.VolumeRemove(ctx, host, name, force)
+	if errors.Is(err, podman.ErrNotFound) {
+		return nil
+	}
+	return err
+}
+
 // Logs returns a channel of log lines from one container in an instance.
 func (s *Service) Logs(ctx context.Context, host, tmpl, slug, container string, opts podman.LogOptions) (<-chan podman.LogLine, error) {
 	if _, err := s.lookup(host, tmpl); err != nil {

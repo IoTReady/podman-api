@@ -65,6 +65,10 @@ func NewRouter(svc *instance.Service, keys []config.APIKey, audit func(http.Hand
 	// Logs.
 	mux.Handle("GET /hosts/{host}/instances/{template}/{slug}/logs", guard("instances:read", http.HandlerFunc(h.logsInstance)))
 
+	// Volumes.
+	mux.Handle("GET /hosts/{host}/instances/{template}/{slug}/volumes", guard("instances:read", http.HandlerFunc(h.instanceVolumes)))
+	mux.Handle("DELETE /hosts/{host}/volumes/{name}", guard("instances:write", http.HandlerFunc(h.deleteVolume)))
+
 	return mux
 }
 
