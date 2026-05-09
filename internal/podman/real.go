@@ -1,6 +1,7 @@
 package podman
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"os"
@@ -10,7 +11,9 @@ import (
 	"github.com/containers/podman/v5/pkg/bindings"
 	"github.com/containers/podman/v5/pkg/bindings/play"
 	"github.com/containers/podman/v5/pkg/bindings/pods"
+	"github.com/containers/podman/v5/pkg/bindings/secrets"
 	"github.com/containers/podman/v5/pkg/bindings/system"
+	"github.com/containers/podman/v5/pkg/bindings/volumes"
 	"github.com/containers/podman/v5/pkg/domain/entities"
 
 	"github.com/iotready/podman-api/internal/config"
@@ -220,6 +223,79 @@ func (r *Real) PodRemove(ctx context.Context, id, name string, force bool) error
 	}
 	_, err = pods.Remove(c, name, opts)
 	return mapNotFound(err)
+}
+
+func (r *Real) SecretCreate(ctx context.Context, id, name string, value []byte) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	opts := &secrets.CreateOptions{Name: &name}
+	_, err = secrets.Create(c, bytes.NewReader(value), opts)
+	return err
+}
+
+func (r *Real) SecretList(ctx context.Context, id string) ([]Secret, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	reps, err := secrets.List(c, &secrets.ListOptions{})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Secret, 0, len(reps))
+	for _, s := range reps {
+		out = append(out, Secret{Name: s.Spec.Name, CreatedAt: s.CreatedAt})
+	}
+	return out, nil
+}
+
+func (r *Real) SecretInspect(ctx context.Context, id, name string) (Secret, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return Secret{}, err
+	}
+	rep, err := secrets.Inspect(c, name, &secrets.InspectOptions{})
+	if err != nil {
+		return Secret{}, mapNotFound(err)
+	}
+	return Secret{Name: rep.Spec.Name, CreatedAt: rep.CreatedAt}, nil
+}
+
+func (r *Real) SecretRemove(ctx context.Context, id, name string) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	return mapNotFound(secrets.Remove(c, name))
+}
+
+func (r *Real) VolumeInspect(ctx context.Context, id, name string) (Volume, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return Volume{}, err
+	}
+	rep, err := volumes.Inspect(c, name, &volumes.InspectOptions{})
+	if err != nil {
+		return Volume{}, mapNotFound(err)
+	}
+	v := Volume{Name: rep.Name}
+	// Size is not always populated; leave at 0 if missing.
+	return v, nil
+}
+
+func (r *Real) VolumeRemove(ctx context.Context, id, name string, force bool) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	opts := &volumes.RemoveOptions{}
+	if force {
+		t := true
+		opts.Force = &t
+	}
+	return mapNotFound(volumes.Remove(c, name, opts))
 }
 
 // --- helpers ---
