@@ -1,6 +1,9 @@
 package podman
 
-import "context"
+import (
+	"context"
+	"errors"
+)
 
 // Client is the contract every consumer of podman speaks. The real
 // implementation calls libpod via SSH-tunnelled or unix-socket connections;
@@ -43,3 +46,6 @@ type LogOptions struct {
 	Since  string // RFC3339 or duration like "5m"; "" = beginning
 	Follow bool
 }
+
+// ErrNotFound is returned when a pod, container, secret, or volume isn't present.
+var ErrNotFound = errors.New("podman: not found")
