@@ -66,9 +66,6 @@ type handlers struct {
 
 // Stub implementations for handlers defined in subsequent task files.
 // Each stub returns 501 Not Implemented; later tasks replace them.
-func (h *handlers) listSecrets(w http.ResponseWriter, _ *http.Request)     { notImpl(w) }
-func (h *handlers) putSecret(w http.ResponseWriter, _ *http.Request)       { notImpl(w) }
-func (h *handlers) deleteSecret(w http.ResponseWriter, _ *http.Request)    { notImpl(w) }
 func (h *handlers) listInstances(w http.ResponseWriter, _ *http.Request)   { notImpl(w) }
 func (h *handlers) getInstance(w http.ResponseWriter, _ *http.Request)     { notImpl(w) }
 func (h *handlers) createInstance(w http.ResponseWriter, _ *http.Request)  { notImpl(w) }

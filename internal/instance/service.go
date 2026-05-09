@@ -299,3 +299,36 @@ func (s *Service) PortsInUse(ctx context.Context, host string) ([]podman.PortMap
 	}
 	return s.client.UsedHostPorts(ctx, host)
 }
+
+// HostSecrets lists secrets on a host.
+func (s *Service) HostSecrets(ctx context.Context, host string) ([]podman.Secret, error) {
+	if _, ok := s.hosts[host]; !ok {
+		return nil, ErrUnknownHost
+	}
+	return s.client.SecretList(ctx, host)
+}
+
+// PutHostSecret creates-or-rotates a host secret. We "rotate" by removing
+// then recreating, since podman secrets are immutable.
+func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []byte) error {
+	if _, ok := s.hosts[host]; !ok {
+		return ErrUnknownHost
+	}
+	if _, err := s.client.SecretInspect(ctx, host, name); err == nil {
+		if err := s.client.SecretRemove(ctx, host, name); err != nil {
+			return err
+		}
+	}
+	return s.client.SecretCreate(ctx, host, name, value)
+}
+
+func (s *Service) DeleteHostSecret(ctx context.Context, host, name string) error {
+	if _, ok := s.hosts[host]; !ok {
+		return ErrUnknownHost
+	}
+	err := s.client.SecretRemove(ctx, host, name)
+	if errors.Is(err, podman.ErrNotFound) {
+		return nil
+	}
+	return err
+}
