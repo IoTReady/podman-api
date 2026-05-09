@@ -63,11 +63,3 @@ func NewRouter(svc *instance.Service, keys []config.APIKey) http.Handler {
 type handlers struct {
 	svc *instance.Service
 }
-
-// Stub implementations for handlers defined in subsequent task files.
-// Each stub returns 501 Not Implemented; later tasks replace them.
-func (h *handlers) logsInstance(w http.ResponseWriter, _ *http.Request) { notImpl(w) }
-
-func notImpl(w http.ResponseWriter) {
-	WriteJSON(w, http.StatusNotImplemented, ErrorBody{Code: "not_implemented", Message: "handler not yet implemented"})
-}

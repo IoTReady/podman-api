@@ -332,3 +332,18 @@ func (s *Service) DeleteHostSecret(ctx context.Context, host, name string) error
 	}
 	return err
 }
+
+// Logs returns a channel of log lines from one container in an instance.
+func (s *Service) Logs(ctx context.Context, host, tmpl, slug, container string, opts podman.LogOptions) (<-chan podman.LogLine, error) {
+	if _, err := s.lookup(host, tmpl); err != nil {
+		return nil, err
+	}
+	if _, err := s.client.PodInspect(ctx, host, podName(tmpl, slug)); err != nil {
+		if errors.Is(err, podman.ErrNotFound) {
+			return nil, ErrInstanceNotFound
+		}
+		return nil, err
+	}
+	cname := podName(tmpl, slug) + "-" + container
+	return s.client.ContainerLogs(ctx, host, cname, opts)
+}
