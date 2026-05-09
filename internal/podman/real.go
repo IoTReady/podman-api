@@ -74,7 +74,9 @@ func (r *Real) URIFor(id string) (string, error) {
 }
 
 // ctxFor returns a libpod-ready context for hostID, opening the connection
-// on first use.
+// on first use. The connection context is rooted at context.Background() so
+// it outlives any individual request context — per-request cancellation must
+// not kill the cached long-lived connection.
 func (r *Real) ctxFor(parent context.Context, id string) (context.Context, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -89,13 +91,19 @@ func (r *Real) ctxFor(parent context.Context, id string) (context.Context, error
 	if err != nil {
 		return nil, err
 	}
+	// Use context.Background() — not the caller's per-request context — so
+	// the cached connection context is never cancelled by a request ending.
+	// Individual operations still honour per-call cancellation because
+	// DoRequest creates http.NewRequestWithContext(ctx, ...) from the
+	// per-call context passed into each method (PodInspect, PodList, etc.).
+	connBase := context.Background()
 	var c context.Context
 	if h.Addr != "unix" && h.SSHKey != "" {
 		// SSH host with explicit key file. The fourth arg (`machine`) is false
 		// for non-machine connections per the bindings API.
-		c, err = bindings.NewConnectionWithIdentity(parent, uri, h.SSHKey, false)
+		c, err = bindings.NewConnectionWithIdentity(connBase, uri, h.SSHKey, false)
 	} else {
-		c, err = bindings.NewConnection(parent, uri)
+		c, err = bindings.NewConnection(connBase, uri)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("connect to host %q: %w", id, err)
