@@ -74,8 +74,8 @@ func HashToken(token string) (string, error) {
 	}
 	hash := argon2.IDKey([]byte(token), salt, time, memory, threads, keyLen)
 	enc := func(b []byte) string { return base64.RawStdEncoding.EncodeToString(b) }
-	return fmt.Sprintf("$argon2id$v=19$m=%d,t=%d,p=%d$%s$%s",
-		memory, time, threads, enc(salt), enc(hash)), nil
+	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
+		argon2.Version, memory, time, threads, enc(salt), enc(hash)), nil
 }
 
 // VerifyToken checks token against an argon2id PHC string.
@@ -103,6 +103,9 @@ func VerifyToken(token, encoded string) (bool, error) {
 	want, err := base64.RawStdEncoding.DecodeString(parts[5])
 	if err != nil {
 		return false, err
+	}
+	if len(salt) == 0 || len(want) == 0 {
+		return false, errors.New("argon2id hash: empty salt or hash")
 	}
 	got := argon2.IDKey([]byte(token), salt, time, memory, threads, uint32(len(want)))
 	return subtle.ConstantTimeCompare(got, want) == 1, nil

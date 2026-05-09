@@ -31,6 +31,20 @@ func TestKey_HasScope(t *testing.T) {
 	assert.False(t, k.HasScope("secrets:write"))
 }
 
+func TestVerifyToken_EmptyHashRejected(t *testing.T) {
+	// Empty salt: $argon2id$v=19$m=65536,t=3,p=4$$<hash>
+	encoded := "$argon2id$v=19$m=65536,t=3,p=4$$ZHVtbXktaGFzaC0zMi1ieXRlcy0wMDAwMDAwMA"
+	ok, err := VerifyToken("anything", encoded)
+	require.Error(t, err)
+	assert.False(t, ok)
+
+	// Empty hash:
+	encoded2 := "$argon2id$v=19$m=65536,t=3,p=4$ZHVtbXktc2FsdC0xNi1ieXRlcw$"
+	ok, err = VerifyToken("anything", encoded2)
+	require.Error(t, err)
+	assert.False(t, ok)
+}
+
 func TestVerifyArgon2id(t *testing.T) {
 	hash, err := HashToken("hunter2")
 	require.NoError(t, err)
