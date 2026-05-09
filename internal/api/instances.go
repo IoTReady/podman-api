@@ -117,3 +117,58 @@ func queryBool(r *http.Request, key string) bool {
 	b, _ := strconv.ParseBool(v)
 	return b
 }
+
+func (h *handlers) startInstance(w http.ResponseWriter, r *http.Request) {
+	if err := h.svc.Start(r.Context(), r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")); err != nil {
+		WriteError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handlers) stopInstance(w http.ResponseWriter, r *http.Request) {
+	if err := h.svc.Stop(r.Context(), r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")); err != nil {
+		WriteError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handlers) restartInstance(w http.ResponseWriter, r *http.Request) {
+	if err := h.svc.Restart(r.Context(), r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")); err != nil {
+		WriteError(w, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (h *handlers) upgradeInstance(w http.ResponseWriter, r *http.Request) {
+	host := r.PathValue("host")
+	tmpl := r.PathValue("template")
+	slug := r.PathValue("slug")
+	var body struct {
+		Image      string            `json:"image"`
+		Parameters map[string]any    `json:"parameters"`
+		Secrets    map[string]string `json:"secrets"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+		return
+	}
+	req := instance.ApplyRequest{
+		Template:   tmpl,
+		Slug:       slug,
+		Parameters: body.Parameters,
+		Secrets:    body.Secrets,
+	}
+	if err := h.svc.Upgrade(r.Context(), host, req, body.Image); err != nil {
+		WriteError(w, err)
+		return
+	}
+	obs, err := h.svc.Get(r.Context(), host, tmpl, slug)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, obs)
+}
