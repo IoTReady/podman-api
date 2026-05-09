@@ -37,3 +37,18 @@ func TestRealClient_URIFor(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "ssh://ubuntu@x.example/run/user/1000/podman/podman.sock", uri)
 }
+
+// TestRealClient_URIFor_WithSSHKey is a smoke test that ssh-key-bearing hosts
+// still produce the canonical libpod URI. The SSH identity is wired in
+// ctxFor (via bindings.NewConnectionWithIdentity); end-to-end verification
+// requires a real SSH host and is a manual post-merge step.
+func TestRealClient_URIFor_WithSSHKey(t *testing.T) {
+	hosts := []config.Host{
+		{ID: "ssh", Addr: "user@example", Socket: "/run/podman.sock", SSHKey: "/etc/keys/ssh"},
+	}
+	c, err := NewReal(hosts)
+	require.NoError(t, err)
+	uri, err := c.URIFor("ssh")
+	require.NoError(t, err)
+	assert.Equal(t, "ssh://user@example/run/podman.sock", uri)
+}

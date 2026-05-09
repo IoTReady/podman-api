@@ -69,11 +69,22 @@ func (r *Real) ctxFor(parent context.Context, id string) (context.Context, error
 	if c, ok := r.ctx[id]; ok {
 		return c, nil
 	}
+	h, ok := r.hosts[id]
+	if !ok {
+		return nil, fmt.Errorf("unknown host %q", id)
+	}
 	uri, err := r.URIFor(id)
 	if err != nil {
 		return nil, err
 	}
-	c, err := bindings.NewConnection(parent, uri)
+	var c context.Context
+	if h.Addr != "unix" && h.SSHKey != "" {
+		// SSH host with explicit key file. The fourth arg (`machine`) is false
+		// for non-machine connections per the bindings API.
+		c, err = bindings.NewConnectionWithIdentity(parent, uri, h.SSHKey, false)
+	} else {
+		c, err = bindings.NewConnection(parent, uri)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("connect to host %q: %w", id, err)
 	}
