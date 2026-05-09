@@ -5,10 +5,14 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/containers/podman/v5/pkg/bindings"
+	"github.com/containers/podman/v5/pkg/bindings/containers"
+	"github.com/containers/podman/v5/pkg/bindings/images"
 	"github.com/containers/podman/v5/pkg/bindings/play"
 	"github.com/containers/podman/v5/pkg/bindings/pods"
 	"github.com/containers/podman/v5/pkg/bindings/secrets"
@@ -358,3 +362,90 @@ func podFromList(p *entities.ListPodsReport) Pod {
 	}
 	return out
 }
+
+func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts LogOptions) (<-chan LogLine, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	stdoutCh := make(chan string, 64)
+	stderrCh := make(chan string, 64)
+	out := make(chan LogLine, 64)
+
+	go func() {
+		defer close(out)
+		for {
+			select {
+			case line, ok := <-stdoutCh:
+				if !ok {
+					stdoutCh = nil
+				} else {
+					out <- LogLine{Container: container, Stream: "stdout", Line: line, Time: time.Now()}
+				}
+			case line, ok := <-stderrCh:
+				if !ok {
+					stderrCh = nil
+				} else {
+					out <- LogLine{Container: container, Stream: "stderr", Line: line, Time: time.Now()}
+				}
+			}
+			if stdoutCh == nil && stderrCh == nil {
+				return
+			}
+		}
+	}()
+
+	tail := ""
+	if opts.Tail > 0 {
+		tail = strconv.Itoa(opts.Tail)
+	}
+	follow := opts.Follow
+	logsOpts := &containers.LogOptions{
+		Stdout: boolPtr(true), Stderr: boolPtr(true),
+		Follow: &follow, Tail: &tail, Since: &opts.Since,
+	}
+	go func() {
+		_ = containers.Logs(c, container, logsOpts, stdoutCh, stderrCh)
+		close(stdoutCh)
+		close(stderrCh)
+	}()
+	return out, nil
+}
+
+func (r *Real) ImagePull(ctx context.Context, id, ref string) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	_, err = images.Pull(c, ref, &images.PullOptions{})
+	return err
+}
+
+func (r *Real) UsedHostPorts(ctx context.Context, id string) ([]PortMapping, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	all := true
+	conts, err := containers.List(c, &containers.ListOptions{All: &all})
+	if err != nil {
+		return nil, err
+	}
+	var out []PortMapping
+	for _, ct := range conts {
+		for _, p := range ct.Ports {
+			out = append(out, PortMapping{
+				HostIP:        p.HostIP,
+				HostPort:      int(p.HostPort),
+				ContainerPort: int(p.ContainerPort),
+				Protocol:      p.Protocol,
+			})
+		}
+	}
+	return out, nil
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// Compile-time guarantee that Real satisfies the Client interface.
+var _ Client = (*Real)(nil)
