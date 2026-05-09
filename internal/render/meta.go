@@ -55,6 +55,7 @@ func ParseMeta(src string) (Meta, string, error) {
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	lineNo := 0
+	var sawBody bool
 	for sc.Scan() {
 		line := sc.Text()
 		lineNo++
@@ -62,7 +63,6 @@ func ParseMeta(src string) (Meta, string, error) {
 		if !started {
 			trim := strings.TrimSpace(line)
 			if trim == "" {
-				bodyStart = len(yamlLinesJoined(yamlLines, src, lineNo))
 				continue
 			}
 			if !strings.HasPrefix(trim, "# template-meta:") {
@@ -82,7 +82,8 @@ func ParseMeta(src string) (Meta, string, error) {
 		}
 
 		// Non-comment line ends the block.
-		bodyStart = lineNo - 1
+		bodyStart = lineNo
+		sawBody = true
 		break
 	}
 	if err := sc.Err(); err != nil {
@@ -91,6 +92,13 @@ func ParseMeta(src string) (Meta, string, error) {
 
 	if !started {
 		return Meta{}, "", errors.New("template-meta: block not found at top of file")
+	}
+
+	// If the file ended inside the meta comment block (no non-comment line was
+	// ever seen), bodyStart is still 0. Set it past the last line so that
+	// bodyAfterLine returns "".
+	if !sawBody {
+		bodyStart = lineNo + 1
 	}
 
 	var wrapper struct {
@@ -121,9 +129,4 @@ func bodyAfterLine(src string, n int) string {
 		cur += idx + 1
 	}
 	return src[cur:]
-}
-
-// yamlLinesJoined is unused but kept for future debugging.
-func yamlLinesJoined(lines []string, _ string, _ int) string {
-	return strings.Join(lines, "\n")
 }

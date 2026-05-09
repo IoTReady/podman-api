@@ -1,6 +1,7 @@
 package render
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -37,6 +38,8 @@ kind: Pod
 
 	assert.Contains(t, body, "apiVersion: v1")
 	assert.NotContains(t, body, "template-meta")
+	assert.True(t, strings.HasPrefix(strings.TrimLeft(body, " \t"), "---"),
+		"body must start with --- separator, got: %q", body[:min(40, len(body))])
 }
 
 func TestParseMeta_MissingMeta(t *testing.T) {
@@ -46,6 +49,17 @@ kind: Pod
 	_, _, err := ParseMeta(src)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "template-meta")
+}
+
+func TestParseMeta_EmptyBody(t *testing.T) {
+	src := `# template-meta:
+#   id: x
+#   parameters:
+#     required: []
+`
+	_, body, err := ParseMeta(src)
+	require.NoError(t, err)
+	assert.Equal(t, "", body, "body should be empty when meta block runs to EOF")
 }
 
 func TestParseMeta_MissingID(t *testing.T) {
