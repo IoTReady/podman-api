@@ -75,7 +75,14 @@ func main() {
 	metrics := obs.New()
 	audit := obs.NewAuditMiddleware(os.Stdout)
 
-	router := api.NewRouter(svc, keys, audit, metrics.Handler())
+	// Compose metrics(audit(h)) so every guarded request is both measured
+	// and audit-logged. The caller (main) composes rather than adding a
+	// parameter to NewRouter.
+	combined := func(h http.Handler) http.Handler {
+		return metrics.Middleware()(audit(h))
+	}
+
+	router := api.NewRouter(svc, keys, combined, metrics.Handler())
 
 	srv := &http.Server{
 		Addr:              *addr,

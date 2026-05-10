@@ -2,6 +2,8 @@ package obs
 
 import (
 	"net/http"
+	"strconv"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -32,3 +34,24 @@ func New() *Metrics {
 
 // Handler is the http.Handler for the /metrics endpoint.
 func (m *Metrics) Handler() http.Handler { return promhttp.Handler() }
+
+// Middleware returns an HTTP middleware that records request count and duration.
+// The route label uses r.Pattern (the registered mux pattern, available in
+// Go 1.22+) to avoid label cardinality explosion from path parameters.
+// Falls back to "_other" when the pattern is not populated.
+func (m *Metrics) Middleware() func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+			next.ServeHTTP(rec, r)
+			route := r.Pattern
+			if route == "" {
+				route = "_other"
+			}
+			d := time.Since(start).Seconds()
+			m.requests.WithLabelValues(r.Method, route, strconv.Itoa(rec.status)).Inc()
+			m.latency.WithLabelValues(r.Method, route).Observe(d)
+		})
+	}
+}
