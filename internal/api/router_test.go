@@ -39,6 +39,16 @@ func TestRouter_HealthzNoAuth(t *testing.T) {
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
 
+func TestRouter_MetricsNotMountedWhenNil(t *testing.T) {
+	srv, _ := newServer(t)
+	resp, err := http.Get(srv.URL + "/metrics")
+	require.NoError(t, err)
+	resp.Body.Close()
+	// /metrics must 404 on the main listener unless an operator opted in by
+	// passing a non-nil metricsHandler (and binding -metrics-addr in main).
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
 func TestRouter_HostsRequiresAuth(t *testing.T) {
 	srv, _ := newServer(t)
 	resp, err := http.Get(srv.URL + "/hosts")

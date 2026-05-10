@@ -23,10 +23,11 @@ import (
 
 func main() {
 	var (
-		addr     = flag.String("addr", "127.0.0.1:8080", "bind address")
-		hostsDir = flag.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
-		keysFile = flag.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
-		tmplDir  = flag.String("templates-dir", "", "if set, load templates from this dir instead of embedded")
+		addr        = flag.String("addr", "127.0.0.1:8080", "bind address for the API")
+		metricsAddr = flag.String("metrics-addr", "", "if set, expose /metrics on this address (e.g. 127.0.0.1:9090); empty means no metrics endpoint")
+		hostsDir    = flag.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
+		keysFile    = flag.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
+		tmplDir     = flag.String("templates-dir", "", "if set, load templates from this dir instead of embedded")
 	)
 	flag.Parse()
 
@@ -82,12 +83,25 @@ func main() {
 		return metrics.Middleware()(audit(h))
 	}
 
-	router := api.NewRouter(svc, keys, combined, metrics.Handler())
+	// /metrics is never mounted on the main listener — operators must opt in
+	// with -metrics-addr to bind it on a separate (typically internal) socket.
+	router := api.NewRouter(svc, keys, combined, nil)
 
 	srv := &http.Server{
 		Addr:              *addr,
 		Handler:           router,
 		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	var metricsSrv *http.Server
+	if *metricsAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("GET /metrics", metrics.Handler())
+		metricsSrv = &http.Server{
+			Addr:              *metricsAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
 	}
 
 	idleClosed := make(chan struct{})
@@ -98,8 +112,20 @@ func main() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
+		if metricsSrv != nil {
+			_ = metricsSrv.Shutdown(ctx)
+		}
 		close(idleClosed)
 	}()
+
+	if metricsSrv != nil {
+		go func() {
+			log.Printf("metrics listening on %s", *metricsAddr)
+			if err := metricsSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("metrics listener: %v", err)
+			}
+		}()
+	}
 
 	log.Printf("podman-api listening on %s with %d hosts, %d templates, %d keys",
 		*addr, len(hosts), len(tmpls), len(keys))
