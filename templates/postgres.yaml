@@ -1,0 +1,47 @@
+# template-meta:
+#   id: postgres
+#   parameters:
+#     required: [slug, image, port, db, user]
+#     optional: []
+#   secrets:
+#     per_instance: [password]
+#     per_host_referenced: []
+#   volumes:
+#     - name: data
+#       backup: none
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-{{.slug}}
+  labels:
+    podman-api/template: postgres
+    podman-api/slug: {{.slug}}
+spec:
+  restartPolicy: Always
+  containers:
+    - name: db
+      image: {{.image}}
+      ports:
+        - containerPort: 5432
+          hostPort: {{.port}}
+          hostIP: 127.0.0.1
+      env:
+        - name: POSTGRES_DB
+          value: {{.db}}
+        - name: POSTGRES_USER
+          value: {{.user}}
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-{{.slug}}-password
+              key: postgres-{{.slug}}-password
+      volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: postgres-{{.slug}}-data
