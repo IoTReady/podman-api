@@ -488,7 +488,12 @@ func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts Log
 	follow := opts.Follow
 	logsOpts := &containers.LogOptions{
 		Stdout: boolPtr(true), Stderr: boolPtr(true),
-		Follow: &follow, Tail: &tail, Since: &opts.Since,
+		Follow: &follow, Tail: &tail,
+	}
+	// Only set Since if non-empty: libpod rejects an empty value with
+	// "unable to interpret time value".
+	if opts.Since != "" {
+		logsOpts.Since = &opts.Since
 	}
 	go func() {
 		_ = containers.Logs(mergedCtx, container, logsOpts, stdoutCh, stderrCh)
