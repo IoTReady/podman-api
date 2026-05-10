@@ -54,15 +54,15 @@ func TestAudit_IncludesPathFields(t *testing.T) {
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
-	req, _ := http.NewRequest("DELETE", srv.URL+"/hosts/h1/instances/lite-engine/iotready", nil)
+	req, _ := http.NewRequest("DELETE", srv.URL+"/hosts/h1/instances/postgres/demo", nil)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	resp.Body.Close()
 
 	out := buf.String()
 	assert.Contains(t, out, `"host":"h1"`)
-	assert.Contains(t, out, `"template":"lite-engine"`)
-	assert.Contains(t, out, `"slug":"iotready"`)
+	assert.Contains(t, out, `"template":"postgres"`)
+	assert.Contains(t, out, `"slug":"demo"`)
 	assert.Contains(t, out, `"status":204`)
 	assert.NotContains(t, out, `"error"`)
 }

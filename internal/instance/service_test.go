@@ -13,77 +13,103 @@ import (
 	"github.com/iotready/podman-api/internal/render"
 )
 
-func newSvc(t *testing.T) (*Service, *fake.Fake) {
-	t.Helper()
-	tmpl := config.Template{
+// pgTemplate is the postgres-shaped fixture used across these tests. It mirrors
+// the bundled templates/postgres.yaml but is inlined so the test doesn't depend
+// on the embedded FS.
+func pgTemplate() config.Template {
+	return config.Template{
 		Meta: render.Meta{
-			ID: "lite-engine",
+			ID: "postgres",
 			Parameters: render.Parameters{
-				Required: []string{"slug", "image", "port", "base_url", "app_template", "s3_bucket", "s3_endpoint"},
+				Required: []string{"slug", "image", "port", "db", "user"},
 			},
 			Secrets: render.Secrets{
-				PerInstance:       []string{"auth_secret"},
-				PerHostReferenced: []string{"s3-access-key-id", "s3-secret-access-key"},
+				PerInstance: []string{"password"},
 			},
-			Volumes: []render.Volume{{Name: "data", Backup: "litestream"}},
+			Volumes: []render.Volume{{Name: "data", Backup: "none"}},
 		},
 		Body: `apiVersion: v1
 kind: Pod
 metadata:
-  name: lite-engine-{{.slug}}
+  name: postgres-{{.slug}}
   labels:
-    podman-api/template: lite-engine
+    podman-api/template: postgres
     podman-api/slug: {{.slug}}
+spec:
+  containers:
+    - name: db
+      image: {{.image}}
+`,
+		Source: "postgres.yaml",
+	}
+}
+
+// templateWithHostSecret returns a synthetic template that declares a per-host
+// secret reference, used to exercise the ErrHostSecretMissing path.
+func templateWithHostSecret() config.Template {
+	return config.Template{
+		Meta: render.Meta{
+			ID: "needs-host-secret",
+			Parameters: render.Parameters{
+				Required: []string{"slug", "image"},
+			},
+			Secrets: render.Secrets{
+				PerHostReferenced: []string{"shared-pull-token"},
+			},
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: needs-host-secret-{{.slug}}
 spec:
   containers:
     - name: app
       image: {{.image}}
 `,
-		Source: "lite-engine.yaml",
+		Source: "needs-host-secret.yaml",
 	}
+}
+
+func newSvc(t *testing.T) (*Service, *fake.Fake) {
+	t.Helper()
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	f := fake.New()
-	require.NoError(t, f.SecretCreate(context.Background(), "h1", "s3-access-key-id", []byte("k")))
-	require.NoError(t, f.SecretCreate(context.Background(), "h1", "s3-secret-access-key", []byte("s")))
-	svc := NewService(f, hosts, []config.Template{tmpl})
+	svc := NewService(f, hosts, []config.Template{pgTemplate(), templateWithHostSecret()})
 	return svc, f
+}
+
+func pgApply(slug string) ApplyRequest {
+	return ApplyRequest{
+		Template: "postgres",
+		Slug:     slug,
+		Parameters: map[string]any{
+			"slug": slug, "image": "docker.io/library/postgres:16",
+			"port": 5432, "db": "app", "user": "app",
+		},
+		Secrets: map[string]string{"password": "p"},
+	}
 }
 
 func TestService_Apply_Then_Get(t *testing.T) {
 	svc, _ := newSvc(t)
 	ctx := context.Background()
 
-	req := ApplyRequest{
-		Template: "lite-engine",
-		Slug:     "iotready",
-		Parameters: map[string]any{
-			"slug": "iotready", "image": "x:1", "port": 31001,
-			"base_url": "https://x", "app_template": "crm",
-			"s3_bucket": "b", "s3_endpoint": "https://s3",
-		},
-		Secrets: map[string]string{"auth_secret": "v"},
-	}
-	require.NoError(t, svc.Apply(ctx, "h1", req, true))
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), true))
 
-	obs, err := svc.Get(ctx, "h1", "lite-engine", "iotready")
+	obs, err := svc.Get(ctx, "h1", "postgres", "demo")
 	require.NoError(t, err)
-	assert.Equal(t, "lite-engine", obs.Template)
-	assert.Equal(t, "iotready", obs.Slug)
+	assert.Equal(t, "postgres", obs.Template)
+	assert.Equal(t, "demo", obs.Slug)
 	assert.Equal(t, "Running", obs.Pod.Status)
 }
 
 func TestService_Apply_RequiresHostSecret(t *testing.T) {
-	svc, f := newSvc(t)
-	require.NoError(t, f.SecretRemove(context.Background(), "h1", "s3-access-key-id"))
-
+	svc, _ := newSvc(t)
+	// shared-pull-token is intentionally not seeded on the fake host.
 	err := svc.Apply(context.Background(), "h1", ApplyRequest{
-		Template: "lite-engine",
-		Slug:     "x",
-		Parameters: map[string]any{
-			"slug": "x", "image": "x:1", "port": 1,
-			"base_url": "x", "app_template": "crm", "s3_bucket": "b", "s3_endpoint": "e",
-		},
-		Secrets: map[string]string{"auth_secret": "v"},
+		Template:   "needs-host-secret",
+		Slug:       "x",
+		Parameters: map[string]any{"slug": "x", "image": "x:1"},
 	}, false)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrHostSecretMissing)
@@ -97,47 +123,32 @@ func TestService_UnknownTemplate(t *testing.T) {
 
 func TestService_UnknownHost(t *testing.T) {
 	svc, _ := newSvc(t)
-	err := svc.Apply(context.Background(), "nope", ApplyRequest{Template: "lite-engine", Slug: "x"}, false)
+	err := svc.Apply(context.Background(), "nope", ApplyRequest{Template: "postgres", Slug: "x"}, false)
 	require.ErrorIs(t, err, ErrUnknownHost)
 }
 
 func TestService_Lifecycle(t *testing.T) {
 	svc, _ := newSvc(t)
 	ctx := context.Background()
-	req := ApplyRequest{
-		Template: "lite-engine", Slug: "iotready",
-		Parameters: map[string]any{
-			"slug": "iotready", "image": "x:1", "port": 1,
-			"base_url": "x", "app_template": "crm", "s3_bucket": "b", "s3_endpoint": "e",
-		},
-		Secrets: map[string]string{"auth_secret": "v"},
-	}
-	require.NoError(t, svc.Apply(ctx, "h1", req, true))
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), true))
 
-	require.NoError(t, svc.Stop(ctx, "h1", "lite-engine", "iotready"))
-	obs, _ := svc.Get(ctx, "h1", "lite-engine", "iotready")
+	require.NoError(t, svc.Stop(ctx, "h1", "postgres", "demo"))
+	obs, _ := svc.Get(ctx, "h1", "postgres", "demo")
 	assert.Equal(t, "Exited", obs.Pod.Status)
 
-	require.NoError(t, svc.Start(ctx, "h1", "lite-engine", "iotready"))
-	obs, _ = svc.Get(ctx, "h1", "lite-engine", "iotready")
+	require.NoError(t, svc.Start(ctx, "h1", "postgres", "demo"))
+	obs, _ = svc.Get(ctx, "h1", "postgres", "demo")
 	assert.Equal(t, "Running", obs.Pod.Status)
 
-	require.NoError(t, svc.Delete(ctx, "h1", "lite-engine", "iotready", DeleteOptions{}))
-	_, err := svc.Get(ctx, "h1", "lite-engine", "iotready")
+	require.NoError(t, svc.Delete(ctx, "h1", "postgres", "demo", DeleteOptions{}))
+	_, err := svc.Get(ctx, "h1", "postgres", "demo")
 	require.ErrorIs(t, err, ErrInstanceNotFound)
 }
 
 func TestService_Apply_ConflictWhenExists(t *testing.T) {
 	svc, _ := newSvc(t)
 	ctx := context.Background()
-	req := ApplyRequest{
-		Template: "lite-engine", Slug: "dup",
-		Parameters: map[string]any{
-			"slug": "dup", "image": "x:1", "port": 1,
-			"base_url": "x", "app_template": "crm", "s3_bucket": "b", "s3_endpoint": "e",
-		},
-		Secrets: map[string]string{"auth_secret": "v"},
-	}
+	req := pgApply("dup")
 	// First apply with replace=true succeeds.
 	require.NoError(t, svc.Apply(ctx, "h1", req, true))
 
@@ -149,35 +160,21 @@ func TestService_Apply_ConflictWhenExists(t *testing.T) {
 func TestService_Upgrade_DoesNotMutateCallerMap(t *testing.T) {
 	svc, _ := newSvc(t)
 	ctx := context.Background()
-	apply := ApplyRequest{
-		Template: "lite-engine", Slug: "up",
-		Parameters: map[string]any{
-			"slug": "up", "image": "x:1", "port": 1,
-			"base_url": "x", "app_template": "crm", "s3_bucket": "b", "s3_endpoint": "e",
-		},
-		Secrets: map[string]string{"auth_secret": "v"},
-	}
+	apply := pgApply("up")
 	require.NoError(t, svc.Apply(ctx, "h1", apply, true))
 
-	upgradeReq := ApplyRequest{
-		Template: "lite-engine", Slug: "up",
-		Parameters: map[string]any{
-			"slug": "up", "image": "x:1", "port": 1,
-			"base_url": "x", "app_template": "crm", "s3_bucket": "b", "s3_endpoint": "e",
-		},
-		Secrets: map[string]string{"auth_secret": "v"},
-	}
+	upgradeReq := pgApply("up")
 	originalImage := upgradeReq.Parameters["image"]
-	require.NoError(t, svc.Upgrade(ctx, "h1", upgradeReq, "x:2"))
+	require.NoError(t, svc.Upgrade(ctx, "h1", upgradeReq, "docker.io/library/postgres:17"))
 
 	// Caller's map untouched.
 	assert.Equal(t, originalImage, upgradeReq.Parameters["image"], "Upgrade must not mutate caller's Parameters map")
 
 	// Pod actually has the new image (via observed).
-	obs, err := svc.Get(ctx, "h1", "lite-engine", "up")
+	obs, err := svc.Get(ctx, "h1", "postgres", "up")
 	require.NoError(t, err)
 	require.Len(t, obs.Containers, 1)
-	assert.Equal(t, "x:2", obs.Containers[0].Image)
+	assert.Equal(t, "docker.io/library/postgres:17", obs.Containers[0].Image)
 }
 
 // podman is imported but used only to satisfy reference in tests above.

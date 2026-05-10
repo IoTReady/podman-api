@@ -18,9 +18,9 @@ func TestFake_PlayKubeAndInspect(t *testing.T) {
 apiVersion: v1
 kind: Pod
 metadata:
-  name: lite-engine-x
+  name: example-x
   labels:
-    podman-api/template: lite-engine
+    podman-api/template: example
 spec:
   containers:
     - name: app
@@ -28,9 +28,9 @@ spec:
 `
 	require.NoError(t, f.PlayKube(ctx, "h1", yaml, false))
 
-	p, err := f.PodInspect(ctx, "h1", "lite-engine-x")
+	p, err := f.PodInspect(ctx, "h1", "example-x")
 	require.NoError(t, err)
-	assert.Equal(t, "lite-engine-x", p.Name)
+	assert.Equal(t, "example-x", p.Name)
 	assert.Equal(t, "Running", p.Status)
 	require.Len(t, p.Containers, 1)
 	assert.Equal(t, "app", p.Containers[0].Name)

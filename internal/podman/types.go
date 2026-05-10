@@ -15,8 +15,8 @@ type Pod struct {
 type Container struct {
 	ID           string
 	Name         string
-	Image        string // resolved digest, e.g. "localhost/lite-engine@sha256:..."
-	ImageTag     string // human-readable tag, e.g. "localhost/lite-engine:latest"
+	Image        string // resolved digest, e.g. "docker.io/library/postgres@sha256:..."
+	ImageTag     string // human-readable tag, e.g. "docker.io/library/postgres:16"
 	Status       string
 	StartedAt    time.Time
 	RestartCount int

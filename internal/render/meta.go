@@ -39,7 +39,7 @@ type Volume struct {
 // The block must look like:
 //
 //	# template-meta:
-//	#   id: lite-engine
+//	#   id: postgres
 //	#   parameters: ...
 //
 // The parser stops at the first non-comment line. The body is everything

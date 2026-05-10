@@ -10,16 +10,16 @@ import (
 
 func TestParseMeta_Minimal(t *testing.T) {
 	src := `# template-meta:
-#   id: lite-engine
+#   id: example
 #   parameters:
 #     required: [slug, image]
 #     optional: []
 #   secrets:
-#     per_instance: [auth_secret]
-#     per_host_referenced: [s3-access-key-id]
+#     per_instance: [password]
+#     per_host_referenced: [registry-pull-token]
 #   volumes:
 #     - name: data
-#       backup: litestream
+#       backup: none
 ---
 apiVersion: v1
 kind: Pod
@@ -27,14 +27,14 @@ kind: Pod
 	meta, body, err := ParseMeta(src)
 	require.NoError(t, err)
 
-	assert.Equal(t, "lite-engine", meta.ID)
+	assert.Equal(t, "example", meta.ID)
 	assert.Equal(t, []string{"slug", "image"}, meta.Parameters.Required)
 	assert.Empty(t, meta.Parameters.Optional)
-	assert.Equal(t, []string{"auth_secret"}, meta.Secrets.PerInstance)
-	assert.Equal(t, []string{"s3-access-key-id"}, meta.Secrets.PerHostReferenced)
+	assert.Equal(t, []string{"password"}, meta.Secrets.PerInstance)
+	assert.Equal(t, []string{"registry-pull-token"}, meta.Secrets.PerHostReferenced)
 	require.Len(t, meta.Volumes, 1)
 	assert.Equal(t, "data", meta.Volumes[0].Name)
-	assert.Equal(t, "litestream", meta.Volumes[0].Backup)
+	assert.Equal(t, "none", meta.Volumes[0].Backup)
 
 	assert.Contains(t, body, "apiVersion: v1")
 	assert.NotContains(t, body, "template-meta")
