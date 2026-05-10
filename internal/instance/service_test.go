@@ -2,6 +2,7 @@ package instance
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -94,7 +95,7 @@ func TestService_Apply_Then_Get(t *testing.T) {
 	svc, _ := newSvc(t)
 	ctx := context.Background()
 
-	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), true))
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
 
 	obs, err := svc.Get(ctx, "h1", "postgres", "demo")
 	require.NoError(t, err)
@@ -110,27 +111,27 @@ func TestService_Apply_RequiresHostSecret(t *testing.T) {
 		Template:   "needs-host-secret",
 		Slug:       "x",
 		Parameters: map[string]any{"slug": "x", "image": "x:1"},
-	}, false)
+	}, ApplyOptions{Replace: false})
 	require.Error(t, err)
 	assert.ErrorIs(t, err, ErrHostSecretMissing)
 }
 
 func TestService_UnknownTemplate(t *testing.T) {
 	svc, _ := newSvc(t)
-	err := svc.Apply(context.Background(), "h1", ApplyRequest{Template: "nope", Slug: "x"}, false)
+	err := svc.Apply(context.Background(), "h1", ApplyRequest{Template: "nope", Slug: "x"}, ApplyOptions{Replace: false})
 	require.ErrorIs(t, err, ErrUnknownTemplate)
 }
 
 func TestService_UnknownHost(t *testing.T) {
 	svc, _ := newSvc(t)
-	err := svc.Apply(context.Background(), "nope", ApplyRequest{Template: "postgres", Slug: "x"}, false)
+	err := svc.Apply(context.Background(), "nope", ApplyRequest{Template: "postgres", Slug: "x"}, ApplyOptions{Replace: false})
 	require.ErrorIs(t, err, ErrUnknownHost)
 }
 
 func TestService_Lifecycle(t *testing.T) {
 	svc, _ := newSvc(t)
 	ctx := context.Background()
-	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), true))
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
 
 	require.NoError(t, svc.Stop(ctx, "h1", "postgres", "demo"))
 	obs, _ := svc.Get(ctx, "h1", "postgres", "demo")
@@ -150,10 +151,10 @@ func TestService_Apply_ConflictWhenExists(t *testing.T) {
 	ctx := context.Background()
 	req := pgApply("dup")
 	// First apply with replace=true succeeds.
-	require.NoError(t, svc.Apply(ctx, "h1", req, true))
+	require.NoError(t, svc.Apply(ctx, "h1", req, ApplyOptions{Replace: true}))
 
 	// Second apply with replace=false must return ErrInstanceExists.
-	err := svc.Apply(ctx, "h1", req, false)
+	err := svc.Apply(ctx, "h1", req, ApplyOptions{Replace: false})
 	require.ErrorIs(t, err, ErrInstanceExists)
 }
 
@@ -161,7 +162,7 @@ func TestService_Upgrade_DoesNotMutateCallerMap(t *testing.T) {
 	svc, _ := newSvc(t)
 	ctx := context.Background()
 	apply := pgApply("up")
-	require.NoError(t, svc.Apply(ctx, "h1", apply, true))
+	require.NoError(t, svc.Apply(ctx, "h1", apply, ApplyOptions{Replace: true}))
 
 	upgradeReq := pgApply("up")
 	originalImage := upgradeReq.Parameters["image"]
@@ -175,6 +176,32 @@ func TestService_Upgrade_DoesNotMutateCallerMap(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, obs.Containers, 1)
 	assert.Equal(t, "docker.io/library/postgres:17", obs.Containers[0].Image)
+}
+
+func TestService_Apply_PrePullsImages(t *testing.T) {
+	svc, f := newSvc(t)
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	require.Len(t, f.PullCalls, 1, "Apply must pre-pull every container image")
+	assert.Equal(t, "h1", f.PullCalls[0].Host)
+	assert.Equal(t, "docker.io/library/postgres:16", f.PullCalls[0].Image)
+}
+
+func TestService_Apply_PullFailureMapsToErrImagePull(t *testing.T) {
+	svc, f := newSvc(t)
+	f.PullErr = map[string]error{"": errors.New("manifest unknown")}
+	err := svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrImagePull)
+	assert.Contains(t, err.Error(), "manifest unknown")
+	// Pull failure must abort BEFORE any secret is written so we don't leak orphans.
+	_, secretErr := f.SecretInspect(context.Background(), "h1", "postgres-demo-password")
+	assert.ErrorIs(t, secretErr, podman.ErrNotFound, "no per-instance secret should be created when pull fails")
+}
+
+func TestService_Apply_SkipPull(t *testing.T) {
+	svc, f := newSvc(t)
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true, SkipPull: true}))
+	assert.Empty(t, f.PullCalls, "SkipPull must suppress all ImagePull calls")
 }
 
 // podman is imported but used only to satisfy reference in tests above.

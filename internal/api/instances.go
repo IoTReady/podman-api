@@ -54,7 +54,8 @@ func (h *handlers) createInstance(w http.ResponseWriter, r *http.Request) {
 	if !validInstancePath(w, req.Template, req.Slug) {
 		return
 	}
-	if err := h.svc.Apply(r.Context(), host, req, false); err != nil {
+	opts := instance.ApplyOptions{Replace: false, SkipPull: queryBool(r, "skip_pull")}
+	if err := h.svc.Apply(r.Context(), host, req, opts); err != nil {
 		WriteError(w, err)
 		return
 	}
@@ -89,7 +90,8 @@ func (h *handlers) applyInstance(w http.ResponseWriter, r *http.Request) {
 	req.Template = pathTmpl
 	req.Slug = pathSlug
 
-	if err := h.svc.Apply(r.Context(), host, req, true); err != nil {
+	opts := instance.ApplyOptions{Replace: true, SkipPull: queryBool(r, "skip_pull")}
+	if err := h.svc.Apply(r.Context(), host, req, opts); err != nil {
 		WriteError(w, err)
 		return
 	}

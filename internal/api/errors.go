@@ -52,6 +52,8 @@ func classify(err error) (code string, status int, msg string) {
 		return "instance_already_exists", http.StatusConflict, err.Error()
 	case errors.Is(err, instance.ErrHostSecretMissing):
 		return "host_secret_missing", http.StatusUnprocessableEntity, err.Error()
+	case errors.Is(err, instance.ErrImagePull):
+		return "upstream_error", http.StatusBadGateway, err.Error()
 	case errors.Is(err, podman.ErrNotFound):
 		return "instance_not_found", http.StatusNotFound, err.Error()
 	case errors.Is(err, render.ErrInvalidParameters):

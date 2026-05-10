@@ -23,6 +23,11 @@ type Fake struct {
 
 	// Optional hooks for tests that want to inject errors.
 	PlayKubeErr error
+	// PullErr, if non-nil, makes ImagePull return this error for matching refs.
+	// Key is image ref; the empty key matches any ref.
+	PullErr map[string]error
+	// PullCalls records every (host, image) pair passed to ImagePull.
+	PullCalls []struct{ Host, Image string }
 }
 
 // New returns a fresh fake.
@@ -219,7 +224,18 @@ func (f *Fake) ContainerLogs(_ context.Context, _, _ string, _ podman.LogOptions
 	return ch, nil
 }
 
-func (f *Fake) ImagePull(_ context.Context, _, _ string) error { return nil }
+func (f *Fake) ImagePull(_ context.Context, host, ref string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.PullCalls = append(f.PullCalls, struct{ Host, Image string }{host, ref})
+	if err, ok := f.PullErr[ref]; ok {
+		return err
+	}
+	if err, ok := f.PullErr[""]; ok {
+		return err
+	}
+	return nil
+}
 
 func (f *Fake) Ping(_ context.Context, _ string) error              { return nil }
 func (f *Fake) Version(_ context.Context, _ string) (string, error) { return "fake-1.0", nil }

@@ -18,7 +18,14 @@ var (
 	ErrInstanceNotFound  = errors.New("instance not found")
 	ErrInstanceExists    = errors.New("instance already exists")
 	ErrHostSecretMissing = errors.New("required host secret missing")
+	ErrImagePull         = errors.New("image pull failed")
 )
+
+// ApplyOptions controls the side effects of Apply beyond the request body.
+type ApplyOptions struct {
+	Replace  bool // if false and the pod exists, return ErrInstanceExists
+	SkipPull bool // if true, do not pre-pull container images (CI / local-only refs)
+}
 
 // ApplyRequest is the body of POST /instances and PUT /instances/{...}.
 type ApplyRequest struct {
@@ -92,9 +99,12 @@ func instanceSecretName(tmpl, slug, name string) string {
 	return tmpl + "-" + slug + "-" + name
 }
 
-// Apply creates or replaces an instance. If replace is false and the pod
-// exists, returns ErrInstanceExists.
-func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, replace bool) error {
+// Apply creates or replaces an instance. If opts.Replace is false and the
+// pod exists, returns ErrInstanceExists. Unless opts.SkipPull is set, every
+// container image referenced in the rendered Pod spec is pulled before the
+// manifest is played — this surfaces registry errors fast and avoids the
+// opaque timeout from play kube's implicit pull.
+func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts ApplyOptions) error {
 	tmpl, err := s.lookup(host, req.Template)
 	if err != nil {
 		return err
@@ -118,11 +128,27 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, repl
 	}
 
 	// Strict-create: 409 if pod exists.
-	if !replace {
+	if !opts.Replace {
 		if _, err := s.client.PodInspect(ctx, host, podName(req.Template, req.Slug)); err == nil {
 			return ErrInstanceExists
 		} else if !errors.Is(err, podman.ErrNotFound) {
 			return fmt.Errorf("inspect pod: %w", err)
+		}
+	}
+
+	yaml, err := render.Render(rawTemplate(tmpl), req.Parameters)
+	if err != nil {
+		return fmt.Errorf("render: %w", err)
+	}
+
+	// Pre-pull images BEFORE writing any secrets. A bad image ref then leaves
+	// no orphan secrets behind; secrets that already exist (rotation case) are
+	// only touched once we know the manifest will play.
+	if !opts.SkipPull {
+		for _, img := range containerImages(yaml) {
+			if err := s.client.ImagePull(ctx, host, img); err != nil {
+				return fmt.Errorf("%w: %s: %v", ErrImagePull, img, err)
+			}
 		}
 	}
 
@@ -143,11 +169,7 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, repl
 		req.Secrets[k] = "" // best-effort zero
 	}
 
-	yaml, err := render.Render(rawTemplate(tmpl), req.Parameters)
-	if err != nil {
-		return fmt.Errorf("render: %w", err)
-	}
-	if err := s.client.PlayKube(ctx, host, yaml, replace); err != nil {
+	if err := s.client.PlayKube(ctx, host, yaml, opts.Replace); err != nil {
 		return fmt.Errorf("play kube: %w", err)
 	}
 	return nil
@@ -227,13 +249,12 @@ func (s *Service) lifecycle(ctx context.Context, host, tmpl, slug string,
 	return nil
 }
 
-// Upgrade pulls a new image tag and replaces the pod with the new image.
+// Upgrade replaces the pod with a new image. The pull happens inside Apply
+// (which scans the rendered manifest and pulls every container image), so a
+// bad image ref still fails fast — without a duplicate pre-pull here.
 func (s *Service) Upgrade(ctx context.Context, host string, req ApplyRequest, image string) error {
 	if image == "" {
 		return errors.New("upgrade requires an image")
-	}
-	if err := s.client.ImagePull(ctx, host, image); err != nil {
-		return fmt.Errorf("pull %q: %w", image, err)
 	}
 	// Shallow-copy parameters to avoid mutating the caller's map.
 	params := make(map[string]any, len(req.Parameters)+1)
@@ -242,7 +263,7 @@ func (s *Service) Upgrade(ctx context.Context, host string, req ApplyRequest, im
 	}
 	params["image"] = image
 	req.Parameters = params
-	return s.Apply(ctx, host, req, true)
+	return s.Apply(ctx, host, req, ApplyOptions{Replace: true})
 }
 
 // Delete removes the pod and optionally its volumes and per-instance secrets.
