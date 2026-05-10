@@ -132,7 +132,7 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, repl
 				return fmt.Errorf("remove existing secret %q: %w", name, err)
 			}
 		}
-		if err := s.client.SecretCreate(ctx, host, name, []byte(v)); err != nil {
+		if err := s.client.SecretCreate(ctx, host, name, wrapAsKubeSecret(name, []byte(v))); err != nil {
 			return fmt.Errorf("create secret %q: %w", name, err)
 		}
 	}
@@ -335,7 +335,7 @@ func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []
 			return err
 		}
 	}
-	return s.client.SecretCreate(ctx, host, name, value)
+	return s.client.SecretCreate(ctx, host, name, wrapAsKubeSecret(name, value))
 }
 
 func (s *Service) DeleteHostSecret(ctx context.Context, host, name string) error {
