@@ -36,9 +36,10 @@ type DeleteOptions struct {
 
 // Service orchestrates instance operations against podman hosts.
 type Service struct {
-	client    podman.Client
-	hosts     map[string]config.Host
-	templates map[string]config.Template
+	client     podman.Client
+	hosts      map[string]config.Host
+	templates  map[string]config.Template
+	secretEnvs map[string]map[string]bool // template id -> set of secret-sourced env var names
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex // key = host|template|slug
@@ -46,16 +47,18 @@ type Service struct {
 
 func NewService(client podman.Client, hosts []config.Host, tmpls []config.Template) *Service {
 	s := &Service{
-		client:    client,
-		hosts:     map[string]config.Host{},
-		templates: map[string]config.Template{},
-		locks:     map[string]*sync.Mutex{},
+		client:     client,
+		hosts:      map[string]config.Host{},
+		templates:  map[string]config.Template{},
+		secretEnvs: map[string]map[string]bool{},
+		locks:      map[string]*sync.Mutex{},
 	}
 	for _, h := range hosts {
 		s.hosts[h.ID] = h
 	}
 	for _, t := range tmpls {
 		s.templates[t.Meta.ID] = t
+		s.secretEnvs[t.Meta.ID] = secretEnvNames(t.Body)
 	}
 	return s
 }
@@ -177,7 +180,7 @@ func (s *Service) Get(ctx context.Context, host, tmpl, slug string) (Observed, e
 			vols = append(vols, vv)
 		}
 	}
-	return Normalize(p, tmpl, slug, vols), nil
+	return Normalize(p, tmpl, slug, vols, s.secretEnvs[tmpl]), nil
 }
 
 // List returns all instances of a given template on a host.
@@ -192,7 +195,7 @@ func (s *Service) List(ctx context.Context, host, tmpl string) ([]Observed, erro
 	out := make([]Observed, 0, len(pods))
 	for _, p := range pods {
 		slug := p.Labels["podman-api/slug"]
-		out = append(out, Normalize(p, tmpl, slug, nil))
+		out = append(out, Normalize(p, tmpl, slug, nil, s.secretEnvs[tmpl]))
 	}
 	return out, nil
 }

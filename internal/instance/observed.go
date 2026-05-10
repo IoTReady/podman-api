@@ -45,18 +45,12 @@ type ObservedVolume struct {
 	SizeBytes int64  `json:"size_bytes,omitempty"`
 }
 
-// secretishKeys are env var names whose VALUES are never returned to the CMS.
-var secretishKeys = map[string]bool{
-	"AUTH_SECRET":                  true,
-	"LITESTREAM_ACCESS_KEY_ID":     true,
-	"LITESTREAM_SECRET_ACCESS_KEY": true,
-	"AWS_ACCESS_KEY_ID":            true,
-	"AWS_SECRET_ACCESS_KEY":        true,
-}
-
 // Normalize builds Observed from a Pod + the volumes the API thinks the
-// instance owns. It redacts known-secret env keys from env_summary.
-func Normalize(p podman.Pod, template, slug string, vols []podman.Volume) Observed {
+// instance owns. Env vars whose names appear in secretEnvs (the set derived
+// from the template's secretKeyRef blocks) are dropped from env_summary so
+// secret material never returns to the CMS. A defensive substring check on
+// SECRET also catches anything not anchored to a known template.
+func Normalize(p podman.Pod, template, slug string, vols []podman.Volume, secretEnvs map[string]bool) Observed {
 	out := Observed{
 		Template: template,
 		Slug:     slug,
@@ -83,7 +77,7 @@ func Normalize(p podman.Pod, template, slug string, vols []podman.Volume) Observ
 	out.EnvSummary = map[string]string{}
 	for _, c := range p.Containers {
 		for k, v := range c.Env {
-			if secretishKeys[k] || strings.Contains(strings.ToUpper(k), "SECRET") {
+			if secretEnvs[k] || strings.Contains(strings.ToUpper(k), "SECRET") {
 				continue
 			}
 			out.EnvSummary[k] = v

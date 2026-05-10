@@ -41,7 +41,7 @@ func TestNormalize(t *testing.T) {
 
 	obs := Normalize(p, "lite-engine", "iotready", []podman.Volume{
 		{Name: "lite-engine-iotready-data", SizeBytes: 100},
-	})
+	}, map[string]bool{"AUTH_SECRET": true})
 
 	assert.Equal(t, "lite-engine", obs.Template)
 	assert.Equal(t, "iotready", obs.Slug)
