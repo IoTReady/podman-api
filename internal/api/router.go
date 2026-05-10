@@ -30,7 +30,7 @@ func NewRouter(svc *instance.Service, keys []config.APIKey, audit func(http.Hand
 	}
 
 	guard := func(scope string, h http.Handler) http.Handler {
-		return audit(auth.New(keys, scope)(h))
+		return auth.New(keys, scope)(audit(h))
 	}
 
 	// Hosts (read).
