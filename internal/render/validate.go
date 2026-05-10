@@ -7,6 +7,9 @@ import (
 	"strings"
 )
 
+// ErrInvalidParameters is the sentinel returned by Validate.
+var ErrInvalidParameters = errors.New("invalid parameters")
+
 // Validate checks that params and secrets satisfy the template's contract:
 //   - All Required parameters are present.
 //   - No params outside Required ∪ Optional.
@@ -45,7 +48,7 @@ func Validate(m Meta, params map[string]any, secrets map[string]string) error {
 		return nil
 	}
 	sort.Strings(problems)
-	return errors.New(strings.Join(problems, "; "))
+	return fmt.Errorf("%w: %s", ErrInvalidParameters, strings.Join(problems, "; "))
 }
 
 func stringSet(lists ...[]string) map[string]bool {

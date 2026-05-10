@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/render"
 )
 
 func TestWriteError_KnownSentinels(t *testing.T) {
@@ -22,6 +23,7 @@ func TestWriteError_KnownSentinels(t *testing.T) {
 		{instance.ErrInstanceNotFound, "instance_not_found", http.StatusNotFound},
 		{instance.ErrInstanceExists, "instance_already_exists", http.StatusConflict},
 		{instance.ErrHostSecretMissing, "host_secret_missing", http.StatusUnprocessableEntity},
+		{render.ErrInvalidParameters, "invalid_parameters", http.StatusBadRequest},
 		{errors.New("anything else"), "internal", http.StatusInternalServerError},
 	}
 	for _, c := range cases {
