@@ -16,8 +16,8 @@ func TestDeleteVolume_Idempotent(t *testing.T) {
 
 func TestInstanceVolumes_NotFoundForUnknownInstance(t *testing.T) {
 	srv, tok, _ := newSrvFull(t)
-	// "x" template has no volumes; even if instance exists, returns []. Not having an instance just returns [].
-	resp := authedReq(t, srv, tok, "GET", "/hosts/h1/instances/x/never-deployed/volumes")
+	// "app" template has no volumes; even if instance exists, returns []. Not having an instance just returns [].
+	resp := authedReq(t, srv, tok, "GET", "/hosts/h1/instances/app/never-deployed/volumes")
 	defer resp.Body.Close()
 	// Either 200 with empty list (template loaded, instance doesn't exist but volumes lookup tolerates) or another expected status.
 	assert.Contains(t, []int{http.StatusOK, http.StatusNotFound}, resp.StatusCode)

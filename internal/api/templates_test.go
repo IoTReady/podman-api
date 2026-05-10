@@ -21,9 +21,9 @@ func newSrvWithTmpl(t *testing.T) (*httptest.Server, string) {
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:read"}}}
 	tmpls := []config.Template{
 		{Meta: render.Meta{
-			ID:         "x",
+			ID:         "app",
 			Parameters: render.Parameters{Required: []string{"slug"}},
-		}, Body: "kind: Pod\nname: x-{{.slug}}\n", Source: "x.yaml"},
+		}, Body: "kind: Pod\nname: app-{{.slug}}\n", Source: "app.yaml"},
 	}
 	svc := instance.NewService(fake.New(), nil, tmpls)
 	srv := httptest.NewServer(NewRouter(svc, keys, nil, nil))
@@ -40,16 +40,16 @@ func TestListTemplates(t *testing.T) {
 	var got []map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
 	require.Len(t, got, 1)
-	assert.Equal(t, "x", got[0]["id"])
+	assert.Equal(t, "app", got[0]["id"])
 }
 
 func TestRenderTemplate(t *testing.T) {
 	srv, tok := newSrvWithTmpl(t)
-	resp := authedReq(t, srv, tok, "GET", "/templates/x/render?slug=hello")
+	resp := authedReq(t, srv, tok, "GET", "/templates/app/render?slug=hello")
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	body := make([]byte, 1024)
 	n, _ := resp.Body.Read(body)
-	assert.Contains(t, string(body[:n]), "name: x-hello")
+	assert.Contains(t, string(body[:n]), "name: app-hello")
 }

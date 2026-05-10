@@ -19,6 +19,10 @@ func (h *handlers) listTemplates(w http.ResponseWriter, _ *http.Request) {
 
 func (h *handlers) getTemplate(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !validName(id) {
+		writeInvalidName(w, "template", id)
+		return
+	}
 	for _, t := range h.svc.Templates() {
 		if t.Meta.ID == id {
 			WriteJSON(w, http.StatusOK, templateView(t))
@@ -30,6 +34,10 @@ func (h *handlers) getTemplate(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) renderTemplate(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
+	if !validName(id) {
+		writeInvalidName(w, "template", id)
+		return
+	}
 	var tmpl *config.Template
 	for _, t := range h.svc.Templates() {
 		if t.Meta.ID == id {

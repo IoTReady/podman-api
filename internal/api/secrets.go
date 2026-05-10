@@ -25,6 +25,10 @@ func (h *handlers) listSecrets(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) putSecret(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	name := r.PathValue("name")
+	if !validName(name) {
+		writeInvalidName(w, "name", name)
+		return
+	}
 	var body struct {
 		Value string `json:"value"`
 	}
@@ -46,6 +50,10 @@ func (h *handlers) putSecret(w http.ResponseWriter, r *http.Request) {
 func (h *handlers) deleteSecret(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	name := r.PathValue("name")
+	if !validName(name) {
+		writeInvalidName(w, "name", name)
+		return
+	}
 	if err := h.svc.DeleteHostSecret(r.Context(), host, name); err != nil {
 		WriteError(w, err)
 		return

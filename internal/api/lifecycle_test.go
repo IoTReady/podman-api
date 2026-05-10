@@ -11,15 +11,15 @@ import (
 
 func TestLifecycle_StartStopRestart(t *testing.T) {
 	srv, tok, _ := newSrvFull(t)
-	body := `{"template":"x","slug":"l","parameters":{"slug":"l","image":"i:1"},"secrets":{"auth_secret":"s"}}`
-	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/x/l", bytes.NewBufferString(body))
+	body := `{"template":"app","slug":"lf","parameters":{"slug":"lf","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/lf", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", "application/json")
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
 
 	for _, action := range []string{"stop", "start", "restart"} {
-		req, _ := http.NewRequest("POST", srv.URL+"/hosts/h1/instances/x/l/"+action, nil)
+		req, _ := http.NewRequest("POST", srv.URL+"/hosts/h1/instances/app/lf/"+action, nil)
 		req.Header.Set("Authorization", "Bearer "+tok)
 		resp, err := http.DefaultClient.Do(req)
 		require.NoError(t, err)
@@ -30,15 +30,15 @@ func TestLifecycle_StartStopRestart(t *testing.T) {
 
 func TestUpgrade_PullsAndApplies(t *testing.T) {
 	srv, tok, _ := newSrvFull(t)
-	body := `{"template":"x","slug":"u","parameters":{"slug":"u","image":"i:1"},"secrets":{"auth_secret":"s"}}`
-	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/x/u", bytes.NewBufferString(body))
+	body := `{"template":"app","slug":"up","parameters":{"slug":"up","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/up", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", "application/json")
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
 
-	upgrade := `{"image":"i:2","parameters":{"slug":"u","image":"i:1"},"secrets":{"auth_secret":"s"}}`
-	req, _ = http.NewRequest("POST", srv.URL+"/hosts/h1/instances/x/u/upgrade", bytes.NewBufferString(upgrade))
+	upgrade := `{"image":"i:2","parameters":{"slug":"up","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	req, _ = http.NewRequest("POST", srv.URL+"/hosts/h1/instances/app/up/upgrade", bytes.NewBufferString(upgrade))
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)

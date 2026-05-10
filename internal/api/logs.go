@@ -12,9 +12,16 @@ func (h *handlers) logsInstance(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	tmpl := r.PathValue("template")
 	slug := r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
 	container := r.URL.Query().Get("container")
 	if container == "" {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_query", Message: "container is required"})
+		return
+	}
+	if !validName(container) {
+		writeInvalidName(w, "container", container)
 		return
 	}
 	tail, _ := strconv.Atoi(r.URL.Query().Get("tail"))

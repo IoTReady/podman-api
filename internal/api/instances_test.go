@@ -22,19 +22,19 @@ func newSrvFull(t *testing.T) (*httptest.Server, string, *fake.Fake) {
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*", "secrets:*", "hosts:read"}}}
 	tmpls := []config.Template{
 		{Meta: render.Meta{
-			ID:         "x",
+			ID:         "app",
 			Parameters: render.Parameters{Required: []string{"slug", "image"}},
 			Secrets:    render.Secrets{PerInstance: []string{"auth_secret"}},
 		}, Body: `apiVersion: v1
 kind: Pod
 metadata:
-  name: x-{{.slug}}
+  name: app-{{.slug}}
   labels:
-    podman-api/template: x
+    podman-api/template: app
     podman-api/slug: {{.slug}}
 spec:
   containers:
-    - name: c
+    - name: app
       image: {{.image}}
 `},
 	}
@@ -49,8 +49,8 @@ spec:
 func TestApplyAndGetInstance(t *testing.T) {
 	srv, tok, _ := newSrvFull(t)
 
-	body := `{"template":"x","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
-	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/x/hello", bytes.NewBufferString(body))
+	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/hello", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := http.DefaultClient.Do(req)
@@ -58,19 +58,19 @@ func TestApplyAndGetInstance(t *testing.T) {
 	resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 
-	resp = authedReq(t, srv, tok, "GET", "/hosts/h1/instances/x/hello")
+	resp = authedReq(t, srv, tok, "GET", "/hosts/h1/instances/app/hello")
 	defer resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var got map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
-	assert.Equal(t, "x", got["template"])
+	assert.Equal(t, "app", got["template"])
 	assert.Equal(t, "hello", got["slug"])
 }
 
 func TestCreateConflict(t *testing.T) {
 	srv, tok, _ := newSrvFull(t)
-	body := `{"template":"x","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
 
 	req, _ := http.NewRequest("POST", srv.URL+"/hosts/h1/instances", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer "+tok)
@@ -89,20 +89,20 @@ func TestCreateConflict(t *testing.T) {
 
 func TestDeleteInstance(t *testing.T) {
 	srv, tok, _ := newSrvFull(t)
-	body := `{"template":"x","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
-	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/x/hello", bytes.NewBufferString(body))
+	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/hello", bytes.NewBufferString(body))
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("Content-Type", "application/json")
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
 
-	req, _ = http.NewRequest("DELETE", srv.URL+"/hosts/h1/instances/x/hello", nil)
+	req, _ = http.NewRequest("DELETE", srv.URL+"/hosts/h1/instances/app/hello", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	resp, _ = http.DefaultClient.Do(req)
 	resp.Body.Close()
 	assert.Equal(t, http.StatusNoContent, resp.StatusCode)
 
-	resp = authedReq(t, srv, tok, "GET", "/hosts/h1/instances/x/hello")
+	resp = authedReq(t, srv, tok, "GET", "/hosts/h1/instances/app/hello")
 	resp.Body.Close()
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }

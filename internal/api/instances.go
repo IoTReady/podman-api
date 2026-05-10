@@ -17,6 +17,10 @@ func (h *handlers) listInstances(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	if !validName(template) {
+		writeInvalidName(w, "template", template)
+		return
+	}
 	out, err := h.svc.List(r.Context(), host, template)
 	if err != nil {
 		WriteError(w, err)
@@ -29,6 +33,9 @@ func (h *handlers) getInstance(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	tmpl := r.PathValue("template")
 	slug := r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
 	obs, err := h.svc.Get(r.Context(), host, tmpl, slug)
 	if err != nil {
 		WriteError(w, err)
@@ -42,6 +49,9 @@ func (h *handlers) createInstance(w http.ResponseWriter, r *http.Request) {
 	req, err := decodeApply(r)
 	if err != nil {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+		return
+	}
+	if !validInstancePath(w, req.Template, req.Slug) {
 		return
 	}
 	if err := h.svc.Apply(r.Context(), host, req, false); err != nil {
@@ -58,21 +68,26 @@ func (h *handlers) createInstance(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) applyInstance(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
+	pathTmpl := r.PathValue("template")
+	pathSlug := r.PathValue("slug")
+	if !validInstancePath(w, pathTmpl, pathSlug) {
+		return
+	}
 	req, err := decodeApply(r)
 	if err != nil {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
 		return
 	}
-	if got := r.PathValue("template"); req.Template != "" && req.Template != got {
+	if req.Template != "" && req.Template != pathTmpl {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "template in URL does not match body"})
 		return
 	}
-	if got := r.PathValue("slug"); req.Slug != "" && req.Slug != got {
+	if req.Slug != "" && req.Slug != pathSlug {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "slug in URL does not match body"})
 		return
 	}
-	req.Template = r.PathValue("template")
-	req.Slug = r.PathValue("slug")
+	req.Template = pathTmpl
+	req.Slug = pathSlug
 
 	if err := h.svc.Apply(r.Context(), host, req, true); err != nil {
 		WriteError(w, err)
@@ -90,6 +105,9 @@ func (h *handlers) deleteInstance(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	tmpl := r.PathValue("template")
 	slug := r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
 	opts := instance.DeleteOptions{
 		PruneVolumes: queryBool(r, "prune_volumes"),
 		PruneSecrets: queryBool(r, "prune_secrets"),
@@ -119,7 +137,11 @@ func queryBool(r *http.Request, key string) bool {
 }
 
 func (h *handlers) startInstance(w http.ResponseWriter, r *http.Request) {
-	if err := h.svc.Start(r.Context(), r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")); err != nil {
+	tmpl, slug := r.PathValue("template"), r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
+	if err := h.svc.Start(r.Context(), r.PathValue("host"), tmpl, slug); err != nil {
 		WriteError(w, err)
 		return
 	}
@@ -127,7 +149,11 @@ func (h *handlers) startInstance(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) stopInstance(w http.ResponseWriter, r *http.Request) {
-	if err := h.svc.Stop(r.Context(), r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")); err != nil {
+	tmpl, slug := r.PathValue("template"), r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
+	if err := h.svc.Stop(r.Context(), r.PathValue("host"), tmpl, slug); err != nil {
 		WriteError(w, err)
 		return
 	}
@@ -135,7 +161,11 @@ func (h *handlers) stopInstance(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) restartInstance(w http.ResponseWriter, r *http.Request) {
-	if err := h.svc.Restart(r.Context(), r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")); err != nil {
+	tmpl, slug := r.PathValue("template"), r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
+	if err := h.svc.Restart(r.Context(), r.PathValue("host"), tmpl, slug); err != nil {
 		WriteError(w, err)
 		return
 	}
@@ -146,6 +176,9 @@ func (h *handlers) instanceVolumes(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	tmpl := r.PathValue("template")
 	slug := r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
 	vols, err := h.svc.InstanceVolumes(r.Context(), host, tmpl, slug)
 	if err != nil {
 		WriteError(w, err)
@@ -162,6 +195,9 @@ func (h *handlers) upgradeInstance(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	tmpl := r.PathValue("template")
 	slug := r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
 	var body struct {
 		Image      string            `json:"image"`
 		Parameters map[string]any    `json:"parameters"`
