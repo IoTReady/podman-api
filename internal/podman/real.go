@@ -414,30 +414,65 @@ func podFromList(p *entities.ListPodsReport) Pod {
 	return out
 }
 
+// ContainerLogs streams log lines from a container. Cancellation propagates
+// bidirectionally: if the caller's ctx is cancelled the underlying
+// containers.Logs call is cancelled (via mergedCtx), and if the producer
+// finishes naturally the bridge goroutine exits cleanly.
+//
+// The connection context (c) is long-lived and must not be cancelled per
+// request; mergedCtx derives from c but can be independently cancelled so
+// the streaming call is torn down without killing the cached connection.
 func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts LogOptions) (<-chan LogLine, error) {
 	c, err := r.ctxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+
+	// mergedCtx is derived from the connection context but independently
+	// cancellable. Cancelling it tears down the containers.Logs HTTP stream
+	// without affecting the cached connection context c.
+	mergedCtx, cancel := context.WithCancel(c)
+
+	// Bridge goroutine: propagate caller cancellation to mergedCtx, and also
+	// exit when mergedCtx itself finishes (natural completion or cancel()).
+	go func() {
+		select {
+		case <-ctx.Done():
+		case <-mergedCtx.Done():
+		}
+		cancel()
+	}()
+
 	stdoutCh := make(chan string, 64)
 	stderrCh := make(chan string, 64)
 	out := make(chan LogLine, 64)
 
 	go func() {
 		defer close(out)
+		defer cancel() // signal the bridge and producer to stop when fan-in exits
 		for {
 			select {
+			case <-ctx.Done():
+				return
 			case line, ok := <-stdoutCh:
 				if !ok {
 					stdoutCh = nil
 				} else {
-					out <- LogLine{Container: container, Stream: "stdout", Line: line, Time: time.Now()}
+					select {
+					case out <- LogLine{Container: container, Stream: "stdout", Line: line, Time: time.Now()}:
+					case <-ctx.Done():
+						return
+					}
 				}
 			case line, ok := <-stderrCh:
 				if !ok {
 					stderrCh = nil
 				} else {
-					out <- LogLine{Container: container, Stream: "stderr", Line: line, Time: time.Now()}
+					select {
+					case out <- LogLine{Container: container, Stream: "stderr", Line: line, Time: time.Now()}:
+					case <-ctx.Done():
+						return
+					}
 				}
 			}
 			if stdoutCh == nil && stderrCh == nil {
@@ -456,7 +491,7 @@ func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts Log
 		Follow: &follow, Tail: &tail, Since: &opts.Since,
 	}
 	go func() {
-		_ = containers.Logs(c, container, logsOpts, stdoutCh, stderrCh)
+		_ = containers.Logs(mergedCtx, container, logsOpts, stdoutCh, stderrCh)
 		close(stdoutCh)
 		close(stderrCh)
 	}()
