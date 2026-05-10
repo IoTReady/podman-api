@@ -1,0 +1,239 @@
+// Package fake is an in-memory implementation of podman.Client used by tests.
+// It models pods, secrets, and volumes as maps keyed by host ID.
+package fake
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"sync"
+	"time"
+
+	"gopkg.in/yaml.v3"
+
+	"github.com/iotready/podman-api/internal/podman"
+)
+
+// Fake is a thread-safe in-memory podman.Client.
+type Fake struct {
+	mu      sync.Mutex
+	pods    map[string]map[string]podman.Pod    // hostID -> name -> Pod
+	secrets map[string]map[string]podman.Secret // hostID -> name -> Secret
+	volumes map[string]map[string]podman.Volume // hostID -> name -> Volume
+
+	// Optional hooks for tests that want to inject errors.
+	PlayKubeErr error
+}
+
+// New returns a fresh fake.
+func New() *Fake {
+	return &Fake{
+		pods:    map[string]map[string]podman.Pod{},
+		secrets: map[string]map[string]podman.Secret{},
+		volumes: map[string]map[string]podman.Volume{},
+	}
+}
+
+func (f *Fake) hostPods(h string) map[string]podman.Pod {
+	if _, ok := f.pods[h]; !ok {
+		f.pods[h] = map[string]podman.Pod{}
+	}
+	return f.pods[h]
+}
+func (f *Fake) hostSecrets(h string) map[string]podman.Secret {
+	if _, ok := f.secrets[h]; !ok {
+		f.secrets[h] = map[string]podman.Secret{}
+	}
+	return f.secrets[h]
+}
+func (f *Fake) hostVolumes(h string) map[string]podman.Volume {
+	if _, ok := f.volumes[h]; !ok {
+		f.volumes[h] = map[string]podman.Volume{}
+	}
+	return f.volumes[h]
+}
+
+func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.PlayKubeErr != nil {
+		return f.PlayKubeErr
+	}
+	pods := f.hostPods(hostID)
+	for _, doc := range strings.Split(raw, "\n---\n") {
+		var head struct {
+			Kind     string `yaml:"kind"`
+			Metadata struct {
+				Name   string            `yaml:"name"`
+				Labels map[string]string `yaml:"labels"`
+			} `yaml:"metadata"`
+			Spec struct {
+				Containers []struct {
+					Name  string `yaml:"name"`
+					Image string `yaml:"image"`
+				} `yaml:"containers"`
+			} `yaml:"spec"`
+		}
+		_ = yaml.Unmarshal([]byte(doc), &head)
+		if head.Kind != "Pod" {
+			continue
+		}
+		if _, exists := pods[head.Metadata.Name]; exists && !replace {
+			return fmt.Errorf("pod %q already exists", head.Metadata.Name)
+		}
+		var cs []podman.Container
+		for _, c := range head.Spec.Containers {
+			cs = append(cs, podman.Container{
+				Name: c.Name, Image: c.Image, ImageTag: c.Image,
+				Status: "Running", StartedAt: time.Now(),
+			})
+		}
+		pods[head.Metadata.Name] = podman.Pod{
+			ID: head.Metadata.Name, Name: head.Metadata.Name,
+			Status: "Running", Created: time.Now(),
+			Containers: cs, Labels: head.Metadata.Labels,
+		}
+	}
+	return nil
+}
+
+func (f *Fake) PodInspect(_ context.Context, h, name string) (podman.Pod, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.hostPods(h)[name]
+	if !ok {
+		return podman.Pod{}, podman.ErrNotFound
+	}
+	return p, nil
+}
+
+func (f *Fake) PodList(_ context.Context, h string, filters map[string]string) ([]podman.Pod, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []podman.Pod
+	for _, p := range f.hostPods(h) {
+		match := true
+		for k, v := range filters {
+			if p.Labels[k] != v {
+				match = false
+				break
+			}
+		}
+		if match {
+			out = append(out, p)
+		}
+	}
+	return out, nil
+}
+
+func (f *Fake) setStatus(h, name, status string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.hostPods(h)[name]
+	if !ok {
+		return podman.ErrNotFound
+	}
+	p.Status = status
+	for i := range p.Containers {
+		p.Containers[i].Status = status
+	}
+	f.hostPods(h)[name] = p
+	return nil
+}
+
+func (f *Fake) PodStart(_ context.Context, h, name string) error {
+	return f.setStatus(h, name, "Running")
+}
+func (f *Fake) PodStop(_ context.Context, h, name string) error {
+	return f.setStatus(h, name, "Exited")
+}
+func (f *Fake) PodRestart(_ context.Context, h, name string) error {
+	return f.setStatus(h, name, "Running")
+}
+func (f *Fake) PodRemove(_ context.Context, h, name string, _ bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.hostPods(h)[name]; !ok {
+		return podman.ErrNotFound
+	}
+	delete(f.hostPods(h), name)
+	return nil
+}
+
+func (f *Fake) SecretCreate(_ context.Context, h, name string, _ []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hostSecrets(h)[name] = podman.Secret{Name: name, CreatedAt: time.Now()}
+	return nil
+}
+func (f *Fake) SecretList(_ context.Context, h string) ([]podman.Secret, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []podman.Secret
+	for _, s := range f.hostSecrets(h) {
+		out = append(out, s)
+	}
+	return out, nil
+}
+func (f *Fake) SecretInspect(_ context.Context, h, name string) (podman.Secret, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	s, ok := f.hostSecrets(h)[name]
+	if !ok {
+		return podman.Secret{}, podman.ErrNotFound
+	}
+	return s, nil
+}
+func (f *Fake) SecretRemove(_ context.Context, h, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.hostSecrets(h)[name]; !ok {
+		return podman.ErrNotFound
+	}
+	delete(f.hostSecrets(h), name)
+	return nil
+}
+
+func (f *Fake) VolumeInspect(_ context.Context, h, name string) (podman.Volume, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	v, ok := f.hostVolumes(h)[name]
+	if !ok {
+		return podman.Volume{}, podman.ErrNotFound
+	}
+	return v, nil
+}
+func (f *Fake) VolumeRemove(_ context.Context, h, name string, _ bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.hostVolumes(h)[name]; !ok {
+		return podman.ErrNotFound
+	}
+	delete(f.hostVolumes(h), name)
+	return nil
+}
+
+func (f *Fake) ContainerLogs(_ context.Context, _, _ string, _ podman.LogOptions) (<-chan podman.LogLine, error) {
+	ch := make(chan podman.LogLine)
+	close(ch)
+	return ch, nil
+}
+
+func (f *Fake) ImagePull(_ context.Context, _, _ string) error { return nil }
+
+func (f *Fake) Ping(_ context.Context, _ string) error              { return nil }
+func (f *Fake) Version(_ context.Context, _ string) (string, error) { return "fake-1.0", nil }
+func (f *Fake) UsedHostPorts(_ context.Context, h string) ([]podman.PortMapping, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []podman.PortMapping
+	for _, p := range f.hostPods(h) {
+		for _, c := range p.Containers {
+			out = append(out, c.Ports...)
+		}
+	}
+	return out, nil
+}
+
+// Compile-time guarantee that Fake implements the interface.
+var _ podman.Client = (*Fake)(nil)
