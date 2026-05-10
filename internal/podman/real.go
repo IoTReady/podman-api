@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containers/podman/v5/libpod/define"
 	"github.com/containers/podman/v5/pkg/bindings"
 	"github.com/containers/podman/v5/pkg/bindings/containers"
 	"github.com/containers/podman/v5/pkg/bindings/images"
@@ -169,7 +170,49 @@ func (r *Real) PodInspect(ctx context.Context, id, name string) (Pod, error) {
 		}
 		return Pod{}, err
 	}
-	return podFromInspect(rep), nil
+	out := podFromInspect(rep)
+	// Enrich each container with full inspect data (image, ports, env, etc.).
+	for i := range out.Containers {
+		full, err := containers.Inspect(c, out.Containers[i].ID, &containers.InspectOptions{})
+		if err == nil {
+			enrichContainer(&out.Containers[i], full)
+		}
+	}
+	return out, nil
+}
+
+// enrichContainer fills in Container fields that are not available from the
+// pod inspect report alone.
+func enrichContainer(c *Container, ins *define.InspectContainerData) {
+	c.Image = ins.ImageDigest
+	if c.Image == "" {
+		c.Image = ins.Image
+	}
+	c.ImageTag = ins.ImageName
+	if ins.State != nil && !ins.State.StartedAt.IsZero() {
+		c.StartedAt = ins.State.StartedAt
+	}
+	c.RestartCount = int(ins.RestartCount)
+	if ins.HostConfig != nil {
+		for _, ports := range ins.HostConfig.PortBindings {
+			for _, b := range ports {
+				hp, _ := strconv.Atoi(b.HostPort)
+				c.Ports = append(c.Ports, PortMapping{
+					HostIP:   b.HostIP,
+					HostPort: hp,
+				})
+			}
+		}
+	}
+	if ins.Config != nil && ins.Config.Env != nil {
+		c.Env = make(map[string]string, len(ins.Config.Env))
+		for _, e := range ins.Config.Env {
+			eq := strings.IndexByte(e, '=')
+			if eq > 0 {
+				c.Env[e[:eq]] = e[eq+1:]
+			}
+		}
+	}
 }
 
 func (r *Real) PodList(ctx context.Context, id string, filters map[string]string) ([]Pod, error) {
