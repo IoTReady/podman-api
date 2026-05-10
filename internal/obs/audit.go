@@ -4,6 +4,7 @@ package obs
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"time"
@@ -24,14 +25,22 @@ func NewAuditMiddleware(w io.Writer) func(http.Handler) http.Handler {
 			start := time.Now()
 			rec := &statusRecorder{ResponseWriter: rw, status: http.StatusOK}
 			next.ServeHTTP(rec, r)
-			_ = enc.Encode(map[string]any{
+
+			line := map[string]any{
 				"ts":          start.UTC().Format(time.RFC3339Nano),
 				"method":      r.Method,
 				"path":        r.URL.Path,
 				"status":      rec.status,
 				"duration_ms": time.Since(start).Milliseconds(),
 				"key_id":      auth.KeyIDFromContext(r.Context()),
-			})
+				"host":        r.PathValue("host"),
+				"template":    r.PathValue("template"),
+				"slug":        r.PathValue("slug"),
+			}
+			if rec.status >= 400 {
+				line["error"] = fmt.Sprintf("http %d", rec.status)
+			}
+			_ = enc.Encode(line)
 		})
 	}
 }
