@@ -194,12 +194,17 @@ func enrichContainer(c *Container, ins *define.InspectContainerData) {
 	}
 	c.RestartCount = int(ins.RestartCount)
 	if ins.HostConfig != nil {
-		for _, ports := range ins.HostConfig.PortBindings {
+		// PortBindings maps "<containerPort>/<protocol>" -> []HostPort, so
+		// the container port and protocol live in the map key.
+		for key, ports := range ins.HostConfig.PortBindings {
+			cp, proto := splitPortKey(key)
 			for _, b := range ports {
 				hp, _ := strconv.Atoi(b.HostPort)
 				c.Ports = append(c.Ports, PortMapping{
-					HostIP:   b.HostIP,
-					HostPort: hp,
+					HostIP:        b.HostIP,
+					HostPort:      hp,
+					ContainerPort: cp,
+					Protocol:      proto,
 				})
 			}
 		}
@@ -234,7 +239,17 @@ func (r *Real) PodList(ctx context.Context, id string, filters map[string]string
 	}
 	out := make([]Pod, 0, len(reps))
 	for _, rep := range reps {
-		out = append(out, podFromList(rep))
+		p := podFromList(rep)
+		// Enrich each container with full inspect data so list and get return
+		// the same shape (image_tag, started_at, ports, env, etc.). Skip on
+		// per-container error — partial data beats failing the whole list.
+		for i := range p.Containers {
+			full, err := containers.Inspect(c, p.Containers[i].ID, &containers.InspectOptions{})
+			if err == nil {
+				enrichContainer(&p.Containers[i], full)
+			}
+		}
+		out = append(out, p)
 	}
 	return out, nil
 }
@@ -543,6 +558,18 @@ func (r *Real) UsedHostPorts(ctx context.Context, id string) ([]PortMapping, err
 }
 
 func boolPtr(b bool) *bool { return &b }
+
+// splitPortKey parses a libpod PortBindings key like "5432/tcp" into
+// (containerPort, protocol). Missing protocol defaults to "tcp".
+func splitPortKey(k string) (int, string) {
+	slash := strings.IndexByte(k, '/')
+	if slash < 0 {
+		port, _ := strconv.Atoi(k)
+		return port, "tcp"
+	}
+	port, _ := strconv.Atoi(k[:slash])
+	return port, k[slash+1:]
+}
 
 // Compile-time guarantee that Real satisfies the Client interface.
 var _ Client = (*Real)(nil)
