@@ -484,12 +484,18 @@ func (r *Real) UsedHostPorts(ctx context.Context, id string) ([]PortMapping, err
 	}
 	var out []PortMapping
 	for _, ct := range conts {
+		containerName := ""
+		if len(ct.Names) > 0 {
+			containerName = ct.Names[0]
+		}
 		for _, p := range ct.Ports {
 			out = append(out, PortMapping{
 				HostIP:        p.HostIP,
 				HostPort:      int(p.HostPort),
 				ContainerPort: int(p.ContainerPort),
 				Protocol:      p.Protocol,
+				Pod:           ct.PodName,
+				Container:     containerName,
 			})
 		}
 	}

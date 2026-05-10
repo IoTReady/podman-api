@@ -274,6 +274,22 @@ func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts Dele
 	return nil
 }
 
+// Ping checks reachability of a host.
+func (s *Service) Ping(ctx context.Context, host string) error {
+	if _, ok := s.hosts[host]; !ok {
+		return ErrUnknownHost
+	}
+	return s.client.Ping(ctx, host)
+}
+
+// Version returns the podman version string for a host.
+func (s *Service) Version(ctx context.Context, host string) (string, error) {
+	if _, ok := s.hosts[host]; !ok {
+		return "", ErrUnknownHost
+	}
+	return s.client.Version(ctx, host)
+}
+
 // Hosts returns the configured hosts (read-only view for the API).
 func (s *Service) Hosts() []config.Host {
 	out := make([]config.Host, 0, len(s.hosts))

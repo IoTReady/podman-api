@@ -29,6 +29,8 @@ type PortMapping struct {
 	HostPort      int
 	ContainerPort int
 	Protocol      string // tcp/udp
+	Pod           string // pod name owning this port (empty if not derivable)
+	Container     string // container name owning this port (empty if not derivable)
 }
 
 type Volume struct {
