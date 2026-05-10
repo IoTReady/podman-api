@@ -22,7 +22,7 @@ func newSrvFull(t *testing.T) (*httptest.Server, string, *fake.Fake) {
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*", "secrets:*", "hosts:read"}}}
 	tmpls := []config.Template{
 		{Meta: render.Meta{
-			ID: "x",
+			ID:         "x",
 			Parameters: render.Parameters{Required: []string{"slug", "image"}},
 			Secrets:    render.Secrets{PerInstance: []string{"auth_secret"}},
 		}, Body: `apiVersion: v1
