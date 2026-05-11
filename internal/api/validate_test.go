@@ -18,19 +18,19 @@ func TestValidName_AcceptsAndRejects(t *testing.T) {
 	}
 	bad := []string{
 		"",
-		"a",                  // too short
-		"-ab",                // leading dash
-		"ab-",                // trailing dash
-		"AB",                 // uppercase
-		"ab_cd",              // underscore
-		"ab.cd",              // dot
-		"ab cd",              // space
-		"ab\ncd",             // newline
-		"ab/cd",              // slash
-		"..",                 // path traversal
-		"{{ab}}",             // template delimiter
-		"ab*cd",              // glob
-		"ab:cd",              // colon
+		"a",                     // too short
+		"-ab",                   // leading dash
+		"ab-",                   // trailing dash
+		"AB",                    // uppercase
+		"ab_cd",                 // underscore
+		"ab.cd",                 // dot
+		"ab cd",                 // space
+		"ab\ncd",                // newline
+		"ab/cd",                 // slash
+		"..",                    // path traversal
+		"{{ab}}",                // template delimiter
+		"ab*cd",                 // glob
+		"ab:cd",                 // colon
 		strings.Repeat("a", 41), // too long
 	}
 	for _, s := range bad {

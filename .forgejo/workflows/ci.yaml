@@ -1,0 +1,66 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-test-build:
+    name: lint, test, build
+    runs-on: docker
+    container:
+      # Pin a recent Go on top of a minimal image. The bindings used to
+      # require libbtrfs/libgpgme/libdevmapper headers; the v5 client we
+      # use is pure-Go (no CGO), so we install only what `go test` itself
+      # needs: git, ca-certs, build-essential for the race detector linker.
+      image: docker.io/library/golang:1.26-bookworm
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: install build deps
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            git ca-certificates build-essential
+
+      - name: go env
+        run: |
+          go version
+          go env GOMODCACHE GOCACHE
+
+      - name: cache go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-${{ runner.os }}-
+
+      - name: go mod download
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: gofmt -l (fail on any unformatted file)
+        run: |
+          # Print the diff for clarity, then fail if any output is produced.
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then
+            echo "::error::the following files need gofmt:"
+            echo "$out"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go test -race
+        run: go test -race ./...
+
+      - name: go build
+        run: go build ./...
