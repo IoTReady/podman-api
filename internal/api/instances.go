@@ -12,9 +12,15 @@ func (h *handlers) listInstances(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	template := r.URL.Query().Get("template")
 	if template == "" {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{
-			Code: "invalid_query", Message: "template query parameter is required",
-		})
+		// No template filter: list every podman-api-managed pod on the host
+		// across all loaded templates. Useful for the CMS to enumerate a
+		// host's tenants without N round-trips.
+		out, err := h.svc.ListAllInstances(r.Context(), host)
+		if err != nil {
+			WriteError(w, err)
+			return
+		}
+		WriteJSON(w, http.StatusOK, out)
 		return
 	}
 	if !validName(template) {
