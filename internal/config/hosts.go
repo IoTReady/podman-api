@@ -16,6 +16,10 @@ type Host struct {
 	Socket string            `yaml:"socket"`            // path on the host
 	SSHKey string            `yaml:"ssh_key,omitempty"` // optional
 	Labels map[string]string `yaml:"labels,omitempty"`
+	// Drain, when true, makes the API refuse to *create* new instances on
+	// this host. Replace-shaped writes against existing pods, lifecycle
+	// ops, and reads are unaffected. Hot-reloadable via SIGHUP.
+	Drain bool `yaml:"drain,omitempty"`
 }
 
 // LoadHosts reads every *.yaml in dir into a Host. Unknown fields are rejected.

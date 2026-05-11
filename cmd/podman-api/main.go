@@ -105,24 +105,35 @@ func main() {
 		}
 	}
 
-	// SIGHUP: re-read the keys file and atomically swap the live KeyStore.
-	// A bad reload (parse error, no keys) is logged but does NOT kill the
-	// running process, so a fat-fingered edit doesn't take the API down.
+	// SIGHUP: re-read keys.yaml AND hosts/*.yaml and atomically swap both.
+	// A bad reload of either is logged but does NOT kill the running process,
+	// so a fat-fingered edit can't take the API down. Each is independent —
+	// if hosts parses but keys doesn't, the hosts reload still applies.
 	hup := make(chan os.Signal, 1)
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
 		for range hup {
-			newKeys, fp, err := loadKeys(*keysFile)
-			if err != nil {
+			if newKeys, fp, err := loadKeys(*keysFile); err != nil {
 				log.Printf("keys reload FAILED, keeping previous set: %v", err)
-				continue
-			}
-			if len(newKeys) == 0 {
+			} else if len(newKeys) == 0 {
 				log.Printf("keys reload SKIPPED, file parsed but contained zero keys (path=%s, fp=%s)", *keysFile, fp)
-				continue
+			} else {
+				keyStore.Store(newKeys)
+				log.Printf("keys reloaded: %d entries, fingerprint=%s", len(newKeys), fp)
 			}
-			keyStore.Store(newKeys)
-			log.Printf("keys reloaded: %d entries, fingerprint=%s", len(newKeys), fp)
+
+			if newHosts, err := config.LoadHosts(*hostsDir); err != nil {
+				log.Printf("hosts reload FAILED, keeping previous set: %v", err)
+			} else {
+				svc.SetHosts(newHosts)
+				draining := 0
+				for _, hh := range newHosts {
+					if hh.Drain {
+						draining++
+					}
+				}
+				log.Printf("hosts reloaded: %d entries (%d draining)", len(newHosts), draining)
+			}
 		}
 	}()
 

@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 
+	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 )
 
@@ -10,21 +11,7 @@ func (h *handlers) listHosts(w http.ResponseWriter, r *http.Request) {
 	hosts := h.svc.Hosts()
 	out := make([]map[string]any, 0, len(hosts))
 	for _, host := range hosts {
-		entry := map[string]any{
-			"id":     host.ID,
-			"addr":   host.Addr,
-			"labels": host.Labels,
-			"status": "unknown",
-		}
-		if err := h.svc.Ping(r.Context(), host.ID); err == nil {
-			entry["status"] = "ok"
-			if v, err := h.svc.Version(r.Context(), host.ID); err == nil {
-				entry["podman_version"] = v
-			}
-		} else {
-			entry["status"] = "unreachable"
-		}
-		out = append(out, entry)
+		out = append(out, h.hostView(r, host))
 	}
 	WriteJSON(w, http.StatusOK, out)
 }
@@ -33,22 +20,40 @@ func (h *handlers) getHost(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("host")
 	for _, host := range h.svc.Hosts() {
 		if host.ID == id {
-			entry := map[string]any{
-				"id": host.ID, "addr": host.Addr, "labels": host.Labels, "status": "unknown",
-			}
-			if err := h.svc.Ping(r.Context(), id); err == nil {
-				entry["status"] = "ok"
-				if v, err := h.svc.Version(r.Context(), id); err == nil {
-					entry["podman_version"] = v
-				}
-			} else {
-				entry["status"] = "unreachable"
-			}
-			WriteJSON(w, http.StatusOK, entry)
+			WriteJSON(w, http.StatusOK, h.hostView(r, host))
 			return
 		}
 	}
 	WriteError(w, instance.ErrUnknownHost)
+}
+
+// hostView is the canonical JSON shape for a host: identity + reachability +
+// drain state + a live count of managed instances. Reachability calls run
+// per-request (not cached) so operators get a true picture.
+func (h *handlers) hostView(r *http.Request, host config.Host) map[string]any {
+	entry := map[string]any{
+		"id":       host.ID,
+		"addr":     host.Addr,
+		"labels":   host.Labels,
+		"status":   "unknown",
+		"draining": host.Drain,
+	}
+	reachable := false
+	if err := h.svc.Ping(r.Context(), host.ID); err == nil {
+		reachable = true
+		entry["status"] = "ok"
+		if v, err := h.svc.Version(r.Context(), host.ID); err == nil {
+			entry["podman_version"] = v
+		}
+	} else {
+		entry["status"] = "unreachable"
+	}
+	if reachable {
+		if n, err := h.svc.InstanceCount(r.Context(), host.ID); err == nil {
+			entry["instance_count"] = n
+		}
+	}
+	return entry
 }
 
 func (h *handlers) hostHealthz(w http.ResponseWriter, r *http.Request) {

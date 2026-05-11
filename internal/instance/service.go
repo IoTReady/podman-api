@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/podman"
@@ -19,6 +20,7 @@ var (
 	ErrInstanceExists    = errors.New("instance already exists")
 	ErrHostSecretMissing = errors.New("required host secret missing")
 	ErrImagePull         = errors.New("image pull failed")
+	ErrHostDraining      = errors.New("host is draining")
 )
 
 // ApplyOptions controls the side effects of Apply beyond the request body.
@@ -44,7 +46,7 @@ type DeleteOptions struct {
 // Service orchestrates instance operations against podman hosts.
 type Service struct {
 	client     podman.Client
-	hosts      map[string]config.Host
+	hosts      atomic.Pointer[map[string]config.Host] // hot-swappable on SIGHUP
 	templates  map[string]config.Template
 	secretEnvs map[string]map[string]bool // template id -> set of secret-sourced env var names
 
@@ -55,19 +57,39 @@ type Service struct {
 func NewService(client podman.Client, hosts []config.Host, tmpls []config.Template) *Service {
 	s := &Service{
 		client:     client,
-		hosts:      map[string]config.Host{},
 		templates:  map[string]config.Template{},
 		secretEnvs: map[string]map[string]bool{},
 		locks:      map[string]*sync.Mutex{},
 	}
-	for _, h := range hosts {
-		s.hosts[h.ID] = h
-	}
+	s.SetHosts(hosts)
 	for _, t := range tmpls {
 		s.templates[t.Meta.ID] = t
 		s.secretEnvs[t.Meta.ID] = secretEnvNames(t.Body)
 	}
 	return s
+}
+
+// SetHosts atomically replaces the live host set. Used by main on SIGHUP to
+// pick up edits to hosts/*.yaml (e.g. flipping drain) without restart.
+func (s *Service) SetHosts(hosts []config.Host) {
+	m := make(map[string]config.Host, len(hosts))
+	for _, h := range hosts {
+		m[h.ID] = h
+	}
+	s.hosts.Store(&m)
+}
+
+func (s *Service) hostsSnap() map[string]config.Host {
+	p := s.hosts.Load()
+	if p == nil {
+		return nil
+	}
+	return *p
+}
+
+func (s *Service) host(id string) (config.Host, bool) {
+	h, ok := s.hostsSnap()[id]
+	return h, ok
 }
 
 func (s *Service) instanceLock(host, tmpl, slug string) *sync.Mutex {
@@ -83,7 +105,7 @@ func (s *Service) instanceLock(host, tmpl, slug string) *sync.Mutex {
 }
 
 func (s *Service) lookup(host, tmpl string) (config.Template, error) {
-	if _, ok := s.hosts[host]; !ok {
+	if _, ok := s.host(host); !ok {
 		return config.Template{}, ErrUnknownHost
 	}
 	t, ok := s.templates[tmpl]
@@ -127,13 +149,23 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 		}
 	}
 
-	// Strict-create: 409 if pod exists.
-	if !opts.Replace {
-		if _, err := s.client.PodInspect(ctx, host, podName(req.Template, req.Slug)); err == nil {
-			return ErrInstanceExists
-		} else if !errors.Is(err, podman.ErrNotFound) {
-			return fmt.Errorf("inspect pod: %w", err)
-		}
+	// Drain check: a draining host refuses *create-shaped* Apply. We treat
+	// "create-shaped" as either Replace=false, or Replace=true against a pod
+	// that doesn't exist yet (which would otherwise sneak past the gate).
+	// In-place upgrades of existing pods, lifecycle ops, and reads are
+	// unaffected — drain is about not accepting new tenants.
+	hostCfg, _ := s.host(host) // existence already verified by lookup
+	podExists := false
+	if _, err := s.client.PodInspect(ctx, host, podName(req.Template, req.Slug)); err == nil {
+		podExists = true
+	} else if !errors.Is(err, podman.ErrNotFound) {
+		return fmt.Errorf("inspect pod: %w", err)
+	}
+	if !podExists && hostCfg.Drain {
+		return ErrHostDraining
+	}
+	if !opts.Replace && podExists {
+		return ErrInstanceExists
 	}
 
 	yaml, err := render.Render(rawTemplate(tmpl), req.Parameters)
@@ -222,6 +254,38 @@ func (s *Service) List(ctx context.Context, host, tmpl string) ([]Observed, erro
 	return out, nil
 }
 
+// ListAllInstances returns every podman-api-managed pod on a host across all
+// known templates. The result is the union of List(host, t) for each loaded
+// template id, so a pod for a template the daemon doesn't know about is
+// silently omitted.
+func (s *Service) ListAllInstances(ctx context.Context, host string) ([]Observed, error) {
+	if _, ok := s.host(host); !ok {
+		return nil, ErrUnknownHost
+	}
+	var out []Observed
+	for tmplID := range s.templates {
+		pods, err := s.client.PodList(ctx, host, map[string]string{"podman-api/template": tmplID})
+		if err != nil {
+			return nil, fmt.Errorf("list %s: %w", tmplID, err)
+		}
+		for _, p := range pods {
+			slug := p.Labels["podman-api/slug"]
+			out = append(out, Normalize(p, tmplID, slug, nil, s.secretEnvs[tmplID]))
+		}
+	}
+	return out, nil
+}
+
+// InstanceCount returns the total number of podman-api-managed pods on a
+// host across all known templates. Used by /hosts to surface drain decisions.
+func (s *Service) InstanceCount(ctx context.Context, host string) (int, error) {
+	all, err := s.ListAllInstances(ctx, host)
+	if err != nil {
+		return 0, err
+	}
+	return len(all), nil
+}
+
 func (s *Service) Start(ctx context.Context, host, tmpl, slug string) error {
 	return s.lifecycle(ctx, host, tmpl, slug, s.client.PodStart)
 }
@@ -300,7 +364,7 @@ func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts Dele
 
 // Ping checks reachability of a host.
 func (s *Service) Ping(ctx context.Context, host string) error {
-	if _, ok := s.hosts[host]; !ok {
+	if _, ok := s.host(host); !ok {
 		return ErrUnknownHost
 	}
 	return s.client.Ping(ctx, host)
@@ -308,7 +372,7 @@ func (s *Service) Ping(ctx context.Context, host string) error {
 
 // Version returns the podman version string for a host.
 func (s *Service) Version(ctx context.Context, host string) (string, error) {
-	if _, ok := s.hosts[host]; !ok {
+	if _, ok := s.host(host); !ok {
 		return "", ErrUnknownHost
 	}
 	return s.client.Version(ctx, host)
@@ -316,8 +380,8 @@ func (s *Service) Version(ctx context.Context, host string) (string, error) {
 
 // Hosts returns the configured hosts (read-only view for the API).
 func (s *Service) Hosts() []config.Host {
-	out := make([]config.Host, 0, len(s.hosts))
-	for _, h := range s.hosts {
+	out := make([]config.Host, 0, len(s.hostsSnap()))
+	for _, h := range s.hostsSnap() {
 		out = append(out, h)
 	}
 	return out
@@ -334,7 +398,7 @@ func (s *Service) Templates() []config.Template {
 
 // PortsInUse returns all currently-bound host ports on hostID.
 func (s *Service) PortsInUse(ctx context.Context, host string) ([]podman.PortMapping, error) {
-	if _, ok := s.hosts[host]; !ok {
+	if _, ok := s.host(host); !ok {
 		return nil, ErrUnknownHost
 	}
 	return s.client.UsedHostPorts(ctx, host)
@@ -342,7 +406,7 @@ func (s *Service) PortsInUse(ctx context.Context, host string) ([]podman.PortMap
 
 // HostSecrets lists secrets on a host.
 func (s *Service) HostSecrets(ctx context.Context, host string) ([]podman.Secret, error) {
-	if _, ok := s.hosts[host]; !ok {
+	if _, ok := s.host(host); !ok {
 		return nil, ErrUnknownHost
 	}
 	return s.client.SecretList(ctx, host)
@@ -351,7 +415,7 @@ func (s *Service) HostSecrets(ctx context.Context, host string) ([]podman.Secret
 // PutHostSecret creates-or-rotates a host secret. We "rotate" by removing
 // then recreating, since podman secrets are immutable.
 func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []byte) error {
-	if _, ok := s.hosts[host]; !ok {
+	if _, ok := s.host(host); !ok {
 		return ErrUnknownHost
 	}
 	if _, err := s.client.SecretInspect(ctx, host, name); err == nil {
@@ -363,7 +427,7 @@ func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []
 }
 
 func (s *Service) DeleteHostSecret(ctx context.Context, host, name string) error {
-	if _, ok := s.hosts[host]; !ok {
+	if _, ok := s.host(host); !ok {
 		return ErrUnknownHost
 	}
 	err := s.client.SecretRemove(ctx, host, name)
@@ -392,7 +456,7 @@ func (s *Service) InstanceVolumes(ctx context.Context, host, tmpl, slug string) 
 
 // DeleteVolume removes a named volume on a host. Idempotent.
 func (s *Service) DeleteVolume(ctx context.Context, host, name string, force bool) error {
-	if _, ok := s.hosts[host]; !ok {
+	if _, ok := s.host(host); !ok {
 		return ErrUnknownHost
 	}
 	err := s.client.VolumeRemove(ctx, host, name, force)
