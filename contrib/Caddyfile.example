@@ -1,0 +1,55 @@
+# Caddy reverse-proxy front for podman-api.
+#
+# Caddy terminates TLS via Let's Encrypt and forwards plaintext to the
+# loopback-bound API. Replace `podman-api.example.com` with your real host
+# before deploying.
+
+podman-api.example.com {
+	# Optional: lock down which CMS/jumphost is allowed to talk to the API.
+	# Without this, any client that reaches the public domain can hit the
+	# API, gated only by the bearer token. Defence in depth — keep both.
+	# @allowed remote_ip 203.0.113.10/32 198.51.100.0/24
+	# handle @allowed {
+	# 	reverse_proxy 127.0.0.1:8080
+	# }
+	# handle {
+	# 	respond 403
+	# }
+
+	reverse_proxy 127.0.0.1:8080 {
+		# SSE log streams need a long flush window. Without these, Caddy will
+		# buffer and the client sees logs in chunks of 100s instead of live.
+		flush_interval -1
+		transport http {
+			read_timeout 24h
+		}
+	}
+
+	# Compression is fine for /hosts and /instances JSON. /metrics is on a
+	# different listener (see below) so we don't need to special-case it here.
+	encode gzip
+
+	# Caddy's structured access log; pair with the API's own audit log for
+	# request-level forensics.
+	log {
+		output file /var/log/caddy/podman-api.access.log
+	}
+}
+
+# Metrics: do NOT expose publicly. The recommended pattern is to scrape
+# /metrics via SSH tunnel from the Prometheus host:
+#
+#   ssh -L 9090:127.0.0.1:9090 podman-api.example.com
+#
+# and then point Prometheus at localhost:9090.
+#
+# If you must expose it on a domain, do so on a separate hostname and lock it
+# down with a static IP allowlist:
+#
+# metrics.podman-api.example.com {
+# 	@prom remote_ip 198.51.100.42/32
+# 	handle @prom {
+# 		reverse_proxy 127.0.0.1:9090
+# 	}
+# 	respond 403
+# }

@@ -1,0 +1,62 @@
+[Unit]
+Description=podman-api: REST wrapper around podman libpod
+Documentation=https://git.iotready.com/tej/podman-api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=podman-api
+Group=podman-api
+WorkingDirectory=/etc/podman-api
+
+# Loopback bind by default; expose via Caddy/nginx in front. Override with a
+# drop-in if you want a different addr or to pass extra flags.
+ExecStart=/usr/local/bin/podman-api \
+  -addr=127.0.0.1:8080 \
+  -metrics-addr=127.0.0.1:9090 \
+  -hosts-dir=/etc/podman-api/hosts \
+  -keys-file=/etc/podman-api/keys.yaml
+
+# SIGHUP rotates bearer keys; expose it as the canonical `systemctl reload`.
+ExecReload=/bin/kill -HUP $MAINPID
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=5
+
+# Logs go to journald via stdout; the audit log is a JSON-line stream there.
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — most of the filesystem is read-only to this service.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+# Read-write paths. The SSH key directory is read-only; the user's HOME is
+# whatever you set with `useradd -m` and is needed for ssh-agent state.
+ReadWritePaths=/var/lib/podman-api
+ReadOnlyPaths=/etc/podman-api
+
+# Minimal privilege caps — we only need to bind on a configured port and
+# initiate outbound SSH/HTTP. No raw sockets, no kernel pokes.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# A modest filesystem sandbox. /tmp gets its own namespace.
+PrivateTmp=true
+PrivateDevices=true
+
+[Install]
+WantedBy=multi-user.target
