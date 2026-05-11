@@ -1,0 +1,670 @@
+openapi: 3.0.3
+info:
+  title: podman-api
+  version: 1.0.0
+  description: |
+    REST wrapper around Podman's libpod API. Manages parameterised pod
+    instances across a fleet of remote Podman hosts via SSH-tunneled
+    sockets. See README.md for the deployment story.
+
+servers:
+  - url: http://127.0.0.1:8080
+    description: local loopback (default)
+
+tags:
+  - name: process
+  - name: hosts
+  - name: templates
+  - name: secrets
+  - name: instances
+  - name: lifecycle
+  - name: bulk
+  - name: logs
+  - name: volumes
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        Argon2id-hashed bearer tokens defined in `auth/keys.yaml`. The
+        token's `scopes` must include the scope listed on each operation.
+
+  parameters:
+    HostID:
+      name: host
+      in: path
+      required: true
+      schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+    TemplateID:
+      name: template
+      in: path
+      required: true
+      schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+    Slug:
+      name: slug
+      in: path
+      required: true
+      schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+    SecretName:
+      name: name
+      in: path
+      required: true
+      schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+    VolumeName:
+      name: name
+      in: path
+      required: true
+      schema: {type: string}
+    TemplateOptional:
+      name: template
+      in: query
+      required: false
+      description: optional template filter; omit to list across all templates
+      schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+    SkipPull:
+      name: skip_pull
+      in: query
+      required: false
+      description: skip the pre-pull step (CI / local image refs)
+      schema: {type: boolean, default: false}
+
+  schemas:
+    Error:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [
+            invalid_body, invalid_query, invalid_parameters, invalid_action,
+            missing_token, invalid_token, missing_scope,
+            unknown_host, unknown_template, instance_not_found,
+            instance_already_exists, host_secret_missing, host_draining,
+            upstream_error, too_many_ops, internal,
+          ]
+        message: {type: string}
+        details:
+          type: object
+          additionalProperties: true
+
+    Host:
+      type: object
+      required: [id, addr, status]
+      properties:
+        id: {type: string}
+        addr: {type: string, description: '"unix" or "user@host"'}
+        labels:
+          type: object
+          additionalProperties: {type: string}
+        status:
+          type: string
+          enum: [ok, unreachable, unknown]
+        podman_version:
+          type: string
+          description: present when status=ok
+        draining:
+          type: boolean
+          description: when true, create-shaped Apply returns 423
+        instance_count:
+          type: integer
+          description: managed pods on the host (present when reachable)
+
+    Template:
+      type: object
+      required: [id, parameters, secrets, volumes]
+      properties:
+        id: {type: string}
+        parameters:
+          type: object
+          required: [required, optional]
+          properties:
+            required:
+              type: array
+              items: {type: string}
+            optional:
+              type: array
+              items: {type: string}
+        secrets:
+          type: object
+          properties:
+            per_instance:
+              type: array
+              items: {type: string}
+            per_host_referenced:
+              type: array
+              items: {type: string}
+        volumes:
+          type: array
+          items:
+            type: object
+            properties:
+              name: {type: string}
+              backup: {type: string}
+
+    Container:
+      type: object
+      required: [name, image, status]
+      properties:
+        name: {type: string}
+        image:
+          type: string
+          description: resolved digest, e.g. "docker.io/library/postgres@sha256:..."
+        image_tag: {type: string}
+        status: {type: string}
+        started_at: {type: string, format: date-time}
+        ports:
+          type: array
+          items: {$ref: '#/components/schemas/PortMapping'}
+
+    PortMapping:
+      type: object
+      required: [host_port, container_port, protocol]
+      properties:
+        host_ip: {type: string}
+        host_port: {type: integer}
+        container_port: {type: integer}
+        protocol: {type: string, enum: [tcp, udp]}
+        pod: {type: string}
+        container: {type: string}
+
+    Volume:
+      type: object
+      required: [name, size_bytes]
+      properties:
+        name: {type: string}
+        size_bytes: {type: integer, format: int64}
+
+    Observed:
+      type: object
+      required: [template, slug, pod, containers]
+      properties:
+        template: {type: string}
+        slug: {type: string}
+        pod:
+          type: object
+          properties:
+            id: {type: string}
+            status: {type: string}
+            created: {type: string, format: date-time}
+        containers:
+          type: array
+          items: {$ref: '#/components/schemas/Container'}
+        volumes:
+          type: array
+          items: {$ref: '#/components/schemas/Volume'}
+        env_summary:
+          type: object
+          additionalProperties: {type: string}
+          description: env vars excluding any sourced from secretKeyRef
+
+    ApplyRequest:
+      type: object
+      required: [template, slug, parameters]
+      properties:
+        template: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+        slug: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+        parameters:
+          type: object
+          additionalProperties: true
+          description: all template-required params, plus any optional ones
+        secrets:
+          type: object
+          additionalProperties: {type: string}
+          description: per-instance secret values (zeroed after use)
+
+    UpgradeRequest:
+      type: object
+      required: [image]
+      properties:
+        image: {type: string}
+        parameters:
+          type: object
+          additionalProperties: true
+        secrets:
+          type: object
+          additionalProperties: {type: string}
+
+    SecretValue:
+      type: object
+      required: [value]
+      properties:
+        value: {type: string}
+
+    BulkRequest:
+      type: object
+      required: [ops]
+      properties:
+        ops:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            required: [action, template, slug]
+            properties:
+              action:
+                type: string
+                enum: [start, stop, restart, delete]
+              template: {type: string}
+              slug: {type: string}
+              prune_volumes: {type: boolean}
+              prune_secrets: {type: boolean}
+
+    BulkResult:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            type: object
+            required: [index, action, template, slug, status]
+            properties:
+              index: {type: integer}
+              action: {type: string}
+              template: {type: string}
+              slug: {type: string}
+              status: {type: integer, description: HTTP status for this op}
+              code: {type: string}
+              message: {type: string}
+
+  responses:
+    Unauthorized:
+      description: missing or invalid bearer token
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Forbidden:
+      description: token lacks required scope
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    BadRequest:
+      description: invalid path/query/body
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    NotFound:
+      description: unknown host, template, or instance
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Conflict:
+      description: instance already exists
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    HostDraining:
+      description: 423 when the host is draining and the request is create-shaped
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    UpstreamError:
+      description: 502 when an image pull or other upstream call fails
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+
+security:
+  - bearerAuth: []
+
+paths:
+  /healthz:
+    get:
+      tags: [process]
+      summary: liveness probe (no auth)
+      security: []
+      responses:
+        '200':
+          description: OK
+          content: {application/json: {schema: {type: object}}}
+
+  /openapi.yaml:
+    get:
+      tags: [process]
+      summary: this spec (no auth)
+      security: []
+      responses:
+        '200':
+          description: spec
+          content: {text/yaml: {schema: {type: string}}}
+
+  /hosts:
+    get:
+      tags: [hosts]
+      summary: list configured hosts with reachability and instance count
+      responses:
+        '200':
+          description: list
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Host'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+      x-required-scope: hosts:read
+
+  /hosts/{host}:
+    get:
+      tags: [hosts]
+      summary: one host's reachability and instance count
+      parameters: [{$ref: '#/components/parameters/HostID'}]
+      responses:
+        '200':
+          description: host
+          content: {application/json: {schema: {$ref: '#/components/schemas/Host'}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+      x-required-scope: hosts:read
+
+  /hosts/{host}/healthz:
+    get:
+      tags: [hosts]
+      summary: probe a single host's podman socket
+      parameters: [{$ref: '#/components/parameters/HostID'}]
+      responses:
+        '200': {description: ok}
+        '404': {$ref: '#/components/responses/NotFound'}
+      x-required-scope: hosts:read
+
+  /hosts/{host}/ports-in-use:
+    get:
+      tags: [hosts]
+      summary: every host port currently bound by a managed pod
+      parameters: [{$ref: '#/components/parameters/HostID'}]
+      responses:
+        '200':
+          description: ports
+          content:
+            application/json:
+              schema:
+                type: array
+                items: {$ref: '#/components/schemas/PortMapping'}
+      x-required-scope: hosts:read
+
+  /templates:
+    get:
+      tags: [templates]
+      summary: list loaded templates
+      responses:
+        '200':
+          description: list
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Template'}}
+      x-required-scope: instances:read
+
+  /templates/{id}:
+    get:
+      tags: [templates]
+      summary: one template's metadata
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+      responses:
+        '200':
+          description: template
+          content: {application/json: {schema: {$ref: '#/components/schemas/Template'}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+      x-required-scope: instances:read
+
+  /templates/{id}/render:
+    get:
+      tags: [templates]
+      summary: render a template with query-string parameters (preview only)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+      responses:
+        '200':
+          description: rendered YAML
+          content: {text/yaml: {schema: {type: string}}}
+      x-required-scope: instances:read
+
+  /hosts/{host}/secrets:
+    get:
+      tags: [secrets]
+      summary: list per-host secrets known to podman
+      parameters: [{$ref: '#/components/parameters/HostID'}]
+      responses:
+        '200':
+          description: list
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    name: {type: string}
+                    created_at: {type: string, format: date-time}
+      x-required-scope: secrets:read
+
+  /hosts/{host}/secrets/{name}:
+    put:
+      tags: [secrets]
+      summary: create or rotate a per-host secret
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/SecretName'}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/SecretValue'}}}
+      responses:
+        '204': {description: stored}
+        '400': {$ref: '#/components/responses/BadRequest'}
+      x-required-scope: secrets:write
+    delete:
+      tags: [secrets]
+      summary: remove a per-host secret (idempotent)
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/SecretName'}
+      responses:
+        '204': {description: removed}
+      x-required-scope: secrets:write
+
+  /hosts/{host}/instances:
+    get:
+      tags: [instances]
+      summary: list managed instances on a host (optionally filtered by template)
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateOptional'}
+      responses:
+        '200':
+          description: list
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Observed'}}
+      x-required-scope: instances:read
+    post:
+      tags: [instances]
+      summary: create a new instance (fails if it already exists)
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/SkipPull'}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ApplyRequest'}}}
+      responses:
+        '201':
+          description: created
+          content: {application/json: {schema: {$ref: '#/components/schemas/Observed'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '423': {$ref: '#/components/responses/HostDraining'}
+        '502': {$ref: '#/components/responses/UpstreamError'}
+      x-required-scope: instances:write
+
+  /hosts/{host}/instances/{template}/{slug}:
+    get:
+      tags: [instances]
+      summary: observed shape of one instance
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateID'}
+        - {$ref: '#/components/parameters/Slug'}
+      responses:
+        '200':
+          description: observed
+          content: {application/json: {schema: {$ref: '#/components/schemas/Observed'}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+      x-required-scope: instances:read
+    put:
+      tags: [instances]
+      summary: create or replace an instance (idempotent)
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateID'}
+        - {$ref: '#/components/parameters/Slug'}
+        - {$ref: '#/components/parameters/SkipPull'}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/ApplyRequest'}}}
+      responses:
+        '200':
+          description: applied
+          content: {application/json: {schema: {$ref: '#/components/schemas/Observed'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '423': {$ref: '#/components/responses/HostDraining'}
+        '502': {$ref: '#/components/responses/UpstreamError'}
+      x-required-scope: instances:write
+    delete:
+      tags: [instances]
+      summary: remove an instance and optionally its volumes/secrets
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateID'}
+        - {$ref: '#/components/parameters/Slug'}
+        - {name: prune_volumes, in: query, schema: {type: boolean}}
+        - {name: prune_secrets, in: query, schema: {type: boolean}}
+      responses:
+        '204': {description: removed}
+        '404': {$ref: '#/components/responses/NotFound'}
+      x-required-scope: instances:write
+
+  /hosts/{host}/instances/{template}/{slug}/start:
+    post:
+      tags: [lifecycle]
+      summary: start a stopped instance
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateID'}
+        - {$ref: '#/components/parameters/Slug'}
+      responses:
+        '204': {description: started}
+        '404': {$ref: '#/components/responses/NotFound'}
+      x-required-scope: instances:write
+
+  /hosts/{host}/instances/{template}/{slug}/stop:
+    post:
+      tags: [lifecycle]
+      summary: stop a running instance
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateID'}
+        - {$ref: '#/components/parameters/Slug'}
+      responses:
+        '204': {description: stopped}
+      x-required-scope: instances:write
+
+  /hosts/{host}/instances/{template}/{slug}/restart:
+    post:
+      tags: [lifecycle]
+      summary: restart an instance
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateID'}
+        - {$ref: '#/components/parameters/Slug'}
+      responses:
+        '204': {description: restarted}
+      x-required-scope: instances:write
+
+  /hosts/{host}/instances/{template}/{slug}/upgrade:
+    post:
+      tags: [lifecycle]
+      summary: replace an instance's image
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateID'}
+        - {$ref: '#/components/parameters/Slug'}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/UpgradeRequest'}}}
+      responses:
+        '200':
+          description: upgraded
+          content: {application/json: {schema: {$ref: '#/components/schemas/Observed'}}}
+        '502': {$ref: '#/components/responses/UpstreamError'}
+      x-required-scope: instances:write
+
+  /hosts/{host}/bulk:
+    post:
+      tags: [bulk]
+      summary: run lifecycle ops against many instances on one host
+      parameters: [{$ref: '#/components/parameters/HostID'}]
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/BulkRequest'}}}
+      responses:
+        '200':
+          description: per-op results (response is 200 even when individual ops fail)
+          content: {application/json: {schema: {$ref: '#/components/schemas/BulkResult'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '413':
+          description: more than 100 ops in a single request
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      x-required-scope: instances:write
+
+  /hosts/{host}/instances/{template}/{slug}/logs:
+    get:
+      tags: [logs]
+      summary: container logs as plain text (tail) or SSE (follow)
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateID'}
+        - {$ref: '#/components/parameters/Slug'}
+        - {name: container, in: query, required: true, schema: {type: string}}
+        - {name: tail, in: query, schema: {type: integer}}
+        - {name: since, in: query, schema: {type: string}}
+        - {name: follow, in: query, schema: {type: boolean}}
+      responses:
+        '200':
+          description: log stream
+          content:
+            text/plain: {schema: {type: string}}
+            text/event-stream: {schema: {type: string}}
+      x-required-scope: instances:read
+
+  /hosts/{host}/instances/{template}/{slug}/volumes:
+    get:
+      tags: [volumes]
+      summary: volumes belonging to one instance
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateID'}
+        - {$ref: '#/components/parameters/Slug'}
+      responses:
+        '200':
+          description: volumes
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Volume'}}
+      x-required-scope: instances:read
+
+  /hosts/{host}/volumes/{name}:
+    delete:
+      tags: [volumes]
+      summary: remove a named volume on a host (idempotent)
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/VolumeName'}
+        - {name: force, in: query, schema: {type: boolean}}
+      responses:
+        '204': {description: removed}
+      x-required-scope: instances:write

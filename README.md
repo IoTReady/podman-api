@@ -164,6 +164,12 @@ A systemd unit and an opinionated installer live in `contrib/`. See [`contrib/in
   - `podman_api_request_duration_seconds{host,template,method}` — histogram
   - plus standard Go/process metrics.
 
+## API reference
+
+A complete OpenAPI 3.0 spec lives at [`api/openapi.yaml`](api/openapi.yaml) and is also served by the binary itself at `GET /openapi.yaml` (no auth). Paste either the file or the URL into [editor.swagger.io](https://editor.swagger.io/) for a browsable view.
+
+The summary below is the same routes, grouped by what they do.
+
 ## API quick reference
 
 ```

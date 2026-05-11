@@ -3,6 +3,7 @@ package api
 import (
 	"net/http"
 
+	apispec "github.com/iotready/podman-api/api"
 	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/instance"
 )
@@ -22,6 +23,11 @@ func NewRouter(svc *instance.Service, keys *auth.KeyStore, audit func(http.Handl
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	mux.HandleFunc("GET /openapi.yaml", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(apispec.Spec)
 	})
 
 	if metricsHandler != nil {
