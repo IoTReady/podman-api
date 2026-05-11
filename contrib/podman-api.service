@@ -45,9 +45,13 @@ MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 
 # Read-write paths. The SSH key directory is read-only; the user's HOME is
-# whatever you set with `useradd -m` and is needed for ssh-agent state.
-ReadWritePaths=/var/lib/podman-api
+# whatever you set with `useradd -m` and is needed for ssh-agent state. The
+# log directory is created by the installer and is the destination for
+# `-audit-log-file` (uncomment in ExecStart above to use it).
+ReadWritePaths=/var/lib/podman-api /var/log/podman-api
 ReadOnlyPaths=/etc/podman-api
+LogsDirectory=podman-api
+LogsDirectoryMode=0750
 
 # Minimal privilege caps — we only need to bind on a configured port and
 # initiate outbound SSH/HTTP. No raw sockets, no kernel pokes.

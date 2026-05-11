@@ -26,11 +26,12 @@ import (
 
 func main() {
 	var (
-		addr        = flag.String("addr", "127.0.0.1:8080", "bind address for the API")
-		metricsAddr = flag.String("metrics-addr", "", "if set, expose /metrics on this address (e.g. 127.0.0.1:9090); empty means no metrics endpoint")
-		hostsDir    = flag.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
-		keysFile    = flag.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
-		tmplDir     = flag.String("templates-dir", "", "if set, load templates from this dir instead of embedded")
+		addr         = flag.String("addr", "127.0.0.1:8080", "bind address for the API")
+		metricsAddr  = flag.String("metrics-addr", "", "if set, expose /metrics on this address (e.g. 127.0.0.1:9090); empty means no metrics endpoint")
+		hostsDir     = flag.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
+		keysFile     = flag.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
+		tmplDir      = flag.String("templates-dir", "", "if set, load templates from this dir instead of embedded")
+		auditLogFile = flag.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
 	)
 	flag.Parse()
 
@@ -75,7 +76,22 @@ func main() {
 
 	svc := instance.NewService(client, hosts, tmpls)
 	metrics := obs.New()
-	audit := obs.NewAuditMiddleware(os.Stdout)
+
+	auditSink := os.Stdout
+	if *auditLogFile != "" {
+		f, err := os.OpenFile(*auditLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
+		if err != nil {
+			log.Fatalf("audit log: %v", err)
+		}
+		// Lifetime is the process — we never rotate from inside the binary
+		// (logrotate's copytruncate or `kill -USR1` patterns are out of
+		// scope; see README's "audit log shipping" section). Close on
+		// shutdown for tidy fd accounting.
+		defer f.Close()
+		auditSink = f
+		log.Printf("audit log: writing to %s", *auditLogFile)
+	}
+	audit := obs.NewAuditMiddleware(auditSink)
 
 	// Compose metrics(audit(h)) so every guarded request is both measured
 	// and audit-logged. The caller (main) composes rather than adding a

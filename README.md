@@ -158,11 +158,72 @@ A systemd unit and an opinionated installer live in `contrib/`. See [`contrib/in
 
 ## Observability
 
-- **Audit log:** every state-changing request (POST/PUT/DELETE) emits one JSON line to stdout with method, path, host, template, slug, status, duration, key_id, and any error.
+- **Audit log:** every state-changing request (POST/PUT/DELETE) emits one JSON line to stdout — or, if `-audit-log-file=/var/log/podman-api/audit.log` is set, to that file. Each line includes method, path, host, template, slug, status, duration, key_id, and any error.
 - **Metrics** (when `-metrics-addr` is set):
   - `podman_api_requests_total{host,template,method,status}` — counter
   - `podman_api_request_duration_seconds{host,template,method}` — histogram
   - plus standard Go/process metrics.
+
+### Shipping the audit log
+
+Pick the pattern that matches your supervisor:
+
+**A) Under systemd (default)** — audit lines go to stdout, which systemd routes into journald. Cap journald's on-disk size with a drop-in:
+
+```ini
+# /etc/systemd/journald.conf.d/podman-api.conf
+[Journal]
+SystemMaxUse=2G
+MaxFileSec=1day
+```
+
+To extract just podman-api's audit lines:
+```sh
+journalctl -u podman-api -o cat | jq -c 'select(.method)'
+```
+
+**B) On-disk file with logrotate** — set `-audit-log-file=/var/log/podman-api/audit.log`, then drop:
+
+```
+# /etc/logrotate.d/podman-api
+/var/log/podman-api/audit.log {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate    # podman-api keeps the fd open; copytruncate avoids needing a SIGHUP
+}
+```
+
+`copytruncate` is the right choice because the binary holds the file open across rotations. If you'd rather not pay the copy cost, switch to a `create` strategy and add a `postrotate` hook that calls `systemctl restart podman-api` (you'll lose in-flight log streams).
+
+**C) External collector (Vector / Promtail / Fluent Bit)** — the simplest setup is to keep audit on stdout and let the collector tail journald. Vector example:
+
+```toml
+# /etc/vector/vector.toml
+[sources.podman_api]
+type = "journald"
+include_units = ["podman-api.service"]
+
+[transforms.audit_only]
+type = "filter"
+inputs = ["podman_api"]
+condition = '.message != null && contains(string!(.message), "\"method\":")'
+
+[transforms.parse]
+type = "remap"
+inputs = ["audit_only"]
+source = '. = parse_json!(.message)'
+
+[sinks.loki]
+type = "loki"
+inputs = ["parse"]
+endpoint = "http://loki.internal:3100"
+labels = {job = "podman-api", host = "{{ host }}", template = "{{ template }}"}
+```
+
+If you'd rather feed a collector via stdin (e.g. Fluent Bit's `tail` input on a file), use pattern **B** above and point the collector at the file.
 
 ## API reference
 
