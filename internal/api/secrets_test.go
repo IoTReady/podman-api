@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman/fake"
@@ -20,7 +21,7 @@ func newSrvWithSecrets(t *testing.T) (*httptest.Server, string) {
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"secrets:read", "secrets:write"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	svc := instance.NewService(fake.New(), hosts, nil)
-	srv := httptest.NewServer(NewRouter(svc, keys, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, auth.NewKeyStore(keys), nil, nil))
 	t.Cleanup(srv.Close)
 	return srv, tok
 }

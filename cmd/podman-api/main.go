@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/iotready/podman-api/internal/api"
+	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/obs"
@@ -48,14 +51,12 @@ func main() {
 	if err != nil {
 		log.Fatalf("hosts: %v", err)
 	}
-	keysRaw, err := os.ReadFile(*keysFile)
+	keys, fp, err := loadKeys(*keysFile)
 	if err != nil {
 		log.Fatalf("keys: %v", err)
 	}
-	keys, err := config.ParseKeysYAML(keysRaw)
-	if err != nil {
-		log.Fatalf("keys: %v", err)
-	}
+	keyStore := auth.NewKeyStore(keys)
+	log.Printf("keys loaded: %d entries, fingerprint=%s", len(keys), fp)
 
 	var tmpls []config.Template
 	if *tmplDir != "" {
@@ -85,7 +86,7 @@ func main() {
 
 	// /metrics is never mounted on the main listener — operators must opt in
 	// with -metrics-addr to bind it on a separate (typically internal) socket.
-	router := api.NewRouter(svc, keys, combined, nil)
+	router := api.NewRouter(svc, keyStore, combined, nil)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -103,6 +104,27 @@ func main() {
 			ReadHeaderTimeout: 10 * time.Second,
 		}
 	}
+
+	// SIGHUP: re-read the keys file and atomically swap the live KeyStore.
+	// A bad reload (parse error, no keys) is logged but does NOT kill the
+	// running process, so a fat-fingered edit doesn't take the API down.
+	hup := make(chan os.Signal, 1)
+	signal.Notify(hup, syscall.SIGHUP)
+	go func() {
+		for range hup {
+			newKeys, fp, err := loadKeys(*keysFile)
+			if err != nil {
+				log.Printf("keys reload FAILED, keeping previous set: %v", err)
+				continue
+			}
+			if len(newKeys) == 0 {
+				log.Printf("keys reload SKIPPED, file parsed but contained zero keys (path=%s, fp=%s)", *keysFile, fp)
+				continue
+			}
+			keyStore.Store(newKeys)
+			log.Printf("keys reloaded: %d entries, fingerprint=%s", len(newKeys), fp)
+		}
+	}()
 
 	idleClosed := make(chan struct{})
 	go func() {
@@ -128,9 +150,25 @@ func main() {
 	}
 
 	log.Printf("podman-api listening on %s with %d hosts, %d templates, %d keys",
-		*addr, len(hosts), len(tmpls), len(keys))
+		*addr, len(hosts), len(tmpls), len(keyStore.Load()))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 	<-idleClosed
+}
+
+// loadKeys reads and parses the keys file, returning the parsed list and a
+// short SHA-256 fingerprint of the file contents (for audit logs / operator
+// confirmation that a SIGHUP picked up the intended edit).
+func loadKeys(path string) ([]config.APIKey, string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	keys, err := config.ParseKeysYAML(raw)
+	if err != nil {
+		return nil, "", err
+	}
+	sum := sha256.Sum256(raw)
+	return keys, hex.EncodeToString(sum[:8]), nil
 }

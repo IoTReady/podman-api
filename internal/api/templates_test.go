@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman/fake"
@@ -26,7 +27,7 @@ func newSrvWithTmpl(t *testing.T) (*httptest.Server, string) {
 		}, Body: "kind: Pod\nname: app-{{.slug}}\n", Source: "app.yaml"},
 	}
 	svc := instance.NewService(fake.New(), nil, tmpls)
-	srv := httptest.NewServer(NewRouter(svc, keys, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, auth.NewKeyStore(keys), nil, nil))
 	t.Cleanup(srv.Close)
 	return srv, tok
 }

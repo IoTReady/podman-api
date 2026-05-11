@@ -12,11 +12,13 @@ type ctxKey int
 
 const keyIDKey ctxKey = 0
 
-// New returns middleware that requires a Bearer token matching one of keys
-// AND that the matching key has the requiredScope.
+// New returns middleware that requires a Bearer token matching one of the
+// keys currently held by store, AND that the matching key has the
+// requiredScope. The store snapshot is read per request, so a SIGHUP-triggered
+// reload takes effect on the next inbound request.
 //
 // On failure: 401 (no/invalid token) or 403 (missing scope), with a JSON body.
-func New(keys []config.APIKey, requiredScope string) func(http.Handler) http.Handler {
+func New(store *KeyStore, requiredScope string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			tok := bearer(r)
@@ -24,7 +26,7 @@ func New(keys []config.APIKey, requiredScope string) func(http.Handler) http.Han
 				writeErr(w, http.StatusUnauthorized, "missing_token", "missing or malformed Authorization header")
 				return
 			}
-			matched, ok := match(keys, tok)
+			matched, ok := match(store.Load(), tok)
 			if !ok {
 				writeErr(w, http.StatusUnauthorized, "invalid_token", "token not recognised")
 				return

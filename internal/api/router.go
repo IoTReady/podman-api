@@ -4,14 +4,13 @@ import (
 	"net/http"
 
 	"github.com/iotready/podman-api/internal/auth"
-	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 )
 
 // NewRouter builds the full HTTP handler tree.
 // audit is an optional middleware applied around auth-guarded handlers; pass nil for no-op.
 // metricsHandler is an optional handler mounted at GET /metrics; pass nil to omit the endpoint.
-func NewRouter(svc *instance.Service, keys []config.APIKey, audit func(http.Handler) http.Handler, metricsHandler http.Handler) http.Handler {
+func NewRouter(svc *instance.Service, keys *auth.KeyStore, audit func(http.Handler) http.Handler, metricsHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	h := &handlers{svc: svc}
 

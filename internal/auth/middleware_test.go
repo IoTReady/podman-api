@@ -29,7 +29,7 @@ func newReq(token string) *http.Request {
 
 func TestMiddleware_NoHeader_401(t *testing.T) {
 	k, _ := newKey(t, "hosts:read")
-	mw := New([]config.APIKey{k}, "hosts:read")
+	mw := New(NewKeyStore([]config.APIKey{k}), "hosts:read")
 	rr := httptest.NewRecorder()
 	mw(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("inner handler should not run")
@@ -39,7 +39,7 @@ func TestMiddleware_NoHeader_401(t *testing.T) {
 
 func TestMiddleware_ValidToken_AllowsRequest(t *testing.T) {
 	k, tok := newKey(t, "hosts:read")
-	mw := New([]config.APIKey{k}, "hosts:read")
+	mw := New(NewKeyStore([]config.APIKey{k}), "hosts:read")
 	rr := httptest.NewRecorder()
 	called := false
 	mw(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -52,7 +52,7 @@ func TestMiddleware_ValidToken_AllowsRequest(t *testing.T) {
 
 func TestMiddleware_WrongToken_401(t *testing.T) {
 	k, _ := newKey(t, "hosts:read")
-	mw := New([]config.APIKey{k}, "hosts:read")
+	mw := New(NewKeyStore([]config.APIKey{k}), "hosts:read")
 	rr := httptest.NewRecorder()
 	mw(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("inner should not run")
@@ -62,7 +62,7 @@ func TestMiddleware_WrongToken_401(t *testing.T) {
 
 func TestMiddleware_MissingScope_403(t *testing.T) {
 	k, tok := newKey(t, "hosts:read")
-	mw := New([]config.APIKey{k}, "instances:write")
+	mw := New(NewKeyStore([]config.APIKey{k}), "instances:write")
 	rr := httptest.NewRecorder()
 	mw(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		t.Fatal("inner should not run")
@@ -72,7 +72,7 @@ func TestMiddleware_MissingScope_403(t *testing.T) {
 
 func TestKeyIDFromContext(t *testing.T) {
 	k, tok := newKey(t, "hosts:read")
-	mw := New([]config.APIKey{k}, "hosts:read")
+	mw := New(NewKeyStore([]config.APIKey{k}), "hosts:read")
 	rr := httptest.NewRecorder()
 	mw(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		assert.Equal(t, "k1", KeyIDFromContext(r.Context()))

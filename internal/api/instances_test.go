@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman/fake"
@@ -41,7 +42,7 @@ spec:
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	f := fake.New()
 	svc := instance.NewService(f, hosts, tmpls)
-	srv := httptest.NewServer(NewRouter(svc, keys, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, auth.NewKeyStore(keys), nil, nil))
 	t.Cleanup(srv.Close)
 	return srv, tok, f
 }

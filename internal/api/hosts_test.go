@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman/fake"
@@ -32,7 +33,7 @@ func TestListHosts(t *testing.T) {
 		{ID: "h1", Addr: "unix", Socket: "/x", Labels: map[string]string{"env": "dev"}},
 	}
 	svc := instance.NewService(fake.New(), hosts, nil)
-	srv := httptest.NewServer(NewRouter(svc, keys, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, auth.NewKeyStore(keys), nil, nil))
 	defer srv.Close()
 
 	resp := authedReq(t, srv, tok, "GET", "/hosts")
@@ -52,7 +53,7 @@ func TestHostHealthz(t *testing.T) {
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"hosts:read"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	svc := instance.NewService(fake.New(), hosts, nil)
-	srv := httptest.NewServer(NewRouter(svc, keys, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, auth.NewKeyStore(keys), nil, nil))
 	defer srv.Close()
 
 	resp := authedReq(t, srv, tok, "GET", "/hosts/h1/healthz")

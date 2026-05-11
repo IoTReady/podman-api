@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/obs"
@@ -25,7 +26,7 @@ func newServer(t *testing.T) (*httptest.Server, string) {
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	svc := instance.NewService(fake.New(), hosts, nil)
 
-	r := NewRouter(svc, keys, nil, nil)
+	r := NewRouter(svc, auth.NewKeyStore(keys), nil, nil)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	return srv, tok
@@ -66,7 +67,7 @@ func TestRouter_AuditCapturesKeyID(t *testing.T) {
 
 	var buf bytes.Buffer
 	auditMW := obs.NewAuditMiddleware(&buf)
-	r := NewRouter(svc, keys, auditMW, nil)
+	r := NewRouter(svc, auth.NewKeyStore(keys), auditMW, nil)
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 
