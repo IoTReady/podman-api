@@ -5,3 +5,5 @@ coverage.txt
 .idea/
 .vscode/
 /auth/keys.yaml
+/podman-api
+/hosts/ec2.yaml

@@ -1,7 +1,0 @@
-id: ec2-mum
-addr: fedora@3.111.40.168
-socket: /run/user/1000/podman/podman.sock
-ssh_key: /home/tej/.ssh/iotready-ec2-mumbai.pem
-labels:
-  env: smoke
-  region: ap-south-1
