@@ -15,7 +15,7 @@ const maxBulkOps = 100
 
 // bulkOp is one element of POST /hosts/{h}/bulk.
 type bulkOp struct {
-	Action   string `json:"action"`             // start | stop | restart | delete
+	Action   string `json:"action"` // start | stop | restart | delete
 	Template string `json:"template"`
 	Slug     string `json:"slug"`
 	// PruneVolumes / PruneSecrets are honoured only by action=delete.
