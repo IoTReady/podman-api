@@ -14,7 +14,9 @@ test:
 	go test -tags "$(TAGS)" ./...
 
 test-integration:
-	go test -tags "$(TAGS),integration" ./...
+	# `go test -tags` cannot mix space- and comma-separated tags, so append
+	# `integration` with a space (TAGS is already space-separated).
+	go test -tags "$(TAGS) integration" ./...
 
 fmt:
 	gofmt -w .
