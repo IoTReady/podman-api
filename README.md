@@ -4,6 +4,16 @@ A small REST wrapper around [Podman](https://podman.io)'s [libpod REST API](http
 
 It is opinionated, single-binary, and deliberately narrow: one host group, bearer-token auth, audit log to stdout, Prometheus metrics on a separate listener, kubernetes-style secrets, idempotent applies. Use it when Kubernetes is too much and ad-hoc `podman run` over SSH is too little.
 
+## Documentation
+
+This README is the quick reference. The **[wiki](/tej/podman-api/wiki)** is the operator's handbook:
+
+- [Building](/tej/podman-api/wiki/Building) — why the build needs tags, `make` targets, static/cross builds.
+- [Provisioning a Podman Host](/tej/podman-api/wiki/Provisioning-a-Podman-Host) — turn a fresh box into an SSH-drivable target.
+- [Deploying](/tej/podman-api/wiki/Deploying) — install the daemon: user, config tree, systemd, TLS.
+- [Operating](/tej/podman-api/wiki/Operating) — key rotation, audit-log shipping, metrics, health checks.
+- [Troubleshooting](/tej/podman-api/wiki/Troubleshooting) — common failures and their fixes.
+
 ## What it does
 
 - Lists, applies, upgrades, starts/stops, and deletes **pod instances** on remote Podman hosts via SSH-tunneled `podman.sock`.
