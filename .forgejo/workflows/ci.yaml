@@ -107,6 +107,21 @@ jobs:
       - name: checkout
         uses: actions/checkout@v4
 
+      - name: cache go modules + toolchain
+        uses: actions/cache@v4
+        with:
+          # Caching ~/go/pkg/mod also caches the Go 1.26 toolchain that
+          # GOTOOLCHAIN fetches on top of Fedora's golang (it lands under
+          # pkg/mod/golang.org/toolchain), so repeat runs skip both downloads.
+          # Distinct key namespace from the lint-test-build job: different image
+          # and build tags, so its build cache must not be shared.
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-integration-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-integration-${{ runner.os }}-
+
       - name: start podman service
         run: |
           podman system service --time=0 unix:///run/podman/podman.sock &
@@ -118,4 +133,6 @@ jobs:
           podman --version
 
       - name: integration tests
-        run: go test -tags "$GO_TAGS integration" ./internal/podman/... ./cmd/podman-api/...
+        # Explicit -timeout so a nested-podman hang fails clearly instead of
+        # blocking on the 10m default; the two suites take ~2min each locally.
+        run: go test -tags "$GO_TAGS integration" -timeout=10m ./internal/podman/... ./cmd/podman-api/...
