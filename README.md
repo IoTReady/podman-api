@@ -269,7 +269,7 @@ GET    /hosts/{host}/instances?template=<id>                         instances:r
 GET    /hosts/{host}/instances/{template}/{slug}                     instances:read
 POST   /hosts/{host}/instances                                       instances:write
 PUT    /hosts/{host}/instances/{template}/{slug}                     instances:write
-DELETE /hosts/{host}/instances/{template}/{slug}?prune_volumes=...   instances:write
+DELETE /hosts/{host}/instances/{template}/{slug}?prune_volumes=&prune_secrets=  instances:write
 
 POST   /hosts/{host}/instances/{template}/{slug}/start               instances:write
 POST   /hosts/{host}/instances/{template}/{slug}/stop                instances:write
@@ -282,6 +282,8 @@ DELETE /hosts/{host}/volumes/{name}
 ```
 
 The `?skip_pull=true` query on POST/PUT instances skips the pre-pull step, useful for CI or when the image is known to be local.
+
+On DELETE, `prune_volumes` and `prune_secrets` both default to **false** — the pod is removed but its data volumes and per-instance secrets are kept. Pass `?prune_volumes=true&prune_secrets=true` to also reap them. DELETE is an idempotent reconcile: if the pod is already gone, a delete that requests pruning still removes any orphaned volumes/secrets and returns `204` (rather than `404`), so you can clean up after an earlier prune-less delete.
 
 ## FAQ
 

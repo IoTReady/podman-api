@@ -146,6 +146,37 @@ func TestService_Lifecycle(t *testing.T) {
 	require.ErrorIs(t, err, ErrInstanceNotFound)
 }
 
+func TestService_Delete_PrunesOrphanSecretWhenPodAlreadyGone(t *testing.T) {
+	svc, f := newSvc(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("orphan"), ApplyOptions{Replace: true}))
+
+	// Applying created the per-instance secret.
+	secs, err := f.SecretList(ctx, "h1")
+	require.NoError(t, err)
+	require.Len(t, secs, 1)
+
+	// A prune-less delete removes the pod but leaves the secret orphaned.
+	require.NoError(t, svc.Delete(ctx, "h1", "postgres", "orphan", DeleteOptions{}))
+	secs, _ = f.SecretList(ctx, "h1")
+	require.Len(t, secs, 1, "secret should be orphaned after a prune-less delete")
+
+	// Deleting again WITH prune must reap the orphan and succeed even though the
+	// pod is already gone — delete is an idempotent reconcile, not a 404.
+	require.NoError(t, svc.Delete(ctx, "h1", "postgres", "orphan",
+		DeleteOptions{PruneSecrets: true, PruneVolumes: true}))
+	secs, _ = f.SecretList(ctx, "h1")
+	require.Empty(t, secs, "orphaned secret should be pruned")
+}
+
+func TestService_Delete_AbsentInstanceWithoutPruneIsNotFound(t *testing.T) {
+	svc, _ := newSvc(t)
+	// Nothing applied; deleting a non-existent instance without prune flags
+	// still reports not-found (the idempotent-prune path must not mask this).
+	err := svc.Delete(context.Background(), "h1", "postgres", "ghost", DeleteOptions{})
+	require.ErrorIs(t, err, ErrInstanceNotFound)
+}
+
 func TestService_Apply_ConflictWhenExists(t *testing.T) {
 	svc, _ := newSvc(t)
 	ctx := context.Background()
