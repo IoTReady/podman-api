@@ -339,11 +339,15 @@ func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts Dele
 	lock.Lock()
 	defer lock.Unlock()
 
+	podExisted := true
 	if err := s.client.PodRemove(ctx, host, podName(tmpl, slug), true); err != nil {
-		if errors.Is(err, podman.ErrNotFound) {
-			return ErrInstanceNotFound
+		if !errors.Is(err, podman.ErrNotFound) {
+			return err
 		}
-		return err
+		// The pod is already gone. We still honour any prune request below so a
+		// caller can reap secrets/volumes orphaned by an earlier prune-less
+		// delete — delete is an idempotent reconcile toward "gone".
+		podExisted = false
 	}
 
 	t := s.templates[tmpl]
@@ -358,6 +362,12 @@ func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts Dele
 			full := tmpl + "-" + slug + "-" + v.Name
 			_ = s.client.VolumeRemove(ctx, host, full, true)
 		}
+	}
+	// If the pod was already gone and the caller asked for no pruning, there was
+	// nothing to delete — report not-found as before. When a prune was
+	// requested we treat the call as a successful reconcile.
+	if !podExisted && !opts.PruneSecrets && !opts.PruneVolumes {
+		return ErrInstanceNotFound
 	}
 	return nil
 }
