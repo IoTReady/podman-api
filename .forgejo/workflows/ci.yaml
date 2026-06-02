@@ -76,3 +76,46 @@ jobs:
 
       - name: go build
         run: go build -tags "$GO_TAGS" ./...
+
+  integration:
+    name: integration (podman-in-podman)
+    runs-on: self-hosted
+    container:
+      # Fedora-based image that ships podman, catatonit and netavark and is
+      # built to run podman nested. --privileged is required for nested podman
+      # (storage + the networking that `podman play kube` hostPort bindings
+      # need). If the runner forbids privileged jobs this step fails fast and
+      # the runner config needs to allow it.
+      image: quay.io/podman/stable
+      options: --privileged
+    env:
+      # Rootful podman serves its API socket under $XDG_RUNTIME_DIR/podman; the
+      # integration tests look for $XDG_RUNTIME_DIR/podman/podman.sock.
+      XDG_RUNTIME_DIR: /run
+      # vfs needs no /dev/fuse or overlay support, so it works regardless of how
+      # the outer runner is configured. Slower than overlay but the test images
+      # (alpine) are tiny.
+      STORAGE_DRIVER: vfs
+    steps:
+      # nodejs is needed by the JS-based actions/checkout; go.mod pins go 1.26
+      # which Go's GOTOOLCHAIN auto-fetches on top of Fedora's older toolchain.
+      - name: install go + nodejs
+        run: |
+          dnf -y install golang nodejs git make >/dev/null
+          go version
+
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: start podman service
+        run: |
+          podman system service --time=0 unix:///run/podman/podman.sock &
+          for i in $(seq 1 30); do
+            [ -S /run/podman/podman.sock ] && break
+            sleep 1
+          done
+          podman info >/dev/null
+          podman --version
+
+      - name: integration tests
+        run: go test -tags "$GO_TAGS integration" ./internal/podman/... ./cmd/podman-api/...
