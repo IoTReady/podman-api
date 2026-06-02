@@ -18,21 +18,26 @@ jobs:
     name: lint, test, build
     runs-on: self-hosted
     container:
-      # Pin a recent Go on top of a minimal image. build-essential supplies the
-      # C toolchain the race detector's linker needs; the GO_TAGS above exclude
-      # the CGO graph drivers so no libbtrfs/libgpgme/libdevmapper headers are
-      # required.
+      # Pin a recent Go. The GO_TAGS above exclude the CGO graph drivers so no
+      # libbtrfs/libgpgme/libdevmapper headers are required; nodejs and the C
+      # toolchain are installed in the first step below.
       image: docker.io/library/golang:1.26-bookworm
 
     steps:
-      - name: checkout
-        uses: actions/checkout@v4
-
-      - name: install build deps
+      # Must run BEFORE any `uses:` step. actions/checkout and actions/cache are
+      # JavaScript actions that the runner executes with `node`, which the
+      # golang image does not ship — without this the job fails with
+      # "executable file `node` not found in $PATH". `run:` steps use the shell,
+      # not node, so this one is safe to run first. build-essential supplies the
+      # C toolchain the race detector's linker needs.
+      - name: install system deps (nodejs for JS actions + C toolchain)
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            git ca-certificates build-essential
+            nodejs git ca-certificates build-essential
+
+      - name: checkout
+        uses: actions/checkout@v4
 
       - name: go env
         run: |
