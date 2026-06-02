@@ -16,7 +16,7 @@ env:
 jobs:
   lint-test-build:
     name: lint, test, build
-    runs-on: docker
+    runs-on: self-hosted
     container:
       # Pin a recent Go on top of a minimal image. build-essential supplies the
       # C toolchain the race detector's linker needs; the GO_TAGS above exclude
