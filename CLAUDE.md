@@ -37,6 +37,14 @@ go build -tags "$TAGS" -o bin/podman-api ./cmd/podman-api
 
 Keep the tag list in `Makefile` and `.forgejo/workflows/ci.yaml` in sync.
 
+## Documentation
+
+Operator docs live in the Forgejo **wiki** (`git.iotready.com/tej/podman-api/wiki`,
+a separate `podman-api.wiki.git` repo): Building, Provisioning a Podman Host,
+Deploying, Operating, Troubleshooting. The README is the quick reference and
+links into the wiki. Wikis have no PR flow — publish pages directly (git push to
+the wiki repo, or `forgejo api POST /repos/tej/podman-api/wiki/new`).
+
 ## Workflow conventions
 
 - Feature work happens in git worktrees under `.worktrees/` (git-ignored).
