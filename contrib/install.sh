@@ -21,8 +21,10 @@ SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 if [[ -z "${BINARY}" ]]; then
 	echo "==> building podman-api from ${SRC_DIR}"
-	(cd "${SRC_DIR}" && go build -o /tmp/podman-api ./cmd/podman-api)
-	BINARY=/tmp/podman-api
+	# `make build` carries the required build tags (see Makefile / README);
+	# a plain `go build` fails on a clean host without the podman -dev headers.
+	make -C "${SRC_DIR}" build
+	BINARY="${SRC_DIR}/bin/podman-api"
 fi
 
 if [[ ! -x "${BINARY}" ]]; then
