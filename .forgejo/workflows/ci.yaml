@@ -6,15 +6,22 @@ on:
   pull_request:
     branches: [main]
 
+env:
+  # The podman v5 bindings transitively pull in the storage graph drivers
+  # (btrfs, devicemapper) and gpgme, which need CGO + system -dev headers.
+  # We use only the remote libpod client, so we exclude those drivers and
+  # swap gpgme for pure-Go OpenPGP. Keep in sync with the Makefile's TAGS.
+  GO_TAGS: "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper"
+
 jobs:
   lint-test-build:
     name: lint, test, build
     runs-on: docker
     container:
-      # Pin a recent Go on top of a minimal image. The bindings used to
-      # require libbtrfs/libgpgme/libdevmapper headers; the v5 client we
-      # use is pure-Go (no CGO), so we install only what `go test` itself
-      # needs: git, ca-certs, build-essential for the race detector linker.
+      # Pin a recent Go on top of a minimal image. build-essential supplies the
+      # C toolchain the race detector's linker needs; the GO_TAGS above exclude
+      # the CGO graph drivers so no libbtrfs/libgpgme/libdevmapper headers are
+      # required.
       image: docker.io/library/golang:1.26-bookworm
 
     steps:
@@ -46,7 +53,7 @@ jobs:
         run: go mod download
 
       - name: go vet
-        run: go vet ./...
+        run: go vet -tags "$GO_TAGS" ./...
 
       - name: gofmt -l (fail on any unformatted file)
         run: |
@@ -60,7 +67,7 @@ jobs:
           fi
 
       - name: go test -race
-        run: go test -race ./...
+        run: go test -tags "$GO_TAGS" -race ./...
 
       - name: go build
-        run: go build ./...
+        run: go build -tags "$GO_TAGS" ./...

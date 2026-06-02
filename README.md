@@ -37,16 +37,31 @@ Hosts are declared once in `hosts/*.yaml`. Templates are bundled (or loaded from
 
 ## Build
 
-Pure Go, no CGO required.
+Use `make build` — it carries the required build tags:
 
 ```sh
-go build -o podman-api ./cmd/podman-api
+make build          # -> bin/podman-api
 ```
 
-For cross-compile to a Linux server from a Mac/Linux dev box:
+The podman v5 bindings transitively pull in the storage graph drivers (btrfs,
+devicemapper) and gpgme, all of which need CGO and system `-dev` headers. This
+binary uses only the **remote** libpod client, so we exclude those drivers and
+swap gpgme for a pure-Go OpenPGP implementation via build tags. A plain
+`go build` *without* these tags fails on a clean machine (`<btrfs/version.h>`
+not found / missing `gpgme.pc`):
 
 ```sh
-GOOS=linux GOARCH=amd64 go build -o podman-api ./cmd/podman-api
+go build -tags "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper" \
+  -o podman-api ./cmd/podman-api
+```
+
+With those tags no CGO system headers are needed. For cross-compile to a Linux
+server from a Mac/Linux dev box:
+
+```sh
+GOOS=linux GOARCH=amd64 go build \
+  -tags "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper" \
+  -o podman-api ./cmd/podman-api
 ```
 
 ## Configure
