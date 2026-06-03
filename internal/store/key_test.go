@@ -67,3 +67,10 @@ func TestKeyStore_StoreLoad(t *testing.T) {
 		t.Fatal("after Store, key not updated")
 	}
 }
+
+func TestKeyStore_ZeroLoad(t *testing.T) {
+	var ks KeyStore
+	if ks.Load() != ([32]byte{}) {
+		t.Fatal("zero KeyStore should return zero key")
+	}
+}
