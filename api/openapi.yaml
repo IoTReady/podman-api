@@ -21,6 +21,7 @@ tags:
   - name: bulk
   - name: logs
   - name: volumes
+  - name: jobs
 
 components:
   securitySchemes:
@@ -293,6 +294,29 @@ components:
               status: {type: integer, description: HTTP status for this op}
               code: {type: string}
               message: {type: string}
+
+    Job:
+      type: object
+      properties:
+        id: {type: string}
+        kind: {type: string}
+        state:
+          type: string
+          enum: [queued, running, succeeded, failed]
+        args: {}
+        steps:
+          type: array
+          items:
+            type: object
+            properties:
+              ts: {type: string, format: date-time}
+              step: {type: string}
+              detail: {type: string}
+        parent_id: {type: string}
+        error: {type: string}
+        created: {type: string, format: date-time}
+        started: {type: string, format: date-time}
+        finished: {type: string, format: date-time}
 
   responses:
     Unauthorized:
@@ -693,3 +717,60 @@ paths:
       responses:
         '204': {description: removed}
       x-required-scope: instances:write
+
+  /jobs:
+    get:
+      tags: [jobs]
+      summary: list async jobs (requires -state-db)
+      parameters:
+        - name: state
+          in: query
+          required: false
+          description: filter by job state
+          schema:
+            type: string
+            enum: [queued, running, succeeded, failed]
+        - name: kind
+          in: query
+          required: false
+          description: filter by job kind
+          schema: {type: string}
+      responses:
+        '200':
+          description: list
+          content:
+            application/json:
+              schema: {type: array, items: {$ref: '#/components/schemas/Job'}}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '501':
+          description: state store not enabled (-state-db not set)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+      x-required-scope: jobs:read
+
+  /jobs/{id}:
+    get:
+      tags: [jobs]
+      summary: fetch one job by ID (requires -state-db)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '200':
+          description: job
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '501':
+          description: state store not enabled (-state-db not set)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+      x-required-scope: jobs:read

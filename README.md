@@ -112,7 +112,7 @@ keys:
     scopes: [hosts:read]
 ```
 
-The defined scopes are `hosts:read`, `hosts:write`, `instances:read`, `instances:write`, `secrets:read`, `secrets:write` (and `instances:*` / `secrets:*` as shorthand).
+The defined scopes are `hosts:read`, `hosts:write`, `instances:read`, `instances:write`, `secrets:read`, `secrets:write`, `jobs:read` (and `instances:*` / `secrets:*` as shorthand).
 
 **Live key rotation:** edit `auth/keys.yaml`, then `kill -HUP $(pidof podman-api)`. The new key list takes effect on the next inbound request — in-flight log streams are not interrupted. A bad reload (parse error or zero keys) is logged and the previous list stays live, so a fat-fingered edit can't lock you out.
 
@@ -207,6 +207,13 @@ head -c 32 /dev/urandom | base64 > /etc/podman-api/spec.key && chmod 600 /etc/po
 ```
 
 > **Key rotation caveat:** the key is loaded once at startup and there is no re-encrypting rotation yet, so changing the key makes existing rows unreadable. The SQLite `-wal`/`-shm` sidecar files also hold (encrypted) secret material — include them (or checkpoint first) when backing up.
+
+When the store is enabled, async operations (future migrate/evacuate) are tracked as **jobs**, readable via:
+
+- `GET /jobs?state=<queued|running|succeeded|failed>&kind=<kind>` — list jobs, optionally filtered (scope `jobs:read`).
+- `GET /jobs/{id}` — fetch one job by ID (scope `jobs:read`).
+
+Both endpoints return `501` when `-state-db` is not set.
 
 ## Observability
 
@@ -316,6 +323,9 @@ POST   /hosts/{host}/instances/{template}/{slug}/upgrade  body: {"image": "..."}
 GET    /hosts/{host}/instances/{template}/{slug}/logs?container=&tail=&follow=
 GET    /hosts/{host}/instances/{template}/{slug}/volumes
 DELETE /hosts/{host}/volumes/{name}
+
+GET    /jobs?state=&kind=                                             jobs:read
+GET    /jobs/{id}                                                     jobs:read
 ```
 
 The `?skip_pull=true` query on POST/PUT instances skips the pre-pull step, useful for CI or when the image is known to be local.
