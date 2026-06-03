@@ -12,6 +12,7 @@ import (
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // pgTemplate is the postgres-shaped fixture used across these tests. It mirrors
@@ -237,3 +238,61 @@ func TestService_Apply_SkipPull(t *testing.T) {
 
 // podman is imported but used only to satisfy reference in tests above.
 var _ = podman.ErrNotFound
+
+func TestService_Apply_PersistsSpec(t *testing.T) {
+	svc, _ := newSvc(t)
+	mem := store.NewMemory()
+	svc.SetStore(mem)
+	ctx := context.Background()
+
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, "p", sp.Secrets["password"])
+	assert.Equal(t, "docker.io/library/postgres:16", sp.Parameters["image"])
+}
+
+func TestService_Apply_PlayKubeFail_NoSpec(t *testing.T) {
+	svc, f := newSvc(t)
+	mem := store.NewMemory()
+	svc.SetStore(mem)
+	f.PlayKubeErr = errors.New("boom")
+	ctx := context.Background()
+
+	require.Error(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	_, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	assert.ErrorIs(t, err, store.ErrNotFound)
+}
+
+func TestService_Apply_StorePutError_Fatal(t *testing.T) {
+	svc, _ := newSvc(t)
+	mem := store.NewMemory()
+	mem.PutErr = errors.New("db down")
+	svc.SetStore(mem)
+
+	err := svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "persist spec")
+}
+
+func TestService_Delete_RemovesSpec(t *testing.T) {
+	svc, _ := newSvc(t)
+	mem := store.NewMemory()
+	svc.SetStore(mem)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	require.NoError(t, svc.Delete(ctx, "h1", "postgres", "demo", DeleteOptions{}))
+
+	_, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	assert.ErrorIs(t, err, store.ErrNotFound)
+}
+
+func TestService_Delete_NilStore_OK(t *testing.T) {
+	svc, _ := newSvc(t) // no SetStore
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	require.NoError(t, svc.Delete(ctx, "h1", "postgres", "demo", DeleteOptions{}))
+}
