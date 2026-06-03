@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -366,6 +368,41 @@ func (r *Real) VolumeRemove(ctx context.Context, id, name string, force bool) er
 		opts.Force = &t
 	}
 	return mapNotFound(volumes.Remove(c, name, opts))
+}
+
+// VolumeExport streams a volume's contents as an uncompressed tar. The returned
+// reader is the live HTTP response body; the caller must Close it. We issue the
+// REST request directly rather than using the high-level volumes.Export binding
+// because that binding copies into an io.Writer, whereas our contract must hand
+// back a live io.ReadCloser for pipe streaming.
+func (r *Real) VolumeExport(ctx context.Context, id, name string) (io.ReadCloser, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	conn, err := bindings.GetClient(c)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := conn.DoRequest(c, nil, http.MethodGet, "/volumes/%s/export", nil, nil, name)
+	if err != nil {
+		return nil, err
+	}
+	if !resp.IsSuccess() {
+		defer resp.Body.Close()
+		// Process(nil) drains the body and returns podman's error for non-2xx.
+		return nil, mapNotFound(resp.Process(nil))
+	}
+	return resp.Body, nil
+}
+
+// VolumeImport unpacks an uncompressed tar into an existing volume on the host.
+func (r *Real) VolumeImport(ctx context.Context, id, name string, src io.Reader) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	return mapNotFound(volumes.Import(c, name, src))
 }
 
 // --- helpers ---
