@@ -38,6 +38,9 @@ type Client interface {
 	Ping(ctx context.Context, hostID string) error
 	Version(ctx context.Context, hostID string) (string, error)
 	UsedHostPorts(ctx context.Context, hostID string) ([]PortMapping, error)
+
+	// Host
+	HostInfo(ctx context.Context, hostID string) (HostInfo, error)
 }
 
 // LogOptions are the knobs for ContainerLogs.

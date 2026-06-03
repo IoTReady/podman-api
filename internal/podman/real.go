@@ -557,6 +557,11 @@ func (r *Real) UsedHostPorts(ctx context.Context, id string) ([]PortMapping, err
 	return out, nil
 }
 
+// HostInfo is implemented in a later task; temporary stub to satisfy the interface.
+func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
+	return HostInfo{}, fmt.Errorf("HostInfo not yet implemented")
+}
+
 func boolPtr(b bool) *bool { return &b }
 
 // splitPortKey parses a libpod PortBindings key like "5432/tcp" into

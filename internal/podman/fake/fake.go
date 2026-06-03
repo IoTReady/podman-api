@@ -41,6 +41,10 @@ type Fake struct {
 	// PodInspectErr, if non-nil, makes PodInspect return this error (use a
 	// non-ErrNotFound error to exercise the unexpected-backend-error paths).
 	PodInspectErr error
+	// HostInfoVal is returned by HostInfo when HostInfoErr is nil.
+	HostInfoVal podman.HostInfo
+	// HostInfoErr, if non-nil, makes HostInfo return this error.
+	HostInfoErr error
 }
 
 // AddVolume seeds a volume on a host so VolumeInspect resolves it. Test-only.
@@ -273,6 +277,14 @@ func (f *Fake) ImagePull(_ context.Context, host, ref string) error {
 
 func (f *Fake) Ping(_ context.Context, _ string) error              { return nil }
 func (f *Fake) Version(_ context.Context, _ string) (string, error) { return "fake-1.0", nil }
+func (f *Fake) HostInfo(_ context.Context, _ string) (podman.HostInfo, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.HostInfoErr != nil {
+		return podman.HostInfo{}, f.HostInfoErr
+	}
+	return f.HostInfoVal, nil
+}
 func (f *Fake) UsedHostPorts(_ context.Context, h string) ([]podman.PortMapping, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
