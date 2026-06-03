@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -20,7 +21,25 @@ CREATE TABLE IF NOT EXISTS specs (
   created    INTEGER NOT NULL,
   updated    INTEGER NOT NULL,
   PRIMARY KEY (host, template, slug)
-);`
+);
+CREATE TABLE IF NOT EXISTS jobs (
+  id        TEXT PRIMARY KEY,
+  kind      TEXT NOT NULL,
+  args      TEXT NOT NULL,
+  state     TEXT NOT NULL,
+  steps     TEXT NOT NULL DEFAULT '[]',
+  parent_id TEXT,
+  error     TEXT,
+  created   INTEGER NOT NULL,
+  started   INTEGER,
+  finished  INTEGER
+);
+CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);`
+
+// maxOpenConns bounds the SQLite connection pool. >1 enables WAL reader
+// concurrency (API reads while the job runner writes); a competing writer waits
+// up to busy_timeout rather than failing with "database is locked".
+const maxOpenConns = 4
 
 // SQLite is the durable Store backed by a single SQLite file. Secrets are
 // sealed with the key held in keys, read fresh on every Put/Get so a SIGHUP
@@ -33,19 +52,23 @@ type SQLite struct {
 // OpenSQLite opens (creating if needed) the SQLite file at path and ensures the
 // schema exists. keys supplies the AES-256-GCM secret key.
 func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
-	db, err := sql.Open("sqlite", path)
+	// _pragma=busy_timeout(5000) in the DSN applies the timeout on every new
+	// connection in the pool, not just the first one acquired by db.Exec.
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)", path)
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	// SQLite is single-writer; cap the pool to one connection to avoid
-	// "database is locked" under concurrent Apply/Delete.
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
-	// WAL mode: cheaper commits and fewer fsyncs than the default rollback
-	// journal. Its cross-connection read-while-write concurrency needs >1 open
-	// connection; with MaxOpenConns(1) that benefit is not yet realized — the
-	// jobs phase (#32) will raise the cap and add a busy_timeout (see #42).
+	db.SetMaxOpenConns(maxOpenConns)
+	db.SetMaxIdleConns(maxOpenConns)
+	// WAL + busy_timeout: WAL gives many concurrent readers + one writer (the
+	// API reads /jobs while the background runner writes); busy_timeout makes a
+	// competing writer wait rather than failing with "database is locked".
 	if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -55,7 +78,7 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 	}
 	// Reserved schema-version stamp for future migrations. At v1 this is set
 	// unconditionally; a real version gate is added if/when the schema changes.
-	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
+	if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
