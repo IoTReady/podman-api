@@ -251,6 +251,26 @@ func TestGetHost_LoadOmitsAbsentMetrics(t *testing.T) {
 	assert.False(t, hasLA, "loadavg omitted when nil")
 }
 
+// --- GET /hosts: list includes load ------------------------------------------
+
+func TestListHosts_ReturnsAllWithLoad(t *testing.T) {
+	srv, tok, f := newSrvFull(t)
+	f.HostInfoVal = podman.HostInfo{CPUs: 8, MemTotal: 1000, MemFree: 100, MemUsedPct: 90}
+	resp := authedReq(t, srv, tok, "GET", "/hosts")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var body []map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	require.NotEmpty(t, body)
+	for _, hh := range body {
+		if hh["status"] == "ok" {
+			load, ok := hh["load"].(map[string]any)
+			require.True(t, ok, "reachable host has load")
+			assert.Equal(t, float64(8), load["cpus"])
+		}
+	}
+}
+
 // bodyString drains and returns the response body as a string.
 func bodyString(t *testing.T, resp *http.Response) string {
 	t.Helper()
