@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // Sentinel errors mapped by the API layer to JSON error codes.
@@ -49,6 +51,7 @@ type Service struct {
 	hosts      atomic.Pointer[map[string]config.Host] // hot-swappable on SIGHUP
 	templates  map[string]config.Template
 	secretEnvs map[string]map[string]bool // template id -> set of secret-sourced env var names
+	store      store.Store                // nil = store disabled (stateless proxy behaviour)
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex // key = host|template|slug
@@ -78,6 +81,13 @@ func (s *Service) SetHosts(hosts []config.Host) {
 	}
 	s.hosts.Store(&m)
 }
+
+// SetStore wires the optional desired-state store. A nil store (the default)
+// disables persistence and the daemon behaves as a stateless proxy. Called by
+// main after construction, mirroring SetHosts. Unlike SetHosts it is NOT a
+// concurrent hot-swap: it must be called at startup, before the server begins
+// accepting requests.
+func (s *Service) SetStore(st store.Store) { s.store = st }
 
 func (s *Service) hostsSnap() map[string]config.Host {
 	p := s.hosts.Load()
@@ -184,6 +194,15 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 		}
 	}
 
+	// Snapshot secrets (zeroed below) and parameters before persisting, so the
+	// stored spec is independent of the caller's request struct.
+	var secretsCopy map[string]string
+	var paramsCopy map[string]any
+	if s.store != nil {
+		secretsCopy = maps.Clone(req.Secrets)
+		paramsCopy = maps.Clone(req.Parameters)
+	}
+
 	// Push per-instance secrets, then zero the local copies.
 	for k, v := range req.Secrets {
 		name := instanceSecretName(req.Template, req.Slug, k)
@@ -203,6 +222,18 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 
 	if err := s.client.PlayKube(ctx, host, yaml, opts.Replace); err != nil {
 		return fmt.Errorf("play kube: %w", err)
+	}
+	if s.store != nil {
+		sp := store.Spec{
+			Host:       host,
+			Template:   req.Template,
+			Slug:       req.Slug,
+			Parameters: paramsCopy,
+			Secrets:    secretsCopy,
+		}
+		if err := s.store.PutSpec(ctx, sp); err != nil {
+			return fmt.Errorf("persist spec: %w", err)
+		}
 	}
 	return nil
 }
@@ -374,6 +405,16 @@ func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts Dele
 		for _, v := range t.Meta.Volumes {
 			full := tmpl + "-" + slug + "-" + v.Name
 			_ = s.client.VolumeRemove(ctx, host, full, true)
+		}
+	}
+	// Reconcile away the desired-state row. This runs even when the pod was
+	// already gone (so a stale spec doesn't linger); ErrNotFound — never stored,
+	// or an idempotent double-delete — is not an error. Note this happens before
+	// the not-found guard below, so a pod-gone Delete still cleans up the spec
+	// even though it reports ErrInstanceNotFound to the caller.
+	if s.store != nil {
+		if err := s.store.DeleteSpec(ctx, host, tmpl, slug); err != nil && !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("delete spec: %w", err)
 		}
 	}
 	// If the pod was already gone and the caller asked for no pruning, there was

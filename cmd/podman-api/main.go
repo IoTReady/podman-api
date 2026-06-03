@@ -21,6 +21,7 @@ import (
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/obs"
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/store"
 	"github.com/iotready/podman-api/templates"
 )
 
@@ -32,6 +33,8 @@ func main() {
 		keysFile     = flag.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
 		tmplDir      = flag.String("templates-dir", "", "if set, load templates from this dir instead of embedded")
 		auditLogFile = flag.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
+		stateDB      = flag.String("state-db", "", "if set, enable the desired-state store at this SQLite path (required for migrate/evacuate)")
+		specKeyFile  = flag.String("spec-key-file", "", "path to the 32-byte secret encryption key (required when -state-db is set)")
 	)
 	flag.Parse()
 
@@ -75,6 +78,21 @@ func main() {
 	}
 
 	svc := instance.NewService(client, hosts, tmpls)
+
+	specStore, err := openStore(*stateDB, *specKeyFile)
+	if err != nil {
+		log.Fatalf("store: %v", err)
+	}
+	if specStore != nil {
+		// *store.SQLite implements Close; checkpoint WAL + release the handle on
+		// shutdown, mirroring the audit-log file's defer.
+		if closer, ok := specStore.(interface{ Close() error }); ok {
+			defer closer.Close()
+		}
+		svc.SetStore(specStore)
+		log.Printf("desired-state store enabled: %s", *stateDB)
+	}
+
 	metrics := obs.New()
 
 	auditSink := os.Stdout
@@ -150,6 +168,7 @@ func main() {
 				}
 				log.Printf("hosts reloaded: %d entries (%d draining)", len(newHosts), draining)
 			}
+
 		}
 	}()
 
@@ -198,4 +217,29 @@ func loadKeys(path string) ([]config.APIKey, string, error) {
 	}
 	sum := sha256.Sum256(raw)
 	return keys, hex.EncodeToString(sum[:8]), nil
+}
+
+// openStore wires the optional desired-state store from the two flags. It
+// returns (nil, nil) when stateDB is empty (store disabled). When stateDB is
+// set it requires a readable, valid key file; any problem is an error so the
+// caller can refuse to start. The spec key is loaded ONCE at startup — there is
+// deliberately no runtime hot-reload, because rotating to a different key would
+// silently make existing (un-re-encrypted) rows undecryptable (#41). Real
+// re-encrypting rotation is a future, separate capability.
+func openStore(stateDB, keyFile string) (store.Store, error) {
+	if stateDB == "" {
+		return nil, nil
+	}
+	if keyFile == "" {
+		return nil, fmt.Errorf("-state-db requires -spec-key-file")
+	}
+	key, err := store.LoadKeyFile(keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("spec key: %w", err)
+	}
+	st, err := store.OpenSQLite(stateDB, store.NewKeyStore(key))
+	if err != nil {
+		return nil, fmt.Errorf("state db: %w", err)
+	}
+	return st, nil
 }

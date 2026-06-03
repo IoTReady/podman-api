@@ -158,6 +158,7 @@ The opinionated layout for a production host:
 ├── hosts/
 │   └── prod-1.yaml
 ├── keys.yaml
+├── spec.key           # 32-byte AES-256 key; required when -state-db is set
 └── templates/         # optional override
 ```
 
@@ -171,6 +172,17 @@ podman-api \
   -keys-file=/etc/podman-api/keys.yaml
 ```
 
+To enable the desired-state store (required for future migrate/evacuate):
+
+```sh
+podman-api \
+  -addr=127.0.0.1:8080 \
+  -hosts-dir=/etc/podman-api/hosts \
+  -keys-file=/etc/podman-api/keys.yaml \
+  -state-db=/var/lib/podman-api/state.db \
+  -spec-key-file=/etc/podman-api/spec.key
+```
+
 A systemd unit and an opinionated installer live in `contrib/`. See [`contrib/install.sh`](contrib/install.sh) — it creates a dedicated `podman-api` user, installs the binary, and enables the service.
 
 ## Security model
@@ -180,6 +192,21 @@ A systemd unit and an opinionated installer live in `contrib/`. See [`contrib/in
 - **Bearer tokens** are stored as Argon2id PHC strings; the plaintext only exists at issuance time and in the client's config.
 - **Slug/template/secret name validation** happens at the API edge (see "Templates" above) — bad inputs never reach the renderer or podman.
 - **Secrets** flow through the API in the JSON body of `POST /instances`, are stored as Kubernetes Secret objects on the target host, and are zeroed in the in-memory request struct after use.
+
+### State store (optional)
+
+When `-state-db=<path>` is set, the daemon persists each instance's parameters and AES-256-GCM-encrypted secrets to a local SQLite database. This is off by default and is required for the planned migrate/evacuate features.
+
+- **`-state-db <path>`** — enables the desired-state store at this path.
+- **`-spec-key-file <path>`** — 32-byte AES-256-GCM key used to encrypt stored secrets. Required when `-state-db` is set; the daemon refuses to start without a readable, valid key. Loaded once at startup (no runtime reload — see the rotation caveat below). Keep the file `0600` and **separate from the database** — leaking secrets requires compromise of both.
+
+Generate a key:
+
+```sh
+head -c 32 /dev/urandom | base64 > /etc/podman-api/spec.key && chmod 600 /etc/podman-api/spec.key
+```
+
+> **Key rotation caveat:** the key is loaded once at startup and there is no re-encrypting rotation yet, so changing the key makes existing rows unreadable. The SQLite `-wal`/`-shm` sidecar files also hold (encrypted) secret material — include them (or checkpoint first) when backing up.
 
 ## Observability
 
