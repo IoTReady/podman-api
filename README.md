@@ -201,6 +201,7 @@ When `-state-db=<path>` is set, the daemon persists each instance's parameters a
 - **`-spec-key-file <path>`** — 32-byte AES-256-GCM key used to encrypt stored secrets. Required when `-state-db` is set; the daemon refuses to start without a readable, valid key. Keep the file `0600` and **separate from the database** — leaking secrets requires compromise of both. SIGHUP reloads it.
 
 Generate a key:
+
 ```sh
 head -c 32 /dev/urandom | base64 > /etc/podman-api/spec.key && chmod 600 /etc/podman-api/spec.key
 ```
