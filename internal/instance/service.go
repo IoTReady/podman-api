@@ -24,6 +24,9 @@ var (
 	ErrHostSecretMissing = errors.New("required host secret missing")
 	ErrImagePull         = errors.New("image pull failed")
 	ErrHostDraining      = errors.New("host is draining")
+	ErrPortConflict      = errors.New("required host port already in use")
+	ErrSameHost          = errors.New("source and destination host are the same")
+	ErrStoreDisabled     = errors.New("migrate requires the state store")
 )
 
 // ApplyOptions controls the side effects of Apply beyond the request body.
