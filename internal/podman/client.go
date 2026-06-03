@@ -3,6 +3,7 @@ package podman
 import (
 	"context"
 	"errors"
+	"io"
 )
 
 // Client is the contract every consumer of podman speaks. The real
@@ -27,6 +28,12 @@ type Client interface {
 	// Volumes
 	VolumeInspect(ctx context.Context, hostID, name string) (Volume, error)
 	VolumeRemove(ctx context.Context, hostID, name string, force bool) error
+	// VolumeExport streams the named volume's contents from host as an
+	// uncompressed tar. The caller must Close the returned reader.
+	VolumeExport(ctx context.Context, hostID, name string) (io.ReadCloser, error)
+	// VolumeImport unpacks an uncompressed tar (as produced by VolumeExport)
+	// into the named volume on host. The volume must already exist.
+	VolumeImport(ctx context.Context, hostID, name string, r io.Reader) error
 
 	// Logs
 	ContainerLogs(ctx context.Context, hostID, container string, opts LogOptions) (<-chan LogLine, error)

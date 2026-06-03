@@ -3,8 +3,10 @@
 package fake
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -20,9 +22,18 @@ type Fake struct {
 	pods    map[string]map[string]podman.Pod    // hostID -> name -> Pod
 	secrets map[string]map[string]podman.Secret // hostID -> name -> Secret
 	volumes map[string]map[string]podman.Volume // hostID -> name -> Volume
+	volData map[string]map[string][]byte        // hostID -> name -> tar bytes
 
 	// Optional hooks for tests that want to inject errors.
 	PlayKubeErr error
+	// ExportErr, if non-nil, makes VolumeExport fail immediately.
+	ExportErr error
+	// ImportErr, if non-nil, makes VolumeImport fail immediately (without
+	// reading the supplied reader) — models a destination that rejects the import.
+	ImportErr error
+	// ExportReader, if non-nil, overrides VolumeExport's reader. Lets a test
+	// supply a stream that errors mid-transfer.
+	ExportReader func(host, name string) io.ReadCloser
 	// PullErr, if non-nil, makes ImagePull return this error for matching refs.
 	// Key is image ref; the empty key matches any ref.
 	PullErr map[string]error
@@ -54,12 +65,28 @@ func (f *Fake) AddVolume(host string, v podman.Volume) {
 	f.hostVolumes(host)[v.Name] = v
 }
 
+// SetVolumeData seeds a volume and its contents on a host. Test-only.
+func (f *Fake) SetVolumeData(host, name string, data []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hostVolumes(host)[name] = podman.Volume{Name: name}
+	f.hostVolData(host)[name] = data
+}
+
+// VolumeData returns the stored contents of a volume (nil if none). Test-only.
+func (f *Fake) VolumeData(host, name string) []byte {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hostVolData(host)[name]
+}
+
 // New returns a fresh fake.
 func New() *Fake {
 	return &Fake{
 		pods:    map[string]map[string]podman.Pod{},
 		secrets: map[string]map[string]podman.Secret{},
 		volumes: map[string]map[string]podman.Volume{},
+		volData: map[string]map[string][]byte{},
 	}
 }
 
@@ -80,6 +107,12 @@ func (f *Fake) hostVolumes(h string) map[string]podman.Volume {
 		f.volumes[h] = map[string]podman.Volume{}
 	}
 	return f.volumes[h]
+}
+func (f *Fake) hostVolData(h string) map[string][]byte {
+	if _, ok := f.volData[h]; !ok {
+		f.volData[h] = map[string][]byte{}
+	}
+	return f.volData[h]
 }
 
 func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool) error {
@@ -245,6 +278,42 @@ func (f *Fake) VolumeRemove(_ context.Context, h, name string, _ bool) error {
 		return podman.ErrNotFound
 	}
 	delete(f.hostVolumes(h), name)
+	return nil
+}
+
+func (f *Fake) VolumeExport(_ context.Context, h, name string) (io.ReadCloser, error) {
+	if f.ExportReader != nil {
+		return f.ExportReader(h, name), nil
+	}
+	if f.ExportErr != nil {
+		return nil, f.ExportErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.hostVolumes(h)[name]; !ok {
+		return nil, podman.ErrNotFound
+	}
+	src := f.hostVolData(h)[name]
+	buf := make([]byte, len(src))
+	copy(buf, src)
+	return io.NopCloser(bytes.NewReader(buf)), nil
+}
+
+func (f *Fake) VolumeImport(_ context.Context, h, name string, r io.Reader) error {
+	if f.ImportErr != nil {
+		return f.ImportErr
+	}
+	// Read outside the lock — r may be an io.Pipe fed by another goroutine.
+	data, err := io.ReadAll(r)
+	if err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.hostVolumes(h)[name]; !ok {
+		return podman.ErrNotFound
+	}
+	f.hostVolData(h)[name] = data
 	return nil
 }
 
