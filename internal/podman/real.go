@@ -585,10 +585,12 @@ func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
 			out.CPUPct = &busy
 		}
 	}
-	out.Disk.Total = int64(info.Store.GraphRootAllocated)
-	out.Disk.Used = int64(info.Store.GraphRootUsed)
-	out.Disk.Free = out.Disk.Total - out.Disk.Used
-	if df, err := system.DiskUsage(c, &system.DiskOptions{}); err == nil {
+	if info.Store != nil {
+		out.Disk.Total = int64(info.Store.GraphRootAllocated)
+		out.Disk.Used = int64(info.Store.GraphRootUsed)
+		out.Disk.Free = out.Disk.Total - out.Disk.Used
+	}
+	if df, err := system.DiskUsage(c, &system.DiskOptions{}); err == nil && df != nil {
 		var reclaimable int64
 		for _, v := range df.Volumes {
 			reclaimable += v.ReclaimableSize
