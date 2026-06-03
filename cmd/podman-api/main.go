@@ -84,6 +84,11 @@ func main() {
 		log.Fatalf("store: %v", err)
 	}
 	if specStore != nil {
+		// *store.SQLite implements Close; checkpoint WAL + release the handle on
+		// shutdown, mirroring the audit-log file's defer.
+		if closer, ok := specStore.(interface{ Close() error }); ok {
+			defer closer.Close()
+		}
 		svc.SetStore(specStore)
 		log.Printf("desired-state store enabled: %s", *stateDB)
 	}
@@ -169,7 +174,8 @@ func main() {
 					log.Printf("spec key reload FAILED, keeping previous key: %v", err)
 				} else {
 					specKeys.Store(newKey)
-					log.Printf("spec key reloaded from %s", *specKeyFile)
+					sum := sha256.Sum256(newKey[:])
+					log.Printf("spec key reloaded from %s, fingerprint=%s", *specKeyFile, hex.EncodeToString(sum[:8]))
 				}
 			}
 		}
