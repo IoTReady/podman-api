@@ -406,6 +406,14 @@ func (s *Service) Templates() []config.Template {
 	return out
 }
 
+// HostLoad returns a point-in-time resource snapshot for a host.
+func (s *Service) HostLoad(ctx context.Context, host string) (podman.HostInfo, error) {
+	if _, ok := s.host(host); !ok {
+		return podman.HostInfo{}, ErrUnknownHost
+	}
+	return s.client.HostInfo(ctx, host)
+}
+
 // PortsInUse returns all currently-bound host ports on hostID.
 func (s *Service) PortsInUse(ctx context.Context, host string) ([]podman.PortMapping, error) {
 	if _, ok := s.host(host); !ok {

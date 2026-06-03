@@ -148,6 +148,23 @@ func TestService_PutHostSecret_Rotates(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// --- HostLoad ---------------------------------------------------------------
+
+func TestService_HostLoad_UnknownHost(t *testing.T) {
+	svc, _ := newSvc(t)
+	_, err := svc.HostLoad(context.Background(), "nope")
+	assert.ErrorIs(t, err, ErrUnknownHost)
+}
+
+func TestService_HostLoad_PassesThrough(t *testing.T) {
+	svc, f := newSvc(t)
+	f.HostInfoVal = podman.HostInfo{CPUs: 4, MemTotal: 200, MemFree: 50, MemUsedPct: 75}
+	got, err := svc.HostLoad(context.Background(), "h1")
+	require.NoError(t, err)
+	assert.Equal(t, 4, got.CPUs)
+	assert.Equal(t, 75.0, got.MemUsedPct)
+}
+
 // --- hostsSnap: nil guard (white-box) ---------------------------------------
 
 func TestService_HostsSnap_NilBeforeStore(t *testing.T) {
