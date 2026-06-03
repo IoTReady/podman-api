@@ -57,7 +57,9 @@ type JobStore interface {
 	// returns it. ok=false when there is nothing to claim.
 	ClaimNext(ctx context.Context) (job Job, ok bool, err error)
 	AppendStep(ctx context.Context, id string, step JobStep) error
-	// Finish sets the terminal state, finished timestamp, and error (empty for success).
+	// Finish sets the terminal state, finished timestamp, and error (empty for
+	// success). state must be JobSucceeded or JobFailed; passing any other value
+	// is a programming error.
 	Finish(ctx context.Context, id string, state JobState, errMsg string) error
 	// FailRunning marks every job still in running as failed with reason; returns
 	// the count. Called once at startup to reap crash-interrupted jobs.
