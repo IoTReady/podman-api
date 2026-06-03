@@ -741,8 +741,6 @@ paths:
           content:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/Job'}}
-        '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
         '501':
           description: state store not enabled (-state-db not set)
           content:
@@ -765,8 +763,6 @@ paths:
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Job'}
-        '401': {$ref: '#/components/responses/Unauthorized'}
-        '403': {$ref: '#/components/responses/Forbidden'}
         '404': {$ref: '#/components/responses/NotFound'}
         '501':
           description: state store not enabled (-state-db not set)
