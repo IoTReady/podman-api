@@ -21,6 +21,7 @@ import (
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/obs"
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/store"
 	"github.com/iotready/podman-api/templates"
 )
 
@@ -32,6 +33,8 @@ func main() {
 		keysFile     = flag.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
 		tmplDir      = flag.String("templates-dir", "", "if set, load templates from this dir instead of embedded")
 		auditLogFile = flag.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
+		stateDB      = flag.String("state-db", "", "if set, enable the desired-state store at this SQLite path (required for migrate/evacuate)")
+		specKeyFile  = flag.String("spec-key-file", "", "path to the 32-byte secret encryption key (required when -state-db is set)")
 	)
 	flag.Parse()
 
@@ -75,6 +78,16 @@ func main() {
 	}
 
 	svc := instance.NewService(client, hosts, tmpls)
+
+	specStore, specKeys, err := openStore(*stateDB, *specKeyFile)
+	if err != nil {
+		log.Fatalf("store: %v", err)
+	}
+	if specStore != nil {
+		svc.SetStore(specStore)
+		log.Printf("desired-state store enabled: %s", *stateDB)
+	}
+
 	metrics := obs.New()
 
 	auditSink := os.Stdout
@@ -150,6 +163,15 @@ func main() {
 				}
 				log.Printf("hosts reloaded: %d entries (%d draining)", len(newHosts), draining)
 			}
+
+			if specKeys != nil {
+				if newKey, err := store.LoadKeyFile(*specKeyFile); err != nil {
+					log.Printf("spec key reload FAILED, keeping previous key: %v", err)
+				} else {
+					specKeys.Store(newKey)
+					log.Printf("spec key reloaded from %s", *specKeyFile)
+				}
+			}
 		}
 	}()
 
@@ -198,4 +220,27 @@ func loadKeys(path string) ([]config.APIKey, string, error) {
 	}
 	sum := sha256.Sum256(raw)
 	return keys, hex.EncodeToString(sum[:8]), nil
+}
+
+// openStore wires the optional desired-state store from the two flags. It
+// returns (nil, nil, nil) when stateDB is empty (store disabled). When stateDB
+// is set it requires a readable, valid key file; any problem is an error so the
+// caller can refuse to start.
+func openStore(stateDB, keyFile string) (store.Store, *store.KeyStore, error) {
+	if stateDB == "" {
+		return nil, nil, nil
+	}
+	if keyFile == "" {
+		return nil, nil, fmt.Errorf("-state-db requires -spec-key-file")
+	}
+	key, err := store.LoadKeyFile(keyFile)
+	if err != nil {
+		return nil, nil, fmt.Errorf("spec key: %w", err)
+	}
+	ks := store.NewKeyStore(key)
+	st, err := store.OpenSQLite(stateDB, ks)
+	if err != nil {
+		return nil, nil, fmt.Errorf("state db: %w", err)
+	}
+	return st, ks, nil
 }
