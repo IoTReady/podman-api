@@ -79,7 +79,7 @@ func main() {
 
 	svc := instance.NewService(client, hosts, tmpls)
 
-	specStore, specKeys, err := openStore(*stateDB, *specKeyFile)
+	specStore, err := openStore(*stateDB, *specKeyFile)
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
@@ -169,15 +169,6 @@ func main() {
 				log.Printf("hosts reloaded: %d entries (%d draining)", len(newHosts), draining)
 			}
 
-			if specKeys != nil {
-				if newKey, err := store.LoadKeyFile(*specKeyFile); err != nil {
-					log.Printf("spec key reload FAILED, keeping previous key: %v", err)
-				} else {
-					specKeys.Store(newKey)
-					sum := sha256.Sum256(newKey[:])
-					log.Printf("spec key reloaded from %s, fingerprint=%s", *specKeyFile, hex.EncodeToString(sum[:8]))
-				}
-			}
 		}
 	}()
 
@@ -229,24 +220,26 @@ func loadKeys(path string) ([]config.APIKey, string, error) {
 }
 
 // openStore wires the optional desired-state store from the two flags. It
-// returns (nil, nil, nil) when stateDB is empty (store disabled). When stateDB
-// is set it requires a readable, valid key file; any problem is an error so the
-// caller can refuse to start.
-func openStore(stateDB, keyFile string) (store.Store, *store.KeyStore, error) {
+// returns (nil, nil) when stateDB is empty (store disabled). When stateDB is
+// set it requires a readable, valid key file; any problem is an error so the
+// caller can refuse to start. The spec key is loaded ONCE at startup — there is
+// deliberately no runtime hot-reload, because rotating to a different key would
+// silently make existing (un-re-encrypted) rows undecryptable (#41). Real
+// re-encrypting rotation is a future, separate capability.
+func openStore(stateDB, keyFile string) (store.Store, error) {
 	if stateDB == "" {
-		return nil, nil, nil
+		return nil, nil
 	}
 	if keyFile == "" {
-		return nil, nil, fmt.Errorf("-state-db requires -spec-key-file")
+		return nil, fmt.Errorf("-state-db requires -spec-key-file")
 	}
 	key, err := store.LoadKeyFile(keyFile)
 	if err != nil {
-		return nil, nil, fmt.Errorf("spec key: %w", err)
+		return nil, fmt.Errorf("spec key: %w", err)
 	}
-	ks := store.NewKeyStore(key)
-	st, err := store.OpenSQLite(stateDB, ks)
+	st, err := store.OpenSQLite(stateDB, store.NewKeyStore(key))
 	if err != nil {
-		return nil, nil, fmt.Errorf("state db: %w", err)
+		return nil, fmt.Errorf("state db: %w", err)
 	}
-	return st, ks, nil
+	return st, nil
 }

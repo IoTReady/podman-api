@@ -198,7 +198,7 @@ A systemd unit and an opinionated installer live in `contrib/`. See [`contrib/in
 When `-state-db=<path>` is set, the daemon persists each instance's parameters and AES-256-GCM-encrypted secrets to a local SQLite database. This is off by default and is required for the planned migrate/evacuate features.
 
 - **`-state-db <path>`** — enables the desired-state store at this path.
-- **`-spec-key-file <path>`** — 32-byte AES-256-GCM key used to encrypt stored secrets. Required when `-state-db` is set; the daemon refuses to start without a readable, valid key. Keep the file `0600` and **separate from the database** — leaking secrets requires compromise of both. SIGHUP reloads it.
+- **`-spec-key-file <path>`** — 32-byte AES-256-GCM key used to encrypt stored secrets. Required when `-state-db` is set; the daemon refuses to start without a readable, valid key. Loaded once at startup (no runtime reload — see the rotation caveat below). Keep the file `0600` and **separate from the database** — leaking secrets requires compromise of both.
 
 Generate a key:
 
@@ -206,7 +206,7 @@ Generate a key:
 head -c 32 /dev/urandom | base64 > /etc/podman-api/spec.key && chmod 600 /etc/podman-api/spec.key
 ```
 
-> **Key rotation caveat:** rotating the key does not re-encrypt existing rows — secrets written under the old key become unreadable.
+> **Key rotation caveat:** the key is loaded once at startup and there is no re-encrypting rotation yet, so changing the key makes existing rows unreadable. The SQLite `-wal`/`-shm` sidecar files also hold (encrypted) secret material — include them (or checkpoint first) when backing up.
 
 ## Observability
 

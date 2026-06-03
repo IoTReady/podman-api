@@ -32,15 +32,15 @@ func storeSpecFixture() store.Spec {
 }
 
 func TestOpenStore_Disabled(t *testing.T) {
-	st, ks, err := openStore("", "")
-	if err != nil || st != nil || ks != nil {
-		t.Fatalf("disabled store should be (nil,nil,nil), got (%v,%v,%v)", st, ks, err)
+	st, err := openStore("", "")
+	if err != nil || st != nil {
+		t.Fatalf("disabled store should be (nil,nil), got (%v,%v)", st, err)
 	}
 }
 
 func TestOpenStore_MissingKey(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.db")
-	if _, _, err := openStore(db, ""); err == nil {
+	if _, err := openStore(db, ""); err == nil {
 		t.Fatal("expected error when -state-db set without -spec-key-file")
 	}
 }
@@ -49,19 +49,19 @@ func TestOpenStore_BadKey(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.db")
 	bad := filepath.Join(t.TempDir(), "bad.key")
 	_ = os.WriteFile(bad, []byte("not-32-bytes"), 0o600)
-	if _, _, err := openStore(db, bad); err == nil {
+	if _, err := openStore(db, bad); err == nil {
 		t.Fatal("expected error for invalid key file")
 	}
 }
 
 func TestOpenStore_Enabled(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.db")
-	st, ks, err := openStore(db, writeKey(t))
+	st, err := openStore(db, writeKey(t))
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
-	if st == nil || ks == nil {
-		t.Fatal("enabled store should return non-nil store and keystore")
+	if st == nil {
+		t.Fatal("enabled store should return a non-nil store")
 	}
 	if err := st.PutSpec(context.Background(), storeSpecFixture()); err != nil {
 		t.Fatalf("PutSpec via returned store: %v", err)

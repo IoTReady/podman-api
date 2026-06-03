@@ -41,8 +41,10 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 	// "database is locked" under concurrent Apply/Delete.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	// WAL improves read concurrency (a background job runner will read while
-	// Apply/Delete write in later phases) and is safe with a single writer.
+	// WAL mode: cheaper commits and fewer fsyncs than the default rollback
+	// journal. Its cross-connection read-while-write concurrency needs >1 open
+	// connection; with MaxOpenConns(1) that benefit is not yet realized — the
+	// jobs phase (#32) will raise the cap and add a busy_timeout (see #42).
 	if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
 		_ = db.Close()
 		return nil, err

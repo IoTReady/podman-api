@@ -194,11 +194,13 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 		}
 	}
 
-	// Snapshot secrets before they are zeroed below; the store needs the
-	// plaintext to persist (encrypted) for later migrate.
+	// Snapshot secrets (zeroed below) and parameters before persisting, so the
+	// stored spec is independent of the caller's request struct.
 	var secretsCopy map[string]string
+	var paramsCopy map[string]any
 	if s.store != nil {
 		secretsCopy = maps.Clone(req.Secrets)
+		paramsCopy = maps.Clone(req.Parameters)
 	}
 
 	// Push per-instance secrets, then zero the local copies.
@@ -226,7 +228,7 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 			Host:       host,
 			Template:   req.Template,
 			Slug:       req.Slug,
-			Parameters: req.Parameters,
+			Parameters: paramsCopy,
 			Secrets:    secretsCopy,
 		}
 		if err := s.store.PutSpec(ctx, sp); err != nil {
