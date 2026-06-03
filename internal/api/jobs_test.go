@@ -48,7 +48,9 @@ func TestJobs_ListAndGet(t *testing.T) {
 	}
 	body, _ := io.ReadAll(resp.Body)
 	var list []map[string]any
-	_ = json.Unmarshal(body, &list)
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatalf("decode list: %v (body: %s)", err, body)
+	}
 	if len(list) != 1 || list[0]["kind"] != "migrate" {
 		t.Fatalf("list body: %s", string(body))
 	}
@@ -60,7 +62,9 @@ func TestJobs_ListAndGet(t *testing.T) {
 	}
 	body, _ = io.ReadAll(resp.Body)
 	var one map[string]any
-	_ = json.Unmarshal(body, &one)
+	if err := json.Unmarshal(body, &one); err != nil {
+		t.Fatalf("decode one: %v (body: %s)", err, body)
+	}
 	if one["id"] != j.ID || one["state"] != "queued" {
 		t.Fatalf("get body: %s", string(body))
 	}
@@ -76,7 +80,9 @@ func TestJobs_Filter(t *testing.T) {
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
 	var list []map[string]any
-	_ = json.Unmarshal(body, &list)
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatalf("decode list: %v (body: %s)", err, body)
+	}
 	if len(list) != 1 || list[0]["kind"] != "evacuate" {
 		t.Fatalf("filter body: %s", string(body))
 	}
