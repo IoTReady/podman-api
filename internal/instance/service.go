@@ -84,7 +84,9 @@ func (s *Service) SetHosts(hosts []config.Host) {
 
 // SetStore wires the optional desired-state store. A nil store (the default)
 // disables persistence and the daemon behaves as a stateless proxy. Called by
-// main after construction, mirroring SetHosts.
+// main after construction, mirroring SetHosts. Unlike SetHosts it is NOT a
+// concurrent hot-swap: it must be called at startup, before the server begins
+// accepting requests.
 func (s *Service) SetStore(st store.Store) { s.store = st }
 
 func (s *Service) hostsSnap() map[string]config.Host {
@@ -403,6 +405,11 @@ func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts Dele
 			_ = s.client.VolumeRemove(ctx, host, full, true)
 		}
 	}
+	// Reconcile away the desired-state row. This runs even when the pod was
+	// already gone (so a stale spec doesn't linger); ErrNotFound — never stored,
+	// or an idempotent double-delete — is not an error. Note this happens before
+	// the not-found guard below, so a pod-gone Delete still cleans up the spec
+	// even though it reports ErrInstanceNotFound to the caller.
 	if s.store != nil {
 		if err := s.store.DeleteSpec(ctx, host, tmpl, slug); err != nil && !errors.Is(err, store.ErrNotFound) {
 			return fmt.Errorf("delete spec: %w", err)

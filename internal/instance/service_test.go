@@ -296,3 +296,16 @@ func TestService_Delete_NilStore_OK(t *testing.T) {
 	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
 	require.NoError(t, svc.Delete(ctx, "h1", "postgres", "demo", DeleteOptions{}))
 }
+
+func TestService_Delete_StoreDeleteError_Fatal(t *testing.T) {
+	svc, _ := newSvc(t)
+	mem := store.NewMemory()
+	svc.SetStore(mem)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	mem.DeleteErr = errors.New("db down")
+	err := svc.Delete(ctx, "h1", "postgres", "demo", DeleteOptions{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "delete spec")
+}
