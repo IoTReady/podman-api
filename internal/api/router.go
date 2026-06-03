@@ -6,14 +6,15 @@ import (
 	apispec "github.com/iotready/podman-api/api"
 	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // NewRouter builds the full HTTP handler tree.
 // audit is an optional middleware applied around auth-guarded handlers; pass nil for no-op.
 // metricsHandler is an optional handler mounted at GET /metrics; pass nil to omit the endpoint.
-func NewRouter(svc *instance.Service, keys *auth.KeyStore, audit func(http.Handler) http.Handler, metricsHandler http.Handler) http.Handler {
+func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, audit func(http.Handler) http.Handler, metricsHandler http.Handler) http.Handler {
 	mux := http.NewServeMux()
-	h := &handlers{svc: svc}
+	h := &handlers{svc: svc, jobs: jobs}
 
 	if audit == nil {
 		audit = func(h http.Handler) http.Handler { return h }
@@ -77,11 +78,16 @@ func NewRouter(svc *instance.Service, keys *auth.KeyStore, audit func(http.Handl
 	mux.Handle("GET /hosts/{host}/instances/{template}/{slug}/volumes", guard("instances:read", http.HandlerFunc(h.instanceVolumes)))
 	mux.Handle("DELETE /hosts/{host}/volumes/{name}", guard("instances:write", http.HandlerFunc(h.deleteVolume)))
 
+	// Jobs (read). 501 when the store is disabled.
+	mux.Handle("GET /jobs", guard("jobs:read", http.HandlerFunc(h.listJobs)))
+	mux.Handle("GET /jobs/{id}", guard("jobs:read", http.HandlerFunc(h.getJob)))
+
 	return mux
 }
 
 // handlers holds per-request dependencies. Each method is a thin adapter
 // around svc.
 type handlers struct {
-	svc *instance.Service
+	svc  *instance.Service
+	jobs store.JobStore
 }
