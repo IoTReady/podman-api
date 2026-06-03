@@ -77,7 +77,7 @@ func TestE2E_FullLifecycle_LocalOnly(t *testing.T) {
 	hash, _ := config.HashToken(tok)
 	keys := []config.APIKey{{ID: "e2e", SecretHash: hash, Scopes: []string{"instances:*", "hosts:read"}}}
 	svc := instance.NewService(client, hosts, tmpls)
-	r := api.NewRouter(svc, auth.NewKeyStore(keys), nil, nil)
+	r := api.NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil)
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 

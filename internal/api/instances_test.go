@@ -42,7 +42,7 @@ spec:
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	f := fake.New()
 	svc := instance.NewService(f, hosts, tmpls)
-	srv := httptest.NewServer(NewRouter(svc, auth.NewKeyStore(keys), nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil))
 	t.Cleanup(srv.Close)
 	return srv, tok, f
 }

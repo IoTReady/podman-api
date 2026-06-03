@@ -9,6 +9,7 @@ import (
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // ErrorBody is the JSON shape of every error response.
@@ -60,6 +61,10 @@ func classify(err error) (code string, status int, msg string) {
 		return "instance_not_found", http.StatusNotFound, err.Error()
 	case errors.Is(err, render.ErrInvalidParameters):
 		return "invalid_parameters", http.StatusBadRequest, err.Error()
+	case errors.Is(err, errJobsDisabled):
+		return "not_implemented", http.StatusNotImplemented, err.Error()
+	case errors.Is(err, store.ErrNotFound):
+		return "not_found", http.StatusNotFound, err.Error()
 	default:
 		return "internal", http.StatusInternalServerError, err.Error()
 	}

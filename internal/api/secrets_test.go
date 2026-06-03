@@ -21,7 +21,7 @@ func newSrvWithSecrets(t *testing.T) (*httptest.Server, string) {
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"secrets:read", "secrets:write"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	svc := instance.NewService(fake.New(), hosts, nil)
-	srv := httptest.NewServer(NewRouter(svc, auth.NewKeyStore(keys), nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil))
 	t.Cleanup(srv.Close)
 	return srv, tok
 }

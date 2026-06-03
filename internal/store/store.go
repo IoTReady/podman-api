@@ -9,8 +9,8 @@ import (
 	"time"
 )
 
-// ErrNotFound is returned by GetSpec/DeleteSpec when no row matches.
-var ErrNotFound = errors.New("store: spec not found")
+// ErrNotFound is returned when no row matches a lookup (specs or jobs).
+var ErrNotFound = errors.New("store: not found")
 
 // Spec is the desired state of one instance.
 type Spec struct {
