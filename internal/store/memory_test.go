@@ -50,14 +50,16 @@ func TestMemory_DeleteMissing(t *testing.T) {
 func TestMemory_ErrorHooks(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemory()
-	m.PutErr = errors.New("put boom")
-	if err := m.PutSpec(ctx, sampleSpec()); err == nil {
-		t.Fatal("expected PutErr")
+	putErr := errors.New("put boom")
+	m.PutErr = putErr
+	if err := m.PutSpec(ctx, sampleSpec()); !errors.Is(err, putErr) {
+		t.Fatalf("expected PutErr, got %v", err)
 	}
 	m.PutErr = nil
 	_ = m.PutSpec(ctx, sampleSpec())
-	m.DeleteErr = errors.New("del boom")
-	if err := m.DeleteSpec(ctx, "h1", "postgres", "demo"); err == nil {
-		t.Fatal("expected DeleteErr")
+	delErr := errors.New("del boom")
+	m.DeleteErr = delErr
+	if err := m.DeleteSpec(ctx, "h1", "postgres", "demo"); !errors.Is(err, delErr) {
+		t.Fatalf("expected DeleteErr, got %v", err)
 	}
 }

@@ -23,8 +23,11 @@ type Spec struct {
 	Updated    time.Time
 }
 
-// Store persists instance specs. Implementations encrypt Secrets at rest.
+// Store persists instance specs. Implementations encrypt Secrets at rest and
+// stamp Created (first write) and Updated (every write); the in-memory test
+// double does neither.
 type Store interface {
+	// PutSpec inserts or replaces the spec for (s.Host, s.Template, s.Slug).
 	PutSpec(ctx context.Context, s Spec) error
 	GetSpec(ctx context.Context, host, template, slug string) (Spec, error)
 	DeleteSpec(ctx context.Context, host, template, slug string) error

@@ -5,8 +5,10 @@ import (
 	"sync"
 )
 
-// Memory is an in-memory Store for tests. PutErr/DeleteErr, when non-nil, make
-// the corresponding call fail — used to exercise the fatal-failure paths.
+// Memory is an in-memory Store for tests. Secrets are kept in plaintext and
+// timestamps are NOT stamped (unlike the SQLite store) — it is a test double,
+// not a production backend. PutErr/DeleteErr, when non-nil, make the
+// corresponding call fail, to exercise callers' fatal-failure paths.
 type Memory struct {
 	mu    sync.Mutex
 	specs map[string]Spec
@@ -24,12 +26,13 @@ func memKey(host, template, slug string) string {
 	return host + "|" + template + "|" + slug
 }
 
+// PutSpec inserts or replaces (upserts) the spec for (host, template, slug).
 func (m *Memory) PutSpec(_ context.Context, s Spec) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.PutErr != nil {
 		return m.PutErr
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.specs[memKey(s.Host, s.Template, s.Slug)] = s
 	return nil
 }
@@ -45,11 +48,11 @@ func (m *Memory) GetSpec(_ context.Context, host, template, slug string) (Spec, 
 }
 
 func (m *Memory) DeleteSpec(_ context.Context, host, template, slug string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.DeleteErr != nil {
 		return m.DeleteErr
 	}
-	m.mu.Lock()
-	defer m.mu.Unlock()
 	k := memKey(host, template, slug)
 	if _, ok := m.specs[k]; !ok {
 		return ErrNotFound
