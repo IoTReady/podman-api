@@ -52,7 +52,7 @@ type HostInfo struct {
 	MemTotal   int64       // bytes
 	MemFree    int64       // bytes
 	MemUsedPct float64     // derived: (MemTotal-MemFree)/MemTotal*100, 0 if MemTotal==0
-	CPUPct     *float64    // busy percent (user+system); nil when libpod omits CPUUtilization
+	CPUPct     *float64    // average CPU utilization since boot (user+system %); nil when libpod omits CPUUtilization
 	LoadAvg    *[3]float64 // 1/5/15-min; nil when unavailable
 	Disk       DiskUsage
 }

@@ -581,8 +581,9 @@ func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
 			out.MemUsedPct = float64(info.Host.MemTotal-info.Host.MemFree) / float64(info.Host.MemTotal) * 100
 		}
 		if u := info.Host.CPUUtilization; u != nil {
-			busy := u.UserPercent + u.SystemPercent
-			out.CPUPct = &busy
+			// libpod reports utilization cumulative since boot, not instantaneous.
+			sinceBoot := u.UserPercent + u.SystemPercent
+			out.CPUPct = &sinceBoot
 		}
 	}
 	if info.Store != nil {
@@ -625,7 +626,7 @@ func (r *Real) hostLoadAvg(ctx context.Context, id string) *[3]float64 {
 		}
 		raw = string(b)
 	} else {
-		out, err := sshReadLoadAvg(h)
+		out, err := sshReadLoadAvg(ctx, h)
 		if err != nil {
 			return nil
 		}
