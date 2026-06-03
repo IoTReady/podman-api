@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"net/url"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -52,9 +52,10 @@ type SQLite struct {
 // OpenSQLite opens (creating if needed) the SQLite file at path and ensures the
 // schema exists. keys supplies the AES-256-GCM secret key.
 func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
-	// _pragma=busy_timeout(5000) in the DSN applies the timeout on every new
-	// connection in the pool, not just the first one acquired by db.Exec.
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)", path)
+	// file: URI so modernc applies _pragma to every pooled connection. Escape
+	// the path: modernc splits the DSN on the first '?', so a path containing
+	// '?' or '#' would otherwise corrupt the path/query split.
+	dsn := "file:" + url.PathEscape(path) + "?_pragma=busy_timeout(5000)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -68,6 +69,9 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 		_ = db.Close()
 		return nil, err
 	}
+	// belt-and-suspenders: the DSN _pragma above covers every pooled connection;
+	// this explicit Exec surfaces a driver/pragma failure as an OpenSQLite error
+	// (the DSN path's per-connection errors are retried internally, not returned).
 	if _, err := db.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
 		_ = db.Close()
 		return nil, err

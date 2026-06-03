@@ -22,6 +22,8 @@ func TestSQLite_JobsTableExists(t *testing.T) {
 func TestSQLite_BusyTimeoutSet(t *testing.T) {
 	s := openTestStore(t, NewKeyStore(testKey(0x11)))
 	var ms int
+	// QueryRow acquires one pooled connection; all connections get busy_timeout
+	// from the DSN _pragma applied at open time, so a single sample is sufficient.
 	if err := s.db.QueryRow(`PRAGMA busy_timeout`).Scan(&ms); err != nil {
 		t.Fatalf("read busy_timeout: %v", err)
 	}
