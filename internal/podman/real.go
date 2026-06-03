@@ -557,6 +557,102 @@ func (r *Real) UsedHostPorts(ctx context.Context, id string) ([]PortMapping, err
 	return out, nil
 }
 
+// HostInfo returns a point-in-time resource snapshot for a host. CPU/mem/disk
+// come from libpod `info`; reclaimable from `system df`; loadavg is a
+// best-effort read of /proc/loadavg (the one metric libpod does not expose).
+// Any sub-metric that cannot be obtained is left at its zero/nil value rather
+// than failing the whole call; only a failed `info` call (host unreachable)
+// returns an error.
+func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return HostInfo{}, err
+	}
+	info, err := system.Info(c, &system.InfoOptions{})
+	if err != nil {
+		return HostInfo{}, err
+	}
+	out := HostInfo{}
+	if info.Host != nil {
+		out.CPUs = info.Host.CPUs
+		out.MemTotal = info.Host.MemTotal
+		out.MemFree = info.Host.MemFree
+		if info.Host.MemTotal > 0 {
+			out.MemUsedPct = float64(info.Host.MemTotal-info.Host.MemFree) / float64(info.Host.MemTotal) * 100
+		}
+		if u := info.Host.CPUUtilization; u != nil {
+			// libpod reports utilization cumulative since boot, not instantaneous.
+			sinceBoot := u.UserPercent + u.SystemPercent
+			out.CPUPct = &sinceBoot
+		}
+	}
+	if info.Store != nil {
+		out.Disk.Total = int64(info.Store.GraphRootAllocated)
+		out.Disk.Used = int64(info.Store.GraphRootUsed)
+		out.Disk.Free = out.Disk.Total - out.Disk.Used
+		if out.Disk.Free < 0 {
+			out.Disk.Free = 0
+		}
+	}
+	if df, err := system.DiskUsage(c, &system.DiskOptions{}); err == nil && df != nil {
+		var reclaimable int64
+		for _, v := range df.Volumes {
+			reclaimable += v.ReclaimableSize
+		}
+		out.Disk.Reclaimable = reclaimable
+	}
+	if la := r.hostLoadAvg(ctx, id); la != nil {
+		out.LoadAvg = la
+	}
+	return out, nil
+}
+
+// hostLoadAvg reads /proc/loadavg for a host, returning the 1/5/15-minute
+// averages, or nil if it cannot be read. For a unix (local) host it reads the
+// daemon's own /proc/loadavg; for an SSH host it execs `cat /proc/loadavg`
+// over a short-lived SSH session bounded by ctx. Any error yields nil so the
+// metric is absent.
+func (r *Real) hostLoadAvg(ctx context.Context, id string) *[3]float64 {
+	// r.hosts is immutable after NewReal, so no r.mu needed here.
+	h, ok := r.hosts[id]
+	if !ok {
+		return nil
+	}
+	var raw string
+	if h.Addr == "unix" {
+		b, err := os.ReadFile("/proc/loadavg")
+		if err != nil {
+			return nil
+		}
+		raw = string(b)
+	} else {
+		out, err := sshReadLoadAvg(ctx, h)
+		if err != nil {
+			return nil
+		}
+		raw = out
+	}
+	return parseLoadAvg(raw)
+}
+
+// parseLoadAvg extracts the first three space-separated floats from a
+// /proc/loadavg line ("0.42 0.37 0.31 1/512 12345").
+func parseLoadAvg(raw string) *[3]float64 {
+	fields := strings.Fields(raw)
+	if len(fields) < 3 {
+		return nil
+	}
+	var la [3]float64
+	for i := 0; i < 3; i++ {
+		v, err := strconv.ParseFloat(fields[i], 64)
+		if err != nil {
+			return nil
+		}
+		la[i] = v
+	}
+	return &la
+}
+
 func boolPtr(b bool) *bool { return &b }
 
 // splitPortKey parses a libpod PortBindings key like "5432/tcp" into

@@ -43,6 +43,28 @@ type Secret struct {
 	CreatedAt time.Time
 }
 
+// HostInfo is a point-in-time resource snapshot for a host, sourced from
+// libpod `info` + `system df` plus a best-effort read of /proc/loadavg.
+// Pointer fields are nil when the underlying source does not report them, so
+// an absent metric serializes as null rather than a misleading zero.
+type HostInfo struct {
+	CPUs       int         // logical CPUs
+	MemTotal   int64       // bytes
+	MemFree    int64       // bytes
+	MemUsedPct float64     // derived: (MemTotal-MemFree)/MemTotal*100, 0 if MemTotal==0
+	CPUPct     *float64    // average CPU utilization since boot (user+system %); nil when libpod omits CPUUtilization
+	LoadAvg    *[3]float64 // 1/5/15-min; nil when unavailable
+	Disk       DiskUsage
+}
+
+// DiskUsage describes the host's container-storage partition (graphroot).
+type DiskUsage struct {
+	Total       int64 // bytes (graphroot partition size)
+	Used        int64 // bytes
+	Free        int64 // bytes (Total-Used)
+	Reclaimable int64 // bytes reclaimable from dangling volumes (system df)
+}
+
 type LogLine struct {
 	Container string
 	Stream    string // stdout / stderr

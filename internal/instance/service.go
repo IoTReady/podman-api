@@ -286,6 +286,19 @@ func (s *Service) InstanceCount(ctx context.Context, host string) (int, error) {
 	return len(all), nil
 }
 
+// HostCounts returns the number of managed instances and the total number of
+// their containers on a host, in a single ListAllInstances sweep.
+func (s *Service) HostCounts(ctx context.Context, host string) (instances, containers int, err error) {
+	all, err := s.ListAllInstances(ctx, host)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, obs := range all {
+		containers += len(obs.Containers)
+	}
+	return len(all), containers, nil
+}
+
 func (s *Service) Start(ctx context.Context, host, tmpl, slug string) error {
 	return s.lifecycle(ctx, host, tmpl, slug, s.client.PodStart)
 }
@@ -404,6 +417,14 @@ func (s *Service) Templates() []config.Template {
 		out = append(out, t)
 	}
 	return out
+}
+
+// HostLoad returns a point-in-time resource snapshot for a host.
+func (s *Service) HostLoad(ctx context.Context, host string) (podman.HostInfo, error) {
+	if _, ok := s.host(host); !ok {
+		return podman.HostInfo{}, ErrUnknownHost
+	}
+	return s.client.HostInfo(ctx, host)
 }
 
 // PortsInUse returns all currently-bound host ports on hostID.

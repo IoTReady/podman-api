@@ -1,18 +1,31 @@
 package api
 
 import (
+	"context"
 	"net/http"
+	"sync"
+	"time"
 
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/podman"
 )
 
 func (h *handlers) listHosts(w http.ResponseWriter, r *http.Request) {
 	hosts := h.svc.Hosts()
-	out := make([]map[string]any, 0, len(hosts))
-	for _, host := range hosts {
-		out = append(out, h.hostView(r, host))
+	out := make([]map[string]any, len(hosts))
+	const perHostTimeout = 5 * time.Second
+	var wg sync.WaitGroup
+	for i, host := range hosts {
+		wg.Add(1)
+		go func(i int, host config.Host) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(r.Context(), perHostTimeout)
+			defer cancel()
+			out[i] = h.hostViewCtx(ctx, host)
+		}(i, host)
 	}
+	wg.Wait()
 	WriteJSON(w, http.StatusOK, out)
 }
 
@@ -20,17 +33,17 @@ func (h *handlers) getHost(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("host")
 	for _, host := range h.svc.Hosts() {
 		if host.ID == id {
-			WriteJSON(w, http.StatusOK, h.hostView(r, host))
+			WriteJSON(w, http.StatusOK, h.hostViewCtx(r.Context(), host))
 			return
 		}
 	}
 	WriteError(w, instance.ErrUnknownHost)
 }
 
-// hostView is the canonical JSON shape for a host: identity + reachability +
+// hostViewCtx is the canonical JSON shape for a host: identity + reachability +
 // drain state + a live count of managed instances. Reachability calls run
 // per-request (not cached) so operators get a true picture.
-func (h *handlers) hostView(r *http.Request, host config.Host) map[string]any {
+func (h *handlers) hostViewCtx(ctx context.Context, host config.Host) map[string]any {
 	entry := map[string]any{
 		"id":       host.ID,
 		"addr":     host.Addr,
@@ -39,21 +52,49 @@ func (h *handlers) hostView(r *http.Request, host config.Host) map[string]any {
 		"draining": host.Drain,
 	}
 	reachable := false
-	if err := h.svc.Ping(r.Context(), host.ID); err == nil {
+	if err := h.svc.Ping(ctx, host.ID); err == nil {
 		reachable = true
 		entry["status"] = "ok"
-		if v, err := h.svc.Version(r.Context(), host.ID); err == nil {
+		if v, err := h.svc.Version(ctx, host.ID); err == nil {
 			entry["podman_version"] = v
 		}
 	} else {
 		entry["status"] = "unreachable"
 	}
 	if reachable {
-		if n, err := h.svc.InstanceCount(r.Context(), host.ID); err == nil {
-			entry["instance_count"] = n
+		if ic, cc, err := h.svc.HostCounts(ctx, host.ID); err == nil {
+			entry["instance_count"] = ic
+			entry["container_count"] = cc
+		}
+		if info, err := h.svc.HostLoad(ctx, host.ID); err == nil {
+			entry["load"] = loadView(info)
 		}
 	}
 	return entry
+}
+
+// loadView renders a HostInfo as the canonical JSON load object. Pointer
+// metrics absent from the source are omitted entirely (null-by-omission).
+func loadView(info podman.HostInfo) map[string]any {
+	m := map[string]any{
+		"cpus":         info.CPUs,
+		"mem_total":    info.MemTotal,
+		"mem_free":     info.MemFree,
+		"mem_used_pct": info.MemUsedPct,
+		"disk": map[string]any{
+			"total":       info.Disk.Total,
+			"used":        info.Disk.Used,
+			"free":        info.Disk.Free,
+			"reclaimable": info.Disk.Reclaimable,
+		},
+	}
+	if info.CPUPct != nil {
+		m["cpu_pct"] = *info.CPUPct
+	}
+	if info.LoadAvg != nil {
+		m["loadavg"] = []float64{info.LoadAvg[0], info.LoadAvg[1], info.LoadAvg[2]}
+	}
+	return m
 }
 
 func (h *handlers) hostHealthz(w http.ResponseWriter, r *http.Request) {

@@ -148,6 +148,43 @@ func TestService_PutHostSecret_Rotates(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// --- HostLoad ---------------------------------------------------------------
+
+func TestService_HostLoad_UnknownHost(t *testing.T) {
+	svc, _ := newSvc(t)
+	_, err := svc.HostLoad(context.Background(), "nope")
+	assert.ErrorIs(t, err, ErrUnknownHost)
+}
+
+func TestService_HostLoad_PassesThrough(t *testing.T) {
+	svc, f := newSvc(t)
+	f.HostInfoVal = podman.HostInfo{CPUs: 4, MemTotal: 200, MemFree: 50, MemUsedPct: 75}
+	got, err := svc.HostLoad(context.Background(), "h1")
+	require.NoError(t, err)
+	assert.Equal(t, 4, got.CPUs)
+	assert.Equal(t, 75.0, got.MemUsedPct)
+}
+
+// --- HostCounts -------------------------------------------------------------
+
+func TestService_HostCounts(t *testing.T) {
+	svc, _ := newSvc(t)
+	// Apply two instances of the postgres template (each pod has 1 container).
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("a"), ApplyOptions{}))
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("b"), ApplyOptions{}))
+
+	instances, containers, err := svc.HostCounts(context.Background(), "h1")
+	require.NoError(t, err)
+	assert.Equal(t, 2, instances)
+	assert.Equal(t, instances, containers) // postgres template = 1 container per pod
+}
+
+func TestService_HostCounts_UnknownHost(t *testing.T) {
+	svc, _ := newSvc(t)
+	_, _, err := svc.HostCounts(context.Background(), "nope")
+	assert.ErrorIs(t, err, ErrUnknownHost)
+}
+
 // --- hostsSnap: nil guard (white-box) ---------------------------------------
 
 func TestService_HostsSnap_NilBeforeStore(t *testing.T) {
