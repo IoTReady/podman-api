@@ -36,6 +36,8 @@ type Fake struct {
 	// ContainerLogsErr, if non-nil, makes ContainerLogs return this error
 	// instead of a channel.
 	ContainerLogsErr error
+	// UsedHostPortsErr, if non-nil, makes UsedHostPorts return this error.
+	UsedHostPortsErr error
 }
 
 // New returns a fresh fake.
@@ -261,6 +263,9 @@ func (f *Fake) Version(_ context.Context, _ string) (string, error) { return "fa
 func (f *Fake) UsedHostPorts(_ context.Context, h string) ([]podman.PortMapping, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.UsedHostPortsErr != nil {
+		return nil, f.UsedHostPortsErr
+	}
 	var out []podman.PortMapping
 	for _, p := range f.hostPods(h) {
 		for _, c := range p.Containers {
