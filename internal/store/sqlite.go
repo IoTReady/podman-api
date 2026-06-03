@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/url"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -167,3 +168,177 @@ func (s *SQLite) DeleteSpec(ctx context.Context, host, template, slug string) er
 	}
 	return nil
 }
+
+// ---------------------------------------------------------------------------
+// JobStore implementation
+// ---------------------------------------------------------------------------
+
+const jobColumns = `id, kind, args, state, steps, parent_id, error, created, started, finished`
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanJob(sc rowScanner) (Job, error) {
+	var (
+		j                 Job
+		args, steps       string
+		parent, errMsg    sql.NullString
+		created           int64
+		started, finished sql.NullInt64
+	)
+	if err := sc.Scan(&j.ID, &j.Kind, &args, &j.State, &steps, &parent, &errMsg, &created, &started, &finished); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Job{}, ErrNotFound
+		}
+		return Job{}, err
+	}
+	j.Args = json.RawMessage(args)
+	if err := json.Unmarshal([]byte(steps), &j.Steps); err != nil {
+		return Job{}, err
+	}
+	j.ParentID = parent.String
+	j.Error = errMsg.String
+	j.Created = time.Unix(created, 0)
+	if started.Valid {
+		j.Started = time.Unix(started.Int64, 0)
+	}
+	if finished.Valid {
+		j.Finished = time.Unix(finished.Int64, 0)
+	}
+	return j, nil
+}
+
+func (s *SQLite) Enqueue(ctx context.Context, kind string, args json.RawMessage, parentID string) (Job, error) {
+	id := newJobID()
+	now := time.Now().Unix()
+	if len(args) == 0 {
+		args = json.RawMessage("null")
+	}
+	var parent any
+	if parentID != "" {
+		parent = parentID
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO jobs (id, kind, args, state, steps, parent_id, error, created, started, finished)
+VALUES (?, ?, ?, 'queued', '[]', ?, NULL, ?, NULL, NULL)`,
+		id, kind, string(args), parent, now)
+	if err != nil {
+		return Job{}, err
+	}
+	return s.GetJob(ctx, id)
+}
+
+func (s *SQLite) GetJob(ctx context.Context, id string) (Job, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=?`, id)
+	return scanJob(row)
+}
+
+func (s *SQLite) ListJobs(ctx context.Context, f JobFilter) ([]Job, error) {
+	q := `SELECT ` + jobColumns + ` FROM jobs`
+	var where []string
+	var args []any
+	if f.State != "" {
+		where = append(where, "state=?")
+		args = append(args, string(f.State))
+	}
+	if f.Kind != "" {
+		where = append(where, "kind=?")
+		args = append(args, f.Kind)
+	}
+	if len(where) > 0 {
+		q += " WHERE " + strings.Join(where, " AND ")
+	}
+	q += " ORDER BY created DESC, id DESC"
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Job{}
+	for rows.Next() {
+		j, err := scanJob(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, j)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) ClaimNext(ctx context.Context) (Job, bool, error) {
+	now := time.Now().Unix()
+	row := s.db.QueryRowContext(ctx, `
+UPDATE jobs SET state='running', started=?
+WHERE id = (SELECT id FROM jobs WHERE state='queued' ORDER BY created, id LIMIT 1)
+  AND state='queued'
+RETURNING `+jobColumns, now)
+	j, err := scanJob(row)
+	if errors.Is(err, ErrNotFound) {
+		return Job{}, false, nil
+	}
+	if err != nil {
+		return Job{}, false, err
+	}
+	return j, true, nil
+}
+
+func (s *SQLite) AppendStep(ctx context.Context, id string, step JobStep) error {
+	// Only the worker running this job appends steps, so there is no concurrent
+	// AppendStep for the same id — a read-modify-write is safe.
+	var steps string
+	if err := s.db.QueryRowContext(ctx, `SELECT steps FROM jobs WHERE id=?`, id).Scan(&steps); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	var arr []JobStep
+	if err := json.Unmarshal([]byte(steps), &arr); err != nil {
+		return err
+	}
+	arr = append(arr, step)
+	b, err := json.Marshal(arr)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.ExecContext(ctx, `UPDATE jobs SET steps=? WHERE id=?`, string(b), id)
+	return err
+}
+
+func (s *SQLite) Finish(ctx context.Context, id string, state JobState, errMsg string) error {
+	now := time.Now().Unix()
+	var e any
+	if errMsg != "" {
+		e = errMsg
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET state=?, error=?, finished=? WHERE id=?`,
+		string(state), e, now, id)
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (s *SQLite) FailRunning(ctx context.Context, reason string) (int, error) {
+	now := time.Now().Unix()
+	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET state='failed', error=?, finished=? WHERE state='running'`,
+		reason, now)
+	if err != nil {
+		return 0, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+var _ DB = (*SQLite)(nil)
