@@ -112,7 +112,7 @@ components:
           description: managed pods on the host (present when reachable)
         container_count:
           type: integer
-          description: Total containers across podman-api-managed pods on this host.
+          description: total containers across managed pods on the host (present when reachable)
         load:
           type: object
           description: Point-in-time host resource snapshot. Present only when the host is reachable.
