@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/url"
 	"strings"
 	"time"
@@ -307,6 +308,9 @@ func (s *SQLite) AppendStep(ctx context.Context, id string, step JobStep) error 
 }
 
 func (s *SQLite) Finish(ctx context.Context, id string, state JobState, errMsg string) error {
+	if state != JobSucceeded && state != JobFailed {
+		return fmt.Errorf("store.Finish: invalid terminal state %q", state)
+	}
 	now := time.Now().Unix()
 	var e any
 	if errMsg != "" {

@@ -118,6 +118,7 @@ func TestSQLite_ClaimNext_NoDoubleClaim(t *testing.T) {
 	}
 	var mu sync.Mutex
 	claimed := map[string]int{}
+	errCh := make(chan error, 4)
 	var wg sync.WaitGroup
 	for w := 0; w < 4; w++ {
 		wg.Add(1)
@@ -125,7 +126,11 @@ func TestSQLite_ClaimNext_NoDoubleClaim(t *testing.T) {
 			defer wg.Done()
 			for {
 				j, ok, err := s.ClaimNext(ctx)
-				if err != nil || !ok {
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if !ok {
 					return
 				}
 				mu.Lock()
@@ -135,6 +140,10 @@ func TestSQLite_ClaimNext_NoDoubleClaim(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("ClaimNext error: %v", err)
+	}
 	if len(claimed) != n {
 		t.Fatalf("claimed %d distinct jobs, want %d", len(claimed), n)
 	}
@@ -174,5 +183,26 @@ func TestSQLite_AppendStep_Finish_FailRunning(t *testing.T) {
 	got2, _ := s.GetJob(ctx, j2.ID)
 	if got2.State != JobFailed || got2.Error != "interrupted" {
 		t.Fatalf("FailRunning did not mark job: %+v", got2)
+	}
+}
+
+func TestSQLite_Finish_Missing(t *testing.T) {
+	if err := openJobStore(t).Finish(context.Background(), "nope", JobSucceeded, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestSQLite_AppendStep_Missing(t *testing.T) {
+	if err := openJobStore(t).AppendStep(context.Background(), "nope", JobStep{Step: "x"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestSQLite_Finish_RejectsNonTerminal(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+	j, _ := s.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	if err := s.Finish(ctx, j.ID, JobQueued, ""); err == nil {
+		t.Fatal("Finish with non-terminal state should error")
 	}
 }
