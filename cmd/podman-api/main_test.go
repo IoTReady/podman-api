@@ -66,4 +66,7 @@ func TestOpenStore_Enabled(t *testing.T) {
 	if err := st.PutSpec(context.Background(), storeSpecFixture()); err != nil {
 		t.Fatalf("PutSpec via returned store: %v", err)
 	}
+	if _, err := st.Enqueue(context.Background(), "migrate", nil, ""); err != nil {
+		t.Fatalf("Enqueue via returned DB: %v", err)
+	}
 }

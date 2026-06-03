@@ -19,6 +19,7 @@ import (
 	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/jobs"
 	"github.com/iotready/podman-api/internal/obs"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/store"
@@ -79,18 +80,22 @@ func main() {
 
 	svc := instance.NewService(client, hosts, tmpls)
 
-	specStore, err := openStore(*stateDB, *specKeyFile)
+	db, err := openStore(*stateDB, *specKeyFile)
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
-	if specStore != nil {
-		// *store.SQLite implements Close; checkpoint WAL + release the handle on
-		// shutdown, mirroring the audit-log file's defer.
-		if closer, ok := specStore.(interface{ Close() error }); ok {
-			defer closer.Close()
-		}
-		svc.SetStore(specStore)
-		log.Printf("desired-state store enabled: %s", *stateDB)
+	// runnerCtx is cancelled by the shutdown handler to stop the job runner.
+	runnerCtx, cancelRunner := context.WithCancel(context.Background())
+	defer cancelRunner()
+	var jobStore store.JobStore
+	if db != nil {
+		defer db.Close()
+		svc.SetStore(db)
+		jobStore = db
+		// Registry is empty in this phase; migrate/evacuate register handlers later.
+		runner := jobs.NewRunner(db, jobs.Registry{}, jobs.DefaultWorkers)
+		runner.Start(runnerCtx)
+		log.Printf("desired-state store enabled: %s (job runner started)", *stateDB)
 	}
 
 	metrics := obs.New()
@@ -120,7 +125,7 @@ func main() {
 
 	// /metrics is never mounted on the main listener — operators must opt in
 	// with -metrics-addr to bind it on a separate (typically internal) socket.
-	router := api.NewRouter(svc, nil, keyStore, combined, nil)
+	router := api.NewRouter(svc, jobStore, keyStore, combined, nil)
 
 	srv := &http.Server{
 		Addr:              *addr,
@@ -177,6 +182,7 @@ func main() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
+		cancelRunner() // stop the job runner; in-flight jobs are reaped on next boot
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
@@ -226,7 +232,7 @@ func loadKeys(path string) ([]config.APIKey, string, error) {
 // deliberately no runtime hot-reload, because rotating to a different key would
 // silently make existing (un-re-encrypted) rows undecryptable (#41). Real
 // re-encrypting rotation is a future, separate capability.
-func openStore(stateDB, keyFile string) (store.Store, error) {
+func openStore(stateDB, keyFile string) (store.DB, error) {
 	if stateDB == "" {
 		return nil, nil
 	}
