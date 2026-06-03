@@ -286,6 +286,19 @@ func (s *Service) InstanceCount(ctx context.Context, host string) (int, error) {
 	return len(all), nil
 }
 
+// HostCounts returns the number of managed instances and the total number of
+// their containers on a host, in a single ListAllInstances sweep.
+func (s *Service) HostCounts(ctx context.Context, host string) (instances, containers int, err error) {
+	all, err := s.ListAllInstances(ctx, host)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, obs := range all {
+		containers += len(obs.Containers)
+	}
+	return len(all), containers, nil
+}
+
 func (s *Service) Start(ctx context.Context, host, tmpl, slug string) error {
 	return s.lifecycle(ctx, host, tmpl, slug, s.client.PodStart)
 }
