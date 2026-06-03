@@ -110,7 +110,9 @@ rotation) preserves the original birth time and bumps only `updated`.
 `nonce(12) || AES-256-GCM ciphertext`; `open` reverses it. The plaintext is
 `json.Marshal(spec.Secrets)`. The whole map is one blob — simpler than per-key
 columns and sufficient. `sqlite.go` reads the current key from the injected
-`*KeyStore` on **every** seal/open, so a SIGHUP key swap takes effect live.
+`*KeyStore` on **every** seal/open, so the seam is ready for a future
+re-encrypting rotation; the key itself is loaded once at startup (no runtime
+swap — see *Key handling*).
 
 **Key-rotation caveat.** Rotating the key file does **not** re-encrypt existing
 rows; ciphertext written under the old key becomes unreadable. Automatic
@@ -190,10 +192,13 @@ Startup wiring (only when `-state-db` is non-empty):
 3. `st, err := store.OpenSQLite(*stateDB, keyStore)` — fatal on error.
 4. `svc.SetStore(st)`.
 
-The existing SIGHUP goroutine gains a key reload alongside the keys/hosts
-reloads: reload `LoadKeyFile`, and on success `keyStore.Store(newKey)`; on failure
-keep the previous key and log (same contract as the keys/hosts reloads). Reload is
-skipped when the store is disabled.
+The spec key is loaded **once at startup** — there is deliberately no SIGHUP
+hot-reload (unlike the auth keys). Because rows are not re-encrypted, swapping to
+a different key at runtime would silently make existing rows undecryptable; a
+restart covers the only safe case (fixing a startup typo before rows exist). The
+`*KeyStore` seam is retained so a future re-encrypting rotation can use it.
+*(Revised after PR #40 review — issue #41; the original design mirrored the
+auth-key hot-reload, which is unsafe for a data-encryption key.)*
 
 ## Threat model (unchanged from umbrella)
 

@@ -64,8 +64,10 @@ Written on `Apply`, removed on `Delete`. One row per instance.
 | `created`, `updated` | timestamps |
 
 Secret values are encrypted with a daemon key loaded from `-spec-key-file`
-(32 bytes, base64 or raw). Hot-reloadable on SIGHUP like the auth keys. The
-daemon **refuses to start** if `-state-db` is set without a readable key.
+(32 bytes, base64 or raw), read once at startup. The daemon **refuses to start**
+if `-state-db` is set without a readable key. (There is no SIGHUP key hot-reload
+— see the Phase 2 design and issue #41: changing the key can't re-encrypt
+existing rows, so a runtime swap would silently break them.)
 
 ### `jobs` — async operations
 | column | notes |
