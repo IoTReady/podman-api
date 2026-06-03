@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -11,6 +12,7 @@ import (
 // timestamps are NOT stamped (unlike the SQLite store) — it is a test double,
 // not a production backend. PutErr/DeleteErr, when non-nil, make the
 // corresponding call fail, to exercise callers' fatal-failure paths.
+// It also implements JobStore with an in-memory []Job slice.
 type Memory struct {
 	mu    sync.Mutex
 	specs map[string]Spec
@@ -83,7 +85,7 @@ func (m *Memory) GetJob(_ context.Context, id string) (Job, error) {
 	defer m.mu.Unlock()
 	for _, j := range m.jobs {
 		if j.ID == id {
-			return j, nil
+			return cloneJob(j), nil
 		}
 	}
 	return Job{}, ErrNotFound
@@ -101,7 +103,7 @@ func (m *Memory) ListJobs(_ context.Context, f JobFilter) ([]Job, error) {
 		if f.Kind != "" && j.Kind != f.Kind {
 			continue
 		}
-		out = append(out, j)
+		out = append(out, cloneJob(j))
 	}
 	return out, nil
 }
@@ -113,7 +115,7 @@ func (m *Memory) ClaimNext(_ context.Context) (Job, bool, error) {
 		if m.jobs[i].State == JobQueued {
 			m.jobs[i].State = JobRunning
 			m.jobs[i].Started = time.Now()
-			return m.jobs[i], true, nil
+			return cloneJob(m.jobs[i]), true, nil
 		}
 	}
 	return Job{}, false, nil
@@ -132,6 +134,9 @@ func (m *Memory) AppendStep(_ context.Context, id string, step JobStep) error {
 }
 
 func (m *Memory) Finish(_ context.Context, id string, state JobState, errMsg string) error {
+	if state != JobSucceeded && state != JobFailed {
+		return fmt.Errorf("store: Finish: invalid terminal state %q", state)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for i := range m.jobs {
@@ -158,6 +163,21 @@ func (m *Memory) FailRunning(_ context.Context, reason string) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+// cloneJob returns a copy whose Steps and Args do not share backing arrays with
+// the stored job — matching SQLite, which deserializes fresh on every read, so a
+// caller mutating a returned job cannot corrupt the in-memory store.
+func cloneJob(j Job) Job {
+	if j.Steps != nil {
+		steps := make([]JobStep, len(j.Steps))
+		copy(steps, j.Steps)
+		j.Steps = steps
+	}
+	if j.Args != nil {
+		j.Args = append(json.RawMessage(nil), j.Args...)
+	}
+	return j
 }
 
 var _ JobStore = (*Memory)(nil)

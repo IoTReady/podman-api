@@ -68,3 +68,24 @@ func TestMemory_Jobs_ListFilterNewestFirst(t *testing.T) {
 		t.Fatalf("filter failed: %+v", ev)
 	}
 }
+
+func TestMemory_Jobs_Finish_Missing(t *testing.T) {
+	if err := NewMemory().Finish(context.Background(), "nope", JobSucceeded, ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestMemory_Jobs_AppendStep_Missing(t *testing.T) {
+	if err := NewMemory().AppendStep(context.Background(), "nope", JobStep{Step: "x"}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+func TestMemory_Jobs_Finish_RejectsNonTerminal(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+	j, _ := m.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	if err := m.Finish(ctx, j.ID, JobQueued, ""); err == nil {
+		t.Fatal("Finish with non-terminal state should error")
+	}
+}
