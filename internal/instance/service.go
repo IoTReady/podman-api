@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"sync"
 	"sync/atomic"
@@ -536,6 +537,46 @@ func (s *Service) DeleteVolume(ctx context.Context, host, name string, force boo
 		return nil
 	}
 	return err
+}
+
+// CopyVolume streams a named volume's contents from one host to another through
+// an in-process pipe — the data crosses the daemon's network (two connections)
+// but never its disk. The destination volume must already exist. The source is
+// only ever read, so a failed copy leaves it untouched (migrate relies on this).
+func (s *Service) CopyVolume(ctx context.Context, fromHost, toHost, name string) error {
+	rc, err := s.client.VolumeExport(ctx, fromHost, name)
+	if err != nil {
+		return fmt.Errorf("export volume %q from %s: %w", name, fromHost, err)
+	}
+	defer rc.Close()
+
+	pr, pw := io.Pipe()
+	copyDone := make(chan struct{})
+	go func() {
+		_, cerr := io.Copy(pw, rc)
+		// nil cerr closes the pipe with EOF (clean); an error closes it so the
+		// importer's read fails too.
+		pw.CloseWithError(cerr)
+		close(copyDone)
+	}()
+
+	importErr := s.client.VolumeImport(ctx, toHost, name, pr)
+	// Unblock the copy goroutine if the importer stopped reading early, then
+	// wait for it so we never leak it. CloseWithError(nil) == Close, harmless
+	// after a fully-consumed stream.
+	pr.CloseWithError(importErr)
+	<-copyDone
+
+	// Note: a mid-stream source-read failure propagates through the pipe and
+	// surfaces here as importErr, so the message names the destination rather
+	// than the source. io.Pipe couples the two errors (a failed source read and
+	// a rejecting importer both yield the same pipe error), so cleanly
+	// distinguishing the locus needs a read-tracking wrapper — deferred to the
+	// migrate handler (#34), which is this primitive's first caller.
+	if importErr != nil {
+		return fmt.Errorf("import volume %q to %s: %w", name, toHost, importErr)
+	}
+	return nil
 }
 
 // Logs returns a channel of log lines from one container in an instance.
