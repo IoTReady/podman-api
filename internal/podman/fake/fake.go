@@ -38,6 +38,16 @@ type Fake struct {
 	ContainerLogsErr error
 	// UsedHostPortsErr, if non-nil, makes UsedHostPorts return this error.
 	UsedHostPortsErr error
+	// PodInspectErr, if non-nil, makes PodInspect return this error (use a
+	// non-ErrNotFound error to exercise the unexpected-backend-error paths).
+	PodInspectErr error
+}
+
+// AddVolume seeds a volume on a host so VolumeInspect resolves it. Test-only.
+func (f *Fake) AddVolume(host string, v podman.Volume) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hostVolumes(host)[v.Name] = v
 }
 
 // New returns a fresh fake.
@@ -115,6 +125,9 @@ func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool) err
 func (f *Fake) PodInspect(_ context.Context, h, name string) (podman.Pod, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.PodInspectErr != nil {
+		return podman.Pod{}, f.PodInspectErr
+	}
 	p, ok := f.hostPods(h)[name]
 	if !ok {
 		return podman.Pod{}, podman.ErrNotFound
