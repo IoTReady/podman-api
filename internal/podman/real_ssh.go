@@ -1,6 +1,7 @@
 package podman
 
 import (
+	"context"
 	"net"
 	"os"
 	"path/filepath"
@@ -13,10 +14,12 @@ import (
 	"github.com/iotready/podman-api/internal/config"
 )
 
-// sshReadLoadAvg dials the host over SSH and reads /proc/loadavg. It reuses the
-// host's configured key (h.SSHKey) and the user's known_hosts for verification
-// — the same trust the libpod SSH connection relies on.
-func sshReadLoadAvg(h config.Host) (string, error) {
+// sshReadLoadAvg dials the host over SSH and reads /proc/loadavg.
+// It authenticates with the host's configured key (h.SSHKey) and verifies the
+// host against ~/.ssh/known_hosts. NOTE: libpod connects via
+// NewConnectionWithIdentity, so trust can diverge from this path — if the host
+// key is absent from known_hosts, loadavg is silently nil (best-effort).
+func sshReadLoadAvg(ctx context.Context, h config.Host) (string, error) {
 	user, addr := splitUserHost(h.Addr)
 	auth := []ssh.AuthMethod{}
 	if h.SSHKey != "" {
@@ -49,12 +52,29 @@ func sshReadLoadAvg(h config.Host) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer sess.Close()
-	out, err := sess.Output("cat /proc/loadavg")
-	if err != nil {
-		return "", err
+	// Run the remote command in a goroutine so we can select on ctx.Done().
+	// Closing the session unblocks Output() in the goroutine; conn.Close() via
+	// defer tears down any remaining session state. Session.Close is idempotent.
+	type result struct {
+		out []byte
+		err error
 	}
-	return string(out), nil
+	ch := make(chan result, 1)
+	go func() {
+		out, err := sess.Output("cat /proc/loadavg")
+		ch <- result{out, err}
+	}()
+	select {
+	case <-ctx.Done():
+		sess.Close() // unblock the goroutine's Output call
+		return "", ctx.Err()
+	case r := <-ch:
+		sess.Close()
+		if r.err != nil {
+			return "", r.err
+		}
+		return string(r.out), nil
+	}
 }
 
 // splitUserHost parses "user@host" or "user@host:port" into (user, "host:port"),

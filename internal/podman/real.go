@@ -589,6 +589,9 @@ func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
 		out.Disk.Total = int64(info.Store.GraphRootAllocated)
 		out.Disk.Used = int64(info.Store.GraphRootUsed)
 		out.Disk.Free = out.Disk.Total - out.Disk.Used
+		if out.Disk.Free < 0 {
+			out.Disk.Free = 0
+		}
 	}
 	if df, err := system.DiskUsage(c, &system.DiskOptions{}); err == nil && df != nil {
 		var reclaimable int64
@@ -597,7 +600,7 @@ func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
 		}
 		out.Disk.Reclaimable = reclaimable
 	}
-	if la := r.hostLoadAvg(id); la != nil {
+	if la := r.hostLoadAvg(ctx, id); la != nil {
 		out.LoadAvg = la
 	}
 	return out, nil
@@ -606,8 +609,10 @@ func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
 // hostLoadAvg reads /proc/loadavg for a host, returning the 1/5/15-minute
 // averages, or nil if it cannot be read. For a unix (local) host it reads the
 // daemon's own /proc/loadavg; for an SSH host it execs `cat /proc/loadavg`
-// over a short-lived SSH session. Any error yields nil so the metric is absent.
-func (r *Real) hostLoadAvg(id string) *[3]float64 {
+// over a short-lived SSH session bounded by ctx. Any error yields nil so the
+// metric is absent.
+func (r *Real) hostLoadAvg(ctx context.Context, id string) *[3]float64 {
+	// r.hosts is immutable after NewReal, so no r.mu needed here.
 	h, ok := r.hosts[id]
 	if !ok {
 		return nil
