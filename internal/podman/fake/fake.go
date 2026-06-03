@@ -26,6 +26,10 @@ type Fake struct {
 
 	// Optional hooks for tests that want to inject errors.
 	PlayKubeErr error
+	// PlayKubePodStatus overrides the status assigned to pods created by
+	// PlayKube. Empty means "Running". Lets a test force a played pod to stay
+	// un-healthy so a verify-poll times out.
+	PlayKubePodStatus string
 	// ExportErr, if non-nil, makes VolumeExport fail immediately.
 	ExportErr error
 	// ImportErr, if non-nil, makes VolumeImport fail immediately (without
@@ -63,6 +67,14 @@ func (f *Fake) AddVolume(host string, v podman.Volume) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.hostVolumes(host)[v.Name] = v
+}
+
+// AddPod seeds a pod on a host (with whatever container ports it carries), so a
+// test can occupy host ports or pre-place an instance. Test-only.
+func (f *Fake) AddPod(host string, p podman.Pod) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.hostPods(host)[p.Name] = p
 }
 
 // SetVolumeData seeds a volume and its contents on a host. Test-only.
@@ -150,9 +162,13 @@ func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool) err
 				Status: "Running", StartedAt: time.Now(),
 			})
 		}
+		podStatus := "Running"
+		if f.PlayKubePodStatus != "" {
+			podStatus = f.PlayKubePodStatus
+		}
 		pods[head.Metadata.Name] = podman.Pod{
 			ID: head.Metadata.Name, Name: head.Metadata.Name,
-			Status: "Running", Created: time.Now(),
+			Status: podStatus, Created: time.Now(),
 			Containers: cs, Labels: head.Metadata.Labels,
 		}
 	}
@@ -314,6 +330,15 @@ func (f *Fake) VolumeImport(_ context.Context, h, name string, r io.Reader) erro
 		return podman.ErrNotFound
 	}
 	f.hostVolData(h)[name] = data
+	return nil
+}
+
+func (f *Fake) VolumeCreate(_ context.Context, h, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.hostVolumes(h)[name]; !ok {
+		f.hostVolumes(h)[name] = podman.Volume{Name: name}
+	}
 	return nil
 }
 

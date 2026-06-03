@@ -34,6 +34,9 @@ type Client interface {
 	// VolumeImport unpacks an uncompressed tar (as produced by VolumeExport)
 	// into the named volume on host. The volume must already exist.
 	VolumeImport(ctx context.Context, hostID, name string, r io.Reader) error
+	// VolumeCreate creates an empty named volume on host. Creating a volume that
+	// already exists is a no-op (no error).
+	VolumeCreate(ctx context.Context, hostID, name string) error
 
 	// Logs
 	ContainerLogs(ctx context.Context, hostID, container string, opts LogOptions) (<-chan LogLine, error)
