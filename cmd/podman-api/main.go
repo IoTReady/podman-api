@@ -182,7 +182,12 @@ func main() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 		<-sig
-		cancelRunner() // stop the job runner; in-flight jobs are reaped on next boot
+		// Signal the job runner to stop claiming. We deliberately do NOT
+		// runner.Wait() here — shutdown must not block on a long in-flight
+		// handler; an interrupted job stays "running" and is reaped to "failed"
+		// by boot recovery on the next start. (Revisit a bounded drain in #34
+		// when real migrate/evacuate handlers are registered.)
+		cancelRunner()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
