@@ -28,6 +28,14 @@ type Fake struct {
 	PullErr map[string]error
 	// PullCalls records every (host, image) pair passed to ImagePull.
 	PullCalls []struct{ Host, Image string }
+	// PodListErr, if non-nil, makes PodList return this error.
+	PodListErr error
+	// LogLines, if set, are emitted in order by ContainerLogs before the
+	// channel closes. Lets tests exercise the streaming response paths.
+	LogLines []podman.LogLine
+	// ContainerLogsErr, if non-nil, makes ContainerLogs return this error
+	// instead of a channel.
+	ContainerLogsErr error
 }
 
 // New returns a fresh fake.
@@ -115,6 +123,9 @@ func (f *Fake) PodInspect(_ context.Context, h, name string) (podman.Pod, error)
 func (f *Fake) PodList(_ context.Context, h string, filters map[string]string) ([]podman.Pod, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.PodListErr != nil {
+		return nil, f.PodListErr
+	}
 	var out []podman.Pod
 	for _, p := range f.hostPods(h) {
 		match := true
@@ -219,7 +230,15 @@ func (f *Fake) VolumeRemove(_ context.Context, h, name string, _ bool) error {
 }
 
 func (f *Fake) ContainerLogs(_ context.Context, _, _ string, _ podman.LogOptions) (<-chan podman.LogLine, error) {
-	ch := make(chan podman.LogLine)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.ContainerLogsErr != nil {
+		return nil, f.ContainerLogsErr
+	}
+	ch := make(chan podman.LogLine, len(f.LogLines))
+	for _, l := range f.LogLines {
+		ch <- l
+	}
 	close(ch)
 	return ch, nil
 }
