@@ -14,9 +14,13 @@ var ErrNotFound = errors.New("store: spec not found")
 
 // Spec is the desired state of one instance.
 type Spec struct {
-	Host       string
-	Template   string
-	Slug       string
+	Host     string
+	Template string
+	Slug     string
+	// Parameters is the instance's render parameters. NOTE: SQLite-backed
+	// storage round-trips this through JSON, so numbers come back as float64
+	// (e.g. an int 5432 becomes float64(5432)). Callers that re-render via
+	// text/template are unaffected; callers must not type-assert .(int).
 	Parameters map[string]any
 	Secrets    map[string]string
 	Created    time.Time

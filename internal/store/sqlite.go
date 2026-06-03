@@ -40,10 +40,19 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 	// SQLite is single-writer; cap the pool to one connection to avoid
 	// "database is locked" under concurrent Apply/Delete.
 	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	// WAL improves read concurrency (a background job runner will read while
+	// Apply/Delete write in later phases) and is safe with a single writer.
+	if _, err := db.Exec(`PRAGMA journal_mode = WAL`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if _, err := db.Exec(schemaSQL); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
+	// Reserved schema-version stamp for future migrations. At v1 this is set
+	// unconditionally; a real version gate is added if/when the schema changes.
 	if _, err := db.Exec(`PRAGMA user_version = 1`); err != nil {
 		_ = db.Close()
 		return nil, err

@@ -1,8 +1,10 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -95,5 +97,34 @@ func TestSQLite_WrongKey_FailsDecrypt(t *testing.T) {
 	ks.Store(testKey(0x22)) // rotate to the wrong key
 	if _, err := s.GetSpec(ctx, "h1", "postgres", "demo"); err == nil {
 		t.Fatal("GetSpec with wrong key should fail, not panic")
+	}
+}
+
+func TestSQLite_EncryptsSecretsAtRest(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "state.db")
+	s, err := OpenSQLite(db, NewKeyStore(testKey(0x11)))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	if err := s.PutSpec(ctx, sampleSpec()); err != nil {
+		t.Fatalf("PutSpec: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(raw, []byte("hunter2")) {
+			t.Fatalf("secret value found in plaintext in %s", e.Name())
+		}
 	}
 }
