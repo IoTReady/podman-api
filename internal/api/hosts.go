@@ -5,6 +5,7 @@ import (
 
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/podman"
 )
 
 func (h *handlers) listHosts(w http.ResponseWriter, r *http.Request) {
@@ -49,11 +50,39 @@ func (h *handlers) hostView(r *http.Request, host config.Host) map[string]any {
 		entry["status"] = "unreachable"
 	}
 	if reachable {
-		if n, err := h.svc.InstanceCount(r.Context(), host.ID); err == nil {
-			entry["instance_count"] = n
+		if ic, cc, err := h.svc.HostCounts(r.Context(), host.ID); err == nil {
+			entry["instance_count"] = ic
+			entry["container_count"] = cc
+		}
+		if info, err := h.svc.HostLoad(r.Context(), host.ID); err == nil {
+			entry["load"] = loadView(info)
 		}
 	}
 	return entry
+}
+
+// loadView renders a HostInfo as the canonical JSON load object. Pointer
+// metrics absent from the source are omitted entirely (null-by-omission).
+func loadView(info podman.HostInfo) map[string]any {
+	m := map[string]any{
+		"cpus":         info.CPUs,
+		"mem_total":    info.MemTotal,
+		"mem_free":     info.MemFree,
+		"mem_used_pct": info.MemUsedPct,
+		"disk": map[string]any{
+			"total":       info.Disk.Total,
+			"used":        info.Disk.Used,
+			"free":        info.Disk.Free,
+			"reclaimable": info.Disk.Reclaimable,
+		},
+	}
+	if info.CPUPct != nil {
+		m["cpu_pct"] = *info.CPUPct
+	}
+	if info.LoadAvg != nil {
+		m["loadavg"] = []float64{info.LoadAvg[0], info.LoadAvg[1], info.LoadAvg[2]}
+	}
+	return m
 }
 
 func (h *handlers) hostHealthz(w http.ResponseWriter, r *http.Request) {

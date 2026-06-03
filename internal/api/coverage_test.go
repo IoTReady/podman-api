@@ -212,6 +212,45 @@ func TestClassify_RemainingSentinels(t *testing.T) {
 	}
 }
 
+// --- GET /hosts/{host}: counts + load ----------------------------------------
+
+func TestGetHost_IncludesCountsAndLoad(t *testing.T) {
+	srv, tok, f := newSrvFull(t)
+	cpu := 33.0
+	la := [3]float64{0.5, 0.7, 0.9}
+	f.HostInfoVal = podman.HostInfo{
+		CPUs: 8, MemTotal: 1000, MemFree: 250, MemUsedPct: 75,
+		CPUPct: &cpu, LoadAvg: &la,
+		Disk: podman.DiskUsage{Total: 100, Used: 60, Free: 40, Reclaimable: 5},
+	}
+	resp := authedReq(t, srv, tok, "GET", "/hosts/h1")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	load, ok := body["load"].(map[string]any)
+	require.True(t, ok, "load object present")
+	assert.Equal(t, float64(8), load["cpus"])
+	assert.Equal(t, 75.0, load["mem_used_pct"])
+	assert.Equal(t, 33.0, load["cpu_pct"])
+	assert.Equal(t, []any{0.5, 0.7, 0.9}, load["loadavg"])
+	assert.Contains(t, body, "container_count")
+}
+
+func TestGetHost_LoadOmitsAbsentMetrics(t *testing.T) {
+	srv, tok, f := newSrvFull(t)
+	f.HostInfoVal = podman.HostInfo{CPUs: 2, MemTotal: 10, MemFree: 5, MemUsedPct: 50} // CPUPct + LoadAvg nil
+	resp := authedReq(t, srv, tok, "GET", "/hosts/h1")
+	defer resp.Body.Close()
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	load := body["load"].(map[string]any)
+	_, hasCPU := load["cpu_pct"]
+	_, hasLA := load["loadavg"]
+	assert.False(t, hasCPU, "cpu_pct omitted when nil")
+	assert.False(t, hasLA, "loadavg omitted when nil")
+}
+
 // bodyString drains and returns the response body as a string.
 func bodyString(t *testing.T, resp *http.Response) string {
 	t.Helper()
