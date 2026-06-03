@@ -53,6 +53,7 @@ type Runner struct {
 }
 
 // NewRunner builds a runner. workers <= 0 uses DefaultWorkers.
+// The handler registry must not be modified after this call.
 func NewRunner(js store.JobStore, h Registry, workers int) *Runner {
 	if workers <= 0 {
 		workers = DefaultWorkers
@@ -61,6 +62,8 @@ func NewRunner(js store.JobStore, h Registry, workers int) *Runner {
 }
 
 // Notify wakes a worker to check for new work; call after an Enqueue. Non-blocking.
+// One Notify is sufficient for a batch of enqueues — a woken worker drains the
+// queue exhaustively before sleeping again.
 func (r *Runner) Notify() {
 	select {
 	case r.poke <- struct{}{}:
@@ -70,6 +73,7 @@ func (r *Runner) Notify() {
 
 // Start reaps crash-interrupted jobs, then launches the worker pool. It returns
 // immediately; the pool runs until ctx is cancelled. Use Wait to block for exit.
+// It must be called exactly once.
 func (r *Runner) Start(ctx context.Context) {
 	if n, err := r.store.FailRunning(ctx, "interrupted by daemon restart"); err != nil {
 		log.Printf("jobs: boot recovery failed: %v", err)
@@ -97,7 +101,10 @@ func (r *Runner) worker(ctx context.Context) {
 			}
 			job, ok, err := r.store.ClaimNext(ctx)
 			if err != nil {
+				// Back off briefly so a persistent store error can't spin the
+				// worker hot when pokes keep arriving.
 				log.Printf("jobs: claim error: %v", err)
+				time.Sleep(200 * time.Millisecond)
 				break
 			}
 			if !ok {
@@ -114,16 +121,25 @@ func (r *Runner) worker(ctx context.Context) {
 	}
 }
 
+// finish writes the terminal state, logging (not returning) a store error.
+// Finish may fail if ctx is cancelled at shutdown; the job then stays running
+// and is reaped by boot recovery on the next start.
+func (r *Runner) finish(ctx context.Context, id string, state store.JobState, errMsg string) {
+	if err := r.store.Finish(ctx, id, state, errMsg); err != nil {
+		log.Printf("jobs: finish %s failed: %v", id, err)
+	}
+}
+
 func (r *Runner) run(ctx context.Context, job store.Job) {
 	h, ok := r.handlers[job.Kind]
 	if !ok {
-		_ = r.store.Finish(ctx, job.ID, store.JobFailed, "no handler for kind "+job.Kind)
+		r.finish(ctx, job.ID, store.JobFailed, "no handler for kind "+job.Kind)
 		return
 	}
 	jc := &JobContext{store: r.store, id: job.ID}
 	if err := h.Run(ctx, job, jc); err != nil {
-		_ = r.store.Finish(ctx, job.ID, store.JobFailed, err.Error())
+		r.finish(ctx, job.ID, store.JobFailed, err.Error())
 		return
 	}
-	_ = r.store.Finish(ctx, job.ID, store.JobSucceeded, "")
+	r.finish(ctx, job.ID, store.JobSucceeded, "")
 }
