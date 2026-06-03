@@ -110,6 +110,31 @@ components:
         instance_count:
           type: integer
           description: managed pods on the host (present when reachable)
+        container_count:
+          type: integer
+          description: Total containers across podman-api-managed pods on this host.
+        load:
+          type: object
+          description: Point-in-time host resource snapshot. Present only when the host is reachable.
+          properties:
+            cpus: {type: integer}
+            mem_total: {type: integer, format: int64, description: bytes}
+            mem_free: {type: integer, format: int64, description: bytes}
+            mem_used_pct: {type: number}
+            cpu_pct: {type: number, description: "busy %, omitted when unavailable"}
+            loadavg:
+              type: array
+              items: {type: number}
+              minItems: 3
+              maxItems: 3
+              description: "1/5/15-minute load average; omitted when unavailable"
+            disk:
+              type: object
+              properties:
+                total: {type: integer, format: int64}
+                used: {type: integer, format: int64}
+                free: {type: integer, format: int64}
+                reclaimable: {type: integer, format: int64}
 
     Template:
       type: object
