@@ -56,3 +56,12 @@ func TestOpen_TooShort_Fails(t *testing.T) {
 		t.Fatal("open of too-short blob should fail")
 	}
 }
+
+func TestOpen_NonceOnly_Fails(t *testing.T) {
+	// A blob that is exactly the nonce length carries no authenticated
+	// ciphertext; the length guard must reject it.
+	nonceOnly := make([]byte, 12)
+	if _, err := open(testKey(0x11), nonceOnly); err == nil {
+		t.Fatal("open of nonce-only blob should fail")
+	}
+}

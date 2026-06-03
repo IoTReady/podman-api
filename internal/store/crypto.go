@@ -38,7 +38,7 @@ func open(key [32]byte, blob []byte) ([]byte, error) {
 		return nil, err
 	}
 	ns := gcm.NonceSize()
-	if len(blob) < ns {
+	if len(blob) < ns+gcm.Overhead() {
 		return nil, errors.New("store: ciphertext too short")
 	}
 	nonce, ct := blob[:ns], blob[ns:]
