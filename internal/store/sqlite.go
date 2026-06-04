@@ -84,7 +84,7 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 	}
 	// Reserved schema-version stamp for future migrations. At v1 this is set
 	// unconditionally; a real version gate is added if/when the schema changes.
-	if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
+	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -218,19 +218,21 @@ func scanJob(sc rowScanner) (Job, error) {
 	}
 	j.ParentID = parent.String
 	j.Error = errMsg.String
-	j.Created = time.Unix(created, 0)
+	// Job timestamps are stored as Unix nanoseconds (see Enqueue/Finish) for
+	// sub-second durations and FIFO tiebreaks.
+	j.Created = time.Unix(0, created)
 	if started.Valid {
-		j.Started = time.Unix(started.Int64, 0)
+		j.Started = time.Unix(0, started.Int64)
 	}
 	if finished.Valid {
-		j.Finished = time.Unix(finished.Int64, 0)
+		j.Finished = time.Unix(0, finished.Int64)
 	}
 	return j, nil
 }
 
 func (s *SQLite) Enqueue(ctx context.Context, kind string, args json.RawMessage, parentID string) (Job, error) {
 	id := newJobID()
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	if len(args) == 0 {
 		args = json.RawMessage("null")
 	}
@@ -250,7 +252,7 @@ VALUES (?, ?, ?, 'queued', '[]', ?, NULL, ?, NULL, NULL)`,
 
 func (s *SQLite) StartChild(ctx context.Context, kind string, args json.RawMessage, parentID string) (Job, error) {
 	id := newJobID()
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	if len(args) == 0 {
 		args = json.RawMessage("null")
 	}
@@ -310,7 +312,7 @@ func (s *SQLite) ListJobs(ctx context.Context, f JobFilter) ([]Job, error) {
 }
 
 func (s *SQLite) ClaimNext(ctx context.Context) (Job, bool, error) {
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	row := s.db.QueryRowContext(ctx, `
 UPDATE jobs SET state='running', started=?
 WHERE id = (SELECT id FROM jobs WHERE state='queued' ORDER BY created, id LIMIT 1)
@@ -353,7 +355,7 @@ func (s *SQLite) Finish(ctx context.Context, id string, state JobState, errMsg s
 	if state != JobSucceeded && state != JobFailed {
 		return fmt.Errorf("store.Finish: invalid terminal state %q", state)
 	}
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	var e any
 	if errMsg != "" {
 		e = errMsg
@@ -374,7 +376,7 @@ func (s *SQLite) Finish(ctx context.Context, id string, state JobState, errMsg s
 }
 
 func (s *SQLite) FailRunning(ctx context.Context, reason string) (int, error) {
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET state='failed', error=?, finished=? WHERE state='running'`,
 		reason, now)
 	if err != nil {
