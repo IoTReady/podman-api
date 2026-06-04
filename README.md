@@ -201,6 +201,7 @@ When `-state-db=<path>` is set, the daemon persists each instance's parameters a
 
 - **`-state-db <path>`** — enables the desired-state store at this path.
 - **`-spec-key-file <path>`** — 32-byte AES-256-GCM key used to encrypt stored secrets. Required when `-state-db` is set; the daemon refuses to start without a readable, valid key. Loaded once at startup (no runtime reload — see the rotation caveat below). Keep the file `0600` and **separate from the database** — leaking secrets requires compromise of both.
+- **`-jobs-retention <dur>`** — when set (e.g. `168h`), a background sweep prunes terminal (`succeeded`/`failed`) jobs older than the duration, keeping parent/child families intact (a parent is removed only once it has no surviving child). Default `0` (disabled; the `jobs` table accumulates until manual cleanup).
 
 Generate a key:
 
@@ -221,7 +222,7 @@ Both validate the request and return `202 {job_id}`; deeper/destination-side err
 
 Operations are tracked as **jobs**, readable via:
 
-- `GET /jobs?state=<queued|running|succeeded|failed>&kind=<kind>&parent_id=<id>` — list jobs, optionally filtered (scope `jobs:read`). `parent_id` drills into an evacuate's child migrations.
+- `GET /jobs?state=<queued|running|succeeded|failed>&kind=<kind>&parent_id=<id>` — list jobs, optionally filtered (scope `jobs:read`). `parent_id` drills into an evacuate's child migrations. Paginated newest-first: `?limit=` (default 100, max 1000) and `?before=<job_id>` cursor — page by passing the previous page's last id, stopping when fewer than `limit` rows come back.
 - `GET /jobs/{id}` — fetch one job by ID, including its progress steps and error (scope `jobs:read`).
 
 Both endpoints return `501` when `-state-db` is not set.
