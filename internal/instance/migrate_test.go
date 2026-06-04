@@ -3,6 +3,7 @@ package instance
 import (
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -318,6 +319,42 @@ func TestMigrate_VolumeIntegrityMismatch_RollsBack(t *testing.T) {
 	require.ErrorIs(t, err, ErrVolumeIntegrity)
 
 	// Rolled back: source restarted & intact, dest reaped (pod was never even applied).
+	p, perr := f.PodInspect(ctx, "h1", "postgres-db1")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status)
+	_, gerr := mem.GetSpec(ctx, "h1", "postgres", "db1")
+	require.NoError(t, gerr)
+	_, derr := f.PodInspect(ctx, "h2", "postgres-db1")
+	require.ErrorIs(t, derr, podman.ErrNotFound)
+}
+
+// TestMigrate_VolumeReexportFails_RollsBack covers the other integrity branch:
+// the copy succeeds but re-exporting the destination for verification fails, so
+// the move must still roll back rather than reap the source on an unverifiable copy.
+func TestMigrate_VolumeReexportFails_RollsBack(t *testing.T) {
+	ctx := context.Background()
+	svc, f, mem := newMigrateSvc(t)
+	params := map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"}
+	require.NoError(t, mem.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "postgres", Slug: "db1",
+		Parameters: params, Secrets: map[string]string{"password": "p"},
+	}))
+	f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
+	srcTar := tarBytes(t, map[string]string{"PG_VERSION": "16"})
+	f.SetVolumeData("h1", "postgres-db1-data", srcTar)
+	// Source exports (copy + verify re-export) succeed; the dest re-export breaks.
+	f.ExportReader = func(host, _ string) io.ReadCloser {
+		if host == "h2" {
+			return &midStreamReader{err: errors.New("dest export broke")}
+		}
+		return &midStreamReader{data: srcTar, err: io.EOF}
+	}
+
+	err := svc.Migrate(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"}, nil)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "re-export dest")
+
+	// Rolled back: source restarted & intact, dest reaped.
 	p, perr := f.PodInspect(ctx, "h1", "postgres-db1")
 	require.NoError(t, perr)
 	assert.Equal(t, "Running", p.Status)

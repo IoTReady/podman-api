@@ -55,6 +55,11 @@ func parseTar(r io.Reader, m Manifest) error {
 		case tar.TypeSymlink, tar.TypeLink:
 			fi.link = hdr.Linkname
 		}
+		// path.Clean can collapse distinct names (e.g. "./foo" and "foo") to one
+		// key, last-writer-wins. That is safe here: the same cleaning is applied
+		// to both source and dest manifests, and podman's volume export is
+		// deterministic, so a collision cancels out on both sides rather than
+		// producing a false "equal".
 		m[path.Clean(hdr.Name)] = fi
 	}
 }
