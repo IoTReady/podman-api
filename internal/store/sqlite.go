@@ -293,10 +293,15 @@ func (s *SQLite) ListJobs(ctx context.Context, f JobFilter) ([]Job, error) {
 		where = append(where, "parent_id=?")
 		args = append(args, f.ParentID)
 	}
+	if f.Before != "" {
+		where = append(where, "id < ?")
+		args = append(args, f.Before)
+	}
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
-	q += " ORDER BY created DESC, id DESC"
+	q += " ORDER BY created DESC, id DESC LIMIT ?"
+	args = append(args, clampJobLimit(f.Limit))
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err

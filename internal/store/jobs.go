@@ -40,11 +40,32 @@ type Job struct {
 	Finished time.Time // zero until done
 }
 
-// JobFilter narrows ListJobs. Empty fields match anything.
+// JobFilter narrows ListJobs. Empty fields match anything. Limit/Before paginate
+// the result (ordered newest-first); Before is the id of the previous page's
+// last row (a cursor), returning only rows older than it.
 type JobFilter struct {
 	State    JobState
 	Kind     string
 	ParentID string
+	Limit    int    // <=0 → DefaultJobLimit; values above MaxJobLimit are clamped
+	Before   string // cursor: return jobs with id < Before
+}
+
+// Job listing page-size bounds.
+const (
+	DefaultJobLimit = 100
+	MaxJobLimit     = 1000
+)
+
+// clampJobLimit applies the default/maximum page-size policy.
+func clampJobLimit(n int) int {
+	if n <= 0 {
+		return DefaultJobLimit
+	}
+	if n > MaxJobLimit {
+		return MaxJobLimit
+	}
+	return n
 }
 
 // JobStore persists and dispenses jobs. Implemented by *SQLite and *Memory.

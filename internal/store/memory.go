@@ -121,6 +121,7 @@ func (m *Memory) GetJob(_ context.Context, id string) (Job, error) {
 func (m *Memory) ListJobs(_ context.Context, f JobFilter) ([]Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	limit := clampJobLimit(f.Limit)
 	out := []Job{}
 	for i := len(m.jobs) - 1; i >= 0; i-- { // newest first
 		j := m.jobs[i]
@@ -133,7 +134,13 @@ func (m *Memory) ListJobs(_ context.Context, f JobFilter) ([]Job, error) {
 		if f.ParentID != "" && j.ParentID != f.ParentID {
 			continue
 		}
+		if f.Before != "" && j.ID >= f.Before {
+			continue
+		}
 		out = append(out, cloneJob(j))
+		if len(out) == limit {
+			break
+		}
 	}
 	return out, nil
 }
