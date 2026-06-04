@@ -183,12 +183,18 @@ func migrateSchema(db *sql.DB) error {
 	}
 	if v < 4 {
 		if _, err := db.Exec(`ALTER TABLE specs ADD COLUMN domains TEXT NOT NULL DEFAULT '[]'`); err != nil {
-			if !strings.Contains(err.Error(), "duplicate column") {
-				return err
+			// Tolerate the duplicate-column case (a fresh DB where schemaSQL
+			// already created the column) so OpenSQLite stays idempotent;
+			// anything else is a real failure. Inspect the structured
+			// *sqlite.Error rather than matching a bare error string, the same
+			// way isBusy does.
+			var se *sqlite.Error
+			if !errors.As(err, &se) || !strings.Contains(se.Error(), "duplicate column") {
+				return fmt.Errorf("migrateSchema: add domains column: %w", err)
 			}
 		}
 		if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
-			return err
+			return fmt.Errorf("migrateSchema: set user_version: %w", err)
 		}
 	}
 	return nil
@@ -211,12 +217,12 @@ func (s *SQLite) PutSpec(ctx context.Context, sp Spec) error {
 	if err != nil {
 		return err
 	}
+	if sp.Domains == nil {
+		sp.Domains = []string{}
+	}
 	domJSON, err := json.Marshal(sp.Domains)
 	if err != nil {
 		return err
-	}
-	if sp.Domains == nil {
-		domJSON = []byte("[]")
 	}
 	now := time.Now().Unix()
 	return s.write(ctx, func() error {
