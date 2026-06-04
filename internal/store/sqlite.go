@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	sqlite "modernc.org/sqlite"
@@ -49,7 +51,12 @@ const maxOpenConns = 8
 // SQLITE_BUSY/LOCKED before giving up. busy_timeout(5000) handles most
 // contention, but modernc can still return BUSY without invoking the busy
 // handler under write-write races; this is a thin application-level backstop.
-const retryBusyTimeout = 2 * time.Second
+// Shutdown paths pass a cancellable ctx (e.g. finishTimeout), so ctx
+// cancellation — not this ceiling — bounds them.
+const retryBusyTimeout = 5 * time.Second
+
+// retryBackoffCap bounds the per-attempt backoff before jitter.
+const retryBackoffCap = 50 * time.Millisecond
 
 // isBusy reports whether err is a transient SQLite BUSY/LOCKED worth retrying.
 func isBusy(err error) bool {
@@ -65,9 +72,14 @@ func isBusy(err error) bool {
 	}
 }
 
-// retry runs fn, retrying with short capped backoff while retryable(err) is true,
-// until retryBusyTimeout elapses or ctx is done. Success and non-retryable errors
-// return immediately.
+// retry runs fn, retrying while retryable(err) is true until retryBusyTimeout
+// elapses or ctx is done. Success and non-retryable errors return immediately.
+//
+// The sleep is randomized in [backoff/2, backoff] (capped-exponential with
+// jitter). Jitter is essential, not cosmetic: the runner's N workers hit BUSY
+// together, and a fixed schedule would have them all wake and re-collide in
+// lockstep (a thundering herd that never converges under load). Decorrelating
+// the retriers lets one win each round.
 func retry(ctx context.Context, retryable func(error) bool, fn func() error) error {
 	deadline := time.Now().Add(retryBusyTimeout)
 	backoff := time.Millisecond
@@ -79,12 +91,14 @@ func retry(ctx context.Context, retryable func(error) bool, fn func() error) err
 		if ctx.Err() != nil || time.Now().After(deadline) {
 			return err
 		}
+		half := backoff / 2
+		sleep := half + time.Duration(rand.Int63n(int64(backoff-half)+1))
 		select {
 		case <-ctx.Done():
 			return err
-		case <-time.After(backoff):
+		case <-time.After(sleep):
 		}
-		if backoff < 50*time.Millisecond {
+		if backoff < retryBackoffCap {
 			backoff *= 2
 		}
 	}
@@ -101,6 +115,22 @@ func retryBusy(ctx context.Context, fn func() error) error {
 type SQLite struct {
 	db   *sql.DB
 	keys *KeyStore
+	// wmu serializes writes. This daemon is the sole writer to the file and
+	// SQLite permits only one writer at a time, so serializing in-process moves
+	// the wait from the DB file-lock (which returns SQLITE_BUSY immediately under
+	// the modernc driver) to a clean Go lock — eliminating the write-write
+	// thundering herd among the runner's workers. Reads do NOT take wmu: WAL keeps
+	// them concurrent with the in-flight write. retryBusy remains a backstop for
+	// the rare non-write-write BUSY (e.g. WAL checkpoint contention).
+	wmu sync.Mutex
+}
+
+// write serializes fn behind wmu and retries it past a transient BUSY/LOCKED.
+// Every mutating store method funnels through here.
+func (s *SQLite) write(ctx context.Context, fn func() error) error {
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	return retryBusy(ctx, fn)
 }
 
 // OpenSQLite opens (creating if needed) the SQLite file at path and ensures the
@@ -161,7 +191,7 @@ func (s *SQLite) PutSpec(ctx context.Context, sp Spec) error {
 		return err
 	}
 	now := time.Now().Unix()
-	return retryBusy(ctx, func() error {
+	return s.write(ctx, func() error {
 		_, err := s.db.ExecContext(ctx, `
 INSERT INTO specs (host, template, slug, parameters, secrets, created, updated)
 VALUES (?, ?, ?, ?, ?, ?, ?)
@@ -209,19 +239,21 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 }
 
 func (s *SQLite) DeleteSpec(ctx context.Context, host, template, slug string) error {
-	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM specs WHERE host=? AND template=? AND slug=?`, host, template, slug)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return s.write(ctx, func() error {
+		res, err := s.db.ExecContext(ctx,
+			`DELETE FROM specs WHERE host=? AND template=? AND slug=?`, host, template, slug)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 func (s *SQLite) ListSpecKeys(ctx context.Context, host string) ([]SpecKey, error) {
@@ -294,7 +326,7 @@ func (s *SQLite) Enqueue(ctx context.Context, kind string, args json.RawMessage,
 	if parentID != "" {
 		parent = parentID
 	}
-	err := retryBusy(ctx, func() error {
+	err := s.write(ctx, func() error {
 		_, e := s.db.ExecContext(ctx, `
 INSERT INTO jobs (id, kind, args, state, steps, parent_id, error, created, started, finished)
 VALUES (?, ?, ?, 'queued', '[]', ?, NULL, ?, NULL, NULL)`,
@@ -317,7 +349,7 @@ func (s *SQLite) StartChild(ctx context.Context, kind string, args json.RawMessa
 	if parentID != "" {
 		parent = parentID
 	}
-	err := retryBusy(ctx, func() error {
+	err := s.write(ctx, func() error {
 		_, e := s.db.ExecContext(ctx, `
 INSERT INTO jobs (id, kind, args, state, steps, parent_id, error, created, started, finished)
 VALUES (?, ?, ?, 'running', '[]', ?, NULL, ?, ?, NULL)`,
@@ -389,7 +421,7 @@ func (s *SQLite) ClaimNext(ctx context.Context) (Job, bool, error) {
 	// Stamp once outside the retry closure (consistent with the other writes), so
 	// a write that retries past a transient BUSY records the pre-retry claim time.
 	now := time.Now().UnixNano()
-	err := retryBusy(ctx, func() error {
+	err := s.write(ctx, func() error {
 		row := s.db.QueryRowContext(ctx, `
 UPDATE jobs SET state='running', started=?
 WHERE id = (SELECT id FROM jobs WHERE state='queued' ORDER BY created, id LIMIT 1)
@@ -431,7 +463,7 @@ func (s *SQLite) AppendStep(ctx context.Context, id string, step JobStep) error 
 	if err != nil {
 		return err
 	}
-	return retryBusy(ctx, func() error {
+	return s.write(ctx, func() error {
 		_, err := s.db.ExecContext(ctx, `UPDATE jobs SET steps=? WHERE id=?`, string(b), id)
 		return err
 	})
@@ -446,7 +478,7 @@ func (s *SQLite) Finish(ctx context.Context, id string, state JobState, errMsg s
 	if errMsg != "" {
 		e = errMsg
 	}
-	return retryBusy(ctx, func() error {
+	return s.write(ctx, func() error {
 		res, err := s.db.ExecContext(ctx, `UPDATE jobs SET state=?, error=?, finished=? WHERE id=?`,
 			string(state), e, now, id)
 		if err != nil {
@@ -466,7 +498,7 @@ func (s *SQLite) Finish(ctx context.Context, id string, state JobState, errMsg s
 func (s *SQLite) FailRunning(ctx context.Context, reason string) (int, error) {
 	now := time.Now().UnixNano()
 	var n int64
-	err := retryBusy(ctx, func() error {
+	err := s.write(ctx, func() error {
 		res, e := s.db.ExecContext(ctx, `UPDATE jobs SET state='failed', error=?, finished=? WHERE state='running'`,
 			reason, now)
 		if e != nil {
@@ -484,7 +516,7 @@ func (s *SQLite) FailRunning(ctx context.Context, reason string) (int, error) {
 func (s *SQLite) PruneJobs(ctx context.Context, olderThan time.Time) (int, error) {
 	cutoff := olderThan.UnixNano()
 	var total int64
-	err := retryBusy(ctx, func() error {
+	err := s.write(ctx, func() error {
 		tx, err := s.db.BeginTx(ctx, nil)
 		if err != nil {
 			return err
