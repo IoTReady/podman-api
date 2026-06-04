@@ -14,10 +14,36 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 )
 
-// evacuateConcurrency bounds how many child migrations run at once. migrate is
-// heavy (stop + volume cold-copy + apply + verify), so keep it low. var (not
-// const) so same-package tests can change it.
-var evacuateConcurrency = 2
+const (
+	// defaultEvacuateConcurrency bounds how many child migrations run at once
+	// when neither the handler nor the request specifies one. migrate is heavy
+	// (stop + volume cold-copy + apply + verify), so keep it low.
+	defaultEvacuateConcurrency = 2
+	// maxEvacuateConcurrency caps any operator/client value so a fat-fingered
+	// flag or request body can't spawn an unbounded number of migration
+	// goroutines.
+	maxEvacuateConcurrency = 32
+)
+
+// effectiveConcurrency resolves the child-migration bound: a positive request
+// override wins, else a positive handler default, else defaultEvacuateConcurrency;
+// the result is clamped to [1, maxEvacuateConcurrency].
+func effectiveConcurrency(handlerDefault, reqOverride int) int {
+	n := defaultEvacuateConcurrency
+	if handlerDefault > 0 {
+		n = handlerDefault
+	}
+	if reqOverride > 0 {
+		n = reqOverride
+	}
+	if n < 1 {
+		n = 1
+	}
+	if n > maxEvacuateConcurrency {
+		n = maxEvacuateConcurrency
+	}
+	return n
+}
 
 // Handler runs "evacuate" jobs: resolve the host's instances into a migrate
 // plan, run the migrations with bounded concurrency (each as a child migrate
@@ -25,13 +51,16 @@ var evacuateConcurrency = 2
 //
 // A parent evacuate occupies one runner pool worker for the whole fan-out (its
 // children run as goroutines inside it and need no worker). That keeps a single
-// evacuate deadlock-free, but with the default pool of 4, four concurrent
-// evacuates hold all workers for the duration and starve plain migrate/other
-// jobs of a slot. Acceptable at current scale; if many concurrent evacuates
-// become common, give the runner headroom or a separate orchestration pool.
+// evacuate deadlock-free, but a parent holds its worker for the duration, so
+// many concurrent evacuates can starve plain migrate/other jobs of a slot.
+// Acceptable at current scale; if many concurrent evacuates become common, give
+// the runner headroom or a separate orchestration pool.
 type Handler struct {
 	Svc  *instance.Service
 	Jobs store.JobStore
+	// Concurrency is the default child-migration bound (0 -> defaultEvacuateConcurrency).
+	// A request's Concurrency overrides it per call. See effectiveConcurrency.
+	Concurrency int
 	// migrate moves one instance; defaults to Svc.Migrate. Overridable in tests.
 	migrate func(ctx context.Context, req instance.MigrateRequest, step func(step, detail string)) error
 }
@@ -53,7 +82,7 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 		mig = h.Svc.Migrate
 	}
 
-	sem := make(chan struct{}, evacuateConcurrency)
+	sem := make(chan struct{}, effectiveConcurrency(h.Concurrency, req.Concurrency))
 	failures := make([]string, len(moves)) // index-addressed; "" == success
 	var wg sync.WaitGroup
 	for i, m := range moves {

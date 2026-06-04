@@ -202,6 +202,7 @@ When `-state-db=<path>` is set, the daemon persists each instance's parameters a
 - **`-state-db <path>`** — enables the desired-state store at this path.
 - **`-spec-key-file <path>`** — 32-byte AES-256-GCM key used to encrypt stored secrets. Required when `-state-db` is set; the daemon refuses to start without a readable, valid key. Loaded once at startup (no runtime reload — see the rotation caveat below). Keep the file `0600` and **separate from the database** — leaking secrets requires compromise of both.
 - **`-jobs-retention <dur>`** — when set (e.g. `168h`), a background sweep prunes terminal (`succeeded`/`failed`) jobs older than the duration, keeping parent/child families intact (a parent is removed only once it has no surviving child). Default `0` (disabled; the `jobs` table accumulates until manual cleanup).
+- **`-evacuate-concurrency <n>`** — max child migrations an evacuate runs at once (default `2`, clamped to `1..32`). A request body's `"concurrency"` overrides it per call.
 
 Generate a key:
 

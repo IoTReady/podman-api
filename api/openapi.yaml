@@ -278,6 +278,14 @@ components:
           description: >-
             slug -> destination host for every instance on from_host. Must cover
             exactly the instances stored on the host (strict bijection).
+        concurrency:
+          type: integer
+          minimum: 1
+          maximum: 32
+          description: >-
+            optional: max child migrations to run at once for this evacuate.
+            Overrides the server's -evacuate-concurrency default; clamped to
+            [1,32].
 
     JobAccepted:
       type: object
@@ -758,11 +766,13 @@ paths:
       description: >-
         Validates the request synchronously against the stored specs on
         from_host: every instance on the host must have a destination in map and
-        every map key must name an instance on the host (strict bijection);
-        unknown hosts and same-host destinations are rejected. On success enqueues
-        one parent evacuate job that fans out a child migrate job per instance
-        with bounded concurrency. The parent succeeds only if every child
-        migration succeeds; per-child failures surface via
+        every map key must name an instance on the host (strict bijection). Any
+        bad map content — an unmapped/extra/ambiguous slug, a same-host
+        destination, or an unknown destination host — returns 400. An unknown
+        from_host returns 404. On success enqueues one parent evacuate job that
+        fans out a child migrate job per instance with bounded concurrency
+        (see the concurrency field / -evacuate-concurrency). The parent succeeds
+        only if every child migration succeeds; per-child failures surface via
         GET /jobs?parent_id={id}. Per-instance destination-side checks run inside
         each child migrate job, not as the POST status.
       requestBody:
