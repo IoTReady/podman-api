@@ -63,8 +63,9 @@ func (h *handlers) listJobs(w http.ResponseWriter, r *http.Request) {
 	// Empty state/kind query params become zero-value filter fields, which the
 	// store treats as "match all".
 	f := store.JobFilter{
-		State: store.JobState(r.URL.Query().Get("state")),
-		Kind:  r.URL.Query().Get("kind"),
+		State:    store.JobState(r.URL.Query().Get("state")),
+		Kind:     r.URL.Query().Get("kind"),
+		ParentID: r.URL.Query().Get("parent_id"),
 	}
 	jobs, err := h.jobs.ListJobs(r.Context(), f)
 	if err != nil {

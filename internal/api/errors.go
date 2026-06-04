@@ -75,6 +75,8 @@ func classify(err error) (code string, status int, msg string) {
 		return "port_conflict", http.StatusConflict, err.Error()
 	case errors.Is(err, instance.ErrSameHost):
 		return "invalid_request", http.StatusBadRequest, err.Error()
+	case errors.Is(err, instance.ErrInvalidEvacuation):
+		return "invalid_request", http.StatusBadRequest, err.Error()
 	default:
 		return "internal", http.StatusInternalServerError, err.Error()
 	}
