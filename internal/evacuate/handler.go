@@ -143,7 +143,9 @@ func (h *Handler) runChild(ctx context.Context, parentID string, m instance.Migr
 			state = store.JobCanceled
 		}
 	}
-	if ferr := h.Jobs.Finish(ctx, child.ID, state, errMsg); ferr != nil {
+	// Use a detached context so a cancelled parent ctx cannot prevent recording
+	// the child's terminal state — mirrors migrate.go's detached commit pattern.
+	if ferr := h.Jobs.Finish(context.WithoutCancel(ctx), child.ID, state, errMsg); ferr != nil {
 		if migErr == nil {
 			// Migration succeeded but we couldn't record it — surface as failure.
 			return fmt.Errorf("finish child job: %w", ferr)

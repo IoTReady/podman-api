@@ -107,14 +107,18 @@ func main() {
 			"migrate":  &migrate.Handler{Svc: svc},
 			"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: *evacConc},
 		}
-		runner := jobs.NewRunner(db, registry, *jobWorkers)
+		workers := *jobWorkers
+		if workers <= 0 {
+			workers = jobs.DefaultWorkers
+		}
+		runner := jobs.NewRunner(db, registry, workers)
 		canceller = runner
 		runner.Start(runnerCtx)
 		if *jobsRetention > 0 {
 			runner.StartRetention(runnerCtx, *jobsRetention)
 			log.Printf("jobs retention enabled: pruning terminal jobs older than %s", *jobsRetention)
 		}
-		log.Printf("desired-state store enabled: %s (job runner started, %d workers)", *stateDB, *jobWorkers)
+		log.Printf("desired-state store enabled: %s (job runner started, %d workers)", *stateDB, workers)
 	}
 
 	metrics := obs.New()

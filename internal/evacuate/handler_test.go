@@ -209,3 +209,49 @@ func TestEvacuate_CancelMarksChildrenCanceled(t *testing.T) {
 		t.Fatalf("child state = %q, want canceled", children[0].State)
 	}
 }
+
+// ctxAwareFinishStore wraps Memory but rejects Finish on an already-cancelled
+// context, reproducing SQLite's behavior (the plain Memory store ignores ctx).
+type ctxAwareFinishStore struct {
+	*store.Memory
+}
+
+func (c ctxAwareFinishStore) Finish(ctx context.Context, id string, st store.JobState, msg string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return c.Memory.Finish(ctx, id, st, msg)
+}
+
+// TestEvacuate_CancelChildFinishUsesDetachedCtx verifies that a cancelled
+// parent context cannot prevent the child's terminal state from being written
+// to a ctx-aware store (mirrors the SQLite production behavior that the plain
+// Memory store hides by ignoring ctx).
+func TestEvacuate_CancelChildFinishUsesDetachedCtx(t *testing.T) {
+	svc, mem := buildSvc(t, "acme")
+	cs := ctxAwareFinishStore{mem}
+
+	// Enqueue via the underlying mem (cs wraps it, so either works the same).
+	parent, _ := mem.Enqueue(context.Background(), "evacuate", mustArgs(t, "hostA",
+		map[string]string{"acme": "hostB"}), "")
+
+	h := &Handler{Svc: svc, Jobs: cs}
+	ctx, cancel := context.WithCancel(context.Background())
+	// The migrate stub simulates the operator cancellation landing mid-migration:
+	// it cancels the shared ctx before returning, so by the time runChild calls
+	// Finish the ctx is already cancelled — reproducing the production failure.
+	h.migrate = func(_ context.Context, req instance.MigrateRequest, step func(string, string)) error {
+		cancel() // simulate operator cancel landing mid-migration
+		return context.Canceled
+	}
+
+	_ = h.Run(ctx, parent, jobs.NewJobContext(cs, parent.ID))
+
+	children, _ := mem.ListJobs(context.Background(), store.JobFilter{ParentID: parent.ID})
+	if len(children) != 1 {
+		t.Fatalf("want 1 child, got %d", len(children))
+	}
+	if children[0].State != store.JobCanceled {
+		t.Fatalf("child state = %q, want canceled (terminal write must use a detached ctx)", children[0].State)
+	}
+}
