@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/containers/podman/v5/libpod/define"
+	handlers "github.com/containers/podman/v5/pkg/api/handlers"
 	"github.com/containers/podman/v5/pkg/bindings"
 	"github.com/containers/podman/v5/pkg/bindings/containers"
 	"github.com/containers/podman/v5/pkg/bindings/images"
@@ -25,6 +26,7 @@ import (
 	"github.com/containers/podman/v5/pkg/bindings/volumes"
 	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	dockerContainer "github.com/docker/docker/api/types/container"
 	nettypes "go.podman.io/common/libnetwork/types"
 
 	"github.com/iotready/podman-api/internal/config"
@@ -442,6 +444,39 @@ func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
 	_, err = network.CreateWithOptions(c, &nettypes.Network{Name: name},
 		&network.ExtraCreateOptions{IgnoreIfExists: &ignore})
 	return err
+}
+
+func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []string) (ExecResult, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return ExecResult{}, err
+	}
+	sessionID, err := containers.ExecCreate(c, container, &handlers.ExecCreateConfig{
+		ExecOptions: dockerContainer.ExecOptions{
+			Cmd:          cmd,
+			AttachStdout: true,
+			AttachStderr: true,
+		},
+	})
+	if err != nil {
+		return ExecResult{}, mapNotFound(err)
+	}
+	var buf bytes.Buffer
+	var w io.Writer = &buf
+	attach := true
+	if err := containers.ExecStartAndAttach(c, sessionID, &containers.ExecStartAndAttachOptions{
+		OutputStream: &w,
+		ErrorStream:  &w,
+		AttachOutput: &attach,
+		AttachError:  &attach,
+	}); err != nil {
+		return ExecResult{}, err
+	}
+	ins, err := containers.ExecInspect(c, sessionID, &containers.ExecInspectOptions{})
+	if err != nil {
+		return ExecResult{}, err
+	}
+	return ExecResult{ExitCode: ins.ExitCode, Output: buf.String()}, nil
 }
 
 // --- helpers ---

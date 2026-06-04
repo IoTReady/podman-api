@@ -94,6 +94,12 @@ type Fake struct {
 	NetworkEnsureCalls map[string][]string
 	// NetworkEnsureErr, if non-nil, makes NetworkEnsure fail.
 	NetworkEnsureErr error
+
+	// ExecFunc, if set, produces the ContainerExec result for tests. Default
+	// (nil) returns ExitCode 0, empty output.
+	ExecFunc func(host, container string, cmd []string) (podman.ExecResult, error)
+	// ExecCalls records every ContainerExec invocation.
+	ExecCalls []ExecCall
 }
 
 // PlayCall records one PlayKube invocation for assertions.
@@ -101,6 +107,13 @@ type PlayCall struct {
 	Host     string
 	Replace  bool
 	Networks []string
+}
+
+// ExecCall records one ContainerExec invocation for assertions.
+type ExecCall struct {
+	Host      string
+	Container string
+	Cmd       []string
 }
 
 // AddVolume seeds a volume on a host so VolumeInspect resolves it. Test-only.
@@ -503,6 +516,17 @@ func (f *Fake) BuildCachePrune(_ context.Context, host string) (podman.PruneRepo
 
 func (f *Fake) VolumePrune(_ context.Context, host string, filters map[string][]string) (podman.PruneReport, error) {
 	return f.pruneScope(host, "volumes", false, filters)
+}
+
+func (f *Fake) ContainerExec(_ context.Context, host, container string, cmd []string) (podman.ExecResult, error) {
+	f.mu.Lock()
+	f.ExecCalls = append(f.ExecCalls, ExecCall{Host: host, Container: container, Cmd: cmd})
+	fn := f.ExecFunc
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(host, container, cmd)
+	}
+	return podman.ExecResult{}, nil
 }
 
 // Compile-time guarantee that Fake implements the interface.

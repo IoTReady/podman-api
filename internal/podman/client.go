@@ -43,6 +43,12 @@ type Client interface {
 	// already exists is a no-op (no error).
 	NetworkEnsure(ctx context.Context, hostID, name string) error
 
+	// Exec
+	// ContainerExec runs cmd in the named running container and returns its
+	// exit code and combined stdout+stderr. A non-zero exit code is NOT an
+	// error; only a transport/podman failure returns a non-nil error.
+	ContainerExec(ctx context.Context, hostID, container string, cmd []string) (ExecResult, error)
+
 	// Logs
 	ContainerLogs(ctx context.Context, hostID, container string, opts LogOptions) (<-chan LogLine, error)
 
@@ -73,6 +79,12 @@ type Client interface {
 	// The host set is fixed at construction, so a host added via config reload is
 	// not Knows() until the daemon (and client) restarts.
 	Knows(hostID string) bool
+}
+
+// ExecResult is the outcome of ContainerExec.
+type ExecResult struct {
+	ExitCode int
+	Output   string // combined stdout+stderr
 }
 
 // PruneReport summarizes one prune operation: the ids/names removed and the
