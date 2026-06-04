@@ -109,6 +109,46 @@ func TestRunner_BootRecovery_FailsRunning(t *testing.T) {
 	})
 }
 
+// ctxAwareStore wraps a Memory store and fails Finish when the supplied context
+// is already cancelled, reproducing the SQLite behaviour the plain Memory store
+// (which ignores ctx) cannot.
+type ctxAwareStore struct {
+	*store.Memory
+}
+
+func (c ctxAwareStore) Finish(ctx context.Context, id string, state store.JobState, errMsg string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return c.Memory.Finish(ctx, id, state, errMsg)
+}
+
+func TestRunner_FinishSurvivesCancelledRunnerCtx(t *testing.T) {
+	m := store.NewMemory()
+	cs := ctxAwareStore{m}
+	reg := Registry{"test": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+		return nil // succeeds
+	})}
+	r := NewRunner(cs, reg, 1)
+
+	j, _ := m.Enqueue(context.Background(), "test", json.RawMessage(`{}`), "")
+	// Claim it so run() has a running job to finish.
+	claimed, ok, _ := m.ClaimNext(context.Background())
+	if !ok || claimed.ID != j.ID {
+		t.Fatalf("claim failed: ok=%v", ok)
+	}
+
+	// A cancelled runner context must NOT prevent the terminal-state write.
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	r.run(ctx, claimed)
+
+	got, _ := m.GetJob(context.Background(), j.ID)
+	if got.State != store.JobSucceeded {
+		t.Fatalf("want succeeded, got %q (err=%q)", got.State, got.Error)
+	}
+}
+
 func TestRunner_CancelStops(t *testing.T) {
 	m := store.NewMemory()
 	r := NewRunner(m, Registry{}, 2)
