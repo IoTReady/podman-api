@@ -39,6 +39,7 @@ func main() {
 		stateDB       = flag.String("state-db", "", "if set, enable the desired-state store at this SQLite path (required for migrate/evacuate)")
 		specKeyFile   = flag.String("spec-key-file", "", "path to the 32-byte secret encryption key (required when -state-db is set)")
 		jobsRetention = flag.Duration("jobs-retention", 0, "if >0, prune terminal jobs older than this (e.g. 168h); 0 disables")
+		evacConc      = flag.Int("evacuate-concurrency", 2, "max child migrations an evacuate runs at once (1..32); a request's \"concurrency\" overrides per call")
 	)
 	flag.Parse()
 
@@ -97,7 +98,7 @@ func main() {
 		jobStore = db
 		registry := jobs.Registry{
 			"migrate":  &migrate.Handler{Svc: svc},
-			"evacuate": &evacuate.Handler{Svc: svc, Jobs: db},
+			"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: *evacConc},
 		}
 		runner := jobs.NewRunner(db, registry, jobs.DefaultWorkers)
 		runner.Start(runnerCtx)

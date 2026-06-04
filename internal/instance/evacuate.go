@@ -20,6 +20,10 @@ var ErrInvalidEvacuation = errors.New("invalid evacuation request")
 type EvacuateRequest struct {
 	FromHost string            `json:"from_host"`
 	Map      map[string]string `json:"map"`
+	// Concurrency, if >0, overrides the server's default for how many child
+	// migrations run at once (clamped to [1,32] by the handler). Request-only:
+	// it does not affect the migrate plan, so ResolveEvacuation ignores it.
+	Concurrency int `json:"concurrency,omitempty"`
 }
 
 // ResolveEvacuation validates the request against the specs stored on FromHost

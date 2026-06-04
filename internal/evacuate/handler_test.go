@@ -38,7 +38,12 @@ func buildSvc(t *testing.T, slugs ...string) (*instance.Service, *store.Memory) 
 
 func mustArgs(t *testing.T, from string, m map[string]string) json.RawMessage {
 	t.Helper()
-	b, err := json.Marshal(instance.EvacuateRequest{FromHost: from, Map: m})
+	return mustArgsC(t, from, m, 0)
+}
+
+func mustArgsC(t *testing.T, from string, m map[string]string, concurrency int) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(instance.EvacuateRequest{FromHost: from, Map: m, Concurrency: concurrency})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -119,18 +124,35 @@ func TestEvacuateOneFailsSiblingsRun(t *testing.T) {
 	}
 }
 
-func TestEvacuateConcurrencyBound(t *testing.T) {
-	old := evacuateConcurrency
-	evacuateConcurrency = 1
-	defer func() { evacuateConcurrency = old }()
+func TestEffectiveConcurrency(t *testing.T) {
+	cases := []struct{ handler, req, want int }{
+		{0, 0, defaultEvacuateConcurrency},  // both unset -> default
+		{5, 0, 5},                           // handler default honoured
+		{5, 3, 3},                           // request overrides handler
+		{0, 1000, maxEvacuateConcurrency},   // request clamped to max
+		{0, -4, defaultEvacuateConcurrency}, // negative request ignored -> default
+		{1, 0, 1},                           // handler of 1 honoured
+		{1000, 0, maxEvacuateConcurrency},   // handler default clamped to max
+	}
+	for _, c := range cases {
+		if got := effectiveConcurrency(c.handler, c.req); got != c.want {
+			t.Errorf("effectiveConcurrency(%d,%d)=%d, want %d", c.handler, c.req, got, c.want)
+		}
+	}
+}
 
+// runConcurrencyProbe runs an evacuate of 4 instances and reports the max number
+// of child migrations observed in flight at once, given a handler default and a
+// per-request override.
+func runConcurrencyProbe(t *testing.T, handlerDefault, reqOverride int) int32 {
+	t.Helper()
 	ctx := context.Background()
 	svc, mem := buildSvc(t, "a", "b", "c", "d")
-	parent, _ := mem.Enqueue(ctx, "evacuate", mustArgs(t, "hostA",
-		map[string]string{"a": "hostB", "b": "hostB", "c": "hostB", "d": "hostB"}), "")
+	parent, _ := mem.Enqueue(ctx, "evacuate", mustArgsC(t, "hostA",
+		map[string]string{"a": "hostB", "b": "hostB", "c": "hostB", "d": "hostB"}, reqOverride), "")
 
 	var inFlight, maxInFlight int32
-	h := &Handler{Svc: svc, Jobs: mem}
+	h := &Handler{Svc: svc, Jobs: mem, Concurrency: handlerDefault}
 	h.migrate = func(_ context.Context, req instance.MigrateRequest, step func(string, string)) error {
 		n := atomic.AddInt32(&inFlight, 1)
 		for {
@@ -147,7 +169,19 @@ func TestEvacuateConcurrencyBound(t *testing.T) {
 	if err := h.Run(ctx, parent, jobs.NewJobContext(mem, parent.ID)); err != nil {
 		t.Fatal(err)
 	}
-	if maxInFlight != 1 {
-		t.Fatalf("evacuateConcurrency=1 but observed %d in flight", maxInFlight)
+	return maxInFlight
+}
+
+func TestEvacuateConcurrencyBound(t *testing.T) {
+	// Handler default of 1, no request override -> at most 1 in flight.
+	if got := runConcurrencyProbe(t, 1, 0); got != 1 {
+		t.Fatalf("handler Concurrency=1 but observed %d in flight", got)
+	}
+}
+
+func TestEvacuateConcurrencyRequestOverride(t *testing.T) {
+	// Handler default of 1, but the request asks for 1 explicitly -> still 1.
+	if got := runConcurrencyProbe(t, 4, 1); got != 1 {
+		t.Fatalf("request concurrency=1 over handler=4, but observed %d in flight", got)
 	}
 }
