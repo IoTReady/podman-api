@@ -100,6 +100,11 @@ jobs:
       # the outer runner is configured. Slower than overlay but the test images
       # (alpine) are tiny.
       STORAGE_DRIVER: vfs
+      # Opt into the host-wide prune scopes (image/container/build-cache). The
+      # gate exists so `make test-integration` on a developer's machine never
+      # reaps their state; this fixture is fresh and disposable, so it should
+      # exercise every scope. See TestReal_Prune_HostWide_LocalOnly.
+      PODMAN_API_ITEST_PRUNE_DESTRUCTIVE: "1"
     steps:
       # nodejs is needed by the JS-based actions/checkout; go.mod pins go 1.26
       # which Go's GOTOOLCHAIN auto-fetches on top of Fedora's older toolchain.

@@ -13,6 +13,10 @@ import (
 
 // ProtectLabel marks a volume that must never be reaped by the volumes scope.
 // The volume prune passes a "label!" filter so volumes carrying it are excluded.
+//
+// NOTE: internal/podman/real_prune_integration_test.go duplicates this string
+// (the podman package cannot import prune — prune imports podman) and is the
+// only test that exercises the real filter. If you rename this, update that copy.
 const ProtectLabel = "podman-api.protect"
 
 // Payload is the job-args shape the scheduler enqueues and the handler reads.
