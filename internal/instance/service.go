@@ -113,6 +113,50 @@ func (s *Service) SetIngress(c ingress.Controller, network string) {
 
 func (s *Service) ingressEnabled() bool { return s.ingressNet != "" }
 
+// validateIngress enforces the ingress rules for a request carrying domains
+// BEFORE the pod is played or the spec is persisted: ingress must be enabled,
+// the template must declare ingress:, and each domain must be unclaimed by any
+// other instance on the host. Enforcing them up front keeps an invalid spec out
+// of the store; otherwise it would poison deriveRoutes and fail every later
+// reconcile on the host. A request with no domains is always allowed.
+func (s *Service) validateIngress(ctx context.Context, host string, req ApplyRequest, tmpl config.Template) error {
+	if len(req.Domains) == 0 {
+		return nil
+	}
+	if !s.ingressEnabled() {
+		return fmt.Errorf("instance %s/%s declares domains but ingress is disabled", req.Template, req.Slug)
+	}
+	if tmpl.Meta.Ingress == nil {
+		return fmt.Errorf("instance %s/%s declares domains but template %q has no ingress", req.Template, req.Slug, req.Template)
+	}
+	if s.store == nil {
+		return nil
+	}
+	keys, err := s.store.ListSpecKeys(ctx, host)
+	if err != nil {
+		return fmt.Errorf("ingress: check domain uniqueness on %s: %w", host, err)
+	}
+	want := make(map[string]bool, len(req.Domains))
+	for _, d := range req.Domains {
+		want[d] = true
+	}
+	for _, k := range keys {
+		if k.Template == req.Template && k.Slug == req.Slug {
+			continue // the instance being (re)applied — its own domains don't conflict
+		}
+		other, err := s.store.GetSpec(ctx, host, k.Template, k.Slug)
+		if err != nil {
+			return fmt.Errorf("ingress: check domain uniqueness on %s: %w", host, err)
+		}
+		for _, d := range other.Domains {
+			if want[d] {
+				return fmt.Errorf("ingress: domain %q already claimed by %s/%s on %s", d, k.Template, k.Slug, host)
+			}
+		}
+	}
+	return nil
+}
+
 func (s *Service) hostsSnap() map[string]config.Host {
 	p := s.hosts.Load()
 	if p == nil {
@@ -168,13 +212,17 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	if err := render.Validate(tmpl.Meta, req.Parameters, req.Secrets); err != nil {
 		return fmt.Errorf("validate: %w", err)
 	}
-	if len(req.Domains) > 0 && !s.ingressEnabled() {
-		return fmt.Errorf("instance %s/%s declares domains but ingress is disabled", req.Template, req.Slug)
-	}
-
 	lock := s.instanceLock(host, req.Template, req.Slug)
 	lock.Lock()
 	defer lock.Unlock()
+
+	// Validate ingress rules BEFORE playing the pod or persisting the spec, so a
+	// rejected request never leaves a poison spec in the store — a persisted spec
+	// that violates these rules would fail every later reconcile on the host.
+	// deriveRoutes re-checks the same rules at reconcile time as a backstop.
+	if err := s.validateIngress(ctx, host, req, tmpl); err != nil {
+		return err
+	}
 
 	// Pre-check: per-host secrets exist.
 	for _, name := range tmpl.Meta.Secrets.PerHostReferenced {
