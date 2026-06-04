@@ -73,3 +73,46 @@ apiVersion: v1
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "id")
 }
+
+func TestParseMetaIngress(t *testing.T) {
+	src := `# template-meta:
+#   id: web
+#   ingress:
+#     container: web
+#     port: 8080
+---
+apiVersion: v1
+kind: Pod
+`
+	meta, _, err := ParseMeta(src)
+	require.NoError(t, err)
+	require.NotNil(t, meta.Ingress)
+	require.Equal(t, "web", meta.Ingress.Container)
+	require.Equal(t, 8080, meta.Ingress.Port)
+}
+
+func TestParseMetaNoIngress(t *testing.T) {
+	src := `# template-meta:
+#   id: postgres
+---
+apiVersion: v1
+kind: Pod
+`
+	meta, _, err := ParseMeta(src)
+	require.NoError(t, err)
+	require.Nil(t, meta.Ingress)
+}
+
+func TestParseMetaIngressInvalid(t *testing.T) {
+	src := `# template-meta:
+#   id: web
+#   ingress:
+#     container: web
+#     port: 0
+---
+apiVersion: v1
+kind: Pod
+`
+	_, _, err := ParseMeta(src)
+	require.Error(t, err)
+}

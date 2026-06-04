@@ -23,8 +23,11 @@ type Spec struct {
 	// text/template are unaffected; callers must not type-assert .(int).
 	Parameters map[string]any
 	Secrets    map[string]string
-	Created    time.Time
-	Updated    time.Time
+	// Domains are the public hostnames the ingress layer routes to this
+	// instance. Empty for non-web instances. Non-secret; stored in plaintext.
+	Domains []string
+	Created time.Time
+	Updated time.Time
 }
 
 // SpecKey identifies one stored instance without exposing its secrets. Used by

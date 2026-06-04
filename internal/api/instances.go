@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/iotready/podman-api/internal/ingress"
 	"github.com/iotready/podman-api/internal/instance"
 )
 
@@ -60,6 +61,10 @@ func (h *handlers) createInstance(w http.ResponseWriter, r *http.Request) {
 	if !validInstancePath(w, req.Template, req.Slug) {
 		return
 	}
+	if err := ingress.ValidateDomains(req.Domains); err != nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_domains", Message: err.Error()})
+		return
+	}
 	opts := instance.ApplyOptions{Replace: false, SkipPull: queryBool(r, "skip_pull")}
 	if err := h.svc.Apply(r.Context(), host, req, opts); err != nil {
 		WriteError(w, err)
@@ -96,6 +101,10 @@ func (h *handlers) applyInstance(w http.ResponseWriter, r *http.Request) {
 	req.Template = pathTmpl
 	req.Slug = pathSlug
 
+	if err := ingress.ValidateDomains(req.Domains); err != nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_domains", Message: err.Error()})
+		return
+	}
 	opts := instance.ApplyOptions{Replace: true, SkipPull: queryBool(r, "skip_pull")}
 	if err := h.svc.Apply(r.Context(), host, req, opts); err != nil {
 		WriteError(w, err)

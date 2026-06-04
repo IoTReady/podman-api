@@ -3,10 +3,14 @@ package store
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/require"
+	_ "modernc.org/sqlite"
 )
 
 func openTestStore(t *testing.T, ks *KeyStore) *SQLite {
@@ -127,4 +131,62 @@ func TestSQLite_EncryptsSecretsAtRest(t *testing.T) {
 			t.Fatalf("secret value found in plaintext in %s", e.Name())
 		}
 	}
+}
+
+func TestSpecDomainsRoundTrip(t *testing.T) {
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	ctx := context.Background()
+	in := Spec{
+		Host: "h1", Template: "web", Slug: "a",
+		Parameters: map[string]any{},
+		Secrets:    map[string]string{},
+		Domains:    []string{"a.example.com", "b.example.com"},
+	}
+	require.NoError(t, s.PutSpec(ctx, in))
+	got, err := s.GetSpec(ctx, "h1", "web", "a")
+	require.NoError(t, err)
+	require.Equal(t, []string{"a.example.com", "b.example.com"}, got.Domains)
+}
+
+func TestSpecDomainsDefaultsEmpty(t *testing.T) {
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	ctx := context.Background()
+	require.NoError(t, s.PutSpec(ctx, Spec{
+		Host: "h1", Template: "pg", Slug: "a",
+		Parameters: map[string]any{}, Secrets: map[string]string{},
+	}))
+	got, err := s.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	require.Empty(t, got.Domains)
+}
+
+func TestMigrateAddsDomainsColumn(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/old.db"
+	raw, err := sql.Open("sqlite", "file:"+path)
+	require.NoError(t, err)
+	_, err = raw.Exec(`CREATE TABLE specs (
+  host TEXT NOT NULL, template TEXT NOT NULL, slug TEXT NOT NULL,
+  parameters TEXT NOT NULL, secrets BLOB NOT NULL,
+  created INTEGER NOT NULL, updated INTEGER NOT NULL,
+  PRIMARY KEY (host, template, slug));`)
+	require.NoError(t, err)
+	_, err = raw.Exec(`PRAGMA user_version = 3`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	keys := NewKeyStore(testKey(0x11))
+	s, err := OpenSQLite(path, keys)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+	require.NoError(t, s.PutSpec(ctx, Spec{
+		Host: "h", Template: "web", Slug: "x",
+		Parameters: map[string]any{}, Secrets: map[string]string{},
+		Domains: []string{"x.example.com"},
+	}))
+	got, err := s.GetSpec(ctx, "h", "web", "x")
+	require.NoError(t, err)
+	require.Equal(t, []string{"x.example.com"}, got.Domains)
 }
