@@ -296,6 +296,7 @@ components:
         moves:
           type: array
           items: {$ref: '#/components/schemas/PlannedMove'}
+
     PlannedMove:
       type: object
       required: [slug, template, to_host, ok, issues]
@@ -309,6 +310,7 @@ components:
         issues:
           type: array
           items: {$ref: '#/components/schemas/PlanIssue'}
+
     PlanIssue:
       type: object
       required: [code, message]
