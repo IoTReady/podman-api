@@ -69,15 +69,22 @@ func clampJobLimit(n int) int {
 ```
 
 - **SQLite `ListJobs`**: when `Before != ""` add `id < ?` to the WHERE clause;
-  keep `ORDER BY created DESC, id DESC`; append `LIMIT ?` with the clamped value.
-  Because the id is globally unique and time-monotonic, `id < before` is a
-  stable cursor under concurrent inserts and prunes.
-- **Memory `ListJobs`**: same semantics — iterate newest-first, skip rows with
-  `id >= Before` when `Before != ""`, stop after the clamped limit.
+  order by **`id DESC` alone**; append `LIMIT ?` with the clamped value. The id
+  is fixed-width (`%016x-%x` — 16 hex of unix-nanos, a dash, 12 hex of random),
+  so its lexicographic order is a total order on creation time. The cursor key
+  (`id`) MUST equal the sort key: `created` and the id's time-prefix come from
+  two separate clock reads (`newJobID` vs the row's `created`), so ordering by
+  `created` while cursoring on `id` lets concurrent inserts skip a row between
+  pages. Ordering by id alone makes `id < before` a correct, stable cursor.
+- **Memory `ListJobs`**: same semantics — filter (state/kind/parent_id and
+  `id >= Before`), then **sort by `id` descending** (matching SQLite's total
+  order, since append order can diverge from id order under concurrent
+  enqueues), then take the clamped limit.
 
 **API (`internal/api/jobs.go`)**: `listJobs` parses `?limit=` and `?before=`.
-A non-integer `limit` returns `400 invalid_request` ("limit must be an
-integer"); otherwise the parsed value (including 0 / negative) is passed through
+A non-integer `limit` returns `400 invalid_query` ("limit must be an
+integer" — matching the package's query-param error idiom); otherwise the parsed
+value (including 0 / negative) is passed through
 and the store clamps it. `before` is passed verbatim. **The response stays a
 bare JSON array** — no shape change. A client pages by passing the last id it
 received as the next `before`, and stops when it gets fewer than `limit` rows.
@@ -163,7 +170,7 @@ the configured retention.
 
 **API (`internal/api`)**:
 - `?limit=1` returns one element; `?before=<id>` returns the following page;
-  `?limit=abc` → `400 invalid_request`.
+  `?limit=abc` → `400 invalid_query`.
 - `GET /jobs` with no params returns a bare array bounded by the default limit.
 
 ## Out of scope
