@@ -113,33 +113,44 @@ func (s *Service) requiredHostPorts(tmpl config.Template, params map[string]any)
 	return ports, nil
 }
 
-// preflightDest runs all fail-fast destination checks (no mutation).
-func (s *Service) preflightDest(ctx context.Context, req MigrateRequest, tmpl config.Template, eff map[string]any) error {
+// preflightIssues runs every destination preflight check and returns all
+// problems found, in check order. A nil/empty result means the destination
+// would currently accept the instance. Each error is either a sentinel-wrapped
+// blocking condition (ErrHostDraining / ErrInstanceExists / ErrHostSecretMissing
+// / ErrPortConflict) or an infrastructure error that made a check inconclusive.
+// preflightDest (fail-fast executor path) and PlanEvacuation (collect-all preview
+// path) both build on it, so the preview and the executor never disagree.
+func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl config.Template, eff map[string]any) []error {
+	var issues []error
 	hostCfg, _ := s.host(req.ToHost)
 	if hostCfg.Drain {
-		return ErrHostDraining
+		issues = append(issues, ErrHostDraining)
 	}
+	// An infra error here usually means the host is unreachable, which would
+	// fail every subsequent check too — report it once and stop, mirroring the
+	// executor's original fail-fast behaviour.
 	if _, err := s.client.PodInspect(ctx, req.ToHost, podName(req.Template, req.Slug)); err == nil {
-		return ErrInstanceExists
+		issues = append(issues, ErrInstanceExists)
 	} else if !errors.Is(err, podman.ErrNotFound) {
-		return fmt.Errorf("inspect dest pod: %w", err)
+		return append(issues, fmt.Errorf("inspect dest pod: %w", err))
 	}
 	for _, name := range tmpl.Meta.Secrets.PerHostReferenced {
 		if _, err := s.client.SecretInspect(ctx, req.ToHost, name); err != nil {
 			if errors.Is(err, podman.ErrNotFound) {
-				return fmt.Errorf("%w: %s", ErrHostSecretMissing, name)
+				issues = append(issues, fmt.Errorf("%w: %s", ErrHostSecretMissing, name))
+			} else {
+				issues = append(issues, fmt.Errorf("inspect host secret %q: %w", name, err))
 			}
-			return fmt.Errorf("inspect host secret %q: %w", name, err)
 		}
 	}
 	want, err := s.requiredHostPorts(tmpl, eff)
 	if err != nil {
-		return err
+		return append(issues, err)
 	}
 	if len(want) > 0 {
 		used, err := s.PortsInUse(ctx, req.ToHost)
 		if err != nil {
-			return fmt.Errorf("ports in use: %w", err)
+			return append(issues, fmt.Errorf("ports in use: %w", err))
 		}
 		busy := map[int]bool{}
 		for _, p := range used {
@@ -147,9 +158,20 @@ func (s *Service) preflightDest(ctx context.Context, req MigrateRequest, tmpl co
 		}
 		for _, p := range want {
 			if busy[p] {
-				return fmt.Errorf("%w: %d", ErrPortConflict, p)
+				issues = append(issues, fmt.Errorf("%w: %d", ErrPortConflict, p))
 			}
 		}
+	}
+	return issues
+}
+
+// preflightDest runs all fail-fast destination checks (no mutation), returning
+// the first blocking condition or infrastructure error encountered, in check
+// order. It is the executor's guard; PlanEvacuation uses preflightIssues to
+// collect every problem instead.
+func (s *Service) preflightDest(ctx context.Context, req MigrateRequest, tmpl config.Template, eff map[string]any) error {
+	if errs := s.preflightIssues(ctx, req, tmpl, eff); len(errs) > 0 {
+		return errs[0]
 	}
 	return nil
 }
