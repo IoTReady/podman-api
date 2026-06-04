@@ -127,10 +127,19 @@ func (r *Runner) worker(ctx context.Context) {
 	}
 }
 
-// finish writes the terminal state, logging (not returning) a store error.
-// Finish may fail if ctx is cancelled at shutdown; the job then stays running
-// and is reaped by boot recovery on the next start.
-func (r *Runner) finish(ctx context.Context, id string, state store.JobState, errMsg string) {
+// finishTimeout bounds the terminal-state write so a slow/contended store can't
+// hang the worker, while keeping the write independent of the runner's
+// (cancellable) lifecycle context.
+const finishTimeout = 5 * time.Second
+
+// finish writes the terminal state on a fresh short-lived context, logging (not
+// returning) a store error. It deliberately does NOT use the runner's lifecycle
+// context: at shutdown that context is cancelled, and a completed job must still
+// record its true terminal state. Reap-on-boot remains the fallback only for a
+// true process kill in the narrow window between handler-return and this write.
+func (r *Runner) finish(id string, state store.JobState, errMsg string) {
+	ctx, cancel := context.WithTimeout(context.Background(), finishTimeout)
+	defer cancel()
 	if err := r.store.Finish(ctx, id, state, errMsg); err != nil {
 		log.Printf("jobs: finish %s failed: %v", id, err)
 	}
@@ -139,13 +148,13 @@ func (r *Runner) finish(ctx context.Context, id string, state store.JobState, er
 func (r *Runner) run(ctx context.Context, job store.Job) {
 	h, ok := r.handlers[job.Kind]
 	if !ok {
-		r.finish(ctx, job.ID, store.JobFailed, "no handler for kind "+job.Kind)
+		r.finish(job.ID, store.JobFailed, "no handler for kind "+job.Kind)
 		return
 	}
 	jc := &JobContext{store: r.store, id: job.ID}
 	if err := h.Run(ctx, job, jc); err != nil {
-		r.finish(ctx, job.ID, store.JobFailed, err.Error())
+		r.finish(job.ID, store.JobFailed, err.Error())
 		return
 	}
-	r.finish(ctx, job.ID, store.JobSucceeded, "")
+	r.finish(job.ID, store.JobSucceeded, "")
 }
