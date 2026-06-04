@@ -128,6 +128,41 @@ func TestMigrate_PreflightFailFast_SourceUntouched(t *testing.T) {
 	})
 }
 
+func TestMigrate_HappyPath(t *testing.T) {
+	svc, f, mem := newMigrateSvc(t)
+	ctx := context.Background()
+	params := map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"}
+
+	require.NoError(t, mem.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "postgres", Slug: "db1",
+		Parameters: params, Secrets: map[string]string{"password": "p"},
+	}))
+	f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
+	f.SetVolumeData("h1", "postgres-db1-data", []byte("PGDATA"))
+
+	var steps []string
+	err := svc.Migrate(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"},
+		func(s, _ string) { steps = append(steps, s) })
+	require.NoError(t, err)
+
+	// Source gone.
+	_, err = f.PodInspect(ctx, "h1", "postgres-db1")
+	require.ErrorIs(t, err, podman.ErrNotFound)
+	_, err = mem.GetSpec(ctx, "h1", "postgres", "db1")
+	require.ErrorIs(t, err, store.ErrNotFound)
+	assert.Nil(t, f.VolumeData("h1", "postgres-db1-data"))
+
+	// Dest running with copied volume bytes + stored spec.
+	p, err := f.PodInspect(ctx, "h2", "postgres-db1")
+	require.NoError(t, err)
+	assert.Equal(t, "Running", p.Status)
+	assert.Equal(t, []byte("PGDATA"), f.VolumeData("h2", "postgres-db1-data"))
+	_, err = mem.GetSpec(ctx, "h2", "postgres", "db1")
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"load", "preflight", "stop-source", "copy-volume", "apply-dest", "verify", "commit"}, steps)
+}
+
 func TestMigrate_SelfValidates(t *testing.T) {
 	svc, _, mem := newMigrateSvc(t)
 	ctx := context.Background()

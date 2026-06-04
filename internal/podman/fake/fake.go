@@ -294,6 +294,7 @@ func (f *Fake) VolumeRemove(_ context.Context, h, name string, _ bool) error {
 		return podman.ErrNotFound
 	}
 	delete(f.hostVolumes(h), name)
+	delete(f.hostVolData(h), name)
 	return nil
 }
 

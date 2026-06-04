@@ -136,9 +136,10 @@ func (s *Service) preflightDest(ctx context.Context, req MigrateRequest, tmpl co
 	return nil
 }
 
-// Migrate moves an instance from one host to another. step is a best-effort
-// progress callback (may be nil). NOTE: mutation steps are added in a later task;
-// for now Migrate stops after preflight.
+// Migrate moves an instance from one host to another: stop source, copy
+// volumes, apply the spec on the destination, verify it is healthy, then reap
+// the source. Failures before the destination is verified roll back. step is a
+// best-effort progress callback (may be nil).
 func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(step, detail string)) error {
 	if step == nil {
 		step = func(string, string) {}
@@ -172,7 +173,90 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 		return err
 	}
 	step("preflight", req.ToHost)
-	return nil // mutation steps added in a later task
+
+	// From here the source is mutated; failures before verify roll back.
+	if err := s.Stop(ctx, req.FromHost, req.Template, req.Slug); err != nil {
+		return fmt.Errorf("stop source: %w", err)
+	}
+	step("stop-source", req.FromHost)
+
+	if err := s.migratePostStop(ctx, req, eff, spec.Secrets, step); err != nil {
+		step("rollback", err.Error())
+		// Compensate on a detached context: migratePostStop may have failed
+		// *because* ctx was cancelled/timed out (the verify poll returns
+		// ctx.Err()), and the source must still be restarted and the partial
+		// destination reaped regardless.
+		rbctx := context.WithoutCancel(ctx)
+		if rerr := s.Start(rbctx, req.FromHost, req.Template, req.Slug); rerr != nil {
+			step("rollback-restore-failed", rerr.Error())
+		}
+		if rerr := s.Delete(rbctx, req.ToHost, req.Template, req.Slug, DeleteOptions{PruneVolumes: true, PruneSecrets: true}); rerr != nil {
+			step("rollback-reap-failed", rerr.Error())
+		}
+		return err
+	}
+
+	// Verified healthy: dest is now truth. Commit by reaping the source on a
+	// detached context so a late ctx cancellation can't strand a half-committed
+	// state (dest live, source not removed).
+	if err := s.Delete(context.WithoutCancel(ctx), req.FromHost, req.Template, req.Slug, DeleteOptions{PruneVolumes: true, PruneSecrets: true}); err != nil {
+		return fmt.Errorf("commit (delete source): %w", err)
+	}
+	step("commit", req.FromHost)
+	return nil
+}
+
+// migratePostStop runs the destination-mutating steps: copy volumes, apply the
+// spec, verify health. Any error here is rolled back by the caller.
+func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, secrets map[string]string, step func(step, detail string)) error {
+	vols, err := s.InstanceVolumes(ctx, req.FromHost, req.Template, req.Slug)
+	if err != nil {
+		return fmt.Errorf("list source volumes: %w", err)
+	}
+	for _, v := range vols {
+		if err := s.client.VolumeCreate(ctx, req.ToHost, v.Name); err != nil {
+			return fmt.Errorf("create dest volume %q: %w", v.Name, err)
+		}
+		if err := s.CopyVolume(ctx, req.FromHost, req.ToHost, v.Name); err != nil {
+			return fmt.Errorf("copy volume %q: %w", v.Name, err)
+		}
+		step("copy-volume", v.Name)
+	}
+
+	if err := s.Apply(ctx, req.ToHost, ApplyRequest{
+		Template: req.Template, Slug: req.Slug, Parameters: eff, Secrets: secrets,
+	}, ApplyOptions{Replace: false}); err != nil {
+		return fmt.Errorf("apply on dest: %w", err)
+	}
+	step("apply-dest", req.ToHost)
+
+	if err := s.waitRunning(ctx, req.ToHost, req.Template, req.Slug); err != nil {
+		return fmt.Errorf("verify dest: %w", err)
+	}
+	step("verify", req.ToHost)
+	return nil
+}
+
+// waitRunning polls the dest pod until Running, bounded by verifyTimeout and the
+// caller's context.
+func (s *Service) waitRunning(ctx context.Context, host, tmpl, slug string) error {
+	deadline := time.Now().Add(verifyTimeout)
+	ticker := time.NewTicker(verifyInterval)
+	defer ticker.Stop()
+	for {
+		p, err := s.client.PodInspect(ctx, host, podName(tmpl, slug))
+		if err == nil && p.Status == "Running" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("pod %s not running within %s", podName(tmpl, slug), verifyTimeout)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
 }
 
 // mergeParams returns a new map: base overlaid by override (override wins).
