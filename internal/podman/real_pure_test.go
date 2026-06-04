@@ -77,6 +77,28 @@ func TestMapNotFound(t *testing.T) {
 	assert.NoError(t, mapNotFound(nil))
 }
 
+func TestEnrichContainer_Health(t *testing.T) {
+	t.Run("healthcheck status copied", func(t *testing.T) {
+		var c Container
+		enrichContainer(&c, &define.InspectContainerData{
+			State: &define.InspectContainerState{
+				Health: &define.HealthCheckResults{Status: "healthy"},
+			},
+		})
+		if c.Health != "healthy" {
+			t.Fatalf("Health = %q, want %q", c.Health, "healthy")
+		}
+	})
+
+	t.Run("no healthcheck leaves Health empty", func(t *testing.T) {
+		var c Container
+		enrichContainer(&c, &define.InspectContainerData{State: &define.InspectContainerState{}})
+		if c.Health != "" {
+			t.Fatalf("Health = %q, want empty", c.Health)
+		}
+	})
+}
+
 func TestPodFromInspect(t *testing.T) {
 	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	rep := &entities.PodInspectReport{InspectPodData: &define.InspectPodData{
