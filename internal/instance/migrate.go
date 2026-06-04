@@ -126,9 +126,9 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 	if hostCfg.Drain {
 		issues = append(issues, ErrHostDraining)
 	}
-	// An infra error here usually means the host is unreachable, which would
-	// fail every subsequent check too — report it once and stop, mirroring the
-	// executor's original fail-fast behaviour.
+	// An infra error here (host unreachable) makes the remaining checks
+	// inconclusive; report it and stop rather than accumulating spurious
+	// failures.
 	if _, err := s.client.PodInspect(ctx, req.ToHost, podName(req.Template, req.Slug)); err == nil {
 		issues = append(issues, ErrInstanceExists)
 	} else if !errors.Is(err, podman.ErrNotFound) {
