@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/iotready/podman-api/internal/config"
+	"github.com/iotready/podman-api/internal/ingress"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
@@ -59,6 +60,8 @@ type Service struct {
 	templates  map[string]config.Template
 	secretEnvs map[string]map[string]bool // template id -> set of secret-sourced env var names
 	store      store.Store                // nil = store disabled (stateless proxy behaviour)
+	ingress    ingress.Controller         // never nil; ingress.Disabled{} when off
+	ingressNet string                     // shared ingress network; "" when ingress disabled
 
 	verifyVolumes bool // verify each migrated volume's content before reaping the source
 
@@ -74,6 +77,7 @@ func NewService(client podman.Client, hosts []config.Host, tmpls []config.Templa
 		locks:         map[string]*sync.Mutex{},
 		verifyVolumes: true,
 	}
+	s.ingress = ingress.Disabled{}
 	s.SetHosts(hosts)
 	for _, t := range tmpls {
 		s.templates[t.Meta.ID] = t
@@ -98,6 +102,16 @@ func (s *Service) SetHosts(hosts []config.Host) {
 // concurrent hot-swap: it must be called at startup, before the server begins
 // accepting requests.
 func (s *Service) SetStore(st store.Store) { s.store = st }
+
+// SetIngress enables ingress reconciliation. network is the shared podman
+// network app pods join; passing a real controller marks ingress enabled so
+// Apply will accept domains. Call with ingress.Disabled{} and "" to disable.
+func (s *Service) SetIngress(c ingress.Controller, network string) {
+	s.ingress = c
+	s.ingressNet = network
+}
+
+func (s *Service) ingressEnabled() bool { return s.ingressNet != "" }
 
 func (s *Service) hostsSnap() map[string]config.Host {
 	p := s.hosts.Load()
@@ -153,6 +167,9 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	}
 	if err := render.Validate(tmpl.Meta, req.Parameters, req.Secrets); err != nil {
 		return fmt.Errorf("validate: %w", err)
+	}
+	if len(req.Domains) > 0 && !s.ingressEnabled() {
+		return fmt.Errorf("instance %s/%s declares domains but ingress is disabled", req.Template, req.Slug)
 	}
 
 	lock := s.instanceLock(host, req.Template, req.Slug)
@@ -232,7 +249,11 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 		req.Secrets[k] = "" // best-effort zero
 	}
 
-	if err := s.client.PlayKube(ctx, host, yaml, opts.Replace); err != nil {
+	var networks []string
+	if s.ingressEnabled() && tmpl.Meta.Ingress != nil {
+		networks = []string{s.ingressNet}
+	}
+	if err := s.client.PlayKube(ctx, host, yaml, opts.Replace, networks...); err != nil {
 		return fmt.Errorf("play kube: %w", err)
 	}
 	if s.store != nil {
@@ -246,6 +267,11 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 		}
 		if err := s.store.PutSpec(ctx, sp); err != nil {
 			return fmt.Errorf("persist spec: %w", err)
+		}
+	}
+	if s.ingressEnabled() {
+		if err := s.ingress.Reconcile(ctx, host); err != nil {
+			return fmt.Errorf("ingress reconcile: %w", err)
 		}
 	}
 	return nil
@@ -428,6 +454,15 @@ func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts Dele
 	if s.store != nil {
 		if err := s.store.DeleteSpec(ctx, host, tmpl, slug); err != nil && !errors.Is(err, store.ErrNotFound) {
 			return fmt.Errorf("delete spec: %w", err)
+		}
+	}
+	// Reconcile ingress so the deleted instance's routes are dropped. Placed
+	// alongside the spec deletion (before the not-found guard below) so the
+	// common successful-delete path always reconciles, and a redundant delete of
+	// an already-gone pod still converges the proxy toward "route removed".
+	if s.ingressEnabled() {
+		if err := s.ingress.Reconcile(ctx, host); err != nil {
+			return fmt.Errorf("ingress reconcile: %w", err)
 		}
 	}
 	// If the pod was already gone and the caller asked for no pruning, there was
