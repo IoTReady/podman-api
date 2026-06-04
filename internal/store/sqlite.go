@@ -185,9 +185,8 @@ func migrateSchema(db *sql.DB) error {
 		if _, err := db.Exec(`ALTER TABLE specs ADD COLUMN domains TEXT NOT NULL DEFAULT '[]'`); err != nil {
 			// Tolerate the duplicate-column case (a fresh DB where schemaSQL
 			// already created the column) so OpenSQLite stays idempotent;
-			// anything else is a real failure. Inspect the structured
-			// *sqlite.Error rather than matching a bare error string, the same
-			// way isBusy does.
+			// anything else is a real failure. Inspect the typed *sqlite.Error
+			// and match its (stable) message rather than a bare error string.
 			var se *sqlite.Error
 			if !errors.As(err, &se) || !strings.Contains(se.Error(), "duplicate column") {
 				return fmt.Errorf("migrateSchema: add domains column: %w", err)
