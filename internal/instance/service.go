@@ -27,6 +27,7 @@ var (
 	ErrPortConflict      = errors.New("required host port already in use")
 	ErrSameHost          = errors.New("source and destination host are the same")
 	ErrStoreDisabled     = errors.New("migrate requires the state store")
+	ErrVolumeIntegrity   = errors.New("volume copy failed integrity check")
 )
 
 // ApplyOptions controls the side effects of Apply beyond the request body.
@@ -57,16 +58,19 @@ type Service struct {
 	secretEnvs map[string]map[string]bool // template id -> set of secret-sourced env var names
 	store      store.Store                // nil = store disabled (stateless proxy behaviour)
 
+	verifyVolumes bool // verify each migrated volume's content before reaping the source
+
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex // key = host|template|slug
 }
 
 func NewService(client podman.Client, hosts []config.Host, tmpls []config.Template) *Service {
 	s := &Service{
-		client:     client,
-		templates:  map[string]config.Template{},
-		secretEnvs: map[string]map[string]bool{},
-		locks:      map[string]*sync.Mutex{},
+		client:        client,
+		templates:     map[string]config.Template{},
+		secretEnvs:    map[string]map[string]bool{},
+		locks:         map[string]*sync.Mutex{},
+		verifyVolumes: true,
 	}
 	s.SetHosts(hosts)
 	for _, t := range tmpls {
@@ -548,6 +552,21 @@ func (s *Service) DeleteVolume(ctx context.Context, host, name string, force boo
 		return nil
 	}
 	return err
+}
+
+// SetVerifyVolumes toggles post-copy volume integrity verification during
+// migrate. Default true; set false (via -migrate-verify-volumes=false) to skip
+// the extra source+dest re-export per volume.
+func (s *Service) SetVerifyVolumes(v bool) { s.verifyVolumes = v }
+
+// volumeManifest exports a host's volume and fingerprints its tar stream.
+func (s *Service) volumeManifest(ctx context.Context, host, name string) (Manifest, error) {
+	rc, err := s.client.VolumeExport(ctx, host, name)
+	if err != nil {
+		return nil, err
+	}
+	defer rc.Close()
+	return buildManifest(rc)
 }
 
 // CopyVolume streams a named volume's contents from one host to another through
