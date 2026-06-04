@@ -248,6 +248,26 @@ VALUES (?, ?, ?, 'queued', '[]', ?, NULL, ?, NULL, NULL)`,
 	return s.GetJob(ctx, id)
 }
 
+func (s *SQLite) StartChild(ctx context.Context, kind string, args json.RawMessage, parentID string) (Job, error) {
+	id := newJobID()
+	now := time.Now().Unix()
+	if len(args) == 0 {
+		args = json.RawMessage("null")
+	}
+	var parent any
+	if parentID != "" {
+		parent = parentID
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO jobs (id, kind, args, state, steps, parent_id, error, created, started, finished)
+VALUES (?, ?, ?, 'running', '[]', ?, NULL, ?, ?, NULL)`,
+		id, kind, string(args), parent, now, now)
+	if err != nil {
+		return Job{}, err
+	}
+	return s.GetJob(ctx, id)
+}
+
 func (s *SQLite) GetJob(ctx context.Context, id string) (Job, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=?`, id)
 	return scanJob(row)
@@ -264,6 +284,10 @@ func (s *SQLite) ListJobs(ctx context.Context, f JobFilter) ([]Job, error) {
 	if f.Kind != "" {
 		where = append(where, "kind=?")
 		args = append(args, f.Kind)
+	}
+	if f.ParentID != "" {
+		where = append(where, "parent_id=?")
+		args = append(args, f.ParentID)
 	}
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")

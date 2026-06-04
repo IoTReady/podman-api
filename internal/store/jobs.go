@@ -42,8 +42,9 @@ type Job struct {
 
 // JobFilter narrows ListJobs. Empty fields match anything.
 type JobFilter struct {
-	State JobState
-	Kind  string
+	State    JobState
+	Kind     string
+	ParentID string
 }
 
 // JobStore persists and dispenses jobs. Implemented by *SQLite and *Memory.
@@ -51,6 +52,10 @@ type JobStore interface {
 	// Enqueue inserts a new queued job, generating its ID. parentID is "" for
 	// top-level jobs.
 	Enqueue(ctx context.Context, kind string, args json.RawMessage, parentID string) (Job, error)
+	// StartChild inserts a child job already in the running state (never queued),
+	// owned by parentID. Because it is not queued, ClaimNext never claims it — the
+	// caller (a parent job handler) drives it directly.
+	StartChild(ctx context.Context, kind string, args json.RawMessage, parentID string) (Job, error)
 	GetJob(ctx context.Context, id string) (Job, error) // ErrNotFound when absent
 	ListJobs(ctx context.Context, f JobFilter) ([]Job, error)
 	// ClaimNext atomically transitions the oldest queued job to running and

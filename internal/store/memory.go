@@ -92,6 +92,21 @@ func (m *Memory) Enqueue(_ context.Context, kind string, args json.RawMessage, p
 	return j, nil
 }
 
+func (m *Memory) StartChild(_ context.Context, kind string, args json.RawMessage, parentID string) (Job, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(args) == 0 {
+		args = json.RawMessage("null")
+	}
+	now := time.Now()
+	j := Job{
+		ID: newJobID(), Kind: kind, Args: args, State: JobRunning,
+		Steps: []JobStep{}, ParentID: parentID, Created: now, Started: now,
+	}
+	m.jobs = append(m.jobs, j)
+	return cloneJob(j), nil
+}
+
 func (m *Memory) GetJob(_ context.Context, id string) (Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -113,6 +128,9 @@ func (m *Memory) ListJobs(_ context.Context, f JobFilter) ([]Job, error) {
 			continue
 		}
 		if f.Kind != "" && j.Kind != f.Kind {
+			continue
+		}
+		if f.ParentID != "" && j.ParentID != f.ParentID {
 			continue
 		}
 		out = append(out, cloneJob(j))
