@@ -21,6 +21,7 @@ import (
 	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/evacuate"
+	"github.com/iotready/podman-api/internal/ingress"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/jobs"
 	"github.com/iotready/podman-api/internal/migrate"
@@ -54,6 +55,12 @@ func main() {
 		pruneThreshold = flag.Int("prune-disk-threshold", 85, "disk used% high-water that triggers an early prune; 0 disables the threshold trigger")
 		pruneScope     = flag.String("prune-scope", "dangling", "default prune scopes, comma-separated: dangling,all-images,containers,build-cache,volumes")
 		pruneDryRun    = flag.Bool("prune-dry-run", false, "default dry-run: report reclaimable space without removing anything")
+
+		ingressEnabled  = flag.Bool("ingress-enabled", false, "enable per-host Caddy ingress + auto-TLS (requires -state-db)")
+		ingressNetwork  = flag.String("ingress-network", "podman-api-ingress", "shared podman network app pods join for ingress")
+		ingressImage    = flag.String("ingress-caddy-image", "docker.io/library/caddy:2", "Caddy image for the per-host ingress pod")
+		ingressACME     = flag.String("ingress-acme-email", "", "ACME account email for Let's Encrypt (required when -ingress-enabled)")
+		ingressInterval = flag.Duration("ingress-reconcile-interval", 5*time.Minute, "periodic ingress drift-correction interval per host; 0 disables the periodic loop")
 	)
 	flag.Parse()
 
@@ -68,6 +75,15 @@ func main() {
 		}
 		fmt.Println(h)
 		return
+	}
+
+	if *ingressEnabled {
+		if *stateDB == "" {
+			log.Fatalf("ingress: -ingress-enabled requires -state-db (routes are derived from the desired-state store)")
+		}
+		if *ingressACME == "" {
+			log.Fatalf("ingress: -ingress-enabled requires -ingress-acme-email")
+		}
 	}
 
 	hosts, err := config.LoadHosts(*hostsDir)
@@ -117,9 +133,30 @@ func main() {
 	var jobStore store.JobStore
 	var canceller api.JobCanceller
 	var pruneSched *prune.Scheduler
+	var ingressCtl *ingress.CaddyController
 	if db != nil {
 		defer db.Close()
 		svc.SetStore(db)
+
+		if *ingressEnabled {
+			tmplIngress := map[string]ingress.TemplateIngress{}
+			for _, t := range tmpls {
+				if t.Meta.Ingress != nil {
+					tmplIngress[t.Meta.ID] = ingress.TemplateIngress{
+						Container: t.Meta.Ingress.Container,
+						Port:      t.Meta.Ingress.Port,
+					}
+				}
+			}
+			ctl := ingress.NewCaddyController(client, db, tmplIngress, ingress.Config{
+				Network:    *ingressNetwork,
+				CaddyImage: *ingressImage,
+				ACMEEmail:  *ingressACME,
+			})
+			svc.SetIngress(ctl, *ingressNetwork)
+			ingressCtl = ctl
+			log.Printf("ingress enabled (network %s, image %s, reconcile interval %s)", *ingressNetwork, *ingressImage, *ingressInterval)
+		}
 		jobStore = db
 		pruneMetrics := obs.NewPruneMetrics(prometheus.DefaultRegisterer)
 		registry := jobs.Registry{
@@ -244,6 +281,10 @@ func main() {
 		}
 	}()
 
+	// ingressLoopDone is closed when the periodic ingress loop exits (or
+	// immediately if the loop never starts), so the shutdown handler can await it.
+	ingressLoopDone := make(chan struct{})
+
 	idleClosed := make(chan struct{})
 	go func() {
 		sig := make(chan os.Signal, 1)
@@ -258,6 +299,9 @@ func main() {
 		if pruneSched != nil {
 			pruneSched.Wait()
 		}
+		// Wait for the periodic ingress loop (if any) to observe the cancelled
+		// runnerCtx and return before we proceed with HTTP shutdown.
+		<-ingressLoopDone
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
@@ -274,6 +318,30 @@ func main() {
 				log.Printf("metrics listener: %v", err)
 			}
 		}()
+	}
+
+	// Periodic ingress drift-correction: reconcile every known host on a ticker.
+	// Reads the live host set from hostsHolder so a SIGHUP reload is picked up.
+	if ingressCtl != nil && *ingressInterval > 0 {
+		go func() {
+			defer close(ingressLoopDone)
+			t := time.NewTicker(*ingressInterval)
+			defer t.Stop()
+			for {
+				select {
+				case <-runnerCtx.Done():
+					return
+				case <-t.C:
+					for _, h := range *hostsHolder.Load() {
+						if err := ingressCtl.Reconcile(runnerCtx, h.ID); err != nil {
+							log.Printf("ingress: periodic reconcile %s failed: %v", h.ID, err)
+						}
+					}
+				}
+			}
+		}()
+	} else {
+		close(ingressLoopDone)
 	}
 
 	log.Printf("podman-api listening on %s with %d hosts, %d templates, %d keys",
