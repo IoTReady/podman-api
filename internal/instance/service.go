@@ -42,6 +42,7 @@ type ApplyRequest struct {
 	Slug       string            `json:"slug"`
 	Parameters map[string]any    `json:"parameters"`
 	Secrets    map[string]string `json:"secrets"`
+	Domains    []string          `json:"domains,omitempty"`
 }
 
 // DeleteOptions controls cleanup beyond the pod itself.
@@ -206,9 +207,13 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	// stored spec is independent of the caller's request struct.
 	var secretsCopy map[string]string
 	var paramsCopy map[string]any
+	var domainsCopy []string
 	if s.store != nil {
 		secretsCopy = maps.Clone(req.Secrets)
 		paramsCopy = maps.Clone(req.Parameters)
+		if len(req.Domains) > 0 {
+			domainsCopy = append([]string(nil), req.Domains...)
+		}
 	}
 
 	// Push per-instance secrets, then zero the local copies.
@@ -238,6 +243,7 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 			Slug:       req.Slug,
 			Parameters: paramsCopy,
 			Secrets:    secretsCopy,
+			Domains:    domainsCopy,
 		}
 		if err := s.store.PutSpec(ctx, sp); err != nil {
 			return fmt.Errorf("persist spec: %w", err)
