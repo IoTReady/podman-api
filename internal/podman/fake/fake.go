@@ -89,6 +89,11 @@ type Fake struct {
 	HostInfoErr error
 	// HostInfoCalls counts HostInfo invocations (lets a test assert probe throttling).
 	HostInfoCalls int
+
+	// NetworkEnsureCalls records, per host, the network names ensured.
+	NetworkEnsureCalls map[string][]string
+	// NetworkEnsureErr, if non-nil, makes NetworkEnsure fail.
+	NetworkEnsureErr error
 }
 
 // PlayCall records one PlayKube invocation for assertions.
@@ -131,12 +136,13 @@ func (f *Fake) VolumeData(host, name string) []byte {
 // New returns a fresh fake.
 func New() *Fake {
 	return &Fake{
-		pods:         map[string]map[string]podman.Pod{},
-		secrets:      map[string]map[string]podman.Secret{},
-		volumes:      map[string]map[string]podman.Volume{},
-		volData:      map[string]map[string][]byte{},
-		PruneReports: map[string]podman.PruneReport{},
-		PruneErr:     map[string]error{},
+		pods:               map[string]map[string]podman.Pod{},
+		secrets:            map[string]map[string]podman.Secret{},
+		volumes:            map[string]map[string]podman.Volume{},
+		volData:            map[string]map[string][]byte{},
+		PruneReports:       map[string]podman.PruneReport{},
+		PruneErr:           map[string]error{},
+		NetworkEnsureCalls: map[string][]string{},
 	}
 }
 
@@ -389,6 +395,16 @@ func (f *Fake) VolumeCreate(_ context.Context, h, name string) error {
 	if _, ok := f.hostVolumes(h)[name]; !ok {
 		f.hostVolumes(h)[name] = podman.Volume{Name: name}
 	}
+	return nil
+}
+
+func (f *Fake) NetworkEnsure(_ context.Context, host, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.NetworkEnsureErr != nil {
+		return f.NetworkEnsureErr
+	}
+	f.NetworkEnsureCalls[host] = append(f.NetworkEnsureCalls[host], name)
 	return nil
 }
 

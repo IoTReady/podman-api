@@ -38,6 +38,11 @@ type Client interface {
 	// already exists is a no-op (no error).
 	VolumeCreate(ctx context.Context, hostID, name string) error
 
+	// Networks
+	// NetworkEnsure creates the named network if absent; creating one that
+	// already exists is a no-op (no error).
+	NetworkEnsure(ctx context.Context, hostID, name string) error
+
 	// Logs
 	ContainerLogs(ctx context.Context, hostID, container string, opts LogOptions) (<-chan LogLine, error)
 

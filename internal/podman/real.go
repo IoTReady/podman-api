@@ -17,6 +17,7 @@ import (
 	"github.com/containers/podman/v5/pkg/bindings"
 	"github.com/containers/podman/v5/pkg/bindings/containers"
 	"github.com/containers/podman/v5/pkg/bindings/images"
+	network "github.com/containers/podman/v5/pkg/bindings/network"
 	"github.com/containers/podman/v5/pkg/bindings/play"
 	"github.com/containers/podman/v5/pkg/bindings/pods"
 	"github.com/containers/podman/v5/pkg/bindings/secrets"
@@ -24,6 +25,7 @@ import (
 	"github.com/containers/podman/v5/pkg/bindings/volumes"
 	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	nettypes "go.podman.io/common/libnetwork/types"
 
 	"github.com/iotready/podman-api/internal/config"
 )
@@ -427,6 +429,19 @@ func (r *Real) VolumeCreate(ctx context.Context, id, name string) error {
 		return err
 	}
 	return nil
+}
+
+// NetworkEnsure creates the named network if absent. An already-existing
+// network is treated as success so callers can call this idempotently.
+func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	ignore := true
+	_, err = network.CreateWithOptions(c, &nettypes.Network{Name: name},
+		&network.ExtraCreateOptions{IgnoreIfExists: &ignore})
+	return err
 }
 
 // --- helpers ---

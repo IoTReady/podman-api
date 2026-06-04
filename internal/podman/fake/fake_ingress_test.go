@@ -14,3 +14,10 @@ func TestPlayKubeRecordsNetworks(t *testing.T) {
 	require.Len(t, f.PlayCalls, 1)
 	require.Equal(t, []string{"podman-api-ingress"}, f.PlayCalls[0].Networks)
 }
+
+func TestNetworkEnsureRecords(t *testing.T) {
+	f := New()
+	require.NoError(t, f.NetworkEnsure(context.Background(), "h1", "podman-api-ingress"))
+	require.NoError(t, f.NetworkEnsure(context.Background(), "h1", "podman-api-ingress")) // idempotent
+	require.Equal(t, []string{"podman-api-ingress", "podman-api-ingress"}, f.NetworkEnsureCalls["h1"])
+}
