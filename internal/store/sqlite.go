@@ -386,8 +386,10 @@ func (s *SQLite) ClaimNext(ctx context.Context) (Job, bool, error) {
 		j  Job
 		ok bool
 	)
+	// Stamp once outside the retry closure (consistent with the other writes), so
+	// a write that retries past a transient BUSY records the pre-retry claim time.
+	now := time.Now().UnixNano()
 	err := retryBusy(ctx, func() error {
-		now := time.Now().UnixNano()
 		row := s.db.QueryRowContext(ctx, `
 UPDATE jobs SET state='running', started=?
 WHERE id = (SELECT id FROM jobs WHERE state='queued' ORDER BY created, id LIMIT 1)
