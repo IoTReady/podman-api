@@ -66,6 +66,18 @@ func (m *Memory) DeleteSpec(_ context.Context, host, template, slug string) erro
 	return nil
 }
 
+func (m *Memory) ListSpecKeys(_ context.Context, host string) ([]SpecKey, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := []SpecKey{}
+	for _, s := range m.specs {
+		if s.Host == host {
+			out = append(out, SpecKey{Template: s.Template, Slug: s.Slug})
+		}
+	}
+	return out, nil
+}
+
 func (m *Memory) Enqueue(_ context.Context, kind string, args json.RawMessage, parentID string) (Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

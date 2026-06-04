@@ -170,6 +170,24 @@ func (s *SQLite) DeleteSpec(ctx context.Context, host, template, slug string) er
 	return nil
 }
 
+func (s *SQLite) ListSpecKeys(ctx context.Context, host string) ([]SpecKey, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT template, slug FROM specs WHERE host=? ORDER BY template, slug`, host)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SpecKey{}
+	for rows.Next() {
+		var k SpecKey
+		if err := rows.Scan(&k.Template, &k.Slug); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
 // ---------------------------------------------------------------------------
 // JobStore implementation
 // ---------------------------------------------------------------------------

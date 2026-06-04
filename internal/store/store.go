@@ -27,6 +27,13 @@ type Spec struct {
 	Updated    time.Time
 }
 
+// SpecKey identifies one stored instance without exposing its secrets. Used by
+// host-wide planning (evacuate) that only needs to know what is on a host.
+type SpecKey struct {
+	Template string
+	Slug     string
+}
+
 // Store persists instance specs. Implementations encrypt Secrets at rest and
 // stamp Created (first write) and Updated (every write); the in-memory test
 // double does neither.
@@ -35,4 +42,7 @@ type Store interface {
 	PutSpec(ctx context.Context, s Spec) error
 	GetSpec(ctx context.Context, host, template, slug string) (Spec, error)
 	DeleteSpec(ctx context.Context, host, template, slug string) error
+	// ListSpecKeys returns the (template, slug) of every spec on host, without
+	// decrypting secrets. Empty slice (no error) when the host has none.
+	ListSpecKeys(ctx context.Context, host string) ([]SpecKey, error)
 }
