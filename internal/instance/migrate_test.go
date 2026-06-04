@@ -88,6 +88,49 @@ func TestCheckMigratable_Errors(t *testing.T) {
 	require.NoError(t, svc.CheckMigratable(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"}))
 }
 
+func TestPodReady(t *testing.T) {
+	tests := []struct {
+		name string
+		pod  podman.Pod
+		want bool
+	}{
+		{"pod not running", podman.Pod{Status: "Exited", Containers: []podman.Container{{Status: "Running"}}}, false},
+		{"container not running", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Exited"}}}, false},
+		{"no healthcheck, all running", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running"}}}, true},
+		{"healthcheck healthy", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "healthy"}}}, true},
+		{"healthcheck unhealthy", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "unhealthy"}}}, false},
+		{"healthcheck still starting", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "starting"}}}, false},
+		{"mixed declared and undeclared", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "healthy"}, {Status: "Running"}}}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := podReady(tt.pod); got != tt.want {
+				t.Fatalf("podReady = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWaitRunning_HealthGate(t *testing.T) {
+	defer setVerifyKnobs(50*time.Millisecond, 5*time.Millisecond)()
+	svc, f, _ := newMigrateSvc(t)
+	ctx := context.Background()
+
+	t.Run("ready when declared healthcheck is healthy", func(t *testing.T) {
+		f.AddPod("h2", podman.Pod{Name: "web-ok", Status: "Running",
+			Containers: []podman.Container{{Status: "Running", Health: "healthy"}}})
+		require.NoError(t, svc.waitRunning(ctx, "h2", "web", "ok"))
+	})
+
+	t.Run("times out while a healthcheck stays unhealthy", func(t *testing.T) {
+		f.AddPod("h2", podman.Pod{Name: "web-bad", Status: "Running",
+			Containers: []podman.Container{{Status: "Running", Health: "unhealthy"}}})
+		err := svc.waitRunning(ctx, "h2", "web", "bad")
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "not running")
+	})
+}
+
 func TestMigrate_PreflightFailFast_SourceUntouched(t *testing.T) {
 	ctx := context.Background()
 
