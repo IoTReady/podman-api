@@ -23,12 +23,14 @@ type fileInfo struct {
 type Manifest map[string]fileInfo
 
 // buildManifest parses an uncompressed tar stream (as produced by VolumeExport)
-// into a Manifest. It always drains r to EOF — even after a parse error — so a
-// writer feeding r through a pipe can never block on a short read.
+// into a Manifest. It always drains r to EOF — even after a parse error — so the
+// caller's deferred Close releases the connection cleanly rather than on a
+// half-read body. (This also keeps the function safe to feed from an in-process
+// pipe, should a future caller tee the copy stream into it.)
 func buildManifest(r io.Reader) (Manifest, error) {
 	m := Manifest{}
 	err := parseTar(r, m)
-	io.Copy(io.Discard, r) //nolint:errcheck // best-effort drain so a tee'd writer never blocks
+	io.Copy(io.Discard, r) //nolint:errcheck // best-effort drain (see doc comment)
 	return m, err
 }
 
