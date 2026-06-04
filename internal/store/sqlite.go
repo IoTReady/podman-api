@@ -41,11 +41,12 @@ CREATE TABLE IF NOT EXISTS jobs (
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);`
 
 // maxOpenConns bounds the SQLite connection pool. WAL allows many concurrent
-// readers + one writer; setting the pool above jobs.DefaultWorkers (4) leaves
-// read headroom so GET /jobs is not starved when every worker is writing. A
-// competing writer waits up to busy_timeout rather than failing with
-// "database is locked".
-const maxOpenConns = 8
+// readers + one writer; setting the pool above the job worker count
+// (jobs.DefaultWorkers, 8) leaves read headroom so GET /jobs is not starved when
+// a worker holds the write connection. A competing writer waits up to
+// busy_timeout rather than failing with "database is locked". Operators raising
+// -job-workers well above the default may want a correspondingly larger pool.
+const maxOpenConns = 12
 
 // retryBusyTimeout bounds how long a write retries past a transient
 // SQLITE_BUSY/LOCKED before giving up. busy_timeout(5000) handles most

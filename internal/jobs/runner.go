@@ -12,7 +12,11 @@ import (
 )
 
 // DefaultWorkers is the worker-pool size when NewRunner is given workers <= 0.
-const DefaultWorkers = 4
+// Raised from 4 to 8 to give plain jobs headroom: a parent evacuate occupies one
+// worker for its whole fan-out, so a few concurrent evacuates could otherwise
+// starve migrate/other jobs. This raises the starvation threshold; a structural
+// fix (separate orchestration pool) remains a future option (#54).
+const DefaultWorkers = 8
 
 // pollInterval is the safety-net wake even without a Notify (e.g. after a
 // restart that left queued jobs).
