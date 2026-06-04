@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 const schemaSQL = `
@@ -44,6 +44,56 @@ CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);`
 // competing writer waits up to busy_timeout rather than failing with
 // "database is locked".
 const maxOpenConns = 8
+
+// retryBusyTimeout bounds how long a write retries past a transient
+// SQLITE_BUSY/LOCKED before giving up. busy_timeout(5000) handles most
+// contention, but modernc can still return BUSY without invoking the busy
+// handler under write-write races; this is a thin application-level backstop.
+const retryBusyTimeout = 2 * time.Second
+
+// isBusy reports whether err is a transient SQLite BUSY/LOCKED worth retrying.
+func isBusy(err error) bool {
+	var se *sqlite.Error
+	if !errors.As(err, &se) {
+		return false
+	}
+	switch se.Code() & 0xff { // strip extended result-code bits
+	case 5, 6: // SQLITE_BUSY, SQLITE_LOCKED
+		return true
+	default:
+		return false
+	}
+}
+
+// retry runs fn, retrying with short capped backoff while retryable(err) is true,
+// until retryBusyTimeout elapses or ctx is done. Success and non-retryable errors
+// return immediately.
+func retry(ctx context.Context, retryable func(error) bool, fn func() error) error {
+	deadline := time.Now().Add(retryBusyTimeout)
+	backoff := time.Millisecond
+	for {
+		err := fn()
+		if err == nil || !retryable(err) {
+			return err
+		}
+		if ctx.Err() != nil || time.Now().After(deadline) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(backoff):
+		}
+		if backoff < 50*time.Millisecond {
+			backoff *= 2
+		}
+	}
+}
+
+// retryBusy retries fn on a transient SQLite BUSY/LOCKED. See retry / isBusy.
+func retryBusy(ctx context.Context, fn func() error) error {
+	return retry(ctx, isBusy, fn)
+}
 
 // SQLite is the durable Store backed by a single SQLite file. Secrets are
 // sealed with the key held in keys, read fresh on every Put/Get so a SIGHUP
@@ -111,15 +161,17 @@ func (s *SQLite) PutSpec(ctx context.Context, sp Spec) error {
 		return err
 	}
 	now := time.Now().Unix()
-	_, err = s.db.ExecContext(ctx, `
+	return retryBusy(ctx, func() error {
+		_, err := s.db.ExecContext(ctx, `
 INSERT INTO specs (host, template, slug, parameters, secrets, created, updated)
 VALUES (?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(host, template, slug) DO UPDATE SET
   parameters = excluded.parameters,
   secrets    = excluded.secrets,
   updated    = excluded.updated`,
-		sp.Host, sp.Template, sp.Slug, string(params), blob, now, now)
-	return err
+			sp.Host, sp.Template, sp.Slug, string(params), blob, now, now)
+		return err
+	})
 }
 
 func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec, error) {
@@ -242,10 +294,13 @@ func (s *SQLite) Enqueue(ctx context.Context, kind string, args json.RawMessage,
 	if parentID != "" {
 		parent = parentID
 	}
-	_, err := s.db.ExecContext(ctx, `
+	err := retryBusy(ctx, func() error {
+		_, e := s.db.ExecContext(ctx, `
 INSERT INTO jobs (id, kind, args, state, steps, parent_id, error, created, started, finished)
 VALUES (?, ?, ?, 'queued', '[]', ?, NULL, ?, NULL, NULL)`,
-		id, kind, string(args), parent, now)
+			id, kind, string(args), parent, now)
+		return e
+	})
 	if err != nil {
 		return Job{}, err
 	}
@@ -262,10 +317,13 @@ func (s *SQLite) StartChild(ctx context.Context, kind string, args json.RawMessa
 	if parentID != "" {
 		parent = parentID
 	}
-	_, err := s.db.ExecContext(ctx, `
+	err := retryBusy(ctx, func() error {
+		_, e := s.db.ExecContext(ctx, `
 INSERT INTO jobs (id, kind, args, state, steps, parent_id, error, created, started, finished)
 VALUES (?, ?, ?, 'running', '[]', ?, NULL, ?, ?, NULL)`,
-		id, kind, string(args), parent, now, now)
+			id, kind, string(args), parent, now, now)
+		return e
+	})
 	if err != nil {
 		return Job{}, err
 	}
@@ -324,20 +382,32 @@ func (s *SQLite) ListJobs(ctx context.Context, f JobFilter) ([]Job, error) {
 }
 
 func (s *SQLite) ClaimNext(ctx context.Context) (Job, bool, error) {
-	now := time.Now().UnixNano()
-	row := s.db.QueryRowContext(ctx, `
+	var (
+		j  Job
+		ok bool
+	)
+	err := retryBusy(ctx, func() error {
+		now := time.Now().UnixNano()
+		row := s.db.QueryRowContext(ctx, `
 UPDATE jobs SET state='running', started=?
 WHERE id = (SELECT id FROM jobs WHERE state='queued' ORDER BY created, id LIMIT 1)
   AND state='queued'
 RETURNING `+jobColumns, now)
-	j, err := scanJob(row)
-	if errors.Is(err, ErrNotFound) {
-		return Job{}, false, nil
-	}
+		jj, e := scanJob(row)
+		if errors.Is(e, ErrNotFound) {
+			j, ok = Job{}, false
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		j, ok = jj, true
+		return nil
+	})
 	if err != nil {
 		return Job{}, false, err
 	}
-	return j, true, nil
+	return j, ok, nil
 }
 
 func (s *SQLite) AppendStep(ctx context.Context, id string, step JobStep) error {
@@ -359,8 +429,10 @@ func (s *SQLite) AppendStep(ctx context.Context, id string, step JobStep) error 
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `UPDATE jobs SET steps=? WHERE id=?`, string(b), id)
-	return err
+	return retryBusy(ctx, func() error {
+		_, err := s.db.ExecContext(ctx, `UPDATE jobs SET steps=? WHERE id=?`, string(b), id)
+		return err
+	})
 }
 
 func (s *SQLite) Finish(ctx context.Context, id string, state JobState, errMsg string) error {
@@ -372,29 +444,35 @@ func (s *SQLite) Finish(ctx context.Context, id string, state JobState, errMsg s
 	if errMsg != "" {
 		e = errMsg
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET state=?, error=?, finished=? WHERE id=?`,
-		string(state), e, now, id)
-	if err != nil {
-		return err
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if n == 0 {
-		return ErrNotFound
-	}
-	return nil
+	return retryBusy(ctx, func() error {
+		res, err := s.db.ExecContext(ctx, `UPDATE jobs SET state=?, error=?, finished=? WHERE id=?`,
+			string(state), e, now, id)
+		if err != nil {
+			return err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return ErrNotFound
+		}
+		return nil
+	})
 }
 
 func (s *SQLite) FailRunning(ctx context.Context, reason string) (int, error) {
 	now := time.Now().UnixNano()
-	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET state='failed', error=?, finished=? WHERE state='running'`,
-		reason, now)
-	if err != nil {
-		return 0, err
-	}
-	n, err := res.RowsAffected()
+	var n int64
+	err := retryBusy(ctx, func() error {
+		res, e := s.db.ExecContext(ctx, `UPDATE jobs SET state='failed', error=?, finished=? WHERE state='running'`,
+			reason, now)
+		if e != nil {
+			return e
+		}
+		n, e = res.RowsAffected()
+		return e
+	})
 	if err != nil {
 		return 0, err
 	}
@@ -403,41 +481,49 @@ func (s *SQLite) FailRunning(ctx context.Context, reason string) (int, error) {
 
 func (s *SQLite) PruneJobs(ctx context.Context, olderThan time.Time) (int, error) {
 	cutoff := olderThan.UnixNano()
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, err
-	}
-	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+	var total int64
+	err := retryBusy(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
 
-	// 1) Old terminal children first, so their parents can then be considered.
-	rc, err := tx.ExecContext(ctx, `
+		// 1) Old terminal children first, so their parents can then be considered.
+		rc, err := tx.ExecContext(ctx, `
 DELETE FROM jobs
 WHERE parent_id IS NOT NULL AND state IN ('succeeded','failed')
   AND finished IS NOT NULL AND finished < ?`, cutoff)
-	if err != nil {
-		return 0, err
-	}
-	nChild, err := rc.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
+		if err != nil {
+			return err
+		}
+		nChild, err := rc.RowsAffected()
+		if err != nil {
+			return err
+		}
 
-	// 2) Old terminal jobs not referenced as a parent by any surviving row.
-	rp, err := tx.ExecContext(ctx, `
+		// 2) Old terminal jobs not referenced as a parent by any surviving row.
+		rp, err := tx.ExecContext(ctx, `
 DELETE FROM jobs
 WHERE state IN ('succeeded','failed') AND finished IS NOT NULL AND finished < ?
   AND id NOT IN (SELECT parent_id FROM jobs WHERE parent_id IS NOT NULL)`, cutoff)
+		if err != nil {
+			return err
+		}
+		nParent, err := rp.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		total = nChild + nParent
+		return nil
+	})
 	if err != nil {
 		return 0, err
 	}
-	nParent, err := rp.RowsAffected()
-	if err != nil {
-		return 0, err
-	}
-	if err := tx.Commit(); err != nil {
-		return 0, err
-	}
-	return int(nChild + nParent), nil
+	return int(total), nil
 }
 
 var _ DB = (*SQLite)(nil)
