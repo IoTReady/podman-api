@@ -185,3 +185,27 @@ func TestEvacuateConcurrencyRequestOverride(t *testing.T) {
 		t.Fatalf("request concurrency=1 over handler=4, but observed %d in flight", got)
 	}
 }
+
+func TestEvacuate_CancelMarksChildrenCanceled(t *testing.T) {
+	ctx := context.Background()
+	svc, mem := buildSvc(t, "acme")
+	parent, _ := mem.Enqueue(ctx, "evacuate", mustArgs(t, "hostA",
+		map[string]string{"acme": "hostB"}), "")
+
+	h := &Handler{Svc: svc, Jobs: mem}
+	h.migrate = func(_ context.Context, req instance.MigrateRequest, step func(string, string)) error {
+		return context.Canceled // parent canceled -> child rolled back on shared ctx
+	}
+
+	// Run returns an error (the move "failed" from the aggregate's view); we only
+	// assert the child's recorded state here.
+	_ = h.Run(ctx, parent, jobs.NewJobContext(mem, parent.ID))
+
+	children, _ := mem.ListJobs(ctx, store.JobFilter{ParentID: parent.ID})
+	if len(children) != 1 {
+		t.Fatalf("want 1 child, got %d", len(children))
+	}
+	if children[0].State != store.JobCanceled {
+		t.Fatalf("child state = %q, want canceled", children[0].State)
+	}
+}

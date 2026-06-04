@@ -4,6 +4,7 @@ package evacuate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
@@ -136,6 +137,11 @@ func (h *Handler) runChild(ctx context.Context, parentID string, m instance.Migr
 	state, errMsg := store.JobSucceeded, ""
 	if migErr != nil {
 		state, errMsg = store.JobFailed, migErr.Error()
+		if errors.Is(migErr, context.Canceled) {
+			// Parent was canceled: the child rolled back (source intact) on the
+			// shared context. Record it as canceled, not failed.
+			state = store.JobCanceled
+		}
 	}
 	if ferr := h.Jobs.Finish(ctx, child.ID, state, errMsg); ferr != nil {
 		if migErr == nil {
