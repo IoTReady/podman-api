@@ -8,7 +8,8 @@
   <link rel="stylesheet" href="/ui/static/app.css">
   <script src="/ui/static/htmx.min.js" defer></script>
 </head>
-<body hx-headers='{"{{.CSRFHeader}}": "{{.CSRF}}"}'>
+<!-- The header name is the well-known csrfHeader constant (internal/ui/session.go); hardcoded here so a missing data field can't silently produce an empty header and break every htmx mutation. -->
+<body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
   {{template "body" .}}
 </body>
 </html>{{end}}

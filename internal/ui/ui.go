@@ -9,8 +9,12 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 )
 
-// Config wires the UI's dependencies. Auth and Sessions are filled with the
-// single-operator defaults by New when left nil.
+// Config wires the UI's dependencies. New defaults SessionTTL (12h) and
+// Sessions (an in-process MemorySessionStore) when they are left zero/nil. Auth
+// is NOT defaulted — the caller must supply it before serving authenticated
+// routes (the binary wires the single-operator Authenticator). New still
+// succeeds with a nil Auth so the UI can be constructed for template-only tests
+// that never exercise login.
 type Config struct {
 	Svc        *instance.Service
 	Jobs       store.JobStore
