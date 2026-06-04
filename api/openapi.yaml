@@ -743,6 +743,13 @@ paths:
     post:
       tags: [migrate]
       summary: enqueue a job to migrate an instance between hosts (requires -state-db)
+      description: >-
+        Validates the request synchronously (known hosts/template, distinct
+        source/destination, an existing stored spec) and enqueues a migrate job,
+        returning its id. Destination-side checks (host-port conflicts, missing
+        per-host secrets, draining destination, an instance already present) run
+        inside the job and surface as job failure via GET /jobs/{id}, not as the
+        POST status.
       requestBody:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/MigrateRequest'}}}
@@ -754,7 +761,6 @@ paths:
               schema: {$ref: '#/components/schemas/JobAccepted'}
         '400': {$ref: '#/components/responses/BadRequest'}
         '404': {$ref: '#/components/responses/NotFound'}
-        '409': {$ref: '#/components/responses/Conflict'}
         '501':
           description: state store not enabled (-state-db not set)
           content:
