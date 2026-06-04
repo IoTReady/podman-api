@@ -9,6 +9,7 @@ import (
 
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/podman/fake"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 func TestResolveEvacuation(t *testing.T) {
@@ -93,6 +94,24 @@ func TestResolveEvacuation(t *testing.T) {
 		})
 		require.NoError(t, err)
 		assert.Empty(t, moves)
+	})
+
+	t.Run("slug ambiguous across templates", func(t *testing.T) {
+		svc, _, mem := newMigrateSvc(t)
+		require.NoError(t, mem.PutSpec(ctx, store.Spec{
+			Host: "h1", Template: "postgres", Slug: "dup",
+			Parameters: map[string]any{}, Secrets: map[string]string{},
+		}))
+		require.NoError(t, mem.PutSpec(ctx, store.Spec{
+			Host: "h1", Template: "redis", Slug: "dup",
+			Parameters: map[string]any{}, Secrets: map[string]string{},
+		}))
+
+		_, err := svc.ResolveEvacuation(ctx, EvacuateRequest{
+			FromHost: "h1",
+			Map:      map[string]string{"dup": "h2"},
+		})
+		assert.ErrorIs(t, err, ErrInvalidEvacuation)
 	})
 
 	t.Run("store disabled", func(t *testing.T) {
