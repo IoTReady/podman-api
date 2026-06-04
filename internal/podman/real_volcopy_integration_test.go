@@ -9,8 +9,6 @@ import (
 	"io"
 	"testing"
 
-	"github.com/containers/podman/v5/pkg/bindings/volumes"
-	"github.com/containers/podman/v5/pkg/domain/entities/types"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -58,22 +56,21 @@ func TestReal_VolumeCopy_LocalOnly(t *testing.T) {
 	ctx := context.Background()
 
 	const src, dst = "podman-api-itest-vol-src", "podman-api-itest-vol-dst"
-	conn, err := c.ctxFor(ctx, "local")
-	require.NoError(t, err)
 
 	// Register teardown before creating anything so both volumes are removed even
 	// if a create fails partway. Pre-remove clears leftovers from a prior crashed
-	// run so reruns self-heal. We create via the bindings directly because the
-	// Real client exposes no VolumeCreate (only inspect/remove/export/import).
+	// run so reruns self-heal.
 	t.Cleanup(func() {
 		_ = c.VolumeRemove(context.Background(), "local", src, true)
 		_ = c.VolumeRemove(context.Background(), "local", dst, true)
 	})
 	for _, name := range []string{src, dst} {
 		_ = c.VolumeRemove(ctx, "local", name, true) // clear any leftover from a prior crashed run
-		_, err := volumes.Create(conn, types.VolumeCreateOptions{Name: name}, nil)
-		require.NoError(t, err)
+		require.NoError(t, c.VolumeCreate(ctx, "local", name))
 	}
+
+	// VolumeCreate is idempotent — creating an existing volume is not an error.
+	require.NoError(t, c.VolumeCreate(ctx, "local", src))
 
 	// Seed the source volume with a known file via VolumeImport.
 	want := []byte("cold-copy-payload")
