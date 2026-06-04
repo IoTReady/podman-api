@@ -33,7 +33,7 @@ func TestListHosts(t *testing.T) {
 		{ID: "h1", Addr: "unix", Socket: "/x", Labels: map[string]string{"env": "dev"}},
 	}
 	svc := instance.NewService(fake.New(), hosts, nil)
-	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
 	defer srv.Close()
 
 	resp := authedReq(t, srv, tok, "GET", "/hosts")
@@ -53,7 +53,7 @@ func TestHostHealthz(t *testing.T) {
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"hosts:read"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	svc := instance.NewService(fake.New(), hosts, nil)
-	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
 	defer srv.Close()
 
 	resp := authedReq(t, srv, tok, "GET", "/hosts/h1/healthz")

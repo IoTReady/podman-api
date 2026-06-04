@@ -32,7 +32,7 @@ func newEvacSrv(t *testing.T) (*httptest.Server, string, *store.Memory) {
 	mem := store.NewMemory()
 	svc := instance.NewService(fake.New(), hosts, []config.Template{migrateTmpl()})
 	svc.SetStore(mem)
-	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
 	t.Cleanup(srv.Close)
 	return srv, tok, mem
 }
@@ -123,7 +123,7 @@ func TestEvacuate_API_StoreDisabled_501(t *testing.T) {
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*", "jobs:*"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}, {ID: "h2", Addr: "unix", Socket: "/y"}}
 	svc := instance.NewService(fake.New(), hosts, []config.Template{migrateTmpl()})
-	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
 	t.Cleanup(srv.Close)
 
 	resp := postEvacuate(t, srv, tok, instance.EvacuateRequest{FromHost: "h1", Map: map[string]string{}})

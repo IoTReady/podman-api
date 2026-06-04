@@ -43,7 +43,7 @@ func newMigrateSrv(t *testing.T) (*httptest.Server, string, *fake.Fake, *store.M
 	mem := store.NewMemory()
 	svc := instance.NewService(f, hosts, []config.Template{migrateTmpl()})
 	svc.SetStore(mem)
-	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
 	t.Cleanup(srv.Close)
 	return srv, tok, f, mem
 }
@@ -103,7 +103,7 @@ func TestMigrate_API_StoreDisabled_501(t *testing.T) {
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}, {ID: "h2", Addr: "unix", Socket: "/y"}}
 	svc := instance.NewService(fake.New(), hosts, []config.Template{migrateTmpl()})
-	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
 	t.Cleanup(srv.Close)
 
 	resp := postMigrate(t, srv, tok, instance.MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"})

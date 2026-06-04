@@ -12,9 +12,10 @@ import (
 // NewRouter builds the full HTTP handler tree.
 // audit is an optional middleware applied around auth-guarded handlers; pass nil for no-op.
 // metricsHandler is an optional handler mounted at GET /metrics; pass nil to omit the endpoint.
-func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, audit func(http.Handler) http.Handler, metricsHandler http.Handler) http.Handler {
+// canceller is an optional JobCanceller for the POST /jobs/{id}/cancel route; pass nil when the job runner is not wired.
+func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, audit func(http.Handler) http.Handler, metricsHandler http.Handler, canceller JobCanceller) http.Handler {
 	mux := http.NewServeMux()
-	h := &handlers{svc: svc, jobs: jobs}
+	h := &handlers{svc: svc, jobs: jobs, canceller: canceller}
 
 	if audit == nil {
 		audit = func(h http.Handler) http.Handler { return h }
@@ -81,6 +82,7 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 	// Jobs (read). 501 when the store is disabled.
 	mux.Handle("GET /jobs", guard("jobs:read", http.HandlerFunc(h.listJobs)))
 	mux.Handle("GET /jobs/{id}", guard("jobs:read", http.HandlerFunc(h.getJob)))
+	mux.Handle("POST /jobs/{id}/cancel", guard("instances:write", http.HandlerFunc(h.cancelJob)))
 
 	// Migrate enqueues a job; 501 when the store is disabled.
 	mux.Handle("POST /migrate", guard("instances:write", http.HandlerFunc(h.migrate)))
@@ -94,6 +96,7 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 // handlers holds per-request dependencies. Each method is a thin adapter
 // around svc.
 type handlers struct {
-	svc  *instance.Service
-	jobs store.JobStore
+	svc       *instance.Service
+	jobs      store.JobStore
+	canceller JobCanceller
 }

@@ -141,7 +141,7 @@ func main() {
 
 	// /metrics is never mounted on the main listener — operators must opt in
 	// with -metrics-addr to bind it on a separate (typically internal) socket.
-	router := api.NewRouter(svc, jobStore, keyStore, combined, nil)
+	router := api.NewRouter(svc, jobStore, keyStore, combined, nil, nil)
 
 	srv := &http.Server{
 		Addr:              *addr,
