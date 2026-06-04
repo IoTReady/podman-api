@@ -72,7 +72,10 @@ func TestResolveEvacuation(t *testing.T) {
 			FromHost: "h1",
 			Map:      map[string]string{"db1": "nope"},
 		})
-		assert.ErrorIs(t, err, ErrUnknownHost)
+		// An unknown destination named in the map is bad map content, not a
+		// missing top-level resource: it surfaces as ErrInvalidEvacuation (400),
+		// consistent with the other map-content errors above.
+		assert.ErrorIs(t, err, ErrInvalidEvacuation)
 	})
 
 	t.Run("unknown from_host", func(t *testing.T) {

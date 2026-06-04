@@ -100,6 +100,22 @@ func TestEvacuate_API_ValidationFailsNoJob(t *testing.T) {
 	assert.Empty(t, all, "no job should be enqueued when validation fails")
 }
 
+func TestEvacuate_API_UnknownDestHost_400(t *testing.T) {
+	srv, tok, mem := newEvacSrv(t)
+	ctx := context.Background()
+	seedEvac(t, mem, "db1")
+	// db1 mapped to a host that doesn't exist -> bad map content -> 400, no job.
+	// (A bad map must not yield 404; that status is reserved for an unknown
+	// from_host, the resource being operated on.)
+	resp := postEvacuate(t, srv, tok, instance.EvacuateRequest{
+		FromHost: "h1", Map: map[string]string{"db1": "ghost"},
+	})
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	all, err := mem.ListJobs(ctx, store.JobFilter{})
+	require.NoError(t, err)
+	assert.Empty(t, all, "no job should be enqueued when validation fails")
+}
+
 func TestEvacuate_API_StoreDisabled_501(t *testing.T) {
 	tok := "t"
 	hash, err := config.HashToken(tok)

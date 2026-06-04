@@ -9,8 +9,9 @@ import (
 
 // ErrInvalidEvacuation means the request cannot be planned against the stored
 // specs: an instance on the host has no destination in the map, a map entry
-// names no instance, or a slug is ambiguous across templates. The API maps it to
-// 400 invalid_request.
+// names no instance, a slug is ambiguous across templates, or a map entry names
+// an unknown destination host. The API maps it to 400 invalid_request, giving
+// every bad-map case one consistent status.
 var ErrInvalidEvacuation = errors.New("invalid evacuation request")
 
 // EvacuateRequest is the POST /evacuate body and the evacuate job's args. Map is
@@ -73,7 +74,12 @@ func (s *Service) ResolveEvacuation(ctx context.Context, req EvacuateRequest) ([
 			return nil, ErrSameHost
 		}
 		if _, ok := s.host(dest); !ok {
-			return nil, ErrUnknownHost
+			// An unknown destination is bad map content, not a missing top-level
+			// resource: surface it as ErrInvalidEvacuation (400) so every bad-map
+			// case has one consistent status. ErrUnknownHost (404) stays reserved
+			// for an unknown from_host.
+			return nil, fmt.Errorf("%w: no such destination host %q for slug %q",
+				ErrInvalidEvacuation, dest, slug)
 		}
 		moves = append(moves, MigrateRequest{
 			FromHost: req.FromHost, ToHost: dest, Template: tmpl, Slug: slug,
