@@ -15,7 +15,7 @@ const (
 	ScopeDangling   = "dangling"    // dangling image layers
 	ScopeAllImages  = "all-images"  // also unused tagged images
 	ScopeContainers = "containers"  // exited containers
-	ScopeBuildCache = "build-cache" // dangling build cache
+	ScopeBuildCache = "build-cache" // dangling build cache (libpod prunes it via the images-prune endpoint, which also reaps dangling image layers)
 	ScopeVolumes    = "volumes"     // unused (unattached) volumes, protect-filtered
 )
 

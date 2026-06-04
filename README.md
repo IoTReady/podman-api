@@ -251,7 +251,7 @@ Global flag defaults (each host may override via a `prune:` block — see below)
 - **`-prune-interval <dur>`** — routine sweep interval per host (default `24h`). `0` disables the interval trigger (threshold only).
 - **`-prune-disk-threshold <pct>`** — disk used-% that triggers an early prune before the interval is due (default `85`). `0` disables the threshold trigger.
 - **`-prune-scope <list>`** — comma-separated scopes (default `dangling`). Available: `dangling` (dangling image layers), `all-images` (also unused tagged images — costs a re-pull on next deploy), `containers` (exited containers), `build-cache`, `volumes` (unused/unattached volumes). Only `dangling` runs unless you opt into more.
-- **`-prune-dry-run`** — report what each run *would* reclaim (from `system df`) without removing anything (default `false`). Use it to watch a policy before enabling removal.
+- **`-prune-dry-run`** — perform a dry run that removes nothing (default `false`). When the `volumes` scope is enabled it reports the volume-reclaimable bytes from `system df`; image/build-cache sizes aren't available in a dry run. Use it to confirm a policy is sane before enabling removal.
 
 Per-host override in `hosts/*.yaml`:
 

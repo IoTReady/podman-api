@@ -60,7 +60,16 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 			h.metric().RunDone(p.Host, "error")
 			return fmt.Errorf("dry-run host info: %w", err)
 		}
-		jc.Step("dry-run", fmt.Sprintf("scopes=%s reclaimable=%d bytes (nothing removed)", strings.Join(p.Policy.Scope, ","), info.Disk.Reclaimable))
+		// `system df` only reports a reclaimable figure for volumes; images and
+		// build cache have no dry-run size in the libpod bindings. So only quote a
+		// number when the volumes scope is enabled, and label it as such rather
+		// than implying it covers the whole run.
+		detail := fmt.Sprintf("scopes=%s (nothing removed)", strings.Join(p.Policy.Scope, ","))
+		if p.Policy.HasScope(ScopeVolumes) {
+			detail = fmt.Sprintf("scopes=%s volume-reclaimable=%d bytes (nothing removed; image/build-cache sizes unavailable in dry-run)",
+				strings.Join(p.Policy.Scope, ","), info.Disk.Reclaimable)
+		}
+		jc.Step("dry-run", detail)
 		h.metric().RunDone(p.Host, "dry-run")
 		return nil
 	}

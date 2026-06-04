@@ -89,6 +89,30 @@ func TestHandlerDryRunRemovesNothing(t *testing.T) {
 	}
 }
 
+func TestHandlerDryRunImagesOnlyOmitsVolumeReclaimable(t *testing.T) {
+	f := fake.New()
+	// Disk.Reclaimable is volumes-only; an images-only dry-run must NOT quote it.
+	f.HostInfoVal = podman.HostInfo{Disk: podman.DiskUsage{Reclaimable: 4096}}
+	h := &Handler{Client: f}
+	job, err := runHandler(t, h, Payload{Host: "h1", Policy: Policy{Scope: []string{ScopeDangling}, DryRun: true}})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(f.PruneCalls) != 0 {
+		t.Fatalf("dry-run must not call prune, got %+v", f.PruneCalls)
+	}
+	joined := ""
+	for _, s := range job.Steps {
+		joined += s.Step + ":" + s.Detail + "\n"
+	}
+	if !strings.Contains(joined, "dry-run") {
+		t.Fatalf("missing dry-run step: %q", joined)
+	}
+	if strings.Contains(joined, "4096") {
+		t.Fatalf("images-only dry-run must not quote volume-reclaimable: %q", joined)
+	}
+}
+
 func TestHandlerScopeErrorFailsJobButContinues(t *testing.T) {
 	f := fake.New()
 	// PruneErr key "images" is the fake's internal scope key for ImagePrune,
