@@ -217,6 +217,14 @@ CI runner is single-host).
 - **Evacuate** (#35) — builds on migrate; `parent_id` child jobs land there.
 - **Auto-resume** of a crashed migrate (reaped to `failed`; operator re-issues).
 - **Live two-host migrate integration test** (single-host CI).
+- **Application-readiness verification.** Verify is a *liveness* gate — it waits
+  until the destination pod and all its containers report `Running`, then commits
+  by destroying the source (pod + volumes + per-instance secrets). It does not
+  probe in-container application health, so a process that is up but not yet
+  serving is treated as healthy. It also assumes templates have no init/one-shot
+  containers (which would legitimately report non-Running); the current templates
+  are single app-container. A per-template readiness probe before the
+  irreversible source delete is a follow-up.
 
 ## Files touched
 

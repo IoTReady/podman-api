@@ -233,6 +233,16 @@ func TestMigrate_Rollback(t *testing.T) {
 		assertRolledBack(t, f, mem)
 	})
 
+	t.Run("verify fails when a container is not running", func(t *testing.T) {
+		svc, f, mem := seed(t)
+		f.PlayKubeContainerStatus = "Exited" // pod will be Running but container not
+		restore := setVerifyKnobs(50*time.Millisecond, 5*time.Millisecond)
+		defer restore()
+		err := svc.Migrate(ctx, req, nil)
+		require.Error(t, err)
+		assertRolledBack(t, f, mem)
+	})
+
 	t.Run("context cancelled during verify still rolls back", func(t *testing.T) {
 		svc, f, mem := seed(t)
 		f.PlayKubePodStatus = "Exited" // never Running, so verify waits and hits ctx.Done

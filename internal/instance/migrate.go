@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
 	"time"
@@ -70,7 +71,8 @@ func (s *Service) requiredHostPorts(tmpl config.Template, params map[string]any)
 		return nil, fmt.Errorf("render: %w", err)
 	}
 	var ports []int
-	for _, doc := range strings.Split(rendered, "\n---\n") {
+	dec := yaml.NewDecoder(strings.NewReader(rendered))
+	for {
 		var d struct {
 			Kind string `yaml:"kind"`
 			Spec struct {
@@ -81,7 +83,14 @@ func (s *Service) requiredHostPorts(tmpl config.Template, params map[string]any)
 				} `yaml:"containers"`
 			} `yaml:"spec"`
 		}
-		if yaml.Unmarshal([]byte(doc), &d) != nil || d.Kind != "Pod" {
+		err := dec.Decode(&d)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			continue // skip a malformed document
+		}
+		if d.Kind != "Pod" {
 			continue
 		}
 		for _, c := range d.Spec.Containers {
@@ -169,6 +178,7 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 	step("load", req.FromHost+"/"+req.Template+"/"+req.Slug)
 
 	eff := mergeParams(spec.Parameters, req.Parameters)
+	eff["slug"] = req.Slug // canonical slug always wins; pod name must match podName()
 	if err := s.preflightDest(ctx, req, tmpl, eff); err != nil {
 		return err
 	}
@@ -245,7 +255,7 @@ func (s *Service) waitRunning(ctx context.Context, host, tmpl, slug string) erro
 	defer ticker.Stop()
 	for {
 		p, err := s.client.PodInspect(ctx, host, podName(tmpl, slug))
-		if err == nil && p.Status == "Running" {
+		if err == nil && p.Status == "Running" && allContainersRunning(p) {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -257,6 +267,19 @@ func (s *Service) waitRunning(ctx context.Context, host, tmpl, slug string) erro
 		case <-ticker.C:
 		}
 	}
+}
+
+// allContainersRunning reports whether every container in the pod is Running.
+// verify is a liveness gate, not an application-readiness gate (see the spec's
+// limitations); this catches the common "pod phase Running but a container is
+// crash-looping" case before migrate destroys the source data.
+func allContainersRunning(p podman.Pod) bool {
+	for _, c := range p.Containers {
+		if c.Status != "Running" {
+			return false
+		}
+	}
+	return true
 }
 
 // mergeParams returns a new map: base overlaid by override (override wins).

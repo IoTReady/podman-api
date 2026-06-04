@@ -30,6 +30,10 @@ type Fake struct {
 	// PlayKube. Empty means "Running". Lets a test force a played pod to stay
 	// un-healthy so a verify-poll times out.
 	PlayKubePodStatus string
+	// PlayKubeContainerStatus overrides the status of containers created by
+	// PlayKube. Empty means "Running". Lets a test make a pod report Running
+	// while a container is not, exercising the migrate container-level verify.
+	PlayKubeContainerStatus string
 	// ExportErr, if non-nil, makes VolumeExport fail immediately.
 	ExportErr error
 	// ImportErr, if non-nil, makes VolumeImport fail immediately (without
@@ -155,11 +159,15 @@ func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool) err
 		if _, exists := pods[head.Metadata.Name]; exists && !replace {
 			return fmt.Errorf("pod %q already exists", head.Metadata.Name)
 		}
+		cstatus := "Running"
+		if f.PlayKubeContainerStatus != "" {
+			cstatus = f.PlayKubeContainerStatus
+		}
 		var cs []podman.Container
 		for _, c := range head.Spec.Containers {
 			cs = append(cs, podman.Container{
 				Name: c.Name, Image: c.Image, ImageTag: c.Image,
-				Status: "Running", StartedAt: time.Now(),
+				Status: cstatus, StartedAt: time.Now(),
 			})
 		}
 		podStatus := "Running"

@@ -63,6 +63,10 @@ func classify(err error) (code string, status int, msg string) {
 		return "invalid_parameters", http.StatusBadRequest, err.Error()
 	case errors.Is(err, errJobsDisabled):
 		return "not_implemented", http.StatusNotImplemented, err.Error()
+	// Defensive: these surface for direct service callers / job-error
+	// classification; the synchronous POST /migrate path can't return them
+	// (port-conflict is checked inside the job; the jobs-nil guard precedes
+	// the store-disabled check).
 	case errors.Is(err, instance.ErrStoreDisabled):
 		return "not_implemented", http.StatusNotImplemented, err.Error()
 	case errors.Is(err, store.ErrNotFound):
