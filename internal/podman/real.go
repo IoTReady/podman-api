@@ -138,7 +138,7 @@ func (r *Real) Version(ctx context.Context, id string) (string, error) {
 	return info.Version.Version, nil
 }
 
-func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool) error {
+func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool, networks ...string) error {
 	c, err := r.ctxFor(ctx, id)
 	if err != nil {
 		return err
@@ -157,6 +157,9 @@ func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool) error
 	if replace {
 		t := true
 		opts.Replace = &t
+	}
+	if len(networks) > 0 {
+		opts.Network = &networks
 	}
 	_, err = play.Kube(c, tmp.Name(), opts)
 	return err

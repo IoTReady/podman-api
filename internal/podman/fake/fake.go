@@ -65,6 +65,8 @@ type Fake struct {
 	PullErr map[string]error
 	// PullCalls records every (host, image) pair passed to ImagePull.
 	PullCalls []struct{ Host, Image string }
+	// PlayCalls records every PlayKube invocation (host, replace, networks).
+	PlayCalls []PlayCall
 	// PodListErr, if non-nil, makes PodList return this error.
 	PodListErr error
 	// LogLines, if set, are emitted in order by ContainerLogs before the
@@ -87,6 +89,13 @@ type Fake struct {
 	HostInfoErr error
 	// HostInfoCalls counts HostInfo invocations (lets a test assert probe throttling).
 	HostInfoCalls int
+}
+
+// PlayCall records one PlayKube invocation for assertions.
+type PlayCall struct {
+	Host     string
+	Replace  bool
+	Networks []string
 }
 
 // AddVolume seeds a volume on a host so VolumeInspect resolves it. Test-only.
@@ -156,9 +165,10 @@ func (f *Fake) hostVolData(h string) map[string][]byte {
 	return f.volData[h]
 }
 
-func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool) error {
+func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool, networks ...string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.PlayCalls = append(f.PlayCalls, PlayCall{Host: hostID, Replace: replace, Networks: networks})
 	if f.PlayKubeErr != nil {
 		return f.PlayKubeErr
 	}

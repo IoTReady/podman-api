@@ -11,7 +11,7 @@ import (
 // tests use the in-memory fake under ./fake.
 type Client interface {
 	// Pods
-	PlayKube(ctx context.Context, hostID, yaml string, replace bool) error
+	PlayKube(ctx context.Context, hostID, yaml string, replace bool, networks ...string) error
 	PodInspect(ctx context.Context, hostID, name string) (Pod, error)
 	PodList(ctx context.Context, hostID string, labelFilters map[string]string) ([]Pod, error)
 	PodStart(ctx context.Context, hostID, name string) error
