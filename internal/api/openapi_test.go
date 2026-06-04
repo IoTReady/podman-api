@@ -49,6 +49,7 @@ func TestOpenAPI_ServedAndParseable(t *testing.T) {
 		"/hosts/{host}/bulk",
 		"/evacuate",
 		"/migrate",
+		"/jobs/{id}/cancel",
 		"/hosts/{host}/secrets/{name}",
 		"/hosts/{host}/volumes/{name}",
 		"/templates",
