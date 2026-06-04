@@ -38,10 +38,12 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);`
 
-// maxOpenConns bounds the SQLite connection pool. >1 enables WAL reader
-// concurrency (API reads while the job runner writes); a competing writer waits
-// up to busy_timeout rather than failing with "database is locked".
-const maxOpenConns = 4
+// maxOpenConns bounds the SQLite connection pool. WAL allows many concurrent
+// readers + one writer; setting the pool above jobs.DefaultWorkers (4) leaves
+// read headroom so GET /jobs is not starved when every worker is writing. A
+// competing writer waits up to busy_timeout rather than failing with
+// "database is locked".
+const maxOpenConns = 8
 
 // SQLite is the durable Store backed by a single SQLite file. Secrets are
 // sealed with the key held in keys, read fresh on every Put/Get so a SIGHUP
