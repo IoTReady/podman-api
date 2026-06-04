@@ -40,6 +40,9 @@ func main() {
 		specKeyFile   = flag.String("spec-key-file", "", "path to the 32-byte secret encryption key (required when -state-db is set)")
 		jobsRetention = flag.Duration("jobs-retention", 0, "if >0, prune terminal jobs older than this (e.g. 168h); 0 disables")
 		evacConc      = flag.Int("evacuate-concurrency", 2, "max child migrations an evacuate runs at once (1..32); a request's \"concurrency\" overrides per call")
+
+		migrateVerifyTimeout = flag.Duration("migrate-verify-timeout", 60*time.Second, "max wait for a migrated instance to become ready (running + declared healthchecks healthy) before reaping the source")
+		migrateVerifyVolumes = flag.Bool("migrate-verify-volumes", true, "verify each copied volume's content against the source before reaping the source (adds a re-export of source and dest per volume); false disables it")
 	)
 	flag.Parse()
 
@@ -83,6 +86,8 @@ func main() {
 	}
 
 	svc := instance.NewService(client, hosts, tmpls)
+	instance.SetVerifyTimeout(*migrateVerifyTimeout)
+	svc.SetVerifyVolumes(*migrateVerifyVolumes)
 
 	db, err := openStore(*stateDB, *specKeyFile)
 	if err != nil {
