@@ -231,6 +231,57 @@ Operations are tracked as **jobs**, readable via:
 
 Both endpoints return `501` when `-state-db` is not set.
 
+### Host-health automation: scheduled prune (optional)
+
+With the store enabled, the daemon can keep hosts tidy on a schedule, running
+`podman` prune on a **safe, opt-in policy** so production hosts don't fill their
+container-storage partition. Each run is a `prune` **job** — auditable and
+queryable via the jobs API (and surfaced by the UI in a later release). It is
+**off by default**; nothing is auto-deleted until an operator turns it on. Like
+migrate/evacuate it requires `-state-db` (the daemon refuses to start if
+`-prune-enabled` is set without it).
+
+A scheduler evaluates every host roughly once a minute and enqueues a prune when
+**either** the interval has elapsed since that host's last successful prune
+**or** the host's disk crosses a high-water threshold (whichever comes first).
+
+Global flag defaults (each host may override via a `prune:` block — see below):
+
+- **`-prune-enabled`** — turn the feature on (default `false`).
+- **`-prune-interval <dur>`** — routine sweep interval per host (default `24h`). `0` disables the interval trigger (threshold only).
+- **`-prune-disk-threshold <pct>`** — disk used-% that triggers an early prune before the interval is due (default `85`). `0` disables the threshold trigger.
+- **`-prune-scope <list>`** — comma-separated scopes (default `dangling`). Available: `dangling` (dangling image layers), `all-images` (also unused tagged images — costs a re-pull on next deploy), `containers` (exited containers), `build-cache`, `volumes` (unused/unattached volumes). Only `dangling` runs unless you opt into more.
+- **`-prune-dry-run`** — perform a dry run that removes nothing (default `false`). When the `volumes` scope is enabled it reports the volume-reclaimable bytes from `system df`; image/build-cache sizes aren't available in a dry run. Use it to confirm a policy is sane before enabling removal.
+
+Per-host override in `hosts/*.yaml`:
+
+```yaml
+id: web1
+addr: user@web1
+socket: /run/user/1000/podman/podman.sock
+prune:
+  enabled: true
+  interval: 12h
+  disk_threshold_pct: 70
+  scope: [dangling, build-cache]
+  dry_run: false
+```
+
+**Safety.** Prune relies on podman's safe-by-default semantics — only
+dangling/unused objects are removed, never anything in use, and nothing is
+force-removed. Two extra guards protect stateful workloads:
+
+- The scheduler will not start a prune for a host that already has a running
+  **migrate** or **evacuate** job, and while any such move is in flight the
+  `volumes` scope is dropped from that run — so a migration's transiently
+  detached volume can't be reaped.
+- The `volumes` scope skips any volume carrying the protect label
+  `podman-api.protect=true`. Volumes are opt-in regardless.
+
+Runs appear in the jobs API as kind `prune`
+(`GET /jobs?kind=prune&state=succeeded`), and are exported as the Prometheus
+counters `podman_api_prune_runs_total` and `podman_api_prune_reclaimed_bytes_total`.
+
 ## Observability
 
 - **Audit log:** every state-changing request (POST/PUT/DELETE) emits one JSON line to stdout — or, if `-audit-log-file=/var/log/podman-api/audit.log` is set, to that file. Each line includes method, path, host, template, slug, status, duration, key_id, and any error.

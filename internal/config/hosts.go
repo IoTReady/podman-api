@@ -20,6 +20,22 @@ type Host struct {
 	// this host. Replace-shaped writes against existing pods, lifecycle
 	// ops, and reads are unaffected. Hot-reloadable via SIGHUP.
 	Drain bool `yaml:"drain,omitempty"`
+	// Prune is the optional per-host host-health cleanup policy. nil means "use
+	// the global flag defaults". Pointer fields inside distinguish "unset"
+	// (inherit default) from an explicit zero value.
+	Prune *PruneConfig `yaml:"prune,omitempty"`
+}
+
+// PruneConfig is the raw per-host prune policy as parsed from hosts/*.yaml.
+// Every field is a pointer so an omitted field inherits the global default
+// rather than overriding it with a zero value. Resolution lives in the prune
+// package (config must not depend on prune).
+type PruneConfig struct {
+	Enabled       *bool     `yaml:"enabled,omitempty"`
+	Interval      *string   `yaml:"interval,omitempty"` // Go duration, e.g. "12h"
+	DiskThreshold *int      `yaml:"disk_threshold_pct,omitempty"`
+	Scope         *[]string `yaml:"scope,omitempty"`
+	DryRun        *bool     `yaml:"dry_run,omitempty"`
 }
 
 // LoadHosts reads every *.yaml in dir into a Host. Unknown fields are rejected.

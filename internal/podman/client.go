@@ -44,6 +44,19 @@ type Client interface {
 	// Images
 	ImagePull(ctx context.Context, hostID, ref string) error
 
+	// Prune
+	// ImagePrune removes unused images. all=false removes only dangling layers;
+	// all=true also removes tagged images not used by any container.
+	ImagePrune(ctx context.Context, hostID string, all bool) (PruneReport, error)
+	// ContainerPrune removes stopped (exited) containers.
+	ContainerPrune(ctx context.Context, hostID string) (PruneReport, error)
+	// BuildCachePrune removes dangling build cache.
+	BuildCachePrune(ctx context.Context, hostID string) (PruneReport, error)
+	// VolumePrune removes unused (unattached) volumes. filters are libpod volume
+	// prune filters (e.g. {"label!": {"podman-api.protect=true"}}) so callers can
+	// protect volumes; never removes in-use volumes.
+	VolumePrune(ctx context.Context, hostID string, filters map[string][]string) (PruneReport, error)
+
 	// Health
 	Ping(ctx context.Context, hostID string) error
 	Version(ctx context.Context, hostID string) (string, error)
@@ -51,6 +64,17 @@ type Client interface {
 
 	// Host
 	HostInfo(ctx context.Context, hostID string) (HostInfo, error)
+	// Knows reports whether hostID is a registered host this client can reach.
+	// The host set is fixed at construction, so a host added via config reload is
+	// not Knows() until the daemon (and client) restarts.
+	Knows(hostID string) bool
+}
+
+// PruneReport summarizes one prune operation: the ids/names removed and the
+// bytes reclaimed (sum of per-item sizes).
+type PruneReport struct {
+	Items     []string
+	Reclaimed int64
 }
 
 // LogOptions are the knobs for ContainerLogs.

@@ -50,6 +50,16 @@ type Fake struct {
 	// ExportReader, if non-nil, overrides VolumeExport's reader. Lets a test
 	// supply a stream that errors mid-transfer.
 	ExportReader func(host, name string) io.ReadCloser
+	// Prune hooks. PruneReports maps a scope ("images","containers","buildcache",
+	// "volumes") to the report ImagePrune/etc. should return; absent → empty report.
+	// PruneErr maps a scope to an error to return. PruneCalls records every call.
+	PruneReports map[string]podman.PruneReport
+	PruneErr     map[string]error
+	PruneCalls   []PruneCall
+	// Unknown lists hosts that Knows should report as not registered; nil means
+	// every host is known. Lets a test exercise the scheduler's unknown-host skip.
+	Unknown map[string]bool
+
 	// PullErr, if non-nil, makes ImagePull return this error for matching refs.
 	// Key is image ref; the empty key matches any ref.
 	PullErr map[string]error
@@ -75,6 +85,8 @@ type Fake struct {
 	HostInfoVal podman.HostInfo
 	// HostInfoErr, if non-nil, makes HostInfo return this error.
 	HostInfoErr error
+	// HostInfoCalls counts HostInfo invocations (lets a test assert probe throttling).
+	HostInfoCalls int
 }
 
 // AddVolume seeds a volume on a host so VolumeInspect resolves it. Test-only.
@@ -110,10 +122,12 @@ func (f *Fake) VolumeData(host, name string) []byte {
 // New returns a fresh fake.
 func New() *Fake {
 	return &Fake{
-		pods:    map[string]map[string]podman.Pod{},
-		secrets: map[string]map[string]podman.Secret{},
-		volumes: map[string]map[string]podman.Volume{},
-		volData: map[string]map[string][]byte{},
+		pods:         map[string]map[string]podman.Pod{},
+		secrets:      map[string]map[string]podman.Secret{},
+		volumes:      map[string]map[string]podman.Volume{},
+		volData:      map[string]map[string][]byte{},
+		PruneReports: map[string]podman.PruneReport{},
+		PruneErr:     map[string]error{},
 	}
 }
 
@@ -397,9 +411,17 @@ func (f *Fake) ImagePull(_ context.Context, host, ref string) error {
 
 func (f *Fake) Ping(_ context.Context, _ string) error              { return nil }
 func (f *Fake) Version(_ context.Context, _ string) (string, error) { return "fake-1.0", nil }
+
+// Knows reports a host as registered unless it's listed in Unknown.
+func (f *Fake) Knows(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.Unknown[id]
+}
 func (f *Fake) HostInfo(_ context.Context, _ string) (podman.HostInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.HostInfoCalls++
 	if f.HostInfoErr != nil {
 		return podman.HostInfo{}, f.HostInfoErr
 	}
@@ -418,6 +440,43 @@ func (f *Fake) UsedHostPorts(_ context.Context, h string) ([]podman.PortMapping,
 		}
 	}
 	return out, nil
+}
+
+// PruneCall records one prune invocation for assertions.
+type PruneCall struct {
+	Host    string
+	Scope   string              // "images" | "containers" | "buildcache" | "volumes"
+	All     bool                // ImagePrune only
+	Filters map[string][]string // VolumePrune only
+}
+
+func (f *Fake) pruneScope(host, scope string, all bool, filters map[string][]string) (podman.PruneReport, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.PruneCalls = append(f.PruneCalls, PruneCall{Host: host, Scope: scope, All: all, Filters: filters})
+	if err := f.PruneErr[scope]; err != nil {
+		return podman.PruneReport{}, err
+	}
+	if r, ok := f.PruneReports[scope]; ok {
+		return r, nil
+	}
+	return podman.PruneReport{}, nil
+}
+
+func (f *Fake) ImagePrune(_ context.Context, host string, all bool) (podman.PruneReport, error) {
+	return f.pruneScope(host, "images", all, nil)
+}
+
+func (f *Fake) ContainerPrune(_ context.Context, host string) (podman.PruneReport, error) {
+	return f.pruneScope(host, "containers", false, nil)
+}
+
+func (f *Fake) BuildCachePrune(_ context.Context, host string) (podman.PruneReport, error) {
+	return f.pruneScope(host, "buildcache", false, nil)
+}
+
+func (f *Fake) VolumePrune(_ context.Context, host string, filters map[string][]string) (podman.PruneReport, error) {
+	return f.pruneScope(host, "volumes", false, filters)
 }
 
 // Compile-time guarantee that Fake implements the interface.
