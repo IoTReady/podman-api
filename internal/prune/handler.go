@@ -82,6 +82,11 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 
 	type step struct {
 		scope string
+		// guard, when set, is evaluated immediately before the step runs; a true
+		// return skips the step (recording the reason) without it counting as a
+		// failure. Used by the volumes scope to re-check for an active
+		// migrate/evacuate right before it executes — see below.
+		guard func() (skip bool, reason string)
 		run   func() (podman.PruneReport, error)
 	}
 	var steps []step
@@ -90,32 +95,45 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 	// and attribute the bytes to a single scope rather than double-counting.
 	switch {
 	case p.Policy.HasScope(ScopeAllImages):
-		steps = append(steps, step{ScopeAllImages, func() (podman.PruneReport, error) { return h.Client.ImagePrune(ctx, p.Host, true) }})
+		steps = append(steps, step{scope: ScopeAllImages, run: func() (podman.PruneReport, error) { return h.Client.ImagePrune(ctx, p.Host, true) }})
 	case p.Policy.HasScope(ScopeDangling):
-		steps = append(steps, step{ScopeDangling, func() (podman.PruneReport, error) { return h.Client.ImagePrune(ctx, p.Host, false) }})
+		steps = append(steps, step{scope: ScopeDangling, run: func() (podman.PruneReport, error) { return h.Client.ImagePrune(ctx, p.Host, false) }})
 	}
 	if p.Policy.HasScope(ScopeContainers) {
-		steps = append(steps, step{ScopeContainers, func() (podman.PruneReport, error) { return h.Client.ContainerPrune(ctx, p.Host) }})
+		steps = append(steps, step{scope: ScopeContainers, run: func() (podman.PruneReport, error) { return h.Client.ContainerPrune(ctx, p.Host) }})
 	}
 	if p.Policy.HasScope(ScopeBuildCache) {
-		steps = append(steps, step{ScopeBuildCache, func() (podman.PruneReport, error) { return h.Client.BuildCachePrune(ctx, p.Host) }})
+		steps = append(steps, step{scope: ScopeBuildCache, run: func() (podman.PruneReport, error) { return h.Client.BuildCachePrune(ctx, p.Host) }})
 	}
 	if p.Policy.HasScope(ScopeVolumes) {
-		if h.Jobs != nil && migrateOrEvacuateActive(ctx, h.Jobs) {
-			// A migrate/evacuate started while this job was queued — skip volumes
-			// so we can't reap a transiently-detached volume.
-			jc.Step("prune:volumes", "skipped: migrate/evacuate active")
-		} else {
-			steps = append(steps, step{ScopeVolumes, func() (podman.PruneReport, error) {
+		steps = append(steps, step{
+			scope: ScopeVolumes,
+			// Re-check right before VolumePrune (volumes runs last, after the other
+			// scopes): a migrate/evacuate may have started while this job was queued
+			// or while the earlier scopes ran. Skip volumes if so, so we can't reap a
+			// migration's transiently-detached volume.
+			guard: func() (bool, string) {
+				if h.Jobs != nil && migrateOrEvacuateActive(ctx, h.Jobs) {
+					return true, "migrate/evacuate active"
+				}
+				return false, ""
+			},
+			run: func() (podman.PruneReport, error) {
 				return h.Client.VolumePrune(ctx, p.Host, map[string][]string{"label!": {ProtectLabel + "=true"}})
-			}})
-		}
+			},
+		})
 	}
 
 	var firstErr error
 	for _, s := range steps {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if s.guard != nil {
+			if skip, reason := s.guard(); skip {
+				jc.Step("prune:"+s.scope, "skipped: "+reason)
+				continue
+			}
 		}
 		rep, err := s.run()
 		if err != nil {

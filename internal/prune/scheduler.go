@@ -123,9 +123,13 @@ func (s *Scheduler) tick(ctx context.Context, hosts []HostPolicy) {
 			continue // dedup: a prune for this host is queued/running
 		}
 		// Error backoff: after a failed prune, wait before retrying so an
-		// unreachable or persistently-failing host isn't hammered every tick.
+		// unreachable or persistently-failing host isn't hammered every tick. Only
+		// back off when the failure is the most recent terminal outcome — a later
+		// success clears it.
 		if lf, ok := lastFailure[hp.Host]; ok && now.Sub(lf) < failureBackoff {
-			continue
+			if ls, hasSuccess := lastSuccess[hp.Host]; !hasSuccess || lf.After(ls) {
+				continue
+			}
 		}
 
 		// Interval==0 disables the interval trigger (see policy.go); such a host
