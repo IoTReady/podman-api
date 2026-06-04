@@ -3,6 +3,7 @@ package instance
 import (
 	"context"
 	"errors"
+	"io"
 	"testing"
 	"time"
 
@@ -88,6 +89,49 @@ func TestCheckMigratable_Errors(t *testing.T) {
 	require.NoError(t, svc.CheckMigratable(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"}))
 }
 
+func TestPodReady(t *testing.T) {
+	tests := []struct {
+		name string
+		pod  podman.Pod
+		want bool
+	}{
+		{"pod not running", podman.Pod{Status: "Exited", Containers: []podman.Container{{Status: "Running"}}}, false},
+		{"container not running", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Exited"}}}, false},
+		{"no healthcheck, all running", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running"}}}, true},
+		{"healthcheck healthy", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "healthy"}}}, true},
+		{"healthcheck unhealthy", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "unhealthy"}}}, false},
+		{"healthcheck still starting", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "starting"}}}, false},
+		{"mixed declared and undeclared", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "healthy"}, {Status: "Running"}}}, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := podReady(tt.pod); got != tt.want {
+				t.Fatalf("podReady = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWaitRunning_HealthGate(t *testing.T) {
+	defer setVerifyKnobs(50*time.Millisecond, 5*time.Millisecond)()
+	svc, f, _ := newMigrateSvc(t)
+	ctx := context.Background()
+
+	t.Run("ready when declared healthcheck is healthy", func(t *testing.T) {
+		f.AddPod("h2", podman.Pod{Name: "web-ok", Status: "Running",
+			Containers: []podman.Container{{Status: "Running", Health: "healthy"}}})
+		require.NoError(t, svc.waitRunning(ctx, "h2", "web", "ok"))
+	})
+
+	t.Run("times out while a healthcheck stays unhealthy", func(t *testing.T) {
+		f.AddPod("h2", podman.Pod{Name: "web-bad", Status: "Running",
+			Containers: []podman.Container{{Status: "Running", Health: "unhealthy"}}})
+		err := svc.waitRunning(ctx, "h2", "web", "bad")
+		require.Error(t, err)
+		assert.ErrorContains(t, err, "not running")
+	})
+}
+
 func TestMigrate_PreflightFailFast_SourceUntouched(t *testing.T) {
 	ctx := context.Background()
 
@@ -149,7 +193,8 @@ func TestMigrate_HappyPath(t *testing.T) {
 		Parameters: params, Secrets: map[string]string{"password": "p"},
 	}))
 	f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
-	f.SetVolumeData("h1", "postgres-db1-data", []byte("PGDATA"))
+	srcTar := tarBytes(t, map[string]string{"PG_VERSION": "16"})
+	f.SetVolumeData("h1", "postgres-db1-data", srcTar)
 
 	var steps []string
 	err := svc.Migrate(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"},
@@ -167,11 +212,11 @@ func TestMigrate_HappyPath(t *testing.T) {
 	p, err := f.PodInspect(ctx, "h2", "postgres-db1")
 	require.NoError(t, err)
 	assert.Equal(t, "Running", p.Status)
-	assert.Equal(t, []byte("PGDATA"), f.VolumeData("h2", "postgres-db1-data"))
+	assert.Equal(t, srcTar, f.VolumeData("h2", "postgres-db1-data"))
 	_, err = mem.GetSpec(ctx, "h2", "postgres", "db1")
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{"load", "preflight", "stop-source", "copy-volume", "apply-dest", "verify", "commit"}, steps)
+	assert.Equal(t, []string{"load", "preflight", "stop-source", "copy-volume", "verify-volume", "apply-dest", "verify", "commit"}, steps)
 }
 
 func TestMigrate_Rollback(t *testing.T) {
@@ -186,7 +231,7 @@ func TestMigrate_Rollback(t *testing.T) {
 			Parameters: params, Secrets: map[string]string{"password": "p"},
 		}))
 		f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
-		f.SetVolumeData("h1", "postgres-db1-data", []byte("PGDATA"))
+		f.SetVolumeData("h1", "postgres-db1-data", tarBytes(t, map[string]string{"PG_VERSION": "16"}))
 		return svc, f, mem
 	}
 
@@ -253,6 +298,70 @@ func TestMigrate_Rollback(t *testing.T) {
 		// Rollback runs on a detached context, so it completes despite the dead ctx.
 		assertRolledBack(t, f, mem)
 	})
+}
+
+func TestMigrate_VolumeIntegrityMismatch_RollsBack(t *testing.T) {
+	ctx := context.Background()
+	svc, f, mem := newMigrateSvc(t)
+	params := map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"}
+	require.NoError(t, mem.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "postgres", Slug: "db1",
+		Parameters: params, Secrets: map[string]string{"password": "p"},
+	}))
+	f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
+	f.SetVolumeData("h1", "postgres-db1-data", tarBytes(t, map[string]string{"PG_VERSION": "16"}))
+	// Destination receives different content than the source -> manifests differ.
+	f.ImportTransform = func(_, _ string, _ []byte) []byte {
+		return tarBytes(t, map[string]string{"PG_VERSION": "CORRUPT"})
+	}
+
+	err := svc.Migrate(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"}, nil)
+	require.ErrorIs(t, err, ErrVolumeIntegrity)
+
+	// Rolled back: source restarted & intact, dest reaped (pod was never even applied).
+	p, perr := f.PodInspect(ctx, "h1", "postgres-db1")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status)
+	_, gerr := mem.GetSpec(ctx, "h1", "postgres", "db1")
+	require.NoError(t, gerr)
+	_, derr := f.PodInspect(ctx, "h2", "postgres-db1")
+	require.ErrorIs(t, derr, podman.ErrNotFound)
+}
+
+// TestMigrate_VolumeReexportFails_RollsBack covers the other integrity branch:
+// the copy succeeds but re-exporting the destination for verification fails, so
+// the move must still roll back rather than reap the source on an unverifiable copy.
+func TestMigrate_VolumeReexportFails_RollsBack(t *testing.T) {
+	ctx := context.Background()
+	svc, f, mem := newMigrateSvc(t)
+	params := map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"}
+	require.NoError(t, mem.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "postgres", Slug: "db1",
+		Parameters: params, Secrets: map[string]string{"password": "p"},
+	}))
+	f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
+	srcTar := tarBytes(t, map[string]string{"PG_VERSION": "16"})
+	f.SetVolumeData("h1", "postgres-db1-data", srcTar)
+	// Source exports (copy + verify re-export) succeed; the dest re-export breaks.
+	f.ExportReader = func(host, _ string) io.ReadCloser {
+		if host == "h2" {
+			return &midStreamReader{err: errors.New("dest export broke")}
+		}
+		return &midStreamReader{data: srcTar, err: io.EOF}
+	}
+
+	err := svc.Migrate(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"}, nil)
+	require.Error(t, err)
+	assert.ErrorContains(t, err, "re-export dest")
+
+	// Rolled back: source restarted & intact, dest reaped.
+	p, perr := f.PodInspect(ctx, "h1", "postgres-db1")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status)
+	_, gerr := mem.GetSpec(ctx, "h1", "postgres", "db1")
+	require.NoError(t, gerr)
+	_, derr := f.PodInspect(ctx, "h2", "postgres-db1")
+	require.ErrorIs(t, derr, podman.ErrNotFound)
 }
 
 func TestMigrate_SelfValidates(t *testing.T) {

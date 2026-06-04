@@ -34,11 +34,19 @@ type Fake struct {
 	// PlayKube. Empty means "Running". Lets a test make a pod report Running
 	// while a container is not, exercising the migrate container-level verify.
 	PlayKubeContainerStatus string
+	// PlayKubeContainerHealth sets the Health status of containers created by
+	// PlayKube (default "" = no healthcheck declared). Lets a test drive the
+	// migrate readiness gate.
+	PlayKubeContainerHealth string
 	// ExportErr, if non-nil, makes VolumeExport fail immediately.
 	ExportErr error
 	// ImportErr, if non-nil, makes VolumeImport fail immediately (without
 	// reading the supplied reader) — models a destination that rejects the import.
 	ImportErr error
+	// ImportTransform, if non-nil, rewrites the bytes VolumeImport stores on the
+	// destination — lets a test simulate a lossy/corrupting copy so the source
+	// and dest manifests diverge.
+	ImportTransform func(host, name string, in []byte) []byte
 	// ExportReader, if non-nil, overrides VolumeExport's reader. Lets a test
 	// supply a stream that errors mid-transfer.
 	ExportReader func(host, name string) io.ReadCloser
@@ -170,7 +178,7 @@ func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool) err
 		for _, c := range head.Spec.Containers {
 			cs = append(cs, podman.Container{
 				Name: c.Name, Image: c.Image, ImageTag: c.Image,
-				Status: cstatus, StartedAt: time.Now(),
+				Status: cstatus, Health: f.PlayKubeContainerHealth, StartedAt: time.Now(),
 			})
 		}
 		podStatus := "Running"
@@ -338,6 +346,9 @@ func (f *Fake) VolumeImport(_ context.Context, h, name string, r io.Reader) erro
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err
+	}
+	if f.ImportTransform != nil {
+		data = f.ImportTransform(h, name, data)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()

@@ -13,11 +13,14 @@ type Pod struct {
 }
 
 type Container struct {
-	ID           string
-	Name         string
-	Image        string // resolved digest, e.g. "docker.io/library/postgres@sha256:..."
-	ImageTag     string // human-readable tag, e.g. "docker.io/library/postgres:16"
-	Status       string
+	ID       string
+	Name     string
+	Image    string // resolved digest, e.g. "docker.io/library/postgres@sha256:..."
+	ImageTag string // human-readable tag, e.g. "docker.io/library/postgres:16"
+	Status   string
+	// Health is the container's healthcheck status: "" when the container
+	// declares no healthcheck, otherwise "healthy" / "unhealthy" / "starting".
+	Health       string
 	StartedAt    time.Time
 	RestartCount int
 	Ports        []PortMapping

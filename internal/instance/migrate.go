@@ -22,6 +22,15 @@ var (
 	verifyInterval = 2 * time.Second
 )
 
+// SetVerifyTimeout overrides the maximum time waitRunning waits for the
+// destination to become ready before the migrate fails (and rolls back).
+// No-op for d <= 0. Called once at startup from the -migrate-verify-timeout flag.
+func SetVerifyTimeout(d time.Duration) {
+	if d > 0 {
+		verifyTimeout = d
+	}
+}
+
 // MigrateRequest is the POST /migrate body and the migrate job's args.
 type MigrateRequest struct {
 	FromHost   string         `json:"from_host"`
@@ -231,6 +240,20 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 			return fmt.Errorf("copy volume %q: %w", v.Name, err)
 		}
 		step("copy-volume", v.Name)
+		if s.verifyVolumes {
+			src, err := s.volumeManifest(ctx, req.FromHost, v.Name)
+			if err != nil {
+				return fmt.Errorf("verify volume %q: re-export source: %w", v.Name, err)
+			}
+			dst, err := s.volumeManifest(ctx, req.ToHost, v.Name)
+			if err != nil {
+				return fmt.Errorf("verify volume %q: re-export dest: %w", v.Name, err)
+			}
+			if diff, ok := src.firstDiff(dst); !ok {
+				return fmt.Errorf("%w: volume %q differs at %q", ErrVolumeIntegrity, v.Name, diff)
+			}
+			step("verify-volume", v.Name)
+		}
 	}
 
 	if err := s.Apply(ctx, req.ToHost, ApplyRequest{
@@ -255,7 +278,7 @@ func (s *Service) waitRunning(ctx context.Context, host, tmpl, slug string) erro
 	defer ticker.Stop()
 	for {
 		p, err := s.client.PodInspect(ctx, host, podName(tmpl, slug))
-		if err == nil && p.Status == "Running" && allContainersRunning(p) {
+		if err == nil && podReady(p) {
 			return nil
 		}
 		if time.Now().After(deadline) {
@@ -269,13 +292,20 @@ func (s *Service) waitRunning(ctx context.Context, host, tmpl, slug string) erro
 	}
 }
 
-// allContainersRunning reports whether every container in the pod is Running.
-// verify is a liveness gate, not an application-readiness gate (see the spec's
-// limitations); this catches the common "pod phase Running but a container is
-// crash-looping" case before migrate destroys the source data.
-func allContainersRunning(p podman.Pod) bool {
+// podReady reports whether the pod is up and serving: the pod is Running, every
+// container is Running, and every container that declares a healthcheck reports
+// "healthy". Containers with no declared healthcheck (Health == "") are gated on
+// liveness alone, so an instance without healthchecks behaves exactly as before.
+// "starting" (still inside the healthcheck start_period) counts as not ready.
+func podReady(p podman.Pod) bool {
+	if p.Status != "Running" {
+		return false
+	}
 	for _, c := range p.Containers {
 		if c.Status != "Running" {
+			return false
+		}
+		if c.Health != "" && c.Health != "healthy" {
 			return false
 		}
 	}
