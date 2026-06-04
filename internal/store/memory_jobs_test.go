@@ -105,3 +105,31 @@ func TestMemory_Finish_AcceptsCanceled(t *testing.T) {
 		t.Fatalf("bad canceled job: %+v", got)
 	}
 }
+
+func TestMemory_CancelQueued(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+
+	// queued -> canceled (true)
+	q, _ := m.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	ok, err := m.CancelQueued(ctx, q.ID)
+	if err != nil || !ok {
+		t.Fatalf("cancel queued: ok=%v err=%v", ok, err)
+	}
+	got, _ := m.GetJob(ctx, q.ID)
+	if got.State != JobCanceled || got.Finished.IsZero() {
+		t.Fatalf("queued not canceled: %+v", got)
+	}
+
+	// running -> false (not queued)
+	r, _ := m.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	_, _, _ = m.ClaimNext(ctx)
+	if ok, _ := m.CancelQueued(ctx, r.ID); ok {
+		t.Fatal("running job should not CancelQueued")
+	}
+
+	// absent -> false
+	if ok, _ := m.CancelQueued(ctx, "nope"); ok {
+		t.Fatal("absent job should not CancelQueued")
+	}
+}

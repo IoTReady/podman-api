@@ -207,6 +207,19 @@ func (m *Memory) FailRunning(_ context.Context, reason string) (int, error) {
 	return n, nil
 }
 
+func (m *Memory) CancelQueued(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.jobs {
+		if m.jobs[i].ID == id && m.jobs[i].State == JobQueued {
+			m.jobs[i].State = JobCanceled
+			m.jobs[i].Finished = time.Now()
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (m *Memory) PruneJobs(_ context.Context, olderThan time.Time) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

@@ -513,6 +513,24 @@ func (s *SQLite) FailRunning(ctx context.Context, reason string) (int, error) {
 	return int(n), nil
 }
 
+func (s *SQLite) CancelQueued(ctx context.Context, id string) (bool, error) {
+	now := time.Now().UnixNano()
+	var n int64
+	err := s.write(ctx, func() error {
+		res, e := s.db.ExecContext(ctx,
+			`UPDATE jobs SET state='canceled', finished=? WHERE id=? AND state='queued'`, now, id)
+		if e != nil {
+			return e
+		}
+		n, e = res.RowsAffected()
+		return e
+	})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 func (s *SQLite) PruneJobs(ctx context.Context, olderThan time.Time) (int, error) {
 	cutoff := olderThan.UnixNano()
 	var total int64

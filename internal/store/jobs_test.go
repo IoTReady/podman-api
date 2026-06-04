@@ -222,3 +222,30 @@ func TestSQLite_Finish_AcceptsCanceled(t *testing.T) {
 		t.Fatalf("bad canceled job: %+v", got)
 	}
 }
+
+func TestSQLite_CancelQueued(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+
+	q, _ := s.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	ok, err := s.CancelQueued(ctx, q.ID)
+	if err != nil || !ok {
+		t.Fatalf("cancel queued: ok=%v err=%v", ok, err)
+	}
+	got, _ := s.GetJob(ctx, q.ID)
+	if got.State != JobCanceled || got.Finished.IsZero() {
+		t.Fatalf("queued not canceled: %+v", got)
+	}
+
+	r, _ := s.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	if _, _, err := s.ClaimNext(ctx); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if ok, _ := s.CancelQueued(ctx, r.ID); ok {
+		t.Fatal("running job should not CancelQueued")
+	}
+
+	if ok, _ := s.CancelQueued(ctx, "nope"); ok {
+		t.Fatal("absent job should not CancelQueued")
+	}
+}
