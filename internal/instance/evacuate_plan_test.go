@@ -87,11 +87,24 @@ func newPlanSvc(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
 	return svc, f, mem
 }
 
+// seedPGSpec stores a valid postgres spec on h1: full params plus the required
+// per-instance "password" secret. The preview runs render.Validate (mirroring
+// the executor's Apply), so a postgres spec must carry its secret to be clean —
+// exactly as a real stored spec does.
+func seedPGSpec(t *testing.T, mem *store.Memory, slug string) {
+	t.Helper()
+	require.NoError(t, mem.PutSpec(context.Background(), store.Spec{
+		Host: "h1", Template: "postgres", Slug: slug,
+		Parameters: map[string]any{"slug": slug, "image": "x", "port": 5432, "db": "d", "user": "u"},
+		Secrets:    map[string]string{"password": "p"},
+	}))
+}
+
 func TestPlanEvacuation_AllClean(t *testing.T) {
 	svc, _, mem := newPlanSvc(t)
 	ctx := context.Background()
-	seedSpec(t, mem, "h1", "postgres", "db1", map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"})
-	seedSpec(t, mem, "h1", "postgres", "db2", map[string]any{"slug": "db2", "image": "x", "port": 5432, "db": "d", "user": "u"})
+	seedPGSpec(t, mem, "db1")
+	seedPGSpec(t, mem, "db2")
 
 	plan, err := svc.PlanEvacuation(ctx, EvacuateRequest{FromHost: "h1", Map: map[string]string{"db1": "h2", "db2": "h3"}})
 	require.NoError(t, err)
@@ -110,7 +123,7 @@ func TestPlanEvacuation_BlockingConditions(t *testing.T) {
 
 	t.Run("destination draining", func(t *testing.T) {
 		svc, _, mem := newPlanSvc(t)
-		seedSpec(t, mem, "h1", "postgres", "db1", map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"})
+		seedPGSpec(t, mem, "db1")
 		plan, err := svc.PlanEvacuation(ctx, EvacuateRequest{FromHost: "h1", Map: map[string]string{"db1": "draining"}})
 		require.NoError(t, err)
 		require.Len(t, plan.Moves, 1)
@@ -121,7 +134,7 @@ func TestPlanEvacuation_BlockingConditions(t *testing.T) {
 
 	t.Run("instance already exists on destination", func(t *testing.T) {
 		svc, f, mem := newPlanSvc(t)
-		seedSpec(t, mem, "h1", "postgres", "db1", map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"})
+		seedPGSpec(t, mem, "db1")
 		f.AddPod("h2", podman.Pod{Name: "postgres-db1", Status: "Running"})
 		plan, err := svc.PlanEvacuation(ctx, EvacuateRequest{FromHost: "h1", Map: map[string]string{"db1": "h2"}})
 		require.NoError(t, err)
@@ -153,7 +166,7 @@ func TestPlanEvacuation_BlockingConditions(t *testing.T) {
 func TestPlanEvacuation_MixedPlan_AllReportedSorted(t *testing.T) {
 	svc, f, mem := newPlanSvc(t)
 	ctx := context.Background()
-	seedSpec(t, mem, "h1", "postgres", "alpha", map[string]any{"slug": "alpha", "image": "x", "port": 5432, "db": "d", "user": "u"})
+	seedPGSpec(t, mem, "alpha")
 	seedSpec(t, mem, "h1", "web", "beta", map[string]any{"slug": "beta", "image": "x"})
 	f.AddPod("h3", podman.Pod{Name: "other", Status: "Running",
 		Containers: []podman.Container{{Name: "c", Ports: []podman.PortMapping{{HostPort: 8080}}}}})
@@ -172,7 +185,7 @@ func TestPlanEvacuation_MixedPlan_AllReportedSorted(t *testing.T) {
 func TestPlanEvacuation_InconclusiveCheck(t *testing.T) {
 	svc, f, mem := newPlanSvc(t)
 	ctx := context.Background()
-	seedSpec(t, mem, "h1", "postgres", "db1", map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"})
+	seedPGSpec(t, mem, "db1")
 	f.PodInspectErr = errors.New("dial tcp: connection refused")
 
 	plan, err := svc.PlanEvacuation(ctx, EvacuateRequest{FromHost: "h1", Map: map[string]string{"db1": "h2"}})
@@ -182,6 +195,28 @@ func TestPlanEvacuation_InconclusiveCheck(t *testing.T) {
 	assert.Contains(t, plan.Moves[0].Issues[0].Message, "connection refused",
 		"check_error must surface the underlying error to the operator")
 	assert.False(t, plan.Moves[0].OK)
+}
+
+func TestPlanEvacuation_InvalidParameters(t *testing.T) {
+	svc, _, mem := newPlanSvc(t)
+	ctx := context.Background()
+	// Contract drift: the stored postgres spec predates a required param/secret
+	// (here it omits the "password" secret). render.Render tolerates this, so the
+	// live port check passes — but the executor's Apply-time render.Validate would
+	// reject it. The preview must predict that with an invalid_parameters issue.
+	require.NoError(t, mem.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "postgres", Slug: "db1",
+		Parameters: map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"},
+		// Secrets intentionally omitted.
+	}))
+
+	plan, err := svc.PlanEvacuation(ctx, EvacuateRequest{FromHost: "h1", Map: map[string]string{"db1": "h2"}})
+	require.NoError(t, err)
+	require.Len(t, plan.Moves, 1)
+	assert.False(t, plan.Moves[0].OK)
+	require.Len(t, plan.Moves[0].Issues, 1)
+	assert.Equal(t, "invalid_parameters", plan.Moves[0].Issues[0].Code)
+	assert.Contains(t, plan.Moves[0].Issues[0].Message, "password")
 }
 
 func TestPlanEvacuation_StaticValidationErrors(t *testing.T) {

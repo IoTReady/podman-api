@@ -317,7 +317,7 @@ components:
       properties:
         code:
           type: string
-          enum: [destination_draining, instance_exists, host_secret_missing, port_conflict, check_error]
+          enum: [destination_draining, instance_exists, host_secret_missing, port_conflict, invalid_parameters, check_error]
         message: {type: string}
 
     JobAccepted:
@@ -838,8 +838,8 @@ paths:
         is enqueued and nothing is mutated. Each move is ok=true only when its
         issues list is empty; a non-empty list names the blocking conditions
         (destination_draining, instance_exists, host_secret_missing,
-        port_conflict) or an inconclusive check (check_error, e.g. the
-        destination was unreachable). Requires only a read scope.
+        port_conflict, invalid_parameters) or an inconclusive check (check_error,
+        e.g. the destination was unreachable). Requires only a read scope.
       requestBody:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/EvacuateRequest'}}}

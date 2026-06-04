@@ -3,6 +3,8 @@ package instance
 import (
 	"context"
 	"errors"
+
+	"github.com/iotready/podman-api/internal/render"
 )
 
 // Plan issue codes. Stable strings exposed in the POST /evacuate/plan response
@@ -12,6 +14,7 @@ const (
 	codeInstanceExists      = "instance_exists"
 	codeHostSecretMissing   = "host_secret_missing"
 	codePortConflict        = "port_conflict"
+	codeInvalidParameters   = "invalid_parameters"
 	codeCheckError          = "check_error"
 )
 
@@ -72,6 +75,14 @@ func (s *Service) planMove(ctx context.Context, m MigrateRequest) PlannedMove {
 	}
 	eff := mergeParams(spec.Parameters, m.Parameters)
 	eff["slug"] = m.Slug // canonical slug always wins; pod name must match podName()
+	// Predict the executor's Apply-time contract check: Migrate ultimately calls
+	// Apply on the destination, which runs render.Validate. The live port check
+	// below only renders (render.Render tolerates missing keys), so without this
+	// a spec stored under an old, looser template contract would preview ok=true
+	// yet fail the real evacuate at apply.
+	if err := render.Validate(tmpl.Meta, eff, spec.Secrets); err != nil {
+		pm.Issues = append(pm.Issues, PlanIssue{Code: codeInvalidParameters, Message: err.Error()})
+	}
 	for _, e := range s.preflightIssues(ctx, m, tmpl, eff) {
 		pm.Issues = append(pm.Issues, classifyPlanIssue(e))
 	}

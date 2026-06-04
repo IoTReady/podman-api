@@ -139,7 +139,10 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 			if errors.Is(err, podman.ErrNotFound) {
 				issues = append(issues, fmt.Errorf("%w: %s", ErrHostSecretMissing, name))
 			} else {
-				issues = append(issues, fmt.Errorf("inspect host secret %q: %w", name, err))
+				// Infra error (host unreachable): the remaining secret/port checks
+				// would just block on the same dead host. Report it and stop —
+				// avoids piling up timeout-length RPCs on the executor's failure path.
+				return append(issues, fmt.Errorf("inspect host secret %q: %w", name, err))
 			}
 		}
 	}

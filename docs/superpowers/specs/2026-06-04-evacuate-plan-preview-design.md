@@ -107,7 +107,15 @@ type PlanIssue struct {
 | `instance_exists` | `PodInspect` finds a pod | an instance with this name is already on the dest |
 | `host_secret_missing` | `SecretInspect` → NotFound | a required per-host secret isn't seeded on the dest |
 | `port_conflict` | `PortsInUse` ∩ required | a host port the pod binds is already taken |
+| `invalid_parameters` | `render.Validate` | the stored spec's params/secrets no longer satisfy the template contract (e.g. contract tightened after the spec was stored) — the executor would fail this at `Apply` |
 | `check_error` | any inspect call errors for a non-blocking reason (host unreachable, decrypt fail, render error, ...) | the check was **inconclusive** — the preview cannot vouch for this move |
+
+`planMove` also runs `render.Validate(tmpl.Meta, eff, spec.Secrets)` — the same
+param/secret-contract check the executor performs at `Apply` time
+(`migratePostStop` → `Apply`). `render.Render` (used only to extract host ports)
+tolerates missing keys, so without this an evacuate that would fail at `Apply`
+could otherwise preview `ok=true`. This keeps the "a clean move would currently
+be accepted" guarantee honest.
 
 `check_error` is deliberately distinct from a blocking issue: an unreachable
 destination makes a move *inconclusive*, not *known-bad*. The operator sees the
