@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS specs (
   slug       TEXT NOT NULL,
   parameters TEXT NOT NULL,
   secrets    BLOB NOT NULL,
+  domains    TEXT NOT NULL DEFAULT '[]',
   created    INTEGER NOT NULL,
   updated    INTEGER NOT NULL,
   PRIMARY KEY (host, template, slug)
@@ -164,13 +165,33 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	// Reserved schema-version stamp for future migrations. At v1 this is set
-	// unconditionally; a real version gate is added if/when the schema changes.
-	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
+	if err := migrateSchema(db); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 	return &SQLite{db: db, keys: keys}, nil
+}
+
+// migrateSchema brings an existing specs table up to the current schema. v4
+// added specs.domains. The ALTER is guarded by user_version, and the
+// duplicate-column case (fresh DB where schemaSQL already created the column)
+// is tolerated so OpenSQLite is idempotent.
+func migrateSchema(db *sql.DB) error {
+	var v int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return err
+	}
+	if v < 4 {
+		if _, err := db.Exec(`ALTER TABLE specs ADD COLUMN domains TEXT NOT NULL DEFAULT '[]'`); err != nil {
+			if !strings.Contains(err.Error(), "duplicate column") {
+				return err
+			}
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Close releases the underlying database handle.
@@ -190,30 +211,39 @@ func (s *SQLite) PutSpec(ctx context.Context, sp Spec) error {
 	if err != nil {
 		return err
 	}
+	domJSON, err := json.Marshal(sp.Domains)
+	if err != nil {
+		return err
+	}
+	if sp.Domains == nil {
+		domJSON = []byte("[]")
+	}
 	now := time.Now().Unix()
 	return s.write(ctx, func() error {
 		_, err := s.db.ExecContext(ctx, `
-INSERT INTO specs (host, template, slug, parameters, secrets, created, updated)
-VALUES (?, ?, ?, ?, ?, ?, ?)
+INSERT INTO specs (host, template, slug, parameters, secrets, domains, created, updated)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(host, template, slug) DO UPDATE SET
   parameters = excluded.parameters,
   secrets    = excluded.secrets,
+  domains    = excluded.domains,
   updated    = excluded.updated`,
-			sp.Host, sp.Template, sp.Slug, string(params), blob, now, now)
+			sp.Host, sp.Template, sp.Slug, string(params), blob, string(domJSON), now, now)
 		return err
 	})
 }
 
 func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT parameters, secrets, created, updated FROM specs WHERE host=? AND template=? AND slug=?`,
+		`SELECT parameters, secrets, domains, created, updated FROM specs WHERE host=? AND template=? AND slug=?`,
 		host, template, slug)
 	var (
 		paramsJSON       string
 		blob             []byte
+		domainsJSON      string
 		created, updated int64
 	)
-	if err := row.Scan(&paramsJSON, &blob, &created, &updated); err != nil {
+	if err := row.Scan(&paramsJSON, &blob, &domainsJSON, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Spec{}, ErrNotFound
 		}
@@ -231,9 +261,13 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 	if err := json.Unmarshal(secJSON, &secrets); err != nil {
 		return Spec{}, err
 	}
+	var domains []string
+	if err := json.Unmarshal([]byte(domainsJSON), &domains); err != nil {
+		return Spec{}, err
+	}
 	return Spec{
 		Host: host, Template: template, Slug: slug,
-		Parameters: params, Secrets: secrets,
+		Parameters: params, Secrets: secrets, Domains: domains,
 		Created: time.Unix(created, 0), Updated: time.Unix(updated, 0),
 	}, nil
 }
