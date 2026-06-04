@@ -17,6 +17,7 @@ const (
 	JobRunning   JobState = "running"
 	JobSucceeded JobState = "succeeded"
 	JobFailed    JobState = "failed"
+	JobCanceled  JobState = "canceled"
 )
 
 // JobStep is one progress entry recorded by a handler.

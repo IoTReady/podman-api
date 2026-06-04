@@ -470,7 +470,7 @@ func (s *SQLite) AppendStep(ctx context.Context, id string, step JobStep) error 
 }
 
 func (s *SQLite) Finish(ctx context.Context, id string, state JobState, errMsg string) error {
-	if state != JobSucceeded && state != JobFailed {
+	if state != JobSucceeded && state != JobFailed && state != JobCanceled {
 		return fmt.Errorf("store.Finish: invalid terminal state %q", state)
 	}
 	now := time.Now().UnixNano()

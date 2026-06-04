@@ -176,7 +176,7 @@ func (m *Memory) AppendStep(_ context.Context, id string, step JobStep) error {
 }
 
 func (m *Memory) Finish(_ context.Context, id string, state JobState, errMsg string) error {
-	if state != JobSucceeded && state != JobFailed {
+	if state != JobSucceeded && state != JobFailed && state != JobCanceled {
 		return fmt.Errorf("store: Finish: invalid terminal state %q", state)
 	}
 	m.mu.Lock()

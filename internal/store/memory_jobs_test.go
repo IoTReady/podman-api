@@ -89,3 +89,19 @@ func TestMemory_Jobs_Finish_RejectsNonTerminal(t *testing.T) {
 		t.Fatal("Finish with non-terminal state should error")
 	}
 }
+
+func TestMemory_Finish_AcceptsCanceled(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+	j, _ := m.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	if _, _, err := m.ClaimNext(ctx); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := m.Finish(ctx, j.ID, JobCanceled, "canceled by operator"); err != nil {
+		t.Fatalf("Finish canceled: %v", err)
+	}
+	got, _ := m.GetJob(ctx, j.ID)
+	if got.State != JobCanceled || got.Error != "canceled by operator" || got.Finished.IsZero() {
+		t.Fatalf("bad canceled job: %+v", got)
+	}
+}
