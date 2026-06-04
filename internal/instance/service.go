@@ -523,9 +523,17 @@ func (s *Service) InstanceVolumes(ctx context.Context, host, tmpl, slug string) 
 	var out []podman.Volume
 	for _, v := range t.Meta.Volumes {
 		name := tmpl + "-" + slug + "-" + v.Name
-		if vv, err := s.client.VolumeInspect(ctx, host, name); err == nil {
-			out = append(out, vv)
+		vv, err := s.client.VolumeInspect(ctx, host, name)
+		if errors.Is(err, podman.ErrNotFound) {
+			continue // a declared volume may legitimately not exist yet — skip it
 		}
+		if err != nil {
+			// Do NOT swallow transient errors: callers (migrate/evacuate) reap the
+			// source after copying this set, so a silently-dropped volume means
+			// data loss. Fail loud instead. (#50)
+			return nil, fmt.Errorf("inspect volume %q: %w", name, err)
+		}
+		out = append(out, vv)
 	}
 	return out, nil
 }
