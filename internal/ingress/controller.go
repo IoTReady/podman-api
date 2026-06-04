@@ -77,5 +77,5 @@ func (c *CaddyController) hostLock(host string) *sync.Mutex {
 // Compile-time guarantees.
 var (
 	_ Controller = Disabled{}
-	// _ Controller = (*CaddyController)(nil) // TODO(task 8): re-enable once Reconcile lands
+	_ Controller = (*CaddyController)(nil)
 )
