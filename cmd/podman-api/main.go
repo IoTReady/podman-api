@@ -18,6 +18,7 @@ import (
 	"github.com/iotready/podman-api/internal/api"
 	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/config"
+	"github.com/iotready/podman-api/internal/evacuate"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/jobs"
 	"github.com/iotready/podman-api/internal/migrate"
@@ -94,7 +95,8 @@ func main() {
 		svc.SetStore(db)
 		jobStore = db
 		registry := jobs.Registry{
-			"migrate": &migrate.Handler{Svc: svc},
+			"migrate":  &migrate.Handler{Svc: svc},
+			"evacuate": &evacuate.Handler{Svc: svc, Jobs: db},
 		}
 		runner := jobs.NewRunner(db, registry, jobs.DefaultWorkers)
 		runner.Start(runnerCtx)
