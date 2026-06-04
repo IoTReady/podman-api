@@ -12,6 +12,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -24,8 +26,10 @@ import (
 	"github.com/iotready/podman-api/internal/migrate"
 	"github.com/iotready/podman-api/internal/obs"
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/prune"
 	"github.com/iotready/podman-api/internal/store"
 	"github.com/iotready/podman-api/templates"
+	"github.com/prometheus/client_golang/prometheus"
 )
 
 func main() {
@@ -44,6 +48,12 @@ func main() {
 
 		migrateVerifyTimeout = flag.Duration("migrate-verify-timeout", 60*time.Second, "max wait for a migrated instance to become ready (running + declared healthchecks healthy) before reaping the source")
 		migrateVerifyVolumes = flag.Bool("migrate-verify-volumes", true, "verify each copied volume's content against the source before reaping the source (adds a re-export of source and dest per volume); false disables it")
+
+		pruneEnabled   = flag.Bool("prune-enabled", false, "enable scheduled host-health prune/cleanup (requires -state-db)")
+		pruneInterval  = flag.Duration("prune-interval", 24*time.Hour, "default interval between scheduled prunes per host")
+		pruneThreshold = flag.Int("prune-disk-threshold", 85, "disk used% high-water that triggers an early prune; 0 disables the threshold trigger")
+		pruneScope     = flag.String("prune-scope", "dangling", "default prune scopes, comma-separated: dangling,all-images,containers,build-cache,volumes")
+		pruneDryRun    = flag.Bool("prune-dry-run", false, "default dry-run: report reclaimable space without removing anything")
 	)
 	flag.Parse()
 
@@ -64,6 +74,10 @@ func main() {
 	if err != nil {
 		log.Fatalf("hosts: %v", err)
 	}
+	// hostsHolder mirrors the live host set so the prune scheduler can read the
+	// current policies on each tick, including after a SIGHUP reload.
+	var hostsHolder atomic.Pointer[[]config.Host]
+	hostsHolder.Store(&hosts)
 	keys, fp, err := loadKeys(*keysFile)
 	if err != nil {
 		log.Fatalf("keys: %v", err)
@@ -94,18 +108,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
+	if *pruneEnabled && db == nil {
+		log.Fatalf("-prune-enabled requires -state-db")
+	}
 	// runnerCtx is cancelled by the shutdown handler to stop the job runner.
 	runnerCtx, cancelRunner := context.WithCancel(context.Background())
 	defer cancelRunner()
 	var jobStore store.JobStore
 	var canceller api.JobCanceller
+	var pruneSched *prune.Scheduler
 	if db != nil {
 		defer db.Close()
 		svc.SetStore(db)
 		jobStore = db
+		pruneMetrics := obs.NewPruneMetrics(prometheus.DefaultRegisterer)
 		registry := jobs.Registry{
 			"migrate":  &migrate.Handler{Svc: svc},
 			"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: *evacConc},
+			"prune":    &prune.Handler{Client: client, Metrics: pruneMetrics},
 		}
 		workers := *jobWorkers
 		if workers <= 0 {
@@ -119,6 +139,25 @@ func main() {
 			log.Printf("jobs retention enabled: pruning terminal jobs older than %s", *jobsRetention)
 		}
 		log.Printf("desired-state store enabled: %s (job runner started, %d workers)", *stateDB, workers)
+
+		if *pruneEnabled {
+			def := prune.Defaults{
+				Enabled:       true,
+				Interval:      *pruneInterval,
+				DiskThreshold: *pruneThreshold,
+				Scope:         splitScopes(*pruneScope),
+				DryRun:        *pruneDryRun,
+			}
+			// Validate the startup set once so a misconfigured policy fails loudly at boot.
+			if _, err := resolveAll(*hostsHolder.Load(), def); err != nil {
+				log.Fatalf("prune policy: %v", err)
+			}
+			pruneSched = &prune.Scheduler{Store: db, Client: client, Now: time.Now}
+			pruneSched.Start(runnerCtx, func() []prune.HostPolicy {
+				return buildHostPolicies(*hostsHolder.Load(), def)
+			})
+			log.Printf("prune scheduler enabled (interval %s, disk threshold %d%%, scopes %v)", *pruneInterval, *pruneThreshold, def.Scope)
+		}
 	}
 
 	metrics := obs.New()
@@ -188,6 +227,10 @@ func main() {
 				log.Printf("hosts reload FAILED, keeping previous set: %v", err)
 			} else {
 				svc.SetHosts(newHosts)
+				// newHosts is never reassigned after this point, so storing its
+				// address publishes the freshly-loaded set to the prune scheduler's
+				// hostsFn; the slice is treated as immutable after load.
+				hostsHolder.Store(&newHosts)
 				draining := 0
 				for _, hh := range newHosts {
 					if hh.Drain {
@@ -211,6 +254,9 @@ func main() {
 		// by boot recovery on the next start. (Revisit a bounded drain in #34
 		// when real migrate/evacuate handlers are registered.)
 		cancelRunner()
+		if pruneSched != nil {
+			pruneSched.Wait()
+		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
@@ -276,4 +322,45 @@ func openStore(stateDB, keyFile string) (store.DB, error) {
 		return nil, fmt.Errorf("state db: %w", err)
 	}
 	return st, nil
+}
+
+// splitScopes parses a comma-separated scope flag, trimming spaces and dropping empties.
+func splitScopes(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// buildHostPolicies resolves every host's prune policy over the defaults,
+// skipping (with a log) any host whose policy fails to resolve so one bad file
+// never stops the others.
+func buildHostPolicies(hosts []config.Host, def prune.Defaults) []prune.HostPolicy {
+	var out []prune.HostPolicy
+	for _, h := range hosts {
+		p, err := prune.Resolve(h.Prune, def)
+		if err != nil {
+			log.Printf("prune: host %s policy invalid, skipping: %v", h.ID, err)
+			continue
+		}
+		out = append(out, prune.HostPolicy{Host: h.ID, Policy: p})
+	}
+	return out
+}
+
+// resolveAll resolves all host policies, returning the first error (used at boot
+// to fail loudly on a misconfigured startup set).
+func resolveAll(hosts []config.Host, def prune.Defaults) ([]prune.HostPolicy, error) {
+	var out []prune.HostPolicy
+	for _, h := range hosts {
+		p, err := prune.Resolve(h.Prune, def)
+		if err != nil {
+			return nil, fmt.Errorf("host %s: %w", h.ID, err)
+		}
+		out = append(out, prune.HostPolicy{Host: h.ID, Policy: p})
+	}
+	return out, nil
 }
