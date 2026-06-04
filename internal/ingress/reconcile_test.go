@@ -41,8 +41,13 @@ func TestReconcileExistingHostCopiesAndReloads(t *testing.T) {
 	last := f.CopyCalls[len(f.CopyCalls)-1]
 	require.Equal(t, caddyConfigDir, last.DestDir)
 	require.Equal(t, caddyConfigFile, last.Name)
+	// cp + exec must target the container name `podman kube play` actually
+	// assigns ("<pod>-caddy"), not the bare spec name, or every steady-state
+	// reconcile would hit a non-existent container.
+	require.Equal(t, caddyContainer, last.Container)
 	require.Contains(t, string(last.Content), "reverse_proxy web-blog:8080")
 	require.GreaterOrEqual(t, len(f.ExecCalls), 2)
+	require.Equal(t, caddyContainer, f.ExecCalls[len(f.ExecCalls)-1].Container)
 	require.Contains(t, f.ExecCalls[len(f.ExecCalls)-2].Cmd, "validate")
 	require.Contains(t, f.ExecCalls[len(f.ExecCalls)-1].Cmd, "reload")
 }

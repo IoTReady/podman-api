@@ -14,9 +14,11 @@ const (
 	// caddyPodName is the globally-unique name of the per-host Caddy system pod.
 	// It cannot collide with app pods, which are "<template>-<slug>".
 	caddyPodName = "podman-api-ingress-caddy"
-	// caddyContainer is the container name `podman kube play` assigns from the
-	// pod spec's container `name: caddy`.
-	caddyContainer = "caddy"
+	// caddyContainer is the container name `podman kube play` assigns: the repo
+	// convention (see instance.Service.Logs) is "<pod-name>-<container-name>",
+	// so the pod's `name: caddy` container is reachable for exec/cp as
+	// "podman-api-ingress-caddy-caddy", NOT the bare "caddy".
+	caddyContainer = caddyPodName + "-caddy"
 	// caddyConfigDir is where the Caddyfile lives inside the container.
 	caddyConfigDir = "/etc/caddy"
 	// caddyConfigFile is the Caddyfile name inside caddyConfigDir.
