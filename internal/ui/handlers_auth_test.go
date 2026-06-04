@@ -57,6 +57,34 @@ func TestLoginFailureRerendersForm(t *testing.T) {
 	}
 }
 
+func TestCSRFGuardedPostRejectedWithoutToken(t *testing.T) {
+	u := testUI(t)
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	r := httptest.NewRequest("POST", "/ui/logout", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (missing CSRF token)", w.Code)
+	}
+}
+
+func TestCSRFGuardedPostAcceptedWithToken(t *testing.T) {
+	u := testUI(t)
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	r := httptest.NewRequest("POST", "/ui/logout", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	r.Header.Set(csrfHeader, csrfToken(tok))
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/ui/login" {
+		t.Fatalf("got %d %q; want 303 /ui/login", w.Code, w.Header().Get("Location"))
+	}
+	if _, ok := u.cfg.Sessions.Lookup(tok); ok {
+		t.Error("logout should have deleted the session")
+	}
+}
+
 func TestProtectedRouteRedirectsWhenUnauthenticated(t *testing.T) {
 	u := testUI(t)
 	r := httptest.NewRequest("GET", "/ui", nil)

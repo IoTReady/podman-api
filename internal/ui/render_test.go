@@ -18,7 +18,7 @@ func TestRenderFullPageVsFragment(t *testing.T) {
 
 	// Full page (no HX-Request) → includes <!DOCTYPE>.
 	full := httptest.NewRecorder()
-	u.render(full, httptest.NewRequest("GET", "/ui/login", nil), "login", map[string]any{})
+	u.render(full, httptest.NewRequest("GET", "/ui/login", nil), http.StatusOK, "login", map[string]any{})
 	if !strings.Contains(full.Body.String(), "<!DOCTYPE html>") {
 		t.Error("full page should include the layout")
 	}
@@ -27,7 +27,7 @@ func TestRenderFullPageVsFragment(t *testing.T) {
 	frag := httptest.NewRecorder()
 	r := httptest.NewRequest("GET", "/ui/login", nil)
 	r.Header.Set("HX-Request", "true")
-	u.render(frag, r, "login", map[string]any{})
+	u.render(frag, r, http.StatusOK, "login", map[string]any{})
 	if strings.Contains(frag.Body.String(), "<!DOCTYPE html>") {
 		t.Error("HTMX fragment must not include the layout")
 	}
@@ -39,7 +39,7 @@ func TestRenderUnknownBlockIs500(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := httptest.NewRecorder()
-	u.render(w, httptest.NewRequest("GET", "/ui", nil), "does-not-exist", nil)
+	u.render(w, httptest.NewRequest("GET", "/ui", nil), http.StatusOK, "does-not-exist", nil)
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("unknown block: status = %d, want 500", w.Code)
 	}

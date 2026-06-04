@@ -11,15 +11,19 @@ import (
 )
 
 // render writes block either wrapped in the layout (normal navigation) or bare
-// (HTMX fragment, when HX-Request is set). data is shallow-augmented with the
-// CSRF token used by the layout's hx-headers attribute.
+// (HTMX fragment, when HX-Request is set), with the given HTTP status. data is
+// shallow-augmented with the CSRF token used by the layout's hx-headers
+// attribute. Most callers pass http.StatusOK; error re-renders (e.g. a failed
+// login or an invalid form) pass the appropriate 4xx.
 //
 // The block name is validated against the parsed template set up front: every
 // caller passes a compile-time constant, so an unknown block is a programmer
 // error, and validating turns it into a clean 500 instead of a partially-written
-// 200. We render into a buffer and only write once execution fully succeeds, so
-// a mid-template failure can't emit a partial body under a 200 status.
-func (u *UI) render(w http.ResponseWriter, r *http.Request, block string, data map[string]any) {
+// response. We render into a buffer and only write once execution fully
+// succeeds, and we set Content-Type + WriteHeader(status) before the body so the
+// status and headers are always correct (writing them after WriteHeader is a
+// silent no-op on a real ResponseWriter).
+func (u *UI) render(w http.ResponseWriter, r *http.Request, status int, block string, data map[string]any) {
 	if data == nil {
 		data = map[string]any{}
 	}
@@ -52,6 +56,7 @@ func (u *UI) render(w http.ResponseWriter, r *http.Request, block string, data m
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(status)
 	_, _ = w.Write(buf.Bytes())
 }
 

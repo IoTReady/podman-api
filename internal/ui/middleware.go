@@ -7,10 +7,14 @@ import (
 
 type ctxKey int
 
-const identityKey ctxKey = 0
+const (
+	identityKey ctxKey = iota
+	sessionTokenKey
+)
 
-// requireSession resolves the session cookie to an Identity and injects it into
-// the context, or redirects to /ui/login when absent/invalid.
+// requireSession resolves the session cookie to an Identity and injects both the
+// Identity and the raw session token into the context, or redirects to
+// /ui/login when absent/invalid.
 func (u *UI) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(sessionCookie)
@@ -24,24 +28,28 @@ func (u *UI) requireSession(next http.Handler) http.Handler {
 			return
 		}
 		ctx := context.WithValue(r.Context(), identityKey, id)
+		ctx = context.WithValue(ctx, sessionTokenKey, c.Value)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
 // requireCSRF rejects unsafe methods whose CSRF token (form field or header)
-// does not match the session-derived token.
+// does not match the token derived from the active session. It reads the
+// session token from the context populated by requireSession, so it must be
+// nested inside requireSession; a request without a verified session in context
+// is rejected rather than trusting a raw cookie.
 func (u *UI) requireCSRF(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet || r.Method == http.MethodHead {
 			next.ServeHTTP(w, r)
 			return
 		}
-		c, err := r.Cookie(sessionCookie)
-		if err != nil {
+		sessTok, ok := r.Context().Value(sessionTokenKey).(string)
+		if !ok || sessTok == "" {
 			http.Error(w, "forbidden", http.StatusForbidden)
 			return
 		}
-		want := csrfToken(c.Value)
+		want := csrfToken(sessTok)
 		got := r.Header.Get(csrfHeader)
 		if got == "" {
 			got = r.FormValue(csrfField)
