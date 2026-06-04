@@ -182,13 +182,15 @@ func migrateSchema(db *sql.DB) error {
 		return err
 	}
 	if v < 4 {
-		if _, err := db.Exec(`ALTER TABLE specs ADD COLUMN domains TEXT NOT NULL DEFAULT '[]'`); err != nil {
-			// Tolerate the duplicate-column case (a fresh DB where schemaSQL
-			// already created the column) so OpenSQLite stays idempotent;
-			// anything else is a real failure. Inspect the typed *sqlite.Error
-			// and match its (stable) message rather than a bare error string.
-			var se *sqlite.Error
-			if !errors.As(err, &se) || !strings.Contains(se.Error(), "duplicate column") {
+		// specs.domains is created by schemaSQL on a fresh DB but absent on a
+		// pre-v4 DB. Add it only when missing — checking the catalog avoids
+		// depending on the driver's duplicate-column error text.
+		has, err := columnExists(db, "specs", "domains")
+		if err != nil {
+			return fmt.Errorf("migrateSchema: check domains column: %w", err)
+		}
+		if !has {
+			if _, err := db.Exec(`ALTER TABLE specs ADD COLUMN domains TEXT NOT NULL DEFAULT '[]'`); err != nil {
 				return fmt.Errorf("migrateSchema: add domains column: %w", err)
 			}
 		}
@@ -197,6 +199,16 @@ func migrateSchema(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// columnExists reports whether table has a column named col, read from the
+// SQLite schema catalog (pragma_table_info) rather than inferred from an error.
+func columnExists(db *sql.DB, table, col string) (bool, error) {
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM pragma_table_info(?) WHERE name = ?`, table, col).Scan(&n); err != nil {
+		return false, err
+	}
+	return n > 0, nil
 }
 
 // Close releases the underlying database handle.

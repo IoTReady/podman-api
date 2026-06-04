@@ -22,6 +22,9 @@ func ValidateDomains(domains []string) error {
 		if d != strings.ToLower(d) {
 			return fmt.Errorf("ingress: domain %q must be lowercase", d)
 		}
+		if len(d) > 253 {
+			return fmt.Errorf("ingress: domain %q exceeds the 253-character FQDN limit", d)
+		}
 		if !domainRE.MatchString(d) {
 			return fmt.Errorf("ingress: invalid domain %q", d)
 		}
