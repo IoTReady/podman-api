@@ -764,31 +764,92 @@ Parse `?limit=` / `?before=` in `listJobs` and reject non-integer limits.
 - Modify: `internal/api/jobs.go` (the `listJobs` handler ~line 58-80; add `strconv` import)
 - Test: `internal/api/jobs_pagination_test.go` (Create)
 
-First, inspect the existing jobs API test for the test harness pattern (how a `*handlers`/router with a Memory job store is built, and how authenticated requests are made):
-
-Run: `ls internal/api/*jobs*_test.go internal/api/evacuate_test.go` and read whichever exists to copy the setup (key scopes, request helper). The migrate/evacuate tests already build an authenticated client with `jobs:*` scope.
+The harness already exists in `internal/api/jobs_test.go`: `newSrvWithJobs(t, js store.JobStore) (*httptest.Server, string)` builds a test server (key scope `jobs:read`, sufficient for `GET /jobs`) wired to the given job store and returns `(srv, token)`; `authedReq(t, srv, tok, method, path) *http.Response` makes an authenticated request. Use these directly. The error body shape is `{"code": "...", "message": "..."}` (`ErrorBody` in `errors.go`).
 
 - [ ] **Step 1: Write the failing test**
 
-Create `internal/api/jobs_pagination_test.go`. Mirror the setup used by the existing jobs/evacuate API tests in this package (same router constructor, same auth helper, a `store.Memory` as the job store). The assertions:
+Create `internal/api/jobs_pagination_test.go`:
 
 ```go
-// Pseudocode shape — adapt the harness (router build + authed request helper)
-// to match internal/api/evacuate_test.go / the existing jobs test in this pkg.
-//
-// 1. Seed 3 jobs via the memory store's Enqueue.
-// 2. GET /jobs?limit=1            → 200, JSON array of length 1 (newest).
-// 3. GET /jobs?before=<that id>&limit=1 → 200, array len 1, the next-newest id.
-// 4. GET /jobs?limit=abc          → 400, error code "invalid_request".
-// 5. GET /jobs                    → 200, bare JSON array (len 3 here).
-```
+package api
 
-Write it concretely using this package's existing helpers. Decode the body into `[]map[string]any` (or a local `jobView`-shaped struct) and assert `len` and the `id` field. For the 400 case, assert the HTTP status is 400 and the JSON body's `error`/`code` field is `invalid_request` (match how `errors.go` shapes errors — `WriteError`).
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"testing"
+
+	"github.com/iotready/podman-api/internal/store"
+)
+
+func TestJobs_Pagination(t *testing.T) {
+	js := store.NewMemory()
+	ctx := context.Background()
+	var ids []string // oldest..newest
+	for i := 0; i < 3; i++ {
+		j, err := js.Enqueue(ctx, "test", json.RawMessage(`{}`), "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, j.ID)
+	}
+	srv, tok := newSrvWithJobs(t, js)
+
+	decode := func(resp *http.Response) []map[string]any {
+		t.Helper()
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			b, _ := io.ReadAll(resp.Body)
+			t.Fatalf("status %d: %s", resp.StatusCode, b)
+		}
+		var list []map[string]any
+		if err := json.NewDecoder(resp.Body).Decode(&list); err != nil {
+			t.Fatal(err)
+		}
+		return list
+	}
+
+	// limit caps the page; newest first.
+	p1 := decode(authedReq(t, srv, tok, "GET", "/jobs?limit=1"))
+	if len(p1) != 1 || p1[0]["id"] != ids[2] {
+		t.Fatalf("page1: %+v", p1)
+	}
+
+	// before cursor returns the next page.
+	p2 := decode(authedReq(t, srv, tok, "GET", "/jobs?limit=1&before="+ids[2]))
+	if len(p2) != 1 || p2[0]["id"] != ids[1] {
+		t.Fatalf("page2: %+v", p2)
+	}
+
+	// no params → bare array bounded by the default limit (3 here).
+	all := decode(authedReq(t, srv, tok, "GET", "/jobs"))
+	if len(all) != 3 {
+		t.Fatalf("all: %+v", all)
+	}
+
+	// non-integer limit → 400 invalid_query.
+	resp := authedReq(t, srv, tok, "GET", "/jobs?limit=abc")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad limit status = %d, want 400", resp.StatusCode)
+	}
+	var eb map[string]any
+	if err := json.NewDecoder(resp.Body).Decode(&eb); err != nil {
+		t.Fatal(err)
+	}
+	if eb["code"] != "invalid_query" {
+		t.Fatalf("error code = %v, want invalid_query", eb["code"])
+	}
+}
+```
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `go test -tags "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper" -run 'Pagination' ./internal/api/`
 Expected: FAIL — limit/before are ignored (no clamping/cursor) and `?limit=abc` returns 200, not 400.
+
+NOTE: the API error idiom in this package is `WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "...", Message: "..."})` (see `internal/api/logs.go`, `migrate.go`). Bad query params use code `invalid_query`. There is no `APIError` type — use `ErrorBody` directly as shown in Step 3.
 
 - [ ] **Step 3: Parse the params**
 
@@ -811,7 +872,7 @@ func (h *handlers) listJobs(w http.ResponseWriter, r *http.Request) {
 	if s := r.URL.Query().Get("limit"); s != "" {
 		n, err := strconv.Atoi(s)
 		if err != nil {
-			WriteError(w, &APIError{Code: "invalid_request", Status: http.StatusBadRequest, Message: "limit must be an integer"})
+			WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_query", Message: "limit must be an integer"})
 			return
 		}
 		f.Limit = n // store clamps to [1, MaxJobLimit]
@@ -829,7 +890,7 @@ func (h *handlers) listJobs(w http.ResponseWriter, r *http.Request) {
 }
 ```
 
-IMPORTANT — verify the error-construction shape first: open `internal/api/errors.go` and use whatever the package's actual idiom is for returning a 400 with code `invalid_request`. If there is a helper/constructor (e.g. `WriteErrorCode(w, "invalid_request", http.StatusBadRequest, "...")` or a sentinel error mapped in `classify`), use that instead of the `&APIError{...}` literal above. The literal is illustrative; match the real type/field names in this package so it compiles and matches existing error responses.
+The `ErrorBody{Code: "invalid_query", ...}` literal above IS the real package idiom (confirmed against `internal/api/logs.go` and `migrate.go` — `WriteJSON` + `ErrorBody`, no `APIError` type). `ErrorBody` is already defined in `internal/api/errors.go` in this same package, so no extra import is needed for it.
 
 - [ ] **Step 4: Run tests to verify they pass**
 
