@@ -16,6 +16,7 @@ type Meta struct {
 	Parameters Parameters `yaml:"parameters"`
 	Secrets    Secrets    `yaml:"secrets"`
 	Volumes    []Volume   `yaml:"volumes"`
+	Ingress    *Ingress   `yaml:"ingress"`
 }
 
 type Parameters struct {
@@ -31,6 +32,13 @@ type Secrets struct {
 type Volume struct {
 	Name   string `yaml:"name"`
 	Backup string `yaml:"backup,omitempty"`
+}
+
+// Ingress declares which container+port in the rendered pod serves HTTP, so the
+// ingress layer can route a domain to it. Absent on non-web templates.
+type Ingress struct {
+	Container string `yaml:"container"`
+	Port      int    `yaml:"port"`
 }
 
 // ParseMeta extracts the template-meta block from the head of the file
@@ -109,6 +117,15 @@ func ParseMeta(src string) (Meta, string, error) {
 	}
 	if wrapper.Meta.ID == "" {
 		return Meta{}, "", errors.New("template-meta: id is required")
+	}
+
+	if ing := wrapper.Meta.Ingress; ing != nil {
+		if ing.Container == "" {
+			return Meta{}, "", errors.New("template-meta: ingress.container is required")
+		}
+		if ing.Port <= 0 || ing.Port > 65535 {
+			return Meta{}, "", fmt.Errorf("template-meta: ingress.port %d out of range", ing.Port)
+		}
 	}
 
 	body := bodyAfterLine(src, bodyStart)
