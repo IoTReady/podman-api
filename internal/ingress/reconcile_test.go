@@ -47,6 +47,18 @@ func TestReconcileExistingHostCopiesAndReloads(t *testing.T) {
 	require.Contains(t, f.ExecCalls[len(f.ExecCalls)-1].Cmd, "reload")
 }
 
+func TestReconcileNoRoutesNoPodIsNoop(t *testing.T) {
+	f := fake.New()
+	// empty memStore -> zero routes; no Caddy pod exists yet
+	c := NewCaddyController(f, &memStore{}, map[string]TemplateIngress{"web": {Port: 8080}},
+		Config{Network: "n", CaddyImage: "img", ACMEEmail: "ops@example.com"})
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+
+	require.Empty(t, f.PlayCalls, "no Caddy pod should be created when there are no routes")
+	require.Empty(t, f.NetworkEnsureCalls["h1"], "no network should be ensured when there are no routes")
+}
+
 func TestReconcileFailsWhenValidateFails(t *testing.T) {
 	f := fake.New()
 	f.ExecFunc = func(_, _ string, cmd []string) (podman.ExecResult, error) {

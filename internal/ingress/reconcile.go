@@ -2,7 +2,10 @@ package ingress
 
 import (
 	"context"
+	"errors"
 	"fmt"
+
+	"github.com/iotready/podman-api/internal/podman"
 )
 
 // Reconcile makes host's Caddy proxy match the store-derived routes. It is
@@ -19,6 +22,18 @@ func (c *CaddyController) Reconcile(ctx context.Context, host string) error {
 	caddyfile, err := RenderCaddyfile(c.cfg.ACMEEmail, routes)
 	if err != nil {
 		return fmt.Errorf("ingress: render caddyfile: %w", err)
+	}
+
+	// Nothing to serve and no proxy yet: don't stand up an idle Caddy pod
+	// (which would bind :80/:443) on a host that has no ingress instances. If a
+	// pod already exists, fall through so a drop-to-zero still pushes the
+	// global-only config and removes the last route.
+	if len(routes) == 0 {
+		if _, err := c.client.PodInspect(ctx, host, caddyPodName); errors.Is(err, podman.ErrNotFound) {
+			return nil
+		} else if err != nil {
+			return fmt.Errorf("ingress: inspect caddy pod: %w", err)
+		}
 	}
 
 	created, err := c.ensureProxy(ctx, host, caddyfile)
