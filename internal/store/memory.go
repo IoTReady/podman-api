@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -122,9 +123,8 @@ func (m *Memory) ListJobs(_ context.Context, f JobFilter) ([]Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	limit := clampJobLimit(f.Limit)
-	out := []Job{}
-	for i := len(m.jobs) - 1; i >= 0; i-- { // newest first
-		j := m.jobs[i]
+	var matched []Job
+	for _, j := range m.jobs {
 		if f.State != "" && j.State != f.State {
 			continue
 		}
@@ -137,10 +137,15 @@ func (m *Memory) ListJobs(_ context.Context, f JobFilter) ([]Job, error) {
 		if f.Before != "" && j.ID >= f.Before {
 			continue
 		}
-		out = append(out, cloneJob(j))
-		if len(out) == limit {
-			break
-		}
+		matched = append(matched, j)
+	}
+	// Sort by id descending (newest first), the same total order SQLite uses, so
+	// the limit truncates the right rows and the Before cursor stays consistent —
+	// append order can diverge from id order under concurrent enqueues.
+	sort.Slice(matched, func(i, k int) bool { return matched[i].ID > matched[k].ID })
+	out := []Job{}
+	for i := 0; i < len(matched) && i < limit; i++ {
+		out = append(out, cloneJob(matched[i]))
 	}
 	return out, nil
 }

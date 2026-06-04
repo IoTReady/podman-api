@@ -300,7 +300,12 @@ func (s *SQLite) ListJobs(ctx context.Context, f JobFilter) ([]Job, error) {
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
-	q += " ORDER BY created DESC, id DESC LIMIT ?"
+	// Order by id alone: the id is fixed-width "<unixnano>-<rand>", so its
+	// lexicographic order is a total order on creation time. The Before cursor
+	// (id < ?) must use the SAME key as ORDER BY — created and the id time-prefix
+	// come from two separate clock reads and can disagree under concurrent
+	// inserts, so ordering by created here would let the id cursor skip a row.
+	q += " ORDER BY id DESC LIMIT ?"
 	args = append(args, clampJobLimit(f.Limit))
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
