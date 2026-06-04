@@ -21,14 +21,16 @@ This README is the quick reference. The **[wiki](/tej/podman-api/wiki)** is the 
 - Manages **per-host** and **per-instance secrets** as Kubernetes Secret resources (so `secretKeyRef` works).
 - Pre-pulls every container image before play, so a bad tag fails fast with a clear registry error instead of a 30-second timeout.
 - Streams **logs** as plain text or SSE.
+- **Migrates and evacuates** instances across hosts (opt-in, requires the state store): `POST /migrate` moves one instance, `POST /evacuate` clears a whole host, both as async jobs. Movement is cold-copy (stop → copy volumes → re-apply → verify → reap source) with rollback if the destination doesn't come up.
 - Exposes **Prometheus metrics** on a separate, opt-in listener so they aren't world-readable on the public port.
 
 ## What it doesn't do
 
 - No multi-replica HA; one daemon, one config tree.
 - No image registry, no scheduler, no rolling deploy primitives. (`Upgrade` is single-pod replace-in-place.)
-- No webhook callbacks; callers poll.
-- No pod migration across hosts; an instance is bound to the host where it was applied.
+- No webhook callbacks; callers poll (including the async migrate/evacuate jobs).
+- No daemon-side placement/scheduler — cross-host moves work, but the *client* chooses destinations (the daemon executes the move).
+- No live migration — cross-host moves are cold (stop → copy volumes → re-apply → verify → reap the source).
 
 ## Architecture
 
@@ -172,7 +174,7 @@ podman-api \
   -keys-file=/etc/podman-api/keys.yaml
 ```
 
-To enable the desired-state store (required for future migrate/evacuate):
+To enable the desired-state store (required for migrate/evacuate):
 
 ```sh
 podman-api \
@@ -195,7 +197,7 @@ A systemd unit and an opinionated installer live in `contrib/`. See [`contrib/in
 
 ### State store (optional)
 
-When `-state-db=<path>` is set, the daemon persists each instance's parameters and AES-256-GCM-encrypted secrets to a local SQLite database. This is off by default and is required for the planned migrate/evacuate features.
+When `-state-db=<path>` is set, the daemon persists each instance's parameters and AES-256-GCM-encrypted secrets to a local SQLite database. This is off by default and is required for the migrate/evacuate features. With it the daemon becomes a **stateful controller**: it holds desired state (the store) beside the podman actuator, so it can move an instance to another host by name without the client re-supplying secrets.
 
 - **`-state-db <path>`** — enables the desired-state store at this path.
 - **`-spec-key-file <path>`** — 32-byte AES-256-GCM key used to encrypt stored secrets. Required when `-state-db` is set; the daemon refuses to start without a readable, valid key. Loaded once at startup (no runtime reload — see the rotation caveat below). Keep the file `0600` and **separate from the database** — leaking secrets requires compromise of both.
@@ -208,10 +210,19 @@ head -c 32 /dev/urandom | base64 > /etc/podman-api/spec.key && chmod 600 /etc/po
 
 > **Key rotation caveat:** the key is loaded once at startup and there is no re-encrypting rotation yet, so changing the key makes existing rows unreadable. The SQLite `-wal`/`-shm` sidecar files also hold (encrypted) secret material — include them (or checkpoint first) when backing up.
 
-When the store is enabled, async operations (future migrate/evacuate) are tracked as **jobs**, readable via:
+### Migrate & evacuate (optional)
 
-- `GET /jobs?state=<queued|running|succeeded|failed>&kind=<kind>` — list jobs, optionally filtered (scope `jobs:read`).
-- `GET /jobs/{id}` — fetch one job by ID (scope `jobs:read`).
+With the store enabled, the daemon exposes server-side cross-host moves as async jobs:
+
+- **`POST /migrate`** `{from_host, to_host, template, slug, parameters?}` — move one instance. Validated synchronously (known hosts, distinct source/destination, an existing stored spec), then enqueued. The job stops the source, cold-copies its volumes, re-applies the spec on the destination, **verifies** every container is Running, then reaps the source. If the destination doesn't come up it rolls back (restarts the source, reaps the partial destination). Scope `instances:write`.
+- **`POST /evacuate`** `{from_host, map:{slug: to_host, ...}}` — clear a whole host. Enqueues one **parent** job that fans out a child `migrate` job per instance at bounded concurrency. The `map` must cover exactly the instances on the host (strict bijection); placement is the client's choice. A sibling failure doesn't abort the others — the parent succeeds only if every child does, otherwise it fails with per-child detail. Scope `instances:write`.
+
+Both validate the request and return `202 {job_id}`; deeper/destination-side errors surface as job failures, not the POST status. Both return `501` when `-state-db` is not set.
+
+Operations are tracked as **jobs**, readable via:
+
+- `GET /jobs?state=<queued|running|succeeded|failed>&kind=<kind>&parent_id=<id>` — list jobs, optionally filtered (scope `jobs:read`). `parent_id` drills into an evacuate's child migrations.
+- `GET /jobs/{id}` — fetch one job by ID, including its progress steps and error (scope `jobs:read`).
 
 Both endpoints return `501` when `-state-db` is not set.
 
@@ -324,9 +335,14 @@ GET    /hosts/{host}/instances/{template}/{slug}/logs?container=&tail=&follow=
 GET    /hosts/{host}/instances/{template}/{slug}/volumes
 DELETE /hosts/{host}/volumes/{name}
 
-GET    /jobs?state=&kind=                                             jobs:read
+POST   /migrate   body: {from_host,to_host,template,slug,parameters?} instances:write
+POST   /evacuate   body: {from_host, map:{slug:to_host}}              instances:write
+
+GET    /jobs?state=&kind=&parent_id=                                  jobs:read
 GET    /jobs/{id}                                                     jobs:read
 ```
+
+`POST /migrate` and `POST /evacuate` require `-state-db` (else `501`), validate synchronously, and return `202 {job_id}`; poll `GET /jobs/{id}` for progress. For an evacuate, `GET /jobs?parent_id=<id>` lists its child migrations.
 
 The `?skip_pull=true` query on POST/PUT instances skips the pre-pull step, useful for CI or when the image is known to be local.
 
