@@ -31,6 +31,30 @@ func TestMemorySessionStoreLifecycle(t *testing.T) {
 	}
 }
 
+func TestMemorySessionStoreSlidingExpiry(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	s := NewMemorySessionStore(time.Hour)
+	s.now = func() time.Time { return now }
+
+	tok, err := s.Create(Identity{Subject: "operator"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Just before the original expiry: a successful lookup must renew the TTL.
+	now = now.Add(59 * time.Minute)
+	if _, ok := s.Lookup(tok); !ok {
+		t.Fatal("session should still resolve before expiry")
+	}
+
+	// Past the ORIGINAL expiry but within one TTL of the renewing lookup: the
+	// slide must have kept it alive.
+	now = now.Add(30 * time.Minute) // t+89m; original expiry was t+60m
+	if _, ok := s.Lookup(tok); !ok {
+		t.Error("sliding expiry should have renewed the session on the prior lookup")
+	}
+}
+
 func TestMemorySessionStoreDelete(t *testing.T) {
 	s := NewMemorySessionStore(time.Hour)
 	tok, _ := s.Create(Identity{Subject: "operator"})

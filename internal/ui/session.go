@@ -80,7 +80,9 @@ func (s *MemorySessionStore) Delete(tok string) {
 // are stable per session within a process lifetime and unforgeable without it.
 var csrfKey = func() []byte {
 	b := make([]byte, 32)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		panic("ui: failed to generate CSRF key: " + err.Error())
+	}
 	return b
 }()
 
