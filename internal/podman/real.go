@@ -405,6 +405,22 @@ func (r *Real) VolumeImport(ctx context.Context, id, name string, src io.Reader)
 	return mapNotFound(volumes.Import(c, name, src))
 }
 
+// VolumeCreate creates an empty named volume. An already-existing name is
+// treated as success so migrate's create-then-copy step is idempotent on retry.
+func (r *Real) VolumeCreate(ctx context.Context, id, name string) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	if _, err := volumes.Create(c, entities.VolumeCreateOptions{Name: name}, nil); err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "already exists") {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
 // --- helpers ---
 
 func isNotFound(err error) bool {

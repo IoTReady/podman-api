@@ -33,6 +33,12 @@ type JobContext struct {
 	id    string
 }
 
+// NewJobContext builds a JobContext for a job id. Exposed so handlers can be
+// exercised in tests without the full runner.
+func NewJobContext(js store.JobStore, id string) *JobContext {
+	return &JobContext{store: js, id: id}
+}
+
 // Step records a progress entry. It is best-effort: a store error is logged, not
 // returned, so progress logging never fails the job.
 func (jc *JobContext) Step(step, detail string) {
