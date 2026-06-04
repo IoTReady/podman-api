@@ -544,7 +544,7 @@ func (s *SQLite) PruneJobs(ctx context.Context, olderThan time.Time) (int, error
 		// 1) Old terminal children first, so their parents can then be considered.
 		rc, err := tx.ExecContext(ctx, `
 DELETE FROM jobs
-WHERE parent_id IS NOT NULL AND state IN ('succeeded','failed')
+WHERE parent_id IS NOT NULL AND state IN ('succeeded','failed','canceled')
   AND finished IS NOT NULL AND finished < ?`, cutoff)
 		if err != nil {
 			return err
@@ -557,7 +557,7 @@ WHERE parent_id IS NOT NULL AND state IN ('succeeded','failed')
 		// 2) Old terminal jobs not referenced as a parent by any surviving row.
 		rp, err := tx.ExecContext(ctx, `
 DELETE FROM jobs
-WHERE state IN ('succeeded','failed') AND finished IS NOT NULL AND finished < ?
+WHERE state IN ('succeeded','failed','canceled') AND finished IS NOT NULL AND finished < ?
   AND id NOT IN (SELECT parent_id FROM jobs WHERE parent_id IS NOT NULL)`, cutoff)
 		if err != nil {
 			return err

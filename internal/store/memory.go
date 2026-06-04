@@ -224,7 +224,9 @@ func (m *Memory) PruneJobs(_ context.Context, olderThan time.Time) (int, error) 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	terminal := func(j Job) bool { return j.State == JobSucceeded || j.State == JobFailed }
+	terminal := func(j Job) bool {
+		return j.State == JobSucceeded || j.State == JobFailed || j.State == JobCanceled
+	}
 	isOld := func(j Job) bool {
 		return !j.Finished.IsZero() && j.Finished.Before(olderThan)
 	}
