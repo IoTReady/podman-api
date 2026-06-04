@@ -104,13 +104,13 @@ type Identity struct {
 }
 ```
 
-- **Single-operator impl** verifies the submitted password against a bcrypt hash, reusing
-  `config.HashToken` / `config.VerifyToken`.
+- **Single-operator impl** verifies the submitted password against an argon2id hash, reusing
+  `config.HashToken` / `config.VerifyToken` (the same PHC-format scheme used for API tokens).
 - **Credential provisioning:** new `-operator-file` flag → a YAML file holding `password_hash:`
   (and optionally `username:`, default `operator`). Reloaded on **SIGHUP** alongside
   `keys.yaml` and `hosts/*.yaml`, following the existing atomic-swap pattern; a bad reload is
-  logged and the previous value retained. A `podman-api hash-password <plaintext>` subcommand
-  (mirroring the existing `hash-token`) prints a hash for the file.
+  logged and the previous value retained. The existing `podman-api hash-token <plaintext>`
+  subcommand prints a PHC hash usable for `password_hash:` (no new subcommand needed).
 
 ### 3.5 Sessions
 
