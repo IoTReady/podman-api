@@ -179,6 +179,8 @@ func TestPlanEvacuation_InconclusiveCheck(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, plan.Moves[0].Issues, 1)
 	assert.Equal(t, "check_error", plan.Moves[0].Issues[0].Code)
+	assert.Contains(t, plan.Moves[0].Issues[0].Message, "connection refused",
+		"check_error must surface the underlying error to the operator")
 	assert.False(t, plan.Moves[0].OK)
 }
 
