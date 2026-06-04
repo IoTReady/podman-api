@@ -20,6 +20,16 @@ const TickInterval = time.Minute
 // this is ample for any realistic queue depth.
 const activeScanLimit = 500
 
+// failureBackoff is how long to wait after a failed prune before re-enqueuing for
+// the same host, so an unreachable or persistently-failing host isn't retried
+// every tick (which would otherwise flood the job store).
+const failureBackoff = time.Hour
+
+// thresholdProbeInterval throttles the per-host HostInfo disk probe so a
+// threshold-only host isn't queried over SSH on every tick. The interval trigger
+// is unaffected by this.
+const thresholdProbeInterval = 5 * time.Minute
+
 // HostPolicy pairs a host id with its resolved policy. The caller (main) builds
 // this slice once at startup and again on SIGHUP reload.
 type HostPolicy struct {
@@ -37,6 +47,10 @@ type Scheduler struct {
 	// lastOverride, when set for a host, replaces the store-derived last-prune
 	// time. Test seam only; nil in production.
 	lastOverride map[string]time.Time
+
+	// lastProbe throttles per-host HostInfo disk probes (see thresholdProbeInterval).
+	// Touched only from the single tick goroutine, so it needs no lock.
+	lastProbe map[string]time.Time
 
 	wg sync.WaitGroup
 }
@@ -78,29 +92,54 @@ func (s *Scheduler) Wait() { s.wg.Wait() }
 
 // tick evaluates every host once.
 func (s *Scheduler) tick(ctx context.Context, hosts []HostPolicy) {
+	// Skip the job scans and host probes entirely when no host has prune enabled.
+	hasEnabled := false
+	for _, hp := range hosts {
+		if hp.Policy.Enabled {
+			hasEnabled = true
+			break
+		}
+	}
+	if !hasEnabled {
+		return
+	}
+
 	now := s.Now()
-	inflight, lastPrune := s.scanPruneJobs(ctx)
-	migrateActive := s.migrateOrEvacuateActive(ctx)
+	inflight, lastSuccess, lastFailure := s.scanPruneJobs(ctx)
+	migrateActive := migrateOrEvacuateActive(ctx, s.Store)
 
 	for _, hp := range hosts {
 		if !hp.Policy.Enabled {
 			continue
 		}
+		if !s.Client.Knows(hp.Host) {
+			// Added via config reload but the podman client is fixed at startup,
+			// so it's unreachable until the daemon restarts. Skip rather than
+			// enqueue prunes that can only fail (and would re-enqueue every tick).
+			log.Printf("prune: host %s not known to the podman client (added since startup?), skipping until restart", hp.Host)
+			continue
+		}
 		if inflight[hp.Host] {
 			continue // dedup: a prune for this host is queued/running
 		}
+		// Error backoff: after a failed prune, wait before retrying so an
+		// unreachable or persistently-failing host isn't hammered every tick.
+		if lf, ok := lastFailure[hp.Host]; ok && now.Sub(lf) < failureBackoff {
+			continue
+		}
 
+		// Interval==0 disables the interval trigger (see policy.go); such a host
+		// prunes only when it crosses the disk threshold. A never-pruned host with
+		// a positive interval is due immediately.
 		due := false
-		if last, ok := lastPrune[hp.Host]; !ok {
-			due = true // never pruned
-		} else if hp.Policy.Interval > 0 && now.Sub(last) >= hp.Policy.Interval {
-			// Interval==0 disables the interval trigger (see policy.go); such a
-			// host only prunes when it crosses the disk threshold.
-			due = true
+		if hp.Policy.Interval > 0 {
+			if last, ok := lastSuccess[hp.Host]; !ok || now.Sub(last) >= hp.Policy.Interval {
+				due = true
+			}
 		}
 
 		overThreshold := false
-		if !due && hp.Policy.DiskThreshold > 0 {
+		if !due && hp.Policy.DiskThreshold > 0 && s.probeDue(hp.Host, now) {
 			info, err := s.Client.HostInfo(ctx, hp.Host)
 			if err != nil {
 				log.Printf("prune: host %s info failed, skipping this tick: %v", hp.Host, err)
@@ -137,14 +176,29 @@ func (s *Scheduler) tick(ctx context.Context, hosts []HostPolicy) {
 	}
 }
 
+// probeDue reports whether host is due for a HostInfo disk probe, recording the
+// probe time when it returns true. Throttles probes to thresholdProbeInterval.
+func (s *Scheduler) probeDue(host string, now time.Time) bool {
+	if s.lastProbe == nil {
+		s.lastProbe = map[string]time.Time{}
+	}
+	if last, ok := s.lastProbe[host]; ok && now.Sub(last) < thresholdProbeInterval {
+		return false
+	}
+	s.lastProbe[host] = now
+	return true
+}
+
 // scanPruneJobs returns, from the most recent prune jobs, the set of hosts with a
-// queued/running prune (in-flight) and the last successful prune time per host.
-func (s *Scheduler) scanPruneJobs(ctx context.Context) (inflight map[string]bool, last map[string]time.Time) {
+// queued/running prune (in-flight), the last successful prune time per host, and
+// the last failed prune time per host (used for the error backoff).
+func (s *Scheduler) scanPruneJobs(ctx context.Context) (inflight map[string]bool, lastSuccess, lastFailure map[string]time.Time) {
 	inflight = map[string]bool{}
-	last = map[string]time.Time{}
+	lastSuccess = map[string]time.Time{}
+	lastFailure = map[string]time.Time{}
 	if s.lastOverride != nil {
 		for h, t := range s.lastOverride {
-			last[h] = t
+			lastSuccess[h] = t
 		}
 	}
 	jobs, err := s.Store.ListJobs(ctx, store.JobFilter{Kind: "prune", Limit: activeScanLimit})
@@ -162,10 +216,14 @@ func (s *Scheduler) scanPruneJobs(ctx context.Context) (inflight map[string]bool
 			inflight[p.Host] = true
 		case store.JobSucceeded:
 			if s.lastOverride != nil {
-				continue // test seam wins
+				continue // test seam wins for last-success
 			}
-			if cur, ok := last[p.Host]; !ok || j.Finished.After(cur) {
-				last[p.Host] = j.Finished
+			if cur, ok := lastSuccess[p.Host]; !ok || j.Finished.After(cur) {
+				lastSuccess[p.Host] = j.Finished
+			}
+		case store.JobFailed:
+			if cur, ok := lastFailure[p.Host]; !ok || j.Finished.After(cur) {
+				lastFailure[p.Host] = j.Finished
 			}
 		}
 	}
@@ -174,10 +232,12 @@ func (s *Scheduler) scanPruneJobs(ctx context.Context) (inflight map[string]bool
 
 // migrateOrEvacuateActive reports whether any migrate/evacuate job is queued or
 // running. Coarse-grained (host-agnostic) on purpose: the only dangerous overlap
-// is volume reaping, which we suppress entirely while any such job is active.
-func (s *Scheduler) migrateOrEvacuateActive(ctx context.Context) bool {
+// is volume reaping, which is suppressed entirely while any such job is active.
+// Shared by the scheduler (enqueue-time scope drop) and the handler (run-time
+// re-check). On a store error it returns true — fail safe toward not pruning.
+func migrateOrEvacuateActive(ctx context.Context, js store.JobStore) bool {
 	for _, kind := range []string{"migrate", "evacuate"} {
-		jobs, err := s.Store.ListJobs(ctx, store.JobFilter{Kind: kind, Limit: activeScanLimit})
+		jobs, err := js.ListJobs(ctx, store.JobFilter{Kind: kind, Limit: activeScanLimit})
 		if err != nil {
 			log.Printf("prune: list %s jobs failed (assuming active for safety): %v", kind, err)
 			return true

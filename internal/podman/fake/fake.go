@@ -53,12 +53,12 @@ type Fake struct {
 	// Prune hooks. PruneReports maps a scope ("images","containers","buildcache",
 	// "volumes") to the report ImagePrune/etc. should return; absent → empty report.
 	// PruneErr maps a scope to an error to return. PruneCalls records every call.
-	PruneReports map[string]struct {
-		Items     []string
-		Reclaimed int64
-	}
-	PruneErr   map[string]error
-	PruneCalls []PruneCall
+	PruneReports map[string]podman.PruneReport
+	PruneErr     map[string]error
+	PruneCalls   []PruneCall
+	// Unknown lists hosts that Knows should report as not registered; nil means
+	// every host is known. Lets a test exercise the scheduler's unknown-host skip.
+	Unknown map[string]bool
 
 	// PullErr, if non-nil, makes ImagePull return this error for matching refs.
 	// Key is image ref; the empty key matches any ref.
@@ -85,6 +85,8 @@ type Fake struct {
 	HostInfoVal podman.HostInfo
 	// HostInfoErr, if non-nil, makes HostInfo return this error.
 	HostInfoErr error
+	// HostInfoCalls counts HostInfo invocations (lets a test assert probe throttling).
+	HostInfoCalls int
 }
 
 // AddVolume seeds a volume on a host so VolumeInspect resolves it. Test-only.
@@ -120,15 +122,12 @@ func (f *Fake) VolumeData(host, name string) []byte {
 // New returns a fresh fake.
 func New() *Fake {
 	return &Fake{
-		pods:    map[string]map[string]podman.Pod{},
-		secrets: map[string]map[string]podman.Secret{},
-		volumes: map[string]map[string]podman.Volume{},
-		volData: map[string]map[string][]byte{},
-		PruneReports: map[string]struct {
-			Items     []string
-			Reclaimed int64
-		}{},
-		PruneErr: map[string]error{},
+		pods:         map[string]map[string]podman.Pod{},
+		secrets:      map[string]map[string]podman.Secret{},
+		volumes:      map[string]map[string]podman.Volume{},
+		volData:      map[string]map[string][]byte{},
+		PruneReports: map[string]podman.PruneReport{},
+		PruneErr:     map[string]error{},
 	}
 }
 
@@ -412,9 +411,17 @@ func (f *Fake) ImagePull(_ context.Context, host, ref string) error {
 
 func (f *Fake) Ping(_ context.Context, _ string) error              { return nil }
 func (f *Fake) Version(_ context.Context, _ string) (string, error) { return "fake-1.0", nil }
+
+// Knows reports a host as registered unless it's listed in Unknown.
+func (f *Fake) Knows(id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return !f.Unknown[id]
+}
 func (f *Fake) HostInfo(_ context.Context, _ string) (podman.HostInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.HostInfoCalls++
 	if f.HostInfoErr != nil {
 		return podman.HostInfo{}, f.HostInfoErr
 	}
@@ -451,7 +458,7 @@ func (f *Fake) pruneScope(host, scope string, all bool, filters map[string][]str
 		return podman.PruneReport{}, err
 	}
 	if r, ok := f.PruneReports[scope]; ok {
-		return podman.PruneReport{Items: r.Items, Reclaimed: r.Reclaimed}, nil
+		return r, nil
 	}
 	return podman.PruneReport{}, nil
 }

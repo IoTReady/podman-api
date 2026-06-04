@@ -4,14 +4,13 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/iotready/podman-api/internal/podman"
 )
 
 func TestImagePruneRecordsCallAndReturnsCannedReport(t *testing.T) {
 	f := New()
-	f.PruneReports["images"] = struct {
-		Items     []string
-		Reclaimed int64
-	}{Items: []string{"sha256:aaa"}, Reclaimed: 4096}
+	f.PruneReports["images"] = podman.PruneReport{Items: []string{"sha256:aaa"}, Reclaimed: 4096}
 
 	rep, err := f.ImagePrune(context.Background(), "h1", true)
 	if err != nil {

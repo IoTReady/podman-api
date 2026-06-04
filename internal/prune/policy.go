@@ -92,6 +92,9 @@ func Resolve(hc *config.PruneConfig, def Defaults) (Policy, error) {
 		}
 		seen[s] = struct{}{}
 	}
+	if p.Enabled && len(p.Scope) == 0 {
+		return Policy{}, fmt.Errorf("prune is enabled but scope is empty")
+	}
 	return p, nil
 }
 

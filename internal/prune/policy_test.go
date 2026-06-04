@@ -71,6 +71,18 @@ func TestResolveRejectsDuplicateScope(t *testing.T) {
 	}
 }
 
+func TestResolveRejectsEmptyScopeWhenEnabled(t *testing.T) {
+	// An enabled policy with no scopes would enqueue no-op prune jobs forever.
+	_, err := Resolve(&config.PruneConfig{Enabled: ptr(true), Scope: ptr([]string{})}, Defaults{})
+	if err == nil {
+		t.Fatal("expected empty-scope error for an enabled policy")
+	}
+	// A disabled policy with an empty scope is fine (it never runs).
+	if _, err := Resolve(&config.PruneConfig{Enabled: ptr(false), Scope: ptr([]string{})}, Defaults{}); err != nil {
+		t.Fatalf("disabled empty-scope policy should resolve: %v", err)
+	}
+}
+
 func TestResolveScopeIsNotAliasOfDefaults(t *testing.T) {
 	def := Defaults{Scope: []string{ScopeDangling}}
 	got, err := Resolve(nil, def)

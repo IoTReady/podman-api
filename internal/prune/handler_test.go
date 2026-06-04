@@ -29,10 +29,7 @@ func runHandler(t *testing.T, h *Handler, payload Payload) (store.Job, error) {
 
 func TestHandlerRunsOnlyEnabledScopesInOrder(t *testing.T) {
 	f := fake.New()
-	f.PruneReports = map[string]struct {
-		Items     []string
-		Reclaimed int64
-	}{
+	f.PruneReports = map[string]podman.PruneReport{
 		"images":     {Items: []string{"i1"}, Reclaimed: 100},
 		"containers": {Items: []string{"c1"}, Reclaimed: 200},
 		"volumes":    {Items: []string{"v1"}, Reclaimed: 300},
@@ -55,6 +52,60 @@ func TestHandlerRunsOnlyEnabledScopesInOrder(t *testing.T) {
 	}
 	if f.PruneCalls[2].Filters["label!"][0] != ProtectLabel+"=true" {
 		t.Fatalf("volume prune missing protect filter: %+v", f.PruneCalls[2].Filters)
+	}
+}
+
+func TestHandlerCollapsesImageScopes(t *testing.T) {
+	// dangling + all-images both enabled must run ImagePrune exactly once (all=true),
+	// not twice — avoids redundant work and double-counted reclaimed bytes.
+	f := fake.New()
+	h := &Handler{Client: f}
+	pol := Policy{Scope: []string{ScopeDangling, ScopeAllImages}}
+	if _, err := runHandler(t, h, Payload{Host: "h1", Policy: pol}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	imageCalls := 0
+	for _, c := range f.PruneCalls {
+		if c.Scope == "images" {
+			imageCalls++
+			if !c.All {
+				t.Fatal("collapsed image prune must use all=true")
+			}
+		}
+	}
+	if imageCalls != 1 {
+		t.Fatalf("expected exactly 1 image prune call, got %d (%+v)", imageCalls, f.PruneCalls)
+	}
+}
+
+func TestHandlerSkipsVolumesWhenMigrateActiveAtRunTime(t *testing.T) {
+	// Even though the scheduler drops volumes at enqueue time, a job can sit queued
+	// while a migrate starts. With Jobs set, the handler re-checks at run time and
+	// skips the volumes scope, but still runs the others.
+	f := fake.New()
+	mem := store.NewMemory()
+	// An active (queued) migrate makes the run-time guard fire.
+	mem.Enqueue(context.Background(), "migrate", json.RawMessage(`{}`), "")
+	args, _ := json.Marshal(Payload{Host: "h1", Policy: Policy{Scope: []string{ScopeDangling, ScopeVolumes}}})
+	job, _ := mem.Enqueue(context.Background(), "prune", args, "")
+	h := &Handler{Client: f, Jobs: mem}
+	if err := h.Run(context.Background(), job, jobs.NewJobContext(mem, job.ID)); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, c := range f.PruneCalls {
+		if c.Scope == "volumes" {
+			t.Fatalf("volumes must be skipped while migrate active: %+v", f.PruneCalls)
+		}
+	}
+	// dangling still ran.
+	ranImages := false
+	for _, c := range f.PruneCalls {
+		if c.Scope == "images" {
+			ranImages = true
+		}
+	}
+	if !ranImages {
+		t.Fatal("non-volume scopes must still run")
 	}
 }
 
@@ -144,10 +195,7 @@ func (s *spyMetrics) Reclaimed(_, scope string, b int64) { s.reclaimed[scope] = 
 
 func TestHandlerMetricsOnSuccess(t *testing.T) {
 	f := fake.New()
-	f.PruneReports = map[string]struct {
-		Items     []string
-		Reclaimed int64
-	}{"images": {Items: []string{"i1"}, Reclaimed: 512}}
+	f.PruneReports = map[string]podman.PruneReport{"images": {Items: []string{"i1"}, Reclaimed: 512}}
 	spy := &spyMetrics{reclaimed: map[string]int64{}}
 	h := &Handler{Client: f, Metrics: spy}
 	if _, err := runHandler(t, h, Payload{Host: "h1", Policy: Policy{Scope: []string{ScopeDangling}}}); err != nil {

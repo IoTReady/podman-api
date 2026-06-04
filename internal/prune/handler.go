@@ -31,8 +31,14 @@ type Metrics interface {
 
 // Handler implements jobs.Handler for the "prune" kind.
 type Handler struct {
-	Client  podman.Client
-	Metrics Metrics // optional
+	Client podman.Client
+	// Jobs, when set, enables a run-time safety re-check: before running the
+	// volumes scope the handler re-queries for an active migrate/evacuate and
+	// skips volumes if one is in flight. The scheduler also drops the volumes
+	// scope at enqueue time, but a job can sit queued while a move starts, so the
+	// guarantee belongs here too.
+	Jobs    store.JobStore // optional
+	Metrics Metrics        // optional
 }
 
 var _ jobs.Handler = (*Handler)(nil)
@@ -78,21 +84,36 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 		scope string
 		run   func() (podman.PruneReport, error)
 	}
-	steps := []step{
-		{ScopeDangling, func() (podman.PruneReport, error) { return h.Client.ImagePrune(ctx, p.Host, false) }},
-		{ScopeAllImages, func() (podman.PruneReport, error) { return h.Client.ImagePrune(ctx, p.Host, true) }},
-		{ScopeContainers, func() (podman.PruneReport, error) { return h.Client.ContainerPrune(ctx, p.Host) }},
-		{ScopeBuildCache, func() (podman.PruneReport, error) { return h.Client.BuildCachePrune(ctx, p.Host) }},
-		{ScopeVolumes, func() (podman.PruneReport, error) {
-			return h.Client.VolumePrune(ctx, p.Host, map[string][]string{"label!": {ProtectLabel + "=true"}})
-		}},
+	var steps []step
+	// Image scopes collapse onto a single images.Prune call: all-images (all=true)
+	// is a superset of dangling (all=false), so when both are enabled we run once
+	// and attribute the bytes to a single scope rather than double-counting.
+	switch {
+	case p.Policy.HasScope(ScopeAllImages):
+		steps = append(steps, step{ScopeAllImages, func() (podman.PruneReport, error) { return h.Client.ImagePrune(ctx, p.Host, true) }})
+	case p.Policy.HasScope(ScopeDangling):
+		steps = append(steps, step{ScopeDangling, func() (podman.PruneReport, error) { return h.Client.ImagePrune(ctx, p.Host, false) }})
+	}
+	if p.Policy.HasScope(ScopeContainers) {
+		steps = append(steps, step{ScopeContainers, func() (podman.PruneReport, error) { return h.Client.ContainerPrune(ctx, p.Host) }})
+	}
+	if p.Policy.HasScope(ScopeBuildCache) {
+		steps = append(steps, step{ScopeBuildCache, func() (podman.PruneReport, error) { return h.Client.BuildCachePrune(ctx, p.Host) }})
+	}
+	if p.Policy.HasScope(ScopeVolumes) {
+		if h.Jobs != nil && migrateOrEvacuateActive(ctx, h.Jobs) {
+			// A migrate/evacuate started while this job was queued — skip volumes
+			// so we can't reap a transiently-detached volume.
+			jc.Step("prune:volumes", "skipped: migrate/evacuate active")
+		} else {
+			steps = append(steps, step{ScopeVolumes, func() (podman.PruneReport, error) {
+				return h.Client.VolumePrune(ctx, p.Host, map[string][]string{"label!": {ProtectLabel + "=true"}})
+			}})
+		}
 	}
 
 	var firstErr error
 	for _, s := range steps {
-		if !p.Policy.HasScope(s.scope) {
-			continue
-		}
 		if err := ctx.Err(); err != nil {
 			return err
 		}

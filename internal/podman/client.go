@@ -64,6 +64,10 @@ type Client interface {
 
 	// Host
 	HostInfo(ctx context.Context, hostID string) (HostInfo, error)
+	// Knows reports whether hostID is a registered host this client can reach.
+	// The host set is fixed at construction, so a host added via config reload is
+	// not Knows() until the daemon (and client) restarts.
+	Knows(hostID string) bool
 }
 
 // PruneReport summarizes one prune operation: the ids/names removed and the

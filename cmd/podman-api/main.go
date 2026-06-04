@@ -125,7 +125,7 @@ func main() {
 		registry := jobs.Registry{
 			"migrate":  &migrate.Handler{Svc: svc},
 			"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: *evacConc},
-			"prune":    &prune.Handler{Client: client, Metrics: pruneMetrics},
+			"prune":    &prune.Handler{Client: client, Jobs: db, Metrics: pruneMetrics},
 		}
 		workers := *jobWorkers
 		if workers <= 0 {
@@ -149,12 +149,13 @@ func main() {
 				DryRun:        *pruneDryRun,
 			}
 			// Validate the startup set once so a misconfigured policy fails loudly at boot.
-			if _, err := resolveAll(*hostsHolder.Load(), def); err != nil {
+			if _, err := buildHostPolicies(*hostsHolder.Load(), def); err != nil {
 				log.Fatalf("prune policy: %v", err)
 			}
 			pruneSched = &prune.Scheduler{Store: db, Client: client, Now: time.Now}
 			pruneSched.Start(runnerCtx, func() []prune.HostPolicy {
-				return buildHostPolicies(*hostsHolder.Load(), def)
+				policies, _ := buildHostPolicies(*hostsHolder.Load(), def)
+				return policies
 			})
 			log.Printf("prune scheduler enabled (interval %s, disk threshold %d%%, scopes %v)", *pruneInterval, *pruneThreshold, def.Scope)
 		}
@@ -335,32 +336,24 @@ func splitScopes(s string) []string {
 	return out
 }
 
-// buildHostPolicies resolves every host's prune policy over the defaults,
-// skipping (with a log) any host whose policy fails to resolve so one bad file
-// never stops the others.
-func buildHostPolicies(hosts []config.Host, def prune.Defaults) []prune.HostPolicy {
+// buildHostPolicies resolves every host's prune policy over the defaults. It
+// skips (with a log) any host whose policy fails to resolve so one bad file never
+// stops the others, and also returns the first such error. The per-tick caller
+// ignores the error and uses the slice; the boot-time caller treats a non-nil
+// error as fatal so a misconfigured startup set fails loudly.
+func buildHostPolicies(hosts []config.Host, def prune.Defaults) ([]prune.HostPolicy, error) {
 	var out []prune.HostPolicy
+	var firstErr error
 	for _, h := range hosts {
 		p, err := prune.Resolve(h.Prune, def)
 		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("host %s: %w", h.ID, err)
+			}
 			log.Printf("prune: host %s policy invalid, skipping: %v", h.ID, err)
 			continue
 		}
 		out = append(out, prune.HostPolicy{Host: h.ID, Policy: p})
 	}
-	return out
-}
-
-// resolveAll resolves all host policies, returning the first error (used at boot
-// to fail loudly on a misconfigured startup set).
-func resolveAll(hosts []config.Host, def prune.Defaults) ([]prune.HostPolicy, error) {
-	var out []prune.HostPolicy
-	for _, h := range hosts {
-		p, err := prune.Resolve(h.Prune, def)
-		if err != nil {
-			return nil, fmt.Errorf("host %s: %w", h.ID, err)
-		}
-		out = append(out, prune.HostPolicy{Host: h.ID, Policy: p})
-	}
-	return out, nil
+	return out, firstErr
 }

@@ -73,6 +73,65 @@ func TestTickReadsLastPruneFromStore(t *testing.T) {
 	}
 }
 
+func TestTickSkipsUnknownHost(t *testing.T) {
+	mem := store.NewMemory()
+	f := fake.New()
+	f.Unknown = map[string]bool{"h1": true} // added via reload, client can't reach it
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	s := &Scheduler{Store: mem, Client: f, Now: func() time.Time { return now }}
+	s.tick(context.Background(), []HostPolicy{hp("h1", enabledDanglingPolicy())})
+	jobs, _ := mem.ListJobs(context.Background(), store.JobFilter{Kind: "prune", State: store.JobQueued})
+	if len(jobs) != 0 {
+		t.Fatalf("unknown host must not enqueue, got %d", len(jobs))
+	}
+}
+
+func TestTickBacksOffAfterRecentFailure(t *testing.T) {
+	mem := store.NewMemory()
+	f := fake.New()
+	ctx := context.Background()
+	// Seed a recently-failed prune for h1.
+	args, _ := json.Marshal(Payload{Host: "h1"})
+	j, _ := mem.Enqueue(ctx, "prune", args, "")
+	mem.ClaimNext(ctx)
+	mem.Finish(ctx, j.ID, store.JobFailed, "boom")
+	got, _ := mem.GetJob(ctx, j.ID)
+
+	// 5 minutes after the failure — within failureBackoff (1h).
+	now := got.Finished.Add(5 * time.Minute)
+	s := &Scheduler{Store: mem, Client: f, Now: func() time.Time { return now }}
+	s.tick(ctx, []HostPolicy{hp("h1", enabledDanglingPolicy())})
+	jobs, _ := mem.ListJobs(ctx, store.JobFilter{Kind: "prune", State: store.JobQueued})
+	if len(jobs) != 0 {
+		t.Fatalf("must back off within failureBackoff after a failure, got %d queued", len(jobs))
+	}
+
+	// Past the backoff window — should retry.
+	now2 := got.Finished.Add(failureBackoff + time.Minute)
+	s2 := &Scheduler{Store: mem, Client: f, Now: func() time.Time { return now2 }}
+	s2.tick(ctx, []HostPolicy{hp("h1", enabledDanglingPolicy())})
+	jobs2, _ := mem.ListJobs(ctx, store.JobFilter{Kind: "prune", State: store.JobQueued})
+	if len(jobs2) != 1 {
+		t.Fatalf("should retry after backoff elapses, got %d queued", len(jobs2))
+	}
+}
+
+func TestTickThrottlesThresholdProbe(t *testing.T) {
+	mem := store.NewMemory()
+	f := fake.New()
+	f.HostInfoVal = podman.HostInfo{Disk: podman.DiskUsage{Total: 100, Used: 10}} // under threshold
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+	// Not due by interval (recent success via override), so each tick would probe.
+	s := &Scheduler{Store: mem, Client: f, Now: func() time.Time { return now },
+		lastOverride: map[string]time.Time{"h1": now.Add(-1 * time.Minute)}}
+	hps := []HostPolicy{hp("h1", enabledDanglingPolicy())}
+	s.tick(context.Background(), hps) // probes once
+	s.tick(context.Background(), hps) // within thresholdProbeInterval → must NOT probe again
+	if f.HostInfoCalls != 1 {
+		t.Fatalf("HostInfo probe not throttled: got %d calls, want 1", f.HostInfoCalls)
+	}
+}
+
 func TestTickEnqueuesWhenIntervalElapsed(t *testing.T) {
 	mem := store.NewMemory()
 	f := fake.New()
