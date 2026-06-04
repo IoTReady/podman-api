@@ -39,8 +39,8 @@ Three components, in dependency order:
 podman.Container.Health  ──►  podReady() / waitRunning()        (readiness gate)
                               (instance/migrate.go)
 
-archive/tar manifest     ──►  CopyVolume() returns src manifest  (integrity)
-                              re-export dest, compare
+archive/tar manifest     ──►  copy, then re-export src + dest,    (integrity)
+                              compare manifests
                               (instance/service.go + migrate.go)
 ```
 
@@ -98,25 +98,24 @@ archive/tar manifest     ──►  CopyVolume() returns src manifest  (integrit
   - **ignore** mtime/uid/gid/mode/pax-records — podman export need not preserve those
     identically across hosts.
   - Sorted-map equality makes the comparison **order/layout independent**.
-- `CopyVolume` tees the source export through the manifest builder *during* the copy,
-  returning the source `Manifest`:
-  ```go
-  func (s *Service) CopyVolume(ctx, fromHost, toHost, name string) (Manifest, error)
-  ```
-  Implementation: the existing copy goroutine writes source bytes to an
-  `io.MultiWriter(importPipeWriter, manifestPipeWriter)`; a second goroutine runs
-  `buildManifest` on the manifest pipe's read end. One source read; sha256 overlaps
-  the network-bound copy. The only caller is `migratePostStop`, so the signature
-  change is contained.
+- `CopyVolume` is left **unchanged** — it stays a pure opaque-byte-stream copy
+  (`error`-only return). Coupling it to tar-validity would break its existing tests
+  (which copy non-tar fixture bytes) and risks a tee/pipe deadlock. Integrity lives
+  entirely in the verify branch instead.
 - `volumeManifest(ctx, host, name) (Manifest, error)` helper: export a host's volume
-  and build its manifest. Used for the **dest re-export** (the one extra read).
+  and build its manifest from the tar stream. Used for **both** the source re-export
+  and the dest export.
 - `migratePostStop` flow per volume becomes:
   ```
   VolumeCreate(dest, v)
-  srcManifest = CopyVolume(src, dest, v)      // tee'd during copy
+  CopyVolume(src, dest, v)                     // unchanged
+  step("copy-volume", v)
   if verifyVolumes {
-      dstManifest = volumeManifest(dest, v)   // one extra dest read
-      if !srcManifest.Equal(dstManifest) { return ErrVolumeIntegrity(v, firstDiff) }
+      srcManifest = volumeManifest(src, v)     // extra source read (verify-only)
+      dstManifest = volumeManifest(dest, v)    // extra dest read   (verify-only)
+      if diff, ok := srcManifest.firstDiff(dstManifest); !ok {
+          return ErrVolumeIntegrity(v, diff)
+      }
       step("verify-volume", v)
   }
   ```
@@ -124,14 +123,20 @@ archive/tar manifest     ──►  CopyVolume() returns src manifest  (integrit
   differing path. The caller's existing rollback path restarts the source and reaps
   the partial dest, so the **source is left intact**.
 - Toggle: `-migrate-verify-volumes` bool flag, **default `true`** (this is the safety
-  batch). When `false`, `migratePostStop` skips the dest re-export and compare; the
-  source manifest is still built (cheap, overlaps the copy) but unused.
+  batch). When `false`, `migratePostStop` skips both re-exports and the compare
+  entirely — zero added I/O.
+- **I/O cost (verify on):** per volume, the source is read twice (copy + re-export)
+  and the dest twice (copy-write + re-export). Re-exporting the source rather than
+  tee'ing it during the copy trades one extra source read for a far simpler,
+  deadlock-free implementation and an unchanged `CopyVolume` contract — a good trade
+  for a cold (already-stopped) migrate. A future optimization could tee the source
+  during the copy to drop that read; out of scope here.
 
 ## Data flow (commit gate)
 
 ```
 stop source
-  └─ per volume: create dest, copy (tee→srcManifest), [re-export dest→dstManifest, compare]
+  └─ per volume: create dest, copy, [verify on: re-export src+dest → compare manifests]
   └─ apply spec on dest
   └─ waitRunning: poll until podReady (Running + declared healthchecks healthy), bounded by -migrate-verify-timeout
   └─ COMMIT: reap source (detached ctx)        ← only reached if every gate above passed
@@ -170,14 +175,18 @@ Unit (no real podman):
 - `buildManifest`: crafted tar → expected manifest; same content in different entry
   order → equal manifests; truncated content / changed byte / missing file → unequal;
   symlink target recorded; mtime/uid differences ignored.
-- `CopyVolume` returns a source manifest matching the bytes streamed (fake export);
-  copy still succeeds and import receives the full stream.
-- `migratePostStop` integrity mismatch (fake where dest export differs from source) →
-  returns `ErrVolumeIntegrity`; caller rollback restarts source and reaps dest.
-- `Manifest.Equal` + first-diff helper unit test.
+- `migratePostStop` integrity mismatch (fake `ImportTransform` corrupts the dest copy
+  so its re-export differs from the source) → migrate returns `ErrVolumeIntegrity`;
+  rollback restarts source and reaps dest. Existing `TestMigrate_HappyPath` /
+  `TestMigrate_Rollback` switch their seeded volume bytes to valid tar (built by a
+  `tarBytes` test helper) and gain the `verify-volume` step in the asserted sequence.
+- `Manifest.firstDiff` helper unit test (equal → ok; differing/missing path → names it).
 
-Fake client additions: per-container `Health`; per-volume content so
-export/import/round-trip and manifest comparison are exercisable in-memory.
+Fake client additions: a `PlayKubeContainerHealth` hook so played containers report a
+health status (for readiness tests); an `ImportTransform func(host, name string, in
+[]byte) []byte` hook so a test can corrupt the destination copy (for the integrity
+rollback test). Existing per-volume content seeding (`SetVolumeData`) already supports
+round-trip + manifest comparison.
 
 ## Documentation
 
