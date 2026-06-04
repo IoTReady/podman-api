@@ -33,12 +33,28 @@ func TestRenderFullPageVsFragment(t *testing.T) {
 	}
 }
 
+func TestRenderUnknownBlockIs500(t *testing.T) {
+	u, err := New(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := httptest.NewRecorder()
+	u.render(w, httptest.NewRequest("GET", "/ui", nil), "does-not-exist", nil)
+	if w.Code != http.StatusInternalServerError {
+		t.Errorf("unknown block: status = %d, want 500", w.Code)
+	}
+}
+
 func TestErrorStatus(t *testing.T) {
 	cases := map[error]int{
-		instance.ErrUnknownHost:    http.StatusNotFound,
-		instance.ErrInstanceExists: http.StatusConflict,
-		instance.ErrHostDraining:   http.StatusConflict,
-		errors.New("boom"):         http.StatusInternalServerError,
+		instance.ErrUnknownHost:       http.StatusNotFound,
+		instance.ErrUnknownTemplate:   http.StatusNotFound,
+		instance.ErrInstanceNotFound:  http.StatusNotFound,
+		instance.ErrInstanceExists:    http.StatusConflict,
+		instance.ErrHostDraining:      http.StatusConflict,
+		instance.ErrPortConflict:      http.StatusConflict,
+		instance.ErrHostSecretMissing: http.StatusBadRequest,
+		errors.New("boom"):            http.StatusInternalServerError,
 	}
 	for err, want := range cases {
 		if got := errorStatus(err); got != want {
