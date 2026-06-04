@@ -6,6 +6,7 @@ import (
 	"context"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/containers/podman/v5/pkg/bindings/containers"
 	"github.com/containers/podman/v5/pkg/bindings/images"
@@ -17,6 +18,34 @@ import (
 
 	"github.com/iotready/podman-api/internal/config"
 )
+
+// pruneDeadline bounds a single prune call. A prune on a healthy daemon returns
+// in well under a second; a multi-second stall means the target daemon is
+// wedged on an object lock (observed on busy podman 4.9.3 hosts) rather than a
+// test-logic failure. 60s is far above any healthy run yet well below the
+// suite's go-test -timeout.
+const pruneDeadline = 60 * time.Second
+
+// runWithin runs fn (a prune call) in a goroutine and fails the test loudly if
+// it does not return within pruneDeadline, instead of hanging the whole
+// integration suite until go test's -timeout fires with a cryptic dump.
+//
+// A per-call context.WithTimeout would NOT work here: Real.ctxFor returns the
+// cached, Background-rooted connection context and discards the per-call ctx, so
+// the deadline never reaches the HTTP request. A wall-clock guard is the only
+// effective bound. On timeout the prune goroutine is abandoned (it holds a wedged
+// HTTP connection) — acceptable, the run is already failing.
+func runWithin(t *testing.T, what string, fn func() error) {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- fn() }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(pruneDeadline):
+		t.Fatalf("%s did not return within %s — the target podman daemon is likely wedged on a lock (not a test-logic failure)", what, pruneDeadline)
+	}
+}
 
 // protectLabel mirrors prune.ProtectLabel. The podman package cannot import
 // prune (prune already imports podman), so the constant is duplicated here —
@@ -70,11 +99,15 @@ func TestReal_VolumePrune_ProtectLabel_LocalOnly(t *testing.T) {
 
 	// The same protect-exclusion the handler issues, additionally scoped to the
 	// itest label so this prune can only ever touch the two fixtures above.
-	rep, err := c.VolumePrune(ctx, "local", map[string][]string{
-		"label":  {itestPruneLabel + "=1"},
-		"label!": {protectLabel + "=true"},
+	var rep PruneReport
+	runWithin(t, "VolumePrune", func() error {
+		var err error
+		rep, err = c.VolumePrune(ctx, "local", map[string][]string{
+			"label":  {itestPruneLabel + "=1"},
+			"label!": {protectLabel + "=true"},
+		})
+		return err
 	})
-	require.NoError(t, err)
 
 	// The protected volume survives.
 	_, err = c.VolumeInspect(ctx, "local", protected)
@@ -124,8 +157,12 @@ func TestReal_Prune_HostWide_LocalOnly(t *testing.T) {
 		created, err := containers.CreateWithSpec(conn, spec, nil)
 		require.NoError(t, err)
 
-		rep, err := c.ContainerPrune(ctx, "local")
-		require.NoError(t, err)
+		var rep PruneReport
+		runWithin(t, "ContainerPrune", func() error {
+			var err error
+			rep, err = c.ContainerPrune(ctx, "local")
+			return err
+		})
 		assert.Contains(t, rep.Items, created.ID, "stopped container should be reaped")
 
 		exists, err := containers.Exists(ctx, created.ID, nil)
@@ -142,8 +179,16 @@ func TestReal_Prune_HostWide_LocalOnly(t *testing.T) {
 		spec := specgen.NewSpecGenerator(img, false)
 		spec.Name = seed
 		spec.Command = []string{"true"}
+		// firstImageID is the dangling image we expect the prune to reap. Capture
+		// it so cleanup self-heals even if the test fails before the prune runs
+		// (otherwise the now-untagged first commit would leak on the host).
+		var firstImageID string
 		t.Cleanup(func() {
 			rmCtr(seed)
+			if firstImageID != "" {
+				_, _ = images.Remove(context.Background(), []string{firstImageID},
+					new(images.RemoveOptions).WithForce(true))
+			}
 			_, _ = images.Remove(context.Background(), []string{repo + ":v1"},
 				new(images.RemoveOptions).WithForce(true))
 		})
@@ -154,19 +199,26 @@ func TestReal_Prune_HostWide_LocalOnly(t *testing.T) {
 		first, err := containers.Commit(conn, seed, new(containers.CommitOptions).
 			WithRepo(repo).WithTag("v1").WithChanges([]string{"LABEL podman-api-itest-seq=1"}))
 		require.NoError(t, err)
+		firstImageID = first.ID
 		_, err = containers.Commit(conn, seed, new(containers.CommitOptions).
 			WithRepo(repo).WithTag("v1").WithChanges([]string{"LABEL podman-api-itest-seq=2"}))
 		require.NoError(t, err)
 
-		rep, err := c.ImagePrune(ctx, "local", false) // dangling only
-		require.NoError(t, err)
-		assert.Contains(t, rep.Items, first.ID, "dangling image should be reaped")
+		var rep PruneReport
+		runWithin(t, "ImagePrune", func() error {
+			var err error
+			rep, err = c.ImagePrune(ctx, "local", false) // dangling only
+			return err
+		})
+		assert.Contains(t, rep.Items, firstImageID, "dangling image should be reaped")
 	})
 
 	t.Run("build-cache", func(t *testing.T) {
 		// Build cache can't be seeded without a real build; this verifies the
 		// binding path executes against a live daemon and returns cleanly.
-		_, err := c.BuildCachePrune(ctx, "local")
-		require.NoError(t, err)
+		runWithin(t, "BuildCachePrune", func() error {
+			_, err := c.BuildCachePrune(ctx, "local")
+			return err
+		})
 	})
 }
