@@ -240,6 +240,20 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 			return fmt.Errorf("copy volume %q: %w", v.Name, err)
 		}
 		step("copy-volume", v.Name)
+		if s.verifyVolumes {
+			src, err := s.volumeManifest(ctx, req.FromHost, v.Name)
+			if err != nil {
+				return fmt.Errorf("verify volume %q: re-export source: %w", v.Name, err)
+			}
+			dst, err := s.volumeManifest(ctx, req.ToHost, v.Name)
+			if err != nil {
+				return fmt.Errorf("verify volume %q: re-export dest: %w", v.Name, err)
+			}
+			if diff, ok := src.firstDiff(dst); !ok {
+				return fmt.Errorf("%w: volume %q differs at %q", ErrVolumeIntegrity, v.Name, diff)
+			}
+			step("verify-volume", v.Name)
+		}
 	}
 
 	if err := s.Apply(ctx, req.ToHost, ApplyRequest{

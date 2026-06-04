@@ -192,7 +192,8 @@ func TestMigrate_HappyPath(t *testing.T) {
 		Parameters: params, Secrets: map[string]string{"password": "p"},
 	}))
 	f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
-	f.SetVolumeData("h1", "postgres-db1-data", []byte("PGDATA"))
+	srcTar := tarBytes(t, map[string]string{"PG_VERSION": "16"})
+	f.SetVolumeData("h1", "postgres-db1-data", srcTar)
 
 	var steps []string
 	err := svc.Migrate(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"},
@@ -210,11 +211,11 @@ func TestMigrate_HappyPath(t *testing.T) {
 	p, err := f.PodInspect(ctx, "h2", "postgres-db1")
 	require.NoError(t, err)
 	assert.Equal(t, "Running", p.Status)
-	assert.Equal(t, []byte("PGDATA"), f.VolumeData("h2", "postgres-db1-data"))
+	assert.Equal(t, srcTar, f.VolumeData("h2", "postgres-db1-data"))
 	_, err = mem.GetSpec(ctx, "h2", "postgres", "db1")
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{"load", "preflight", "stop-source", "copy-volume", "apply-dest", "verify", "commit"}, steps)
+	assert.Equal(t, []string{"load", "preflight", "stop-source", "copy-volume", "verify-volume", "apply-dest", "verify", "commit"}, steps)
 }
 
 func TestMigrate_Rollback(t *testing.T) {
@@ -229,7 +230,7 @@ func TestMigrate_Rollback(t *testing.T) {
 			Parameters: params, Secrets: map[string]string{"password": "p"},
 		}))
 		f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
-		f.SetVolumeData("h1", "postgres-db1-data", []byte("PGDATA"))
+		f.SetVolumeData("h1", "postgres-db1-data", tarBytes(t, map[string]string{"PG_VERSION": "16"}))
 		return svc, f, mem
 	}
 
@@ -296,6 +297,34 @@ func TestMigrate_Rollback(t *testing.T) {
 		// Rollback runs on a detached context, so it completes despite the dead ctx.
 		assertRolledBack(t, f, mem)
 	})
+}
+
+func TestMigrate_VolumeIntegrityMismatch_RollsBack(t *testing.T) {
+	ctx := context.Background()
+	svc, f, mem := newMigrateSvc(t)
+	params := map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"}
+	require.NoError(t, mem.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "postgres", Slug: "db1",
+		Parameters: params, Secrets: map[string]string{"password": "p"},
+	}))
+	f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
+	f.SetVolumeData("h1", "postgres-db1-data", tarBytes(t, map[string]string{"PG_VERSION": "16"}))
+	// Destination receives different content than the source -> manifests differ.
+	f.ImportTransform = func(_, _ string, _ []byte) []byte {
+		return tarBytes(t, map[string]string{"PG_VERSION": "CORRUPT"})
+	}
+
+	err := svc.Migrate(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"}, nil)
+	require.ErrorIs(t, err, ErrVolumeIntegrity)
+
+	// Rolled back: source restarted & intact, dest reaped (pod was never even applied).
+	p, perr := f.PodInspect(ctx, "h1", "postgres-db1")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status)
+	_, gerr := mem.GetSpec(ctx, "h1", "postgres", "db1")
+	require.NoError(t, gerr)
+	_, derr := f.PodInspect(ctx, "h2", "postgres-db1")
+	require.ErrorIs(t, derr, podman.ErrNotFound)
 }
 
 func TestMigrate_SelfValidates(t *testing.T) {

@@ -43,6 +43,10 @@ type Fake struct {
 	// ImportErr, if non-nil, makes VolumeImport fail immediately (without
 	// reading the supplied reader) — models a destination that rejects the import.
 	ImportErr error
+	// ImportTransform, if non-nil, rewrites the bytes VolumeImport stores on the
+	// destination — lets a test simulate a lossy/corrupting copy so the source
+	// and dest manifests diverge.
+	ImportTransform func(host, name string, in []byte) []byte
 	// ExportReader, if non-nil, overrides VolumeExport's reader. Lets a test
 	// supply a stream that errors mid-transfer.
 	ExportReader func(host, name string) io.ReadCloser
@@ -342,6 +346,9 @@ func (f *Fake) VolumeImport(_ context.Context, h, name string, r io.Reader) erro
 	data, err := io.ReadAll(r)
 	if err != nil {
 		return err
+	}
+	if f.ImportTransform != nil {
+		data = f.ImportTransform(h, name, data)
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
