@@ -36,3 +36,14 @@ func TestContainerExecHookAndRecord(t *testing.T) {
 	require.Len(t, f.ExecCalls, 1)
 	require.Equal(t, []string{"caddy", "reload"}, f.ExecCalls[0].Cmd)
 }
+
+func TestCopyToContainerRecords(t *testing.T) {
+	f := New()
+	require.NoError(t, f.CopyToContainer(context.Background(), "h1", "caddy", "/etc/caddy", "Caddyfile", []byte("hello")))
+	require.Len(t, f.CopyCalls, 1)
+	got := f.CopyCalls[0]
+	require.Equal(t, "caddy", got.Container)
+	require.Equal(t, "/etc/caddy", got.DestDir)
+	require.Equal(t, "Caddyfile", got.Name)
+	require.Equal(t, []byte("hello"), got.Content)
+}

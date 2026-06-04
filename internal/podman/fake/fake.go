@@ -100,6 +100,11 @@ type Fake struct {
 	ExecFunc func(host, container string, cmd []string) (podman.ExecResult, error)
 	// ExecCalls records every ContainerExec invocation.
 	ExecCalls []ExecCall
+
+	// CopyCalls records every CopyToContainer invocation.
+	CopyCalls []CopyCall
+	// CopyErr, if non-nil, makes CopyToContainer fail.
+	CopyErr error
 }
 
 // PlayCall records one PlayKube invocation for assertions.
@@ -114,6 +119,15 @@ type ExecCall struct {
 	Host      string
 	Container string
 	Cmd       []string
+}
+
+// CopyCall records one CopyToContainer invocation for assertions.
+type CopyCall struct {
+	Host      string
+	Container string
+	DestDir   string
+	Name      string
+	Content   []byte
 }
 
 // AddVolume seeds a volume on a host so VolumeInspect resolves it. Test-only.
@@ -527,6 +541,18 @@ func (f *Fake) ContainerExec(_ context.Context, host, container string, cmd []st
 		return fn(host, container, cmd)
 	}
 	return podman.ExecResult{}, nil
+}
+
+func (f *Fake) CopyToContainer(_ context.Context, host, container, destDir, name string, content []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.CopyErr != nil {
+		return f.CopyErr
+	}
+	cp := make([]byte, len(content))
+	copy(cp, content)
+	f.CopyCalls = append(f.CopyCalls, CopyCall{Host: host, Container: container, DestDir: destDir, Name: name, Content: cp})
+	return nil
 }
 
 // Compile-time guarantee that Fake implements the interface.

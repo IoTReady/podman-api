@@ -48,6 +48,10 @@ type Client interface {
 	// exit code and combined stdout+stderr. A non-zero exit code is NOT an
 	// error; only a transport/podman failure returns a non-nil error.
 	ContainerExec(ctx context.Context, hostID, container string, cmd []string) (ExecResult, error)
+	// CopyToContainer writes content as a single file `name` into directory
+	// `destDir` inside the running container (e.g. destDir="/etc/caddy",
+	// name="Caddyfile"). destDir must already exist in the container.
+	CopyToContainer(ctx context.Context, hostID, container, destDir, name string, content []byte) error
 
 	// Logs
 	ContainerLogs(ctx context.Context, hostID, container string, opts LogOptions) (<-chan LogLine, error)

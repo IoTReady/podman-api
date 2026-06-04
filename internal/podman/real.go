@@ -1,6 +1,7 @@
 package podman
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"fmt"
@@ -477,6 +478,34 @@ func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []st
 		return ExecResult{}, err
 	}
 	return ExecResult{ExitCode: ins.ExitCode, Output: buf.String()}, nil
+}
+
+func (r *Real) CopyToContainer(ctx context.Context, id, container, destDir, name string, content []byte) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: name,
+		Mode: 0o644,
+		Size: int64(len(content)),
+	}); err != nil {
+		return err
+	}
+	if _, err := tw.Write(content); err != nil {
+		return err
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	// CopyFromArchive copies INTO the container (PUT /containers/{id}/archive).
+	copyFn, err := containers.CopyFromArchive(c, container, destDir, &tarBuf)
+	if err != nil {
+		return mapNotFound(err)
+	}
+	return copyFn()
 }
 
 // --- helpers ---
