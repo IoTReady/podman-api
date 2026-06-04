@@ -70,6 +70,15 @@ coupling it was explicitly rejected.)
    - **Image source** behind a *resolver* (public registries now → private registry later)
 5. **Each phase ships an end-to-end, demoable story** (vertical slices), not horizontal infra
    layers.
+6. **Observability: instrument with OpenTelemetry, egress via a config toggle.** Instrument once
+   with OTel (metrics + logs; traces later) and make the destination pluggable behind the
+   metrics-bus / log-sink seams — *not* a global commitment to one transport. **OSS default:**
+   local Prometheus `/metrics` exposition + structured stdout logs (zero backend; feeds the
+   in-binary UI dashboards; works with users' existing Prometheus/Grafana and `podman logs`).
+   **Commercial / hosted ops:** flip the toggle to **OTLP push** to a hosted backend — no inbound
+   exposed endpoint. Don't go OTLP-only in OSS: the UI needs a *local* metrics source, the
+   self-hoster audience is Prometheus-shaped (OTLP-only would force them to run an OTel Collector),
+   and `curl /metrics` is zero-config debuggability.
 
 ## 4. Roadmap
 
@@ -106,6 +115,14 @@ on features. No UI dependency.
 - **Generic healthchecks / readiness probes** — closes the #54 `waitRunning` gap; gate
   deploys/migrations on readiness; red/green status in the UI.
 - *Seams introduced:* metrics **bus**, log **sink**.
+
+**Observability architecture (see §3.6):** OTel instrumentation; egress is a config toggle. OSS
+ships local `/metrics` + stdout (feeds the UI); commercial pushes OTLP to a hosted backend.
+Two planes stay distinct: **self/control-plane** metrics (#52 — podman-api's own jobs/migrate/
+evacuate; low-volume, may be satisfied by structured events on the same pipeline rather than a
+separate metrics path) vs. **hosted-workload** metrics (#63 — per-container resource usage).
+Candidate hosted backends (verify pricing): Grafana Cloud (least migration), SigNoz/Uptrace
+(OTLP-native).
 
 **✅ Done when:** per-app + host CPU/mem/disk graphs, log tail, health status; deploys block
 until ready.
