@@ -396,4 +396,43 @@ func (s *SQLite) FailRunning(ctx context.Context, reason string) (int, error) {
 	return int(n), nil
 }
 
+func (s *SQLite) PruneJobs(ctx context.Context, olderThan time.Time) (int, error) {
+	cutoff := olderThan.UnixNano()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	// 1) Old terminal children first, so their parents can then be considered.
+	rc, err := tx.ExecContext(ctx, `
+DELETE FROM jobs
+WHERE parent_id IS NOT NULL AND state IN ('succeeded','failed')
+  AND finished IS NOT NULL AND finished < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	nChild, err := rc.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+
+	// 2) Old terminal jobs not referenced as a parent by any surviving row.
+	rp, err := tx.ExecContext(ctx, `
+DELETE FROM jobs
+WHERE state IN ('succeeded','failed') AND finished IS NOT NULL AND finished < ?
+  AND id NOT IN (SELECT parent_id FROM jobs WHERE parent_id IS NOT NULL)`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	nParent, err := rp.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int(nChild + nParent), nil
+}
+
 var _ DB = (*SQLite)(nil)

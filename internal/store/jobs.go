@@ -90,6 +90,10 @@ type JobStore interface {
 	// FailRunning marks every job still in running as failed with reason; returns
 	// the count. Called once at startup to reap crash-interrupted jobs.
 	FailRunning(ctx context.Context, reason string) (int, error)
+	// PruneJobs deletes terminal (succeeded/failed) jobs finished before
+	// olderThan, preserving parent/child integrity: a parent row is deleted only
+	// when it has no surviving child. Returns the number of rows deleted.
+	PruneJobs(ctx context.Context, olderThan time.Time) (int, error)
 }
 
 // DB is the full backend: spec store + job store + closer. main holds one of

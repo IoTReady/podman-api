@@ -202,6 +202,46 @@ func (m *Memory) FailRunning(_ context.Context, reason string) (int, error) {
 	return n, nil
 }
 
+func (m *Memory) PruneJobs(_ context.Context, olderThan time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	terminal := func(j Job) bool { return j.State == JobSucceeded || j.State == JobFailed }
+	isOld := func(j Job) bool {
+		return !j.Finished.IsZero() && j.Finished.Before(olderThan)
+	}
+
+	// Pass 1: delete old terminal children.
+	kept := m.jobs[:0:0]
+	deleted := 0
+	for _, j := range m.jobs {
+		if j.ParentID != "" && terminal(j) && isOld(j) {
+			deleted++
+			continue
+		}
+		kept = append(kept, j)
+	}
+	m.jobs = kept
+
+	// Pass 2: delete old terminal jobs not referenced as a parent by survivors.
+	referenced := map[string]bool{}
+	for _, j := range m.jobs {
+		if j.ParentID != "" {
+			referenced[j.ParentID] = true
+		}
+	}
+	kept = m.jobs[:0:0]
+	for _, j := range m.jobs {
+		if terminal(j) && isOld(j) && !referenced[j.ID] {
+			deleted++
+			continue
+		}
+		kept = append(kept, j)
+	}
+	m.jobs = kept
+	return deleted, nil
+}
+
 // cloneJob returns a copy whose Steps and Args do not share backing arrays with
 // the stored job — matching SQLite, which deserializes fresh on every read, so a
 // caller mutating a returned job cannot corrupt the in-memory store.
