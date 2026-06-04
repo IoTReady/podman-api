@@ -287,6 +287,37 @@ components:
             Overrides the server's -evacuate-concurrency default; clamped to
             [1,32].
 
+    EvacuationPlan:
+      type: object
+      description: Result of POST /evacuate/plan — the resolved moves and their preflight verdicts.
+      required: [from_host, moves]
+      properties:
+        from_host: {type: string}
+        moves:
+          type: array
+          items: {$ref: '#/components/schemas/PlannedMove'}
+    PlannedMove:
+      type: object
+      required: [slug, template, to_host, ok, issues]
+      properties:
+        slug: {type: string}
+        template: {type: string}
+        to_host: {type: string}
+        ok:
+          type: boolean
+          description: true iff issues is empty (the destination would currently accept the move).
+        issues:
+          type: array
+          items: {$ref: '#/components/schemas/PlanIssue'}
+    PlanIssue:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          enum: [destination_draining, instance_exists, host_secret_missing, port_conflict, check_error]
+        message: {type: string}
+
     JobAccepted:
       type: object
       required: [job_id]
@@ -792,6 +823,38 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
       x-required-scope: instances:write
+
+  /evacuate/plan:
+    post:
+      tags: [migrate]
+      summary: preview an evacuation without running it (requires -state-db)
+      description: >-
+        Read-only dry-run of POST /evacuate. Resolves the map against the stored
+        specs on from_host (identical static validation, so a request that would
+        4xx on /evacuate 4xxes here identically), then runs the live destination
+        preflight checks for every instance and returns a per-move report. No job
+        is enqueued and nothing is mutated. Each move is ok=true only when its
+        issues list is empty; a non-empty list names the blocking conditions
+        (destination_draining, instance_exists, host_secret_missing,
+        port_conflict) or an inconclusive check (check_error, e.g. the
+        destination was unreachable). Requires only a read scope.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/EvacuateRequest'}}}
+      responses:
+        '200':
+          description: evacuation plan
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EvacuationPlan'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '501':
+          description: state store not enabled (-state-db not set)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+      x-required-scope: instances:read
 
   /migrate:
     post:
