@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/iotready/podman-api/internal/store"
@@ -60,12 +61,21 @@ func (h *handlers) listJobs(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, errJobsDisabled)
 		return
 	}
-	// Empty state/kind query params become zero-value filter fields, which the
-	// store treats as "match all".
+	// Empty state/kind/parent_id query params become zero-value filter fields,
+	// which the store treats as "match all".
 	f := store.JobFilter{
 		State:    store.JobState(r.URL.Query().Get("state")),
 		Kind:     r.URL.Query().Get("kind"),
 		ParentID: r.URL.Query().Get("parent_id"),
+		Before:   r.URL.Query().Get("before"),
+	}
+	if s := r.URL.Query().Get("limit"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil {
+			WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_query", Message: "limit must be an integer"})
+			return
+		}
+		f.Limit = n // store clamps to [1, MaxJobLimit]
 	}
 	jobs, err := h.jobs.ListJobs(r.Context(), f)
 	if err != nil {
