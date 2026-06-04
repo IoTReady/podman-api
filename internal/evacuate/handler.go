@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 
@@ -21,6 +22,13 @@ var evacuateConcurrency = 2
 // Handler runs "evacuate" jobs: resolve the host's instances into a migrate
 // plan, run the migrations with bounded concurrency (each as a child migrate
 // job), and aggregate onto the parent.
+//
+// A parent evacuate occupies one runner pool worker for the whole fan-out (its
+// children run as goroutines inside it and need no worker). That keeps a single
+// evacuate deadlock-free, but with the default pool of 4, four concurrent
+// evacuates hold all workers for the duration and starve plain migrate/other
+// jobs of a slot. Acceptable at current scale; if many concurrent evacuates
+// become common, give the runner headroom or a separate orchestration pool.
 type Handler struct {
 	Svc  *instance.Service
 	Jobs store.JobStore
@@ -49,10 +57,14 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 	failures := make([]string, len(moves)) // index-addressed; "" == success
 	var wg sync.WaitGroup
 	for i, m := range moves {
+		// Acquire before spawning so at most evacuateConcurrency goroutines exist
+		// at once (matters for a host with many instances). On a cancelled ctx the
+		// in-flight children fail fast and free slots, so the loop still drains and
+		// records a result for every move rather than leaving any counted as ok.
+		sem <- struct{}{}
 		wg.Add(1)
 		go func(i int, m instance.MigrateRequest) {
 			defer wg.Done()
-			sem <- struct{}{}
 			defer func() { <-sem }()
 			if err := h.runChild(ctx, job.ID, m, mig); err != nil {
 				failures[i] = fmt.Sprintf("%s: %v", m.Slug, err)
@@ -96,8 +108,15 @@ func (h *Handler) runChild(ctx context.Context, parentID string, m instance.Migr
 	if migErr != nil {
 		state, errMsg = store.JobFailed, migErr.Error()
 	}
-	if ferr := h.Jobs.Finish(ctx, child.ID, state, errMsg); ferr != nil && migErr == nil {
-		return fmt.Errorf("finish child job: %w", ferr)
+	if ferr := h.Jobs.Finish(ctx, child.ID, state, errMsg); ferr != nil {
+		if migErr == nil {
+			// Migration succeeded but we couldn't record it — surface as failure.
+			return fmt.Errorf("finish child job: %w", ferr)
+		}
+		// Migration also failed: migErr is the more useful cause and is returned
+		// below. Log the dropped finish error so the child left non-terminal
+		// (reaped by boot recovery) is still traceable.
+		log.Printf("evacuate: finish child %s failed (migration error: %v): %v", child.ID, migErr, ferr)
 	}
 	return migErr
 }

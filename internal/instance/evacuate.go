@@ -48,11 +48,18 @@ func (s *Service) ResolveEvacuation(ctx context.Context, req EvacuateRequest) ([
 	}
 
 	// Every instance on the host must have a destination (true evacuate).
+	// Collect all unmapped slugs so the error is deterministic and actionable
+	// rather than naming whichever slug the map happened to range over first.
+	var missing []string
 	for slug := range tmplBySlug {
 		if _, ok := req.Map[slug]; !ok {
-			return nil, fmt.Errorf("%w: no destination for slug %q on %s",
-				ErrInvalidEvacuation, slug, req.FromHost)
+			missing = append(missing, slug)
 		}
+	}
+	if len(missing) > 0 {
+		sort.Strings(missing)
+		return nil, fmt.Errorf("%w: no destination for slug(s) %v on %s",
+			ErrInvalidEvacuation, missing, req.FromHost)
 	}
 
 	moves := make([]MigrateRequest, 0, len(req.Map))
