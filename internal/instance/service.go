@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 
@@ -211,9 +212,7 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	if s.store != nil {
 		secretsCopy = maps.Clone(req.Secrets)
 		paramsCopy = maps.Clone(req.Parameters)
-		if len(req.Domains) > 0 {
-			domainsCopy = append([]string(nil), req.Domains...)
-		}
+		domainsCopy = slices.Clone(req.Domains)
 	}
 
 	// Push per-instance secrets, then zero the local copies.

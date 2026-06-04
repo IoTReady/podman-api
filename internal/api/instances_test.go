@@ -123,3 +123,18 @@ func TestCreateInstanceRejectsBadDomain(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
 	require.Equal(t, "invalid_domains", got["code"])
 }
+
+func TestApplyInstanceRejectsBadDomain(t *testing.T) {
+	srv, tok, _ := newSrvFull(t)
+	body := `{"template":"app","slug":"ab","parameters":{"slug":"ab","image":"i:1"},"secrets":{"auth_secret":"s"},"domains":["NOT A DOMAIN"]}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/ab", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	require.Equal(t, "invalid_domains", got["code"])
+}
