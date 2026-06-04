@@ -660,16 +660,17 @@ git commit -m "feat(api): accept and persist instance domains; reject malformed 
 
 ## What comes after this plan (Phase 2 — write its own plan post-spike)
 
-Once Task 0's findings doc lands, run the writing-plans skill again for the controller, using the spike's recorded backend-name format and copy/exec binding signatures. Phase 2 covers:
+The spike has run — see `docs/superpowers/specs/2026-06-04-ingress-spike-findings.md` (all three assumptions hold). Run the writing-plans skill again for the controller, applying the findings below. Phase 2 covers:
 
-1. New `podman.Client` methods — `NetworkEnsure`, `ContainerExec`, `CopyToContainer` (signatures from Task 0 Step 4) + their `Real` and `Mock` implementations.
-2. `IngressController` interface + `CaddyController` (`EnsureProxy`, `Apply`) — ensures the network + Caddy system pod, renders via `ingress.RenderCaddyfile`, copies the file in, execs `caddy reload` (with `caddy validate` first).
-3. Route derivation: build `[]ingress.Route` from a host's instances (`store.Spec.Domains` × the template's `Meta.Ingress`), computing each `Backend` from the spike's name format. **This is where host-wide domain uniqueness and the "template must declare `ingress:`" rejection are enforced.**
+1. New `podman.Client` methods — `NetworkEnsure`, `ContainerExec`, `CopyToContainer` + their `Real` and `Mock` implementations. (`podman cp` + `caddy reload` over the socket proven via CLI; pin the exact `github.com/containers/podman/v5 v5.8.2` binding signatures during implementation.)
+2. `IngressController` interface + `CaddyController` (`EnsureProxy`, `Apply`) — ensures the network + Caddy system pod, renders via `ingress.RenderCaddyfile`, copies the file in, runs `caddy validate` then execs `caddy reload`.
+3. Route derivation: build `[]ingress.Route` from a host's instances (`store.Spec.Domains` × the template's `Meta.Ingress`). **`Backend` = `<pod-name>:<container-port>`** — the spike confirmed the pod name (`metadata.name` = `<template>-<slug>`, globally unique) resolves on the network, whereas a bare container name (`web`, `db`) is not unique across pods and would collide. **This is where host-wide domain uniqueness and the "template must declare `ingress:`" rejection are enforced.** (`RenderCaddyfile` already re-validates domain/backend syntax as a defense-in-depth boundary, so a derivation bug can't inject Caddyfile directives.)
 4. Attach app pods to the ingress network in the manifest builder (no host port for the HTTP container).
 5. Per-host reconcile (inline on create/delete/upgrade + periodic drift correction), serialized per host with a mutex.
 6. `DNSProvider` no-op seam.
 7. `main()` flags (`-ingress-enabled`, `-ingress-network`, `-ingress-caddy-image`, `-ingress-acme-email`) + wiring; reject `domains` when ingress is disabled.
 8. Integration test behind the `integration` build tag (deploy a web template with a domain; assert route live + cert obtained against a local ACME such as Pebble).
+9. **Provisioning prerequisite (new, from the spike):** rootless podman cannot publish `:80`/`:443` until `net.ipv4.ip_unprivileged_port_start` is lowered to ≤80 system-wide — *or* the Caddy pod runs rootful. Phase 2 picks one; the host-provisioning wiki page must record it.
 
 ## Self-review notes (spec coverage)
 
