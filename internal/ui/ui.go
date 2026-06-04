@@ -48,3 +48,22 @@ func New(cfg Config) (*UI, error) {
 func (u *UI) staticHandler() http.Handler {
 	return http.StripPrefix("/ui/", http.FileServer(http.FS(staticFS)))
 }
+
+// Handler returns the /ui sub-router.
+func (u *UI) Handler() http.Handler {
+	mux := http.NewServeMux()
+
+	// Public. POST /ui/login is intentionally NOT CSRF-guarded: there is no
+	// session yet, and it is itself the credential check (protected by
+	// SameSite=Lax on the cookie it sets).
+	mux.HandleFunc("GET /ui/login", u.loginForm)
+	mux.HandleFunc("POST /ui/login", u.login)
+	mux.Handle("/ui/static/", u.staticHandler())
+
+	guard := func(h http.HandlerFunc) http.Handler { return u.requireSession(h) }
+	guardW := func(h http.HandlerFunc) http.Handler { return u.requireSession(u.requireCSRF(h)) }
+	mux.Handle("GET /ui", guard(u.dashboard))
+	mux.Handle("POST /ui/logout", guardW(u.logout))
+
+	return mux
+}
