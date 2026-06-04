@@ -3,8 +3,12 @@ name: ci
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/**'
 
 env:
   # The podman v5 bindings transitively pull in the storage graph drivers
