@@ -1,0 +1,12 @@
+{{define "login"}}
+<div class="login">
+  <h1>podman-api</h1>
+  {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+  <form method="post" action="/ui/login" class="pure-form pure-form-stacked">
+    <input name="username" placeholder="username" autofocus>
+    <input name="password" type="password" placeholder="password">
+    <button type="submit" class="pure-button pure-button-primary">Sign in</button>
+  </form>
+</div>
+{{end}}
+{{define "body"}}{{template "login" .}}{{end}}
