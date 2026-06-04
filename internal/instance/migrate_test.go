@@ -2,7 +2,9 @@ package instance
 
 import (
 	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -13,6 +15,15 @@ import (
 	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
 )
+
+var migrateFailErr = errors.New("injected failure")
+
+// setVerifyKnobs temporarily shrinks the verify-poll timing for tests.
+func setVerifyKnobs(timeout, interval time.Duration) func() {
+	ot, oi := verifyTimeout, verifyInterval
+	verifyTimeout, verifyInterval = timeout, interval
+	return func() { verifyTimeout, verifyInterval = ot, oi }
+}
 
 // portTemplate is a fixture whose rendered Pod declares a fixed hostPort, used
 // to exercise the dest port-conflict preflight.
@@ -161,6 +172,77 @@ func TestMigrate_HappyPath(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"load", "preflight", "stop-source", "copy-volume", "apply-dest", "verify", "commit"}, steps)
+}
+
+func TestMigrate_Rollback(t *testing.T) {
+	ctx := context.Background()
+	params := map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"}
+
+	// seed: a running source instance with spec(+secret), pod, and a data volume.
+	seed := func(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
+		svc, f, mem := newMigrateSvc(t)
+		require.NoError(t, mem.PutSpec(ctx, store.Spec{
+			Host: "h1", Template: "postgres", Slug: "db1",
+			Parameters: params, Secrets: map[string]string{"password": "p"},
+		}))
+		f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
+		f.SetVolumeData("h1", "postgres-db1-data", []byte("PGDATA"))
+		return svc, f, mem
+	}
+
+	// assertRolledBack: source restored & intact, dest fully reaped.
+	assertRolledBack := func(t *testing.T, f *fake.Fake, mem *store.Memory) {
+		t.Helper()
+		p, err := f.PodInspect(ctx, "h1", "postgres-db1")
+		require.NoError(t, err)
+		assert.Equal(t, "Running", p.Status) // source restarted
+		_, err = mem.GetSpec(ctx, "h1", "postgres", "db1")
+		require.NoError(t, err) // source spec intact
+		_, err = f.PodInspect(ctx, "h2", "postgres-db1")
+		require.ErrorIs(t, err, podman.ErrNotFound) // dest pod reaped
+		_, err = mem.GetSpec(ctx, "h2", "postgres", "db1")
+		require.ErrorIs(t, err, store.ErrNotFound)             // dest spec reaped
+		assert.Nil(t, f.VolumeData("h2", "postgres-db1-data")) // dest volume reaped
+	}
+
+	req := MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"}
+
+	t.Run("copy fails", func(t *testing.T) {
+		svc, f, mem := seed(t)
+		f.ImportErr = migrateFailErr
+		err := svc.Migrate(ctx, req, nil)
+		require.Error(t, err)
+		assertRolledBack(t, f, mem)
+	})
+
+	t.Run("apply fails", func(t *testing.T) {
+		svc, f, mem := seed(t)
+		f.PlayKubeErr = migrateFailErr
+		err := svc.Migrate(ctx, req, nil)
+		require.Error(t, err)
+		assertRolledBack(t, f, mem)
+	})
+
+	t.Run("verify fails", func(t *testing.T) {
+		svc, f, mem := seed(t)
+		f.PlayKubePodStatus = "Exited" // dest pod never reaches Running
+		restore := setVerifyKnobs(50*time.Millisecond, 5*time.Millisecond)
+		defer restore()
+		err := svc.Migrate(ctx, req, nil)
+		require.Error(t, err)
+		assertRolledBack(t, f, mem)
+	})
+
+	t.Run("context cancelled during verify still rolls back", func(t *testing.T) {
+		svc, f, mem := seed(t)
+		f.PlayKubePodStatus = "Exited" // never Running, so verify waits and hits ctx.Done
+		cctx, cancel := context.WithCancel(context.Background())
+		cancel() // already cancelled: waitRunning returns ctx.Err() on first select
+		err := svc.Migrate(cctx, req, nil)
+		require.Error(t, err)
+		// Rollback runs on a detached context, so it completes despite the dead ctx.
+		assertRolledBack(t, f, mem)
+	})
 }
 
 func TestMigrate_SelfValidates(t *testing.T) {
