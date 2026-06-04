@@ -10,6 +10,31 @@
 </head>
 <!-- The header name is the well-known csrfHeader constant (internal/ui/session.go); hardcoded here so a missing data field can't silently produce an empty header and break every htmx mutation. -->
 <body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
+  {{/* Authenticated pages carry .Hosts and render inside the persistent shell
+       (sidebar + #main); the login page has no .Hosts and renders bare. */}}
+  {{if .Hosts}}
+  <div class="shell">
+    {{template "nav" .}}
+    <main id="main">{{template "body" .}}</main>
+  </div>
+  {{else}}
   {{template "body" .}}
+  {{end}}
 </body>
 </html>{{end}}
+
+{{define "nav"}}
+<nav class="sidebar">
+  <div class="label">HOSTS</div>
+  <ul>
+    {{range .Hosts}}
+    <li><a href="/ui/hosts/{{.ID}}" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true">{{.ID}}</a></li>
+    {{end}}
+  </ul>
+  <a href="/ui/jobs" hx-get="/ui/jobs" hx-target="#main" hx-push-url="true">Jobs</a>
+  <form method="post" action="/ui/logout">
+    <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+    <button type="submit">Sign out</button>
+  </form>
+</nav>
+{{end}}

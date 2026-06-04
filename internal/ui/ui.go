@@ -49,6 +49,20 @@ func (u *UI) staticHandler() http.Handler {
 	return http.StripPrefix("/ui/", http.FileServer(http.FS(staticFS)))
 }
 
+// pageData builds the render data for an authenticated page, injecting the host
+// list the layout's sidebar needs (presence of "Hosts" is also what tells the
+// layout to render the persistent shell rather than a bare body). Every
+// authenticated handler should pass its data through this; the login page does
+// not (it renders chrome-free). On a full-page load this populates the sidebar;
+// on an HTMX fragment swap the extra key is simply unused.
+func (u *UI) pageData(data map[string]any) map[string]any {
+	if data == nil {
+		data = map[string]any{}
+	}
+	data["Hosts"] = u.cfg.Svc.Hosts()
+	return data
+}
+
 // Handler returns the /ui sub-router.
 func (u *UI) Handler() http.Handler {
 	mux := http.NewServeMux()

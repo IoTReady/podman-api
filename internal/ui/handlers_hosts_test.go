@@ -51,6 +51,14 @@ func TestDashboardListsHosts(t *testing.T) {
 	}
 }
 
+func TestHostInstancesUnknownHostIs404(t *testing.T) {
+	u := uiWithService(t)
+	w := authedGet(t, u, "/ui/hosts/does-not-exist")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for unknown host", w.Code)
+	}
+}
+
 func TestHostInstancesPageRenders(t *testing.T) {
 	u := uiWithService(t)
 	w := authedGet(t, u, "/ui/hosts/edge-1")

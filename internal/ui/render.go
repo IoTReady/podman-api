@@ -70,12 +70,12 @@ func csrfFromRequest(r *http.Request) string {
 	return csrfToken(c.Value)
 }
 
-// renderError writes an inline HTML error fragment with the mapped status.
-func (u *UI) renderError(w http.ResponseWriter, err error) {
-	status := errorStatus(err)
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.WriteHeader(status)
-	_, _ = w.Write([]byte(`<div class="error">` + template.HTMLEscapeString(err.Error()) + `</div>`))
+// renderError renders the "error" block with the mapped status. Like render it
+// honours HX-Request: an HTMX swap gets a bare error fragment (it lands in
+// #main), while a full-page navigation gets the error wrapped in the layout
+// chrome rather than a naked <div> on a blank page.
+func (u *UI) renderError(w http.ResponseWriter, r *http.Request, err error) {
+	u.render(w, r, errorStatus(err), "error", map[string]any{"Error": err.Error()})
 }
 
 // errorStatus maps instance sentinel errors to HTTP status codes, mirroring the

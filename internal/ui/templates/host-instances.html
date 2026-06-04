@@ -1,12 +1,12 @@
 {{define "host-instances"}}
 <div class="host-head">
   <strong>{{.Host}}</strong> · {{len .Instances}} instances
-  <a class="pure-button" href="/ui/hosts/{{.Host}}/deploy" hx-get="/ui/hosts/{{.Host}}/deploy" hx-target="#main">+ Deploy</a>
+  <a class="pure-button" href="/ui/hosts/{{.Host}}/deploy" hx-get="/ui/hosts/{{.Host}}/deploy" hx-target="#main" hx-push-url="true">+ Deploy</a>
 </div>
 <table class="pure-table">
   <tbody>
   {{range .Instances}}
-    <tr hx-get="/ui/hosts/{{$.Host}}/instances/{{.Template}}/{{.Slug}}" hx-target="#main" style="cursor:pointer">
+    <tr class="clickable" hx-get="/ui/hosts/{{$.Host}}/instances/{{.Template}}/{{.Slug}}" hx-target="#main" hx-push-url="true">
       <td>{{.Template}} / {{.Slug}}</td>
       <td>{{.Pod.Status}}</td>
     </tr>

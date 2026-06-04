@@ -1,20 +1,4 @@
 {{define "dashboard"}}
-<div class="shell">
-  <nav class="sidebar">
-    <div class="label">HOSTS</div>
-    <ul>
-      {{range .Hosts}}
-      <li><a href="/ui/hosts/{{.ID}}" hx-get="/ui/hosts/{{.ID}}" hx-target="#main">{{.ID}}</a></li>
-      {{end}}
-    </ul>
-    <a href="/ui/jobs" hx-get="/ui/jobs" hx-target="#main">Jobs</a>
-    <form method="post" action="/ui/logout">
-      <input type="hidden" name="csrf_token" value="{{.CSRF}}">
-      <button type="submit">Sign out</button>
-    </form>
-  </nav>
-  <main id="main">
-    <p>Select a host.</p>
-  </main>
-</div>
+<h1>Hosts</h1>
+<p>Select a host from the sidebar to see its instances.</p>
 {{end}}
