@@ -195,15 +195,26 @@ func TestCancelJob(t *testing.T) {
 		}
 	})
 
-	t.Run("running but canceller does not have it returns 409", func(t *testing.T) {
+	t.Run("running but not yet in canceller returns 409 not-cancelable", func(t *testing.T) {
 		js := store.NewMemory()
 		j, _ := js.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
-		_, _, _ = js.ClaimNext(ctx) // running on disk, but canceller has nothing (raced to finish)
+		_, _, _ = js.ClaimNext(ctx) // running on disk, but not registered in the runner yet
 		srv, tok := newSrvWithCancel(t, js, fakeCanceller{})
 		resp := authedReq(t, srv, tok, "POST", "/jobs/"+j.ID+"/cancel")
 		defer resp.Body.Close()
 		if resp.StatusCode != http.StatusConflict {
 			t.Fatalf("status %d", resp.StatusCode)
+		}
+		// Still running (not terminal), so the reason must be the transient,
+		// retryable one — not "already terminal".
+		var body struct {
+			Code string `json:"code"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if body.Code != "job_not_cancelable" {
+			t.Fatalf("code = %q, want job_not_cancelable", body.Code)
 		}
 	})
 }

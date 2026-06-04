@@ -900,7 +900,11 @@ paths:
         asynchronous — the handler unwinds (a migrate rolls back, leaving the
         source intact) and the terminal `canceled` state is recorded shortly
         after, so the 202 body may still show `running`. A parent evacuate's
-        in-flight children are canceled with it.
+        in-flight children are canceled with it — cancel the parent to stop the
+        fan-out; child jobs cannot be canceled directly (a child returns 409
+        while running). A 409 with code `job_not_cancelable` (vs `job_terminal`)
+        is transient — the job was just claimed but is not yet cancelable; retry
+        shortly.
       parameters:
         - name: id
           in: path
