@@ -170,6 +170,24 @@ func (s *SQLite) DeleteSpec(ctx context.Context, host, template, slug string) er
 	return nil
 }
 
+func (s *SQLite) ListSpecKeys(ctx context.Context, host string) ([]SpecKey, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT template, slug FROM specs WHERE host=? ORDER BY template, slug`, host)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SpecKey{}
+	for rows.Next() {
+		var k SpecKey
+		if err := rows.Scan(&k.Template, &k.Slug); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
 // ---------------------------------------------------------------------------
 // JobStore implementation
 // ---------------------------------------------------------------------------
@@ -230,6 +248,26 @@ VALUES (?, ?, ?, 'queued', '[]', ?, NULL, ?, NULL, NULL)`,
 	return s.GetJob(ctx, id)
 }
 
+func (s *SQLite) StartChild(ctx context.Context, kind string, args json.RawMessage, parentID string) (Job, error) {
+	id := newJobID()
+	now := time.Now().Unix()
+	if len(args) == 0 {
+		args = json.RawMessage("null")
+	}
+	var parent any
+	if parentID != "" {
+		parent = parentID
+	}
+	_, err := s.db.ExecContext(ctx, `
+INSERT INTO jobs (id, kind, args, state, steps, parent_id, error, created, started, finished)
+VALUES (?, ?, ?, 'running', '[]', ?, NULL, ?, ?, NULL)`,
+		id, kind, string(args), parent, now, now)
+	if err != nil {
+		return Job{}, err
+	}
+	return s.GetJob(ctx, id)
+}
+
 func (s *SQLite) GetJob(ctx context.Context, id string) (Job, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT `+jobColumns+` FROM jobs WHERE id=?`, id)
 	return scanJob(row)
@@ -246,6 +284,10 @@ func (s *SQLite) ListJobs(ctx context.Context, f JobFilter) ([]Job, error) {
 	if f.Kind != "" {
 		where = append(where, "kind=?")
 		args = append(args, f.Kind)
+	}
+	if f.ParentID != "" {
+		where = append(where, "parent_id=?")
+		args = append(args, f.ParentID)
 	}
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")

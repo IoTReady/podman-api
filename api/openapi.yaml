@@ -267,6 +267,18 @@ components:
           additionalProperties: true
           description: optional overrides; defaults to the source instance's stored params
 
+    EvacuateRequest:
+      type: object
+      required: [from_host, map]
+      properties:
+        from_host: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+        map:
+          type: object
+          additionalProperties: {type: string}
+          description: >-
+            slug -> destination host for every instance on from_host. Must cover
+            exactly the instances stored on the host (strict bijection).
+
     JobAccepted:
       type: object
       required: [job_id]
@@ -739,6 +751,38 @@ paths:
         '204': {description: removed}
       x-required-scope: instances:write
 
+  /evacuate:
+    post:
+      tags: [migrate]
+      summary: enqueue a job to evacuate every instance off a host (requires -state-db)
+      description: >-
+        Validates the request synchronously against the stored specs on
+        from_host: every instance on the host must have a destination in map and
+        every map key must name an instance on the host (strict bijection);
+        unknown hosts and same-host destinations are rejected. On success enqueues
+        one parent evacuate job that fans out a child migrate job per instance
+        with bounded concurrency. The parent succeeds only if every child
+        migration succeeds; per-child failures surface via
+        GET /jobs?parent_id={id}. Per-instance destination-side checks run inside
+        each child migrate job, not as the POST status.
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/EvacuateRequest'}}}
+      responses:
+        '202':
+          description: evacuate job accepted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/JobAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '501':
+          description: state store not enabled (-state-db not set)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+      x-required-scope: instances:write
+
   /migrate:
     post:
       tags: [migrate]
@@ -784,6 +828,11 @@ paths:
           in: query
           required: false
           description: filter by job kind
+          schema: {type: string}
+        - name: parent_id
+          in: query
+          required: false
+          description: filter to children of this parent job
           schema: {type: string}
       responses:
         '200':
