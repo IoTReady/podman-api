@@ -163,3 +163,36 @@ func TestRunner_CancelStops(t *testing.T) {
 		t.Fatal("runner did not stop after ctx cancel")
 	}
 }
+
+func TestRunner_CancelRunning(t *testing.T) {
+	m := store.NewMemory()
+	started := make(chan struct{})
+	reg := Registry{"test": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+		close(started)
+		<-ctx.Done() // block until cancelled
+		return ctx.Err()
+	})}
+	r := NewRunner(m, reg, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.Start(ctx)
+
+	j, _ := m.Enqueue(context.Background(), "test", json.RawMessage(`{}`), "")
+	r.Notify()
+	<-started // handler is now running and registered
+
+	if !r.Cancel(j.ID) {
+		t.Fatal("Cancel returned false for a running job")
+	}
+	waitFor(t, func() bool {
+		got, _ := m.GetJob(context.Background(), j.ID)
+		return got.State == store.JobCanceled
+	})
+}
+
+func TestRunner_CancelUnknown(t *testing.T) {
+	r := NewRunner(store.NewMemory(), Registry{}, 1)
+	if r.Cancel("nope") {
+		t.Fatal("Cancel of unknown id returned true")
+	}
+}

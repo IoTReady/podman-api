@@ -56,6 +56,17 @@ type Runner struct {
 	workers  int
 	poke     chan struct{}
 	wg       sync.WaitGroup
+	mu       sync.Mutex
+	inflight map[string]*inflightJob
+}
+
+// inflightJob tracks a currently-running job so an operator request can cancel
+// its handler context. canceled distinguishes an operator cancel from a
+// shutdown/ctx cancel: only Cancel sets it, so a job interrupted by daemon
+// shutdown still records failed, not canceled.
+type inflightJob struct {
+	cancel   context.CancelFunc
+	canceled bool
 }
 
 // NewRunner builds a runner. workers <= 0 uses DefaultWorkers.
@@ -64,7 +75,7 @@ func NewRunner(js store.JobStore, h Registry, workers int) *Runner {
 	if workers <= 0 {
 		workers = DefaultWorkers
 	}
-	return &Runner{store: js, handlers: h, workers: workers, poke: make(chan struct{}, 1)}
+	return &Runner{store: js, handlers: h, workers: workers, poke: make(chan struct{}, 1), inflight: map[string]*inflightJob{}}
 }
 
 // Notify wakes a worker to check for new work; call after an Enqueue. Non-blocking.
@@ -75,6 +86,22 @@ func (r *Runner) Notify() {
 	case r.poke <- struct{}{}:
 	default:
 	}
+}
+
+// Cancel signals an in-flight job to stop. Returns true if the job was found
+// running — its handler context is cancelled and it will finish as canceled;
+// false if no such job is currently running (queued/terminal jobs are handled by
+// the caller via the store).
+func (r *Runner) Cancel(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.inflight[id]
+	if !ok {
+		return false
+	}
+	entry.canceled = true
+	entry.cancel()
+	return true
 }
 
 // Start reaps crash-interrupted jobs, then launches the worker pool. It returns
@@ -189,10 +216,27 @@ func (r *Runner) run(ctx context.Context, job store.Job) {
 		r.finish(job.ID, store.JobFailed, "no handler for kind "+job.Kind)
 		return
 	}
-	jc := &JobContext{store: r.store, id: job.ID}
-	if err := h.Run(ctx, job, jc); err != nil {
+
+	jctx, cancel := context.WithCancel(ctx)
+	entry := &inflightJob{cancel: cancel}
+	r.mu.Lock()
+	r.inflight[job.ID] = entry
+	r.mu.Unlock()
+
+	err := h.Run(jctx, job, &JobContext{store: r.store, id: job.ID})
+
+	r.mu.Lock()
+	canceled := entry.canceled
+	delete(r.inflight, job.ID)
+	r.mu.Unlock()
+	cancel()
+
+	switch {
+	case canceled:
+		r.finish(job.ID, store.JobCanceled, "canceled by operator")
+	case err != nil:
 		r.finish(job.ID, store.JobFailed, err.Error())
-		return
+	default:
+		r.finish(job.ID, store.JobSucceeded, "")
 	}
-	r.finish(job.ID, store.JobSucceeded, "")
 }
