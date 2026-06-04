@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"strconv"
@@ -22,6 +23,7 @@ import (
 	"github.com/containers/podman/v5/pkg/bindings/system"
 	"github.com/containers/podman/v5/pkg/bindings/volumes"
 	"github.com/containers/podman/v5/pkg/domain/entities"
+	"github.com/containers/podman/v5/pkg/domain/entities/reports"
 
 	"github.com/iotready/podman-api/internal/config"
 )
@@ -721,6 +723,78 @@ func splitPortKey(k string) (int, string) {
 	}
 	port, _ := strconv.Atoi(k[:slash])
 	return port, k[slash+1:]
+}
+
+// sumPrune folds libpod's per-item prune reports into our PruneReport. Items with
+// a non-nil Err are skipped from the reclaimed total but still surfaced as ids.
+func sumPrune(reps []*reports.PruneReport) PruneReport {
+	var out PruneReport
+	for _, r := range reps {
+		if r == nil {
+			continue
+		}
+		out.Items = append(out.Items, r.Id)
+		// r.Size is uint64; guard the int64 conversion so an implausibly huge
+		// item can't wrap Reclaimed negative.
+		if r.Err == nil && r.Size <= math.MaxInt64 {
+			out.Reclaimed += int64(r.Size)
+		}
+	}
+	return out
+}
+
+func (r *Real) ImagePrune(ctx context.Context, id string, all bool) (PruneReport, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return PruneReport{}, err
+	}
+	reps, err := images.Prune(c, new(images.PruneOptions).WithAll(all))
+	if err != nil {
+		return PruneReport{}, err
+	}
+	return sumPrune(reps), nil
+}
+
+func (r *Real) ContainerPrune(ctx context.Context, id string) (PruneReport, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return PruneReport{}, err
+	}
+	reps, err := containers.Prune(c, new(containers.PruneOptions))
+	if err != nil {
+		return PruneReport{}, err
+	}
+	return sumPrune(reps), nil
+}
+
+func (r *Real) BuildCachePrune(ctx context.Context, id string) (PruneReport, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return PruneReport{}, err
+	}
+	// Build cache is pruned through the images prune endpoint with the
+	// build-cache flag set (libpod has no standalone build-cache binding in v5).
+	reps, err := images.Prune(c, new(images.PruneOptions).WithBuildCache(true))
+	if err != nil {
+		return PruneReport{}, err
+	}
+	return sumPrune(reps), nil
+}
+
+func (r *Real) VolumePrune(ctx context.Context, id string, filters map[string][]string) (PruneReport, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return PruneReport{}, err
+	}
+	opts := new(volumes.PruneOptions)
+	if len(filters) > 0 {
+		opts = opts.WithFilters(filters)
+	}
+	reps, err := volumes.Prune(c, opts)
+	if err != nil {
+		return PruneReport{}, err
+	}
+	return sumPrune(reps), nil
 }
 
 // Compile-time guarantee that Real satisfies the Client interface.
