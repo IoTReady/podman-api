@@ -176,7 +176,7 @@ func (m *Memory) AppendStep(_ context.Context, id string, step JobStep) error {
 }
 
 func (m *Memory) Finish(_ context.Context, id string, state JobState, errMsg string) error {
-	if state != JobSucceeded && state != JobFailed {
+	if state != JobSucceeded && state != JobFailed && state != JobCanceled {
 		return fmt.Errorf("store: Finish: invalid terminal state %q", state)
 	}
 	m.mu.Lock()
@@ -207,11 +207,26 @@ func (m *Memory) FailRunning(_ context.Context, reason string) (int, error) {
 	return n, nil
 }
 
+func (m *Memory) CancelQueued(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.jobs {
+		if m.jobs[i].ID == id && m.jobs[i].State == JobQueued {
+			m.jobs[i].State = JobCanceled
+			m.jobs[i].Finished = time.Now()
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (m *Memory) PruneJobs(_ context.Context, olderThan time.Time) (int, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	terminal := func(j Job) bool { return j.State == JobSucceeded || j.State == JobFailed }
+	terminal := func(j Job) bool {
+		return j.State == JobSucceeded || j.State == JobFailed || j.State == JobCanceled
+	}
 	isOld := func(j Job) bool {
 		return !j.Finished.IsZero() && j.Finished.Before(olderThan)
 	}

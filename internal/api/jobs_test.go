@@ -28,7 +28,7 @@ func newSrvWithJobs(t *testing.T, js store.JobStore) (*httptest.Server, string) 
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"jobs:read"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	svc := instance.NewService(fake.New(), hosts, nil)
-	srv := httptest.NewServer(NewRouter(svc, js, auth.NewKeyStore(keys), nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, js, auth.NewKeyStore(keys), nil, nil, nil))
 	t.Cleanup(srv.Close)
 	return srv, tok
 }
@@ -111,4 +111,110 @@ func TestJobs_DisabledReturns501(t *testing.T) {
 	if resp.StatusCode != http.StatusNotImplemented {
 		t.Fatalf("want 501 for get, got %d", resp.StatusCode)
 	}
+}
+
+type fakeCanceller struct{ running map[string]bool }
+
+func (f fakeCanceller) Cancel(id string) bool { return f.running[id] }
+
+// newSrvWithCancel wires a router with the given store + canceller and a key
+// scoped instances:write (the cancel route's required scope).
+func newSrvWithCancel(t *testing.T, js store.JobStore, c JobCanceller) (*httptest.Server, string) {
+	t.Helper()
+	tok := "t"
+	hash, err := config.HashToken(tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:write", "jobs:read"}}}
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	svc := instance.NewService(fake.New(), hosts, nil)
+	srv := httptest.NewServer(NewRouter(svc, js, auth.NewKeyStore(keys), nil, nil, c))
+	t.Cleanup(srv.Close)
+	return srv, tok
+}
+
+func TestCancelJob(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("disabled returns 501", func(t *testing.T) {
+		srv, tok := newSrvWithCancel(t, nil, fakeCanceller{})
+		resp := authedReq(t, srv, tok, "POST", "/jobs/x/cancel")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotImplemented {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("absent returns 404", func(t *testing.T) {
+		srv, tok := newSrvWithCancel(t, store.NewMemory(), fakeCanceller{})
+		resp := authedReq(t, srv, tok, "POST", "/jobs/nope/cancel")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("terminal returns 409", func(t *testing.T) {
+		js := store.NewMemory()
+		j, _ := js.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+		_, _, _ = js.ClaimNext(ctx)
+		_ = js.Finish(ctx, j.ID, store.JobSucceeded, "")
+		srv, tok := newSrvWithCancel(t, js, fakeCanceller{})
+		resp := authedReq(t, srv, tok, "POST", "/jobs/"+j.ID+"/cancel")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("queued returns 202 and becomes canceled", func(t *testing.T) {
+		js := store.NewMemory()
+		j, _ := js.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+		srv, tok := newSrvWithCancel(t, js, fakeCanceller{})
+		resp := authedReq(t, srv, tok, "POST", "/jobs/"+j.ID+"/cancel")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		got, _ := js.GetJob(ctx, j.ID)
+		if got.State != store.JobCanceled {
+			t.Fatalf("state %q", got.State)
+		}
+	})
+
+	t.Run("running returns 202 via canceller", func(t *testing.T) {
+		js := store.NewMemory()
+		j, _ := js.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+		_, _, _ = js.ClaimNext(ctx) // now running
+		srv, tok := newSrvWithCancel(t, js, fakeCanceller{running: map[string]bool{j.ID: true}})
+		resp := authedReq(t, srv, tok, "POST", "/jobs/"+j.ID+"/cancel")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusAccepted {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+	})
+
+	t.Run("running but not yet in canceller returns 409 not-cancelable", func(t *testing.T) {
+		js := store.NewMemory()
+		j, _ := js.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+		_, _, _ = js.ClaimNext(ctx) // running on disk, but not registered in the runner yet
+		srv, tok := newSrvWithCancel(t, js, fakeCanceller{})
+		resp := authedReq(t, srv, tok, "POST", "/jobs/"+j.ID+"/cancel")
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusConflict {
+			t.Fatalf("status %d", resp.StatusCode)
+		}
+		// Still running (not terminal), so the reason must be the transient,
+		// retryable one — not "already terminal".
+		var body struct {
+			Code string `json:"code"`
+		}
+		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if body.Code != "job_not_cancelable" {
+			t.Fatalf("code = %q, want job_not_cancelable", body.Code)
+		}
+	})
 }

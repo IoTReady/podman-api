@@ -14,6 +14,13 @@ import (
 // (the -state-db store is off). It classifies to 501 Not Implemented.
 var errJobsDisabled = errors.New("jobs store not enabled (set -state-db)")
 
+// JobCanceller cancels an in-flight (running) job. Implemented by *jobs.Runner.
+// Nil when the job runner is not wired (no -state-db), in which case the cancel
+// endpoint is unreachable anyway (the jobs-disabled guard precedes it).
+type JobCanceller interface {
+	Cancel(id string) bool
+}
+
 type stepView struct {
 	TS     string `json:"ts"`
 	Step   string `json:"step"`
@@ -100,4 +107,83 @@ func (h *handlers) getJob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, toJobView(j))
+}
+
+func (h *handlers) cancelJob(w http.ResponseWriter, r *http.Request) {
+	if h.jobs == nil {
+		WriteError(w, errJobsDisabled)
+		return
+	}
+	id := r.PathValue("id")
+	j, err := h.jobs.GetJob(r.Context(), id)
+	if err != nil {
+		WriteError(w, err) // store.ErrNotFound -> 404
+		return
+	}
+
+	switch j.State {
+	case store.JobSucceeded, store.JobFailed, store.JobCanceled:
+		WriteJSON(w, http.StatusConflict,
+			ErrorBody{Code: "job_terminal", Message: "job is already in a terminal state"})
+		return
+
+	case store.JobRunning:
+		if h.canceller != nil && h.canceller.Cancel(id) {
+			h.writeAcceptedJob(w, r, id)
+			return
+		}
+		// Cancel returned false: the job either just finished, or was claimed but
+		// not yet registered in the runner's in-flight map (a brief claim→register
+		// window). Re-read to report the accurate reason.
+		h.writeCancelConflict(w, r, id)
+		return
+
+	default: // queued
+		ok, err := h.jobs.CancelQueued(r.Context(), id)
+		if err != nil {
+			WriteError(w, err)
+			return
+		}
+		if ok {
+			h.writeAcceptedJob(w, r, id)
+			return
+		}
+		// Not queued any more — it raced into running. Try the in-flight registry;
+		// if that misses too, re-read to report the accurate reason.
+		if h.canceller != nil && h.canceller.Cancel(id) {
+			h.writeAcceptedJob(w, r, id)
+			return
+		}
+		h.writeCancelConflict(w, r, id)
+	}
+}
+
+// writeCancelConflict re-reads the job and returns a 409 that distinguishes a
+// genuinely terminal job from one that is merely not-yet-cancelable (a transient
+// claim→register or queued→running race the operator can retry).
+func (h *handlers) writeCancelConflict(w http.ResponseWriter, r *http.Request, id string) {
+	j, err := h.jobs.GetJob(r.Context(), id)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	switch j.State {
+	case store.JobSucceeded, store.JobFailed, store.JobCanceled:
+		WriteJSON(w, http.StatusConflict,
+			ErrorBody{Code: "job_terminal", Message: "job is already in a terminal state"})
+	default:
+		WriteJSON(w, http.StatusConflict,
+			ErrorBody{Code: "job_not_cancelable", Message: "job is not yet cancelable; retry shortly"})
+	}
+}
+
+// writeAcceptedJob re-reads the job and returns it with 202. Running cancels are
+// asynchronous, so the returned state may still be "running".
+func (h *handlers) writeAcceptedJob(w http.ResponseWriter, r *http.Request, id string) {
+	j, err := h.jobs.GetJob(r.Context(), id)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusAccepted, toJobView(j))
 }

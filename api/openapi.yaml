@@ -343,7 +343,7 @@ components:
         kind: {type: string}
         state:
           type: string
-          enum: [queued, running, succeeded, failed]
+          enum: [queued, running, succeeded, failed, canceled]
         args: {}
         steps:
           type: array
@@ -833,7 +833,7 @@ paths:
           description: filter by job state
           schema:
             type: string
-            enum: [queued, running, succeeded, failed]
+            enum: [queued, running, succeeded, failed, canceled]
         - name: kind
           in: query
           required: false
@@ -889,3 +889,38 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
       x-required-scope: jobs:read
+
+  /jobs/{id}/cancel:
+    post:
+      tags: [jobs]
+      summary: cancel a queued or running job (requires -state-db)
+      description: >
+        Cancels a queued job immediately (it transitions to `canceled`) or
+        signals a running job to stop. Cancellation of a running job is
+        asynchronous — the handler unwinds (a migrate rolls back, leaving the
+        source intact) and the terminal `canceled` state is recorded shortly
+        after, so the 202 body may still show `running`. A parent evacuate's
+        in-flight children are canceled with it — cancel the parent to stop the
+        fan-out; child jobs cannot be canceled directly (a child returns 409
+        while running). A 409 with code `job_not_cancelable` (vs `job_terminal`)
+        is transient — the job was just claimed but is not yet cancelable; retry
+        shortly.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        '202':
+          description: cancellation accepted (queued -> canceled, or running -> stopping)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Job'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '501':
+          description: state store not enabled (-state-db not set)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+      x-required-scope: instances:write

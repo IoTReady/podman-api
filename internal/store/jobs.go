@@ -17,6 +17,7 @@ const (
 	JobRunning   JobState = "running"
 	JobSucceeded JobState = "succeeded"
 	JobFailed    JobState = "failed"
+	JobCanceled  JobState = "canceled"
 )
 
 // JobStep is one progress entry recorded by a handler.
@@ -90,6 +91,10 @@ type JobStore interface {
 	// FailRunning marks every job still in running as failed with reason; returns
 	// the count. Called once at startup to reap crash-interrupted jobs.
 	FailRunning(ctx context.Context, reason string) (int, error)
+	// CancelQueued atomically transitions a still-queued job to canceled (setting
+	// finished). Returns true if it transitioned; false if the job was not in the
+	// queued state (already claimed, terminal, or absent).
+	CancelQueued(ctx context.Context, id string) (bool, error)
 	// PruneJobs deletes terminal (succeeded/failed) jobs finished before
 	// olderThan, preserving parent/child integrity: a parent row is deleted only
 	// when it has no surviving child. Returns the number of rows deleted.

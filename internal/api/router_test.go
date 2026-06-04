@@ -26,7 +26,7 @@ func newServer(t *testing.T) (*httptest.Server, string) {
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	svc := instance.NewService(fake.New(), hosts, nil)
 
-	r := NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil)
+	r := NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil)
 	srv := httptest.NewServer(r)
 	t.Cleanup(srv.Close)
 	return srv, tok
@@ -67,7 +67,7 @@ func TestRouter_AuditCapturesKeyID(t *testing.T) {
 
 	var buf bytes.Buffer
 	auditMW := obs.NewAuditMiddleware(&buf)
-	r := NewRouter(svc, nil, auth.NewKeyStore(keys), auditMW, nil)
+	r := NewRouter(svc, nil, auth.NewKeyStore(keys), auditMW, nil, nil)
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 

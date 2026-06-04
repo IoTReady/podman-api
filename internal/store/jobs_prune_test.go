@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 )
@@ -81,3 +82,28 @@ func testPruneOn(t *testing.T, js JobStore) {
 
 func TestPrune_SQLite(t *testing.T) { testPruneOn(t, openJobStore(t)) }
 func TestPrune_Memory(t *testing.T) { testPruneOn(t, NewMemory()) }
+
+func TestSQLite_PruneJobs_IncludesCanceled(t *testing.T) {
+	ctx := context.Background()
+	js := openJobStore(t)
+
+	old, _ := js.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	if _, _, err := js.ClaimNext(ctx); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := js.Finish(ctx, old.ID, JobCanceled, "canceled by operator"); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+
+	// Prune everything finished before "now + 1h" — the canceled job qualifies.
+	n, err := js.PruneJobs(ctx, time.Now().Add(time.Hour))
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("want 1 pruned, got %d", n)
+	}
+	if _, err := js.GetJob(ctx, old.ID); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("canceled job not pruned: %v", err)
+	}
+}
