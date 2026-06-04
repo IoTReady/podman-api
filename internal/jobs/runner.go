@@ -95,6 +95,44 @@ func (r *Runner) Start(ctx context.Context) {
 // Wait blocks until all workers have exited (after ctx cancellation).
 func (r *Runner) Wait() { r.wg.Wait() }
 
+// retentionInterval is how often StartRetention sweeps after its initial run.
+const retentionInterval = time.Hour
+
+// StartRetention periodically prunes terminal jobs older than retention. It is a
+// no-op when retention <= 0. It sweeps once immediately, then every
+// retentionInterval, until ctx is cancelled. It is tracked by the runner's
+// WaitGroup, so Wait blocks for it too.
+func (r *Runner) StartRetention(ctx context.Context, retention time.Duration) {
+	if retention <= 0 {
+		return
+	}
+	r.wg.Add(1)
+	go func() {
+		defer r.wg.Done()
+		sweep := func() {
+			n, err := r.store.PruneJobs(ctx, time.Now().Add(-retention))
+			if err != nil {
+				log.Printf("jobs: retention sweep failed: %v", err)
+				return
+			}
+			if n > 0 {
+				log.Printf("jobs: retention pruned %d terminal job(s)", n)
+			}
+		}
+		sweep() // prompt first pass so a restart cleans up immediately
+		t := time.NewTicker(retentionInterval)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				sweep()
+			}
+		}
+	}()
+}
+
 func (r *Runner) worker(ctx context.Context) {
 	defer r.wg.Done()
 	t := time.NewTicker(pollInterval)

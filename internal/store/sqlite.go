@@ -38,10 +38,12 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);`
 
-// maxOpenConns bounds the SQLite connection pool. >1 enables WAL reader
-// concurrency (API reads while the job runner writes); a competing writer waits
-// up to busy_timeout rather than failing with "database is locked".
-const maxOpenConns = 4
+// maxOpenConns bounds the SQLite connection pool. WAL allows many concurrent
+// readers + one writer; setting the pool above jobs.DefaultWorkers (4) leaves
+// read headroom so GET /jobs is not starved when every worker is writing. A
+// competing writer waits up to busy_timeout rather than failing with
+// "database is locked".
+const maxOpenConns = 8
 
 // SQLite is the durable Store backed by a single SQLite file. Secrets are
 // sealed with the key held in keys, read fresh on every Put/Get so a SIGHUP
@@ -84,7 +86,7 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 	}
 	// Reserved schema-version stamp for future migrations. At v1 this is set
 	// unconditionally; a real version gate is added if/when the schema changes.
-	if _, err := db.Exec(`PRAGMA user_version = 2`); err != nil {
+	if _, err := db.Exec(`PRAGMA user_version = 3`); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
@@ -218,19 +220,21 @@ func scanJob(sc rowScanner) (Job, error) {
 	}
 	j.ParentID = parent.String
 	j.Error = errMsg.String
-	j.Created = time.Unix(created, 0)
+	// Job timestamps are stored as Unix nanoseconds (see Enqueue/Finish) for
+	// sub-second durations and FIFO tiebreaks.
+	j.Created = time.Unix(0, created)
 	if started.Valid {
-		j.Started = time.Unix(started.Int64, 0)
+		j.Started = time.Unix(0, started.Int64)
 	}
 	if finished.Valid {
-		j.Finished = time.Unix(finished.Int64, 0)
+		j.Finished = time.Unix(0, finished.Int64)
 	}
 	return j, nil
 }
 
 func (s *SQLite) Enqueue(ctx context.Context, kind string, args json.RawMessage, parentID string) (Job, error) {
 	id := newJobID()
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	if len(args) == 0 {
 		args = json.RawMessage("null")
 	}
@@ -250,7 +254,7 @@ VALUES (?, ?, ?, 'queued', '[]', ?, NULL, ?, NULL, NULL)`,
 
 func (s *SQLite) StartChild(ctx context.Context, kind string, args json.RawMessage, parentID string) (Job, error) {
 	id := newJobID()
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	if len(args) == 0 {
 		args = json.RawMessage("null")
 	}
@@ -289,10 +293,20 @@ func (s *SQLite) ListJobs(ctx context.Context, f JobFilter) ([]Job, error) {
 		where = append(where, "parent_id=?")
 		args = append(args, f.ParentID)
 	}
+	if f.Before != "" {
+		where = append(where, "id < ?")
+		args = append(args, f.Before)
+	}
 	if len(where) > 0 {
 		q += " WHERE " + strings.Join(where, " AND ")
 	}
-	q += " ORDER BY created DESC, id DESC"
+	// Order by id alone: the id is fixed-width "<unixnano>-<rand>", so its
+	// lexicographic order is a total order on creation time. The Before cursor
+	// (id < ?) must use the SAME key as ORDER BY — created and the id time-prefix
+	// come from two separate clock reads and can disagree under concurrent
+	// inserts, so ordering by created here would let the id cursor skip a row.
+	q += " ORDER BY id DESC LIMIT ?"
+	args = append(args, clampJobLimit(f.Limit))
 	rows, err := s.db.QueryContext(ctx, q, args...)
 	if err != nil {
 		return nil, err
@@ -310,7 +324,7 @@ func (s *SQLite) ListJobs(ctx context.Context, f JobFilter) ([]Job, error) {
 }
 
 func (s *SQLite) ClaimNext(ctx context.Context) (Job, bool, error) {
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	row := s.db.QueryRowContext(ctx, `
 UPDATE jobs SET state='running', started=?
 WHERE id = (SELECT id FROM jobs WHERE state='queued' ORDER BY created, id LIMIT 1)
@@ -353,7 +367,7 @@ func (s *SQLite) Finish(ctx context.Context, id string, state JobState, errMsg s
 	if state != JobSucceeded && state != JobFailed {
 		return fmt.Errorf("store.Finish: invalid terminal state %q", state)
 	}
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	var e any
 	if errMsg != "" {
 		e = errMsg
@@ -374,7 +388,7 @@ func (s *SQLite) Finish(ctx context.Context, id string, state JobState, errMsg s
 }
 
 func (s *SQLite) FailRunning(ctx context.Context, reason string) (int, error) {
-	now := time.Now().Unix()
+	now := time.Now().UnixNano()
 	res, err := s.db.ExecContext(ctx, `UPDATE jobs SET state='failed', error=?, finished=? WHERE state='running'`,
 		reason, now)
 	if err != nil {
@@ -385,6 +399,45 @@ func (s *SQLite) FailRunning(ctx context.Context, reason string) (int, error) {
 		return 0, err
 	}
 	return int(n), nil
+}
+
+func (s *SQLite) PruneJobs(ctx context.Context, olderThan time.Time) (int, error) {
+	cutoff := olderThan.UnixNano()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+	// 1) Old terminal children first, so their parents can then be considered.
+	rc, err := tx.ExecContext(ctx, `
+DELETE FROM jobs
+WHERE parent_id IS NOT NULL AND state IN ('succeeded','failed')
+  AND finished IS NOT NULL AND finished < ?`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	nChild, err := rc.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+
+	// 2) Old terminal jobs not referenced as a parent by any surviving row.
+	rp, err := tx.ExecContext(ctx, `
+DELETE FROM jobs
+WHERE state IN ('succeeded','failed') AND finished IS NOT NULL AND finished < ?
+  AND id NOT IN (SELECT parent_id FROM jobs WHERE parent_id IS NOT NULL)`, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	nParent, err := rp.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return int(nChild + nParent), nil
 }
 
 var _ DB = (*SQLite)(nil)

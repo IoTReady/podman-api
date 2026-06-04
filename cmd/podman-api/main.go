@@ -30,14 +30,15 @@ import (
 
 func main() {
 	var (
-		addr         = flag.String("addr", "127.0.0.1:8080", "bind address for the API")
-		metricsAddr  = flag.String("metrics-addr", "", "if set, expose /metrics on this address (e.g. 127.0.0.1:9090); empty means no metrics endpoint")
-		hostsDir     = flag.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
-		keysFile     = flag.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
-		tmplDir      = flag.String("templates-dir", "", "if set, load templates from this dir instead of embedded")
-		auditLogFile = flag.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
-		stateDB      = flag.String("state-db", "", "if set, enable the desired-state store at this SQLite path (required for migrate/evacuate)")
-		specKeyFile  = flag.String("spec-key-file", "", "path to the 32-byte secret encryption key (required when -state-db is set)")
+		addr          = flag.String("addr", "127.0.0.1:8080", "bind address for the API")
+		metricsAddr   = flag.String("metrics-addr", "", "if set, expose /metrics on this address (e.g. 127.0.0.1:9090); empty means no metrics endpoint")
+		hostsDir      = flag.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
+		keysFile      = flag.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
+		tmplDir       = flag.String("templates-dir", "", "if set, load templates from this dir instead of embedded")
+		auditLogFile  = flag.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
+		stateDB       = flag.String("state-db", "", "if set, enable the desired-state store at this SQLite path (required for migrate/evacuate)")
+		specKeyFile   = flag.String("spec-key-file", "", "path to the 32-byte secret encryption key (required when -state-db is set)")
+		jobsRetention = flag.Duration("jobs-retention", 0, "if >0, prune terminal jobs older than this (e.g. 168h); 0 disables")
 	)
 	flag.Parse()
 
@@ -100,6 +101,10 @@ func main() {
 		}
 		runner := jobs.NewRunner(db, registry, jobs.DefaultWorkers)
 		runner.Start(runnerCtx)
+		if *jobsRetention > 0 {
+			runner.StartRetention(runnerCtx, *jobsRetention)
+			log.Printf("jobs retention enabled: pruning terminal jobs older than %s", *jobsRetention)
+		}
 		log.Printf("desired-state store enabled: %s (job runner started)", *stateDB)
 	}
 

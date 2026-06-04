@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -121,9 +122,9 @@ func (m *Memory) GetJob(_ context.Context, id string) (Job, error) {
 func (m *Memory) ListJobs(_ context.Context, f JobFilter) ([]Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	out := []Job{}
-	for i := len(m.jobs) - 1; i >= 0; i-- { // newest first
-		j := m.jobs[i]
+	limit := clampJobLimit(f.Limit)
+	var matched []Job
+	for _, j := range m.jobs {
 		if f.State != "" && j.State != f.State {
 			continue
 		}
@@ -133,7 +134,18 @@ func (m *Memory) ListJobs(_ context.Context, f JobFilter) ([]Job, error) {
 		if f.ParentID != "" && j.ParentID != f.ParentID {
 			continue
 		}
-		out = append(out, cloneJob(j))
+		if f.Before != "" && j.ID >= f.Before {
+			continue
+		}
+		matched = append(matched, j)
+	}
+	// Sort by id descending (newest first), the same total order SQLite uses, so
+	// the limit truncates the right rows and the Before cursor stays consistent —
+	// append order can diverge from id order under concurrent enqueues.
+	sort.Slice(matched, func(i, k int) bool { return matched[i].ID > matched[k].ID })
+	out := []Job{}
+	for i := 0; i < len(matched) && i < limit; i++ {
+		out = append(out, cloneJob(matched[i]))
 	}
 	return out, nil
 }
@@ -193,6 +205,46 @@ func (m *Memory) FailRunning(_ context.Context, reason string) (int, error) {
 		}
 	}
 	return n, nil
+}
+
+func (m *Memory) PruneJobs(_ context.Context, olderThan time.Time) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	terminal := func(j Job) bool { return j.State == JobSucceeded || j.State == JobFailed }
+	isOld := func(j Job) bool {
+		return !j.Finished.IsZero() && j.Finished.Before(olderThan)
+	}
+
+	// Pass 1: delete old terminal children.
+	kept := m.jobs[:0:0]
+	deleted := 0
+	for _, j := range m.jobs {
+		if j.ParentID != "" && terminal(j) && isOld(j) {
+			deleted++
+			continue
+		}
+		kept = append(kept, j)
+	}
+	m.jobs = kept
+
+	// Pass 2: delete old terminal jobs not referenced as a parent by survivors.
+	referenced := map[string]bool{}
+	for _, j := range m.jobs {
+		if j.ParentID != "" {
+			referenced[j.ParentID] = true
+		}
+	}
+	kept = m.jobs[:0:0]
+	for _, j := range m.jobs {
+		if terminal(j) && isOld(j) && !referenced[j.ID] {
+			deleted++
+			continue
+		}
+		kept = append(kept, j)
+	}
+	m.jobs = kept
+	return deleted, nil
 }
 
 // cloneJob returns a copy whose Steps and Args do not share backing arrays with
