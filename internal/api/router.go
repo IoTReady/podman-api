@@ -90,6 +90,11 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 	// Evacuate enqueues a parent job that fans out child migrate jobs; 501 when the store is disabled.
 	mux.Handle("POST /evacuate", guard("instances:write", http.HandlerFunc(h.evacuate)))
 
+	// Evacuate plan is a read-only dry-run: resolve the map and run live
+	// destination preflight checks, returning a per-move report. No job, no
+	// mutation; 501 when the store is disabled.
+	mux.Handle("POST /evacuate/plan", guard("instances:read", http.HandlerFunc(h.evacuatePlan)))
+
 	return mux
 }
 
