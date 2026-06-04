@@ -63,8 +63,14 @@ func classify(err error) (code string, status int, msg string) {
 		return "invalid_parameters", http.StatusBadRequest, err.Error()
 	case errors.Is(err, errJobsDisabled):
 		return "not_implemented", http.StatusNotImplemented, err.Error()
+	case errors.Is(err, instance.ErrStoreDisabled):
+		return "not_implemented", http.StatusNotImplemented, err.Error()
 	case errors.Is(err, store.ErrNotFound):
 		return "not_found", http.StatusNotFound, err.Error()
+	case errors.Is(err, instance.ErrPortConflict):
+		return "port_conflict", http.StatusConflict, err.Error()
+	case errors.Is(err, instance.ErrSameHost):
+		return "invalid_request", http.StatusBadRequest, err.Error()
 	default:
 		return "internal", http.StatusInternalServerError, err.Error()
 	}

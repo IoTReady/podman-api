@@ -22,6 +22,7 @@ tags:
   - name: logs
   - name: volumes
   - name: jobs
+  - name: migrate
 
 components:
   securitySchemes:
@@ -84,6 +85,7 @@ components:
             unknown_host, unknown_template, instance_not_found,
             instance_already_exists, host_secret_missing, host_draining,
             upstream_error, too_many_ops, internal,
+            invalid_request, port_conflict, not_found, not_implemented,
           ]
         message: {type: string}
         details:
@@ -251,6 +253,25 @@ components:
         secrets:
           type: object
           additionalProperties: {type: string}
+
+    MigrateRequest:
+      type: object
+      required: [from_host, to_host, template, slug]
+      properties:
+        from_host: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+        to_host: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+        template: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+        slug: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+        parameters:
+          type: object
+          additionalProperties: true
+          description: optional overrides; defaults to the source instance's stored params
+
+    JobAccepted:
+      type: object
+      required: [job_id]
+      properties:
+        job_id: {type: string}
 
     SecretValue:
       type: object
@@ -716,6 +737,29 @@ paths:
         - {name: force, in: query, schema: {type: boolean}}
       responses:
         '204': {description: removed}
+      x-required-scope: instances:write
+
+  /migrate:
+    post:
+      tags: [migrate]
+      summary: enqueue a job to migrate an instance between hosts (requires -state-db)
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/MigrateRequest'}}}
+      responses:
+        '202':
+          description: migrate job accepted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/JobAccepted'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409': {$ref: '#/components/responses/Conflict'}
+        '501':
+          description: state store not enabled (-state-db not set)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
       x-required-scope: instances:write
 
   /jobs:

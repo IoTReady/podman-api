@@ -20,6 +20,7 @@ import (
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/jobs"
+	"github.com/iotready/podman-api/internal/migrate"
 	"github.com/iotready/podman-api/internal/obs"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/store"
@@ -92,8 +93,10 @@ func main() {
 		defer db.Close()
 		svc.SetStore(db)
 		jobStore = db
-		// Registry is empty in this phase; migrate/evacuate register handlers later.
-		runner := jobs.NewRunner(db, jobs.Registry{}, jobs.DefaultWorkers)
+		registry := jobs.Registry{
+			"migrate": &migrate.Handler{Svc: svc},
+		}
+		runner := jobs.NewRunner(db, registry, jobs.DefaultWorkers)
 		runner.Start(runnerCtx)
 		log.Printf("desired-state store enabled: %s (job runner started)", *stateDB)
 	}

@@ -82,6 +82,9 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 	mux.Handle("GET /jobs", guard("jobs:read", http.HandlerFunc(h.listJobs)))
 	mux.Handle("GET /jobs/{id}", guard("jobs:read", http.HandlerFunc(h.getJob)))
 
+	// Migrate enqueues a job; 501 when the store is disabled.
+	mux.Handle("POST /migrate", guard("instances:write", http.HandlerFunc(h.migrate)))
+
 	return mux
 }
 
