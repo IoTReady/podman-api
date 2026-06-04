@@ -1,5 +1,6 @@
 /bin/
 /.worktrees/
+/.superpowers/
 *.test
 *.out
 coverage.txt
