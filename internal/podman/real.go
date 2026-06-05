@@ -436,13 +436,18 @@ func (r *Real) VolumeCreate(ctx context.Context, id, name string) error {
 
 // NetworkEnsure creates the named network if absent. An already-existing
 // network is treated as success so callers can call this idempotently.
+//
+// DNSEnabled is set explicitly: the `podman network create` CLI turns aardvark
+// DNS on by default, but the REST API does not, and the ingress backend routing
+// resolves pods by name on this network — without DNS the proxy can't reach the
+// backend (502).
 func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
 	c, err := r.ctxFor(ctx, id)
 	if err != nil {
 		return err
 	}
 	ignore := true
-	_, err = network.CreateWithOptions(c, &nettypes.Network{Name: name},
+	_, err = network.CreateWithOptions(c, &nettypes.Network{Name: name, DNSEnabled: true},
 		&network.ExtraCreateOptions{IgnoreIfExists: &ignore})
 	return err
 }
