@@ -232,3 +232,30 @@ func TestPlanEvacuation_StaticValidationErrors(t *testing.T) {
 	_, err = svc.PlanEvacuation(ctx, EvacuateRequest{FromHost: "h1", Map: map[string]string{"db1": "h1", "db2": "h2"}})
 	assert.ErrorIs(t, err, ErrSameHost)
 }
+
+func TestPlanEvacuation_ProvisionsPersistedHostSecret(t *testing.T) {
+	svc, _, mem := newPlanSvc(t)
+	ctx := context.Background()
+	// Instance referencing a per-host secret; the secret is persisted for source h1
+	// but absent on dest h2 -> non-blocking, reported in provisions.
+	seedSpec(t, mem, "h1", "needs-host-secret", "s1", map[string]any{"slug": "s1", "image": "x"})
+	require.NoError(t, mem.PutHostSecret(ctx, "h1", "shared-pull-token", []byte("v")))
+
+	plan, err := svc.PlanEvacuation(ctx, EvacuateRequest{FromHost: "h1", Map: map[string]string{"s1": "h2"}})
+	require.NoError(t, err)
+	require.Len(t, plan.Moves, 1)
+	assert.True(t, plan.Moves[0].OK, "provisionable secret keeps the move ok")
+	assert.Empty(t, plan.Moves[0].Issues)
+	assert.Equal(t, []string{"shared-pull-token"}, plan.Moves[0].Provisions)
+}
+
+func TestPlanEvacuation_ProvisionsEmptyByDefault(t *testing.T) {
+	svc, _, mem := newPlanSvc(t)
+	ctx := context.Background()
+	seedPGSpec(t, mem, "db1")
+	plan, err := svc.PlanEvacuation(ctx, EvacuateRequest{FromHost: "h1", Map: map[string]string{"db1": "h2"}})
+	require.NoError(t, err)
+	require.Len(t, plan.Moves, 1)
+	assert.NotNil(t, plan.Moves[0].Provisions, "provisions serializes as [], never null")
+	assert.Empty(t, plan.Moves[0].Provisions)
+}
