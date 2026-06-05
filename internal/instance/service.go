@@ -237,6 +237,10 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	if err != nil {
 		return err
 	}
+	// Fill any omitted parameters from their ParamDef.Default before validation
+	// and render, so callers can omit optional params for a one-click deploy.
+	// Caller-supplied values always win; only absent keys are filled.
+	req.Parameters = render.ApplyDefaults(tmpl.Meta, req.Parameters)
 	if err := render.Validate(tmpl.Meta, req.Parameters, req.Secrets); err != nil {
 		return fmt.Errorf("validate: %w", err)
 	}
