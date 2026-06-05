@@ -12,12 +12,12 @@ import (
 // Meta describes a template's parameter and secret contract.
 // It is parsed from the leading "# template-meta:" comment block.
 type Meta struct {
-	ID         string     `yaml:"id"`
+	ID         string     `yaml:"id" json:"id"`
 	Display    Display    `yaml:"display,omitempty" json:"display,omitempty"`
-	Parameters []ParamDef `yaml:"parameters"`
-	Secrets    Secrets    `yaml:"secrets"`
-	Volumes    []Volume   `yaml:"volumes"`
-	Ingress    *Ingress   `yaml:"ingress"`
+	Parameters []ParamDef `yaml:"parameters" json:"parameters,omitempty"`
+	Secrets    Secrets    `yaml:"secrets" json:"secrets,omitempty"`
+	Volumes    []Volume   `yaml:"volumes" json:"volumes,omitempty"`
+	Ingress    *Ingress   `yaml:"ingress" json:"ingress,omitempty"`
 }
 
 // Display holds human-readable presentation metadata for a template.
@@ -42,20 +42,20 @@ type ParamDef struct {
 }
 
 type Secrets struct {
-	PerInstance       []string `yaml:"per_instance"`
-	PerHostReferenced []string `yaml:"per_host_referenced"`
+	PerInstance       []string `yaml:"per_instance" json:"per_instance,omitempty"`
+	PerHostReferenced []string `yaml:"per_host_referenced" json:"per_host_referenced,omitempty"`
 }
 
 type Volume struct {
-	Name   string `yaml:"name"`
-	Backup string `yaml:"backup,omitempty"`
+	Name   string `yaml:"name" json:"name"`
+	Backup string `yaml:"backup,omitempty" json:"backup,omitempty"`
 }
 
 // Ingress declares which container+port in the rendered pod serves HTTP, so the
 // ingress layer can route a domain to it. Absent on non-web templates.
 type Ingress struct {
-	Container string `yaml:"container"`
-	Port      int    `yaml:"port"`
+	Container string `yaml:"container" json:"container"`
+	Port      int    `yaml:"port" json:"port"`
 }
 
 // validParamTypes is the set of recognised ParamDef.Type values.

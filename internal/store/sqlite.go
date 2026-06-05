@@ -49,6 +49,14 @@ CREATE TABLE IF NOT EXISTS host_secrets (
   created INTEGER NOT NULL,
   updated INTEGER NOT NULL,
   PRIMARY KEY (host, name)
+);
+CREATE TABLE IF NOT EXISTS templates (
+  id      TEXT PRIMARY KEY,
+  body    TEXT NOT NULL,
+  meta    TEXT NOT NULL,
+  origin  TEXT NOT NULL,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL
 );`
 
 // maxOpenConns bounds the SQLite connection pool. WAL allows many concurrent
@@ -183,10 +191,9 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 	return &SQLite{db: db, keys: keys}, nil
 }
 
-// migrateSchema brings an existing specs table up to the current schema. v4
-// added specs.domains. The ALTER is guarded by user_version, and the
-// duplicate-column case (fresh DB where schemaSQL already created the column)
-// is tolerated so OpenSQLite is idempotent.
+// migrateSchema brings an existing DB up to the current schema version.
+// v4 added specs.domains. v5 added the templates table.
+// Each step is guarded by user_version so OpenSQLite is idempotent.
 func migrateSchema(db *sql.DB) error {
 	var v int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
@@ -206,6 +213,24 @@ func migrateSchema(db *sql.DB) error {
 			}
 		}
 		if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
+			return fmt.Errorf("migrateSchema: set user_version: %w", err)
+		}
+		v = 4
+	}
+	if v < 5 {
+		// templates table is created by schemaSQL on a fresh DB but absent on a
+		// pre-v5 DB. CREATE TABLE IF NOT EXISTS is safe for both cases.
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS templates (
+  id      TEXT PRIMARY KEY,
+  body    TEXT NOT NULL,
+  meta    TEXT NOT NULL,
+  origin  TEXT NOT NULL,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migrateSchema: create templates table: %w", err)
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
 			return fmt.Errorf("migrateSchema: set user_version: %w", err)
 		}
 	}
@@ -754,37 +779,14 @@ WHERE state IN ('succeeded','failed','canceled') AND finished IS NOT NULL AND fi
 // TemplateStore implementation
 // ---------------------------------------------------------------------------
 
-const templateSchemaSQL = `
-CREATE TABLE IF NOT EXISTS templates (
-  id      TEXT PRIMARY KEY,
-  meta    TEXT NOT NULL,
-  body    TEXT NOT NULL,
-  origin  TEXT NOT NULL,
-  created INTEGER NOT NULL,
-  updated INTEGER NOT NULL
-);`
-
-// ensureTemplatesTable creates the templates table if it does not yet exist.
-// Called lazily on first template write so existing DBs are upgraded without a
-// schema-version bump for this purely-additive change.
-func (s *SQLite) ensureTemplatesTable(ctx context.Context) error {
-	return s.write(ctx, func() error {
-		_, err := s.db.ExecContext(ctx, templateSchemaSQL)
-		return err
-	})
-}
-
 func (s *SQLite) ListTemplates(ctx context.Context) ([]Template, error) {
-	if _, err := s.db.ExecContext(ctx, templateSchemaSQL); err != nil {
-		return nil, err
-	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, meta, body, origin, created, updated FROM templates ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []Template
+	out := []Template{}
 	for rows.Next() {
 		t, err := scanTemplate(rows)
 		if err != nil {
@@ -792,16 +794,10 @@ func (s *SQLite) ListTemplates(ctx context.Context) ([]Template, error) {
 		}
 		out = append(out, t)
 	}
-	if out == nil {
-		out = []Template{}
-	}
 	return out, rows.Err()
 }
 
 func (s *SQLite) GetTemplate(ctx context.Context, id string) (Template, error) {
-	if _, err := s.db.ExecContext(ctx, templateSchemaSQL); err != nil {
-		return Template{}, err
-	}
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, meta, body, origin, created, updated FROM templates WHERE id=?`, id)
 	t, err := scanTemplate(row)
@@ -812,9 +808,6 @@ func (s *SQLite) GetTemplate(ctx context.Context, id string) (Template, error) {
 }
 
 func (s *SQLite) PutTemplate(ctx context.Context, t Template) error {
-	if err := s.ensureTemplatesTable(ctx); err != nil {
-		return err
-	}
 	metaJSON, err := json.Marshal(t.Meta)
 	if err != nil {
 		return err
@@ -822,22 +815,19 @@ func (s *SQLite) PutTemplate(ctx context.Context, t Template) error {
 	now := time.Now().Unix()
 	return s.write(ctx, func() error {
 		_, err := s.db.ExecContext(ctx, `
-INSERT INTO templates (id, meta, body, origin, created, updated)
+INSERT INTO templates (id, body, meta, origin, created, updated)
 VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
-  meta    = excluded.meta,
   body    = excluded.body,
+  meta    = excluded.meta,
   origin  = excluded.origin,
   updated = excluded.updated`,
-			t.Meta.ID, string(metaJSON), t.Body, t.Origin, now, now)
+			t.Meta.ID, t.Body, string(metaJSON), t.Origin, now, now)
 		return err
 	})
 }
 
 func (s *SQLite) DeleteTemplate(ctx context.Context, id string) error {
-	if err := s.ensureTemplatesTable(ctx); err != nil {
-		return err
-	}
 	return s.write(ctx, func() error {
 		_, err := s.db.ExecContext(ctx, `DELETE FROM templates WHERE id=?`, id)
 		return err
@@ -845,9 +835,6 @@ func (s *SQLite) DeleteTemplate(ctx context.Context, id string) error {
 }
 
 func (s *SQLite) CountTemplates(ctx context.Context) (int, error) {
-	if _, err := s.db.ExecContext(ctx, templateSchemaSQL); err != nil {
-		return 0, err
-	}
 	var n int
 	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM templates`).Scan(&n)
 	return n, err

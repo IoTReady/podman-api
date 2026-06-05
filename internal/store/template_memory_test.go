@@ -8,6 +8,19 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestMemory_TemplatePutStampsTimes(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+	require.NoError(t, m.PutTemplate(ctx, Template{Meta: render.Meta{ID: "a"}, Body: "k", Origin: "user"}))
+	got, _ := m.GetTemplate(ctx, "a")
+	require.False(t, got.Created.IsZero())
+	require.False(t, got.Updated.IsZero())
+	first := got.Created
+	require.NoError(t, m.PutTemplate(ctx, Template{Meta: render.Meta{ID: "a"}, Body: "k2", Origin: "user"}))
+	got2, _ := m.GetTemplate(ctx, "a")
+	require.Equal(t, first, got2.Created, "Created must be preserved on upsert")
+}
+
 func TestMemory_TemplateCRUD(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemory()
