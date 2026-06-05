@@ -242,6 +242,56 @@ func (m *Memory) FailRunning(_ context.Context, reason string) (int, error) {
 	return n, nil
 }
 
+func (m *Memory) MarkReconciling(_ context.Context, kinds []string) (int, error) {
+	if len(kinds) == 0 {
+		return 0, nil
+	}
+	want := make(map[string]bool, len(kinds))
+	for _, k := range kinds {
+		want[k] = true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for i := range m.jobs {
+		if m.jobs[i].State == JobRunning && want[m.jobs[i].Kind] {
+			m.jobs[i].State = JobReconciling
+			n++
+		}
+	}
+	return n, nil
+}
+
+func (m *Memory) ResolveReconciling(_ context.Context, id string, state JobState, errMsg string) (bool, error) {
+	if state != JobSucceeded && state != JobFailed {
+		return false, fmt.Errorf("store: ResolveReconciling: invalid terminal state %q", state)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.jobs {
+		if m.jobs[i].ID == id && m.jobs[i].State == JobReconciling {
+			m.jobs[i].State = state
+			m.jobs[i].Error = errMsg
+			m.jobs[i].Finished = time.Now()
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *Memory) CancelReconciling(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.jobs {
+		if m.jobs[i].ID == id && m.jobs[i].State == JobReconciling {
+			m.jobs[i].State = JobCanceled
+			m.jobs[i].Finished = time.Now()
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (m *Memory) CancelQueued(_ context.Context, id string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -260,7 +310,7 @@ func (m *Memory) PruneJobs(_ context.Context, olderThan time.Time) (int, error) 
 	defer m.mu.Unlock()
 
 	terminal := func(j Job) bool {
-		return j.State == JobSucceeded || j.State == JobFailed || j.State == JobCanceled
+		return j.State.Terminal()
 	}
 	isOld := func(j Job) bool {
 		return !j.Finished.IsZero() && j.Finished.Before(olderThan)

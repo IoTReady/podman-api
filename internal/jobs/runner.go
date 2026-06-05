@@ -22,6 +22,10 @@ const DefaultWorkers = 8
 // restart that left queued jobs).
 const pollInterval = 5 * time.Second
 
+// reconcileInterval is how often the reconcile loop re-sweeps reconciling jobs,
+// retrying those whose hosts were unreachable on the previous pass.
+const defaultReconcileInterval = 30 * time.Second
+
 // Handler executes one job of a given kind. It should honour ctx for cancellation
 // and report progress via jc.Step. Returning a non-nil error fails the job.
 type Handler interface {
@@ -30,6 +34,27 @@ type Handler interface {
 
 // Registry maps a job kind to its handler.
 type Registry map[string]Handler
+
+// Reconciler drives a job that was interrupted by a daemon restart toward a
+// consistent state. It is registered per kind, parallel to Handler.
+//
+// The implementation should honour ctx for cancellation so that a daemon
+// shutdown does not hang the reconcile sweep.
+//
+// resolved reports whether a terminal state was reached. When resolved is
+// true, state must be a terminal state (JobSucceeded or JobFailed).
+// resolved=false means the attempt was inconclusive (e.g. a host was
+// unreachable) and the job should stay reconciling and be retried on the next
+// sweep. A non-nil err is logged and treated as inconclusive.
+//
+// message is the operator-facing text recorded in the job's error field for a
+// terminal failed outcome; it should be empty for success.
+type Reconciler interface {
+	Reconcile(ctx context.Context, job store.Job, jc *JobContext) (state store.JobState, message string, resolved bool, err error)
+}
+
+// Reconcilers maps a job kind to its reconciler.
+type Reconcilers map[string]Reconciler
 
 // JobContext is the handler's progress channel back to the store.
 type JobContext struct {
@@ -55,13 +80,15 @@ func (jc *JobContext) Step(step, detail string) {
 
 // Runner drains queued jobs and dispatches them to handlers.
 type Runner struct {
-	store    store.JobStore
-	handlers Registry
-	workers  int
-	poke     chan struct{}
-	wg       sync.WaitGroup
-	mu       sync.Mutex
-	inflight map[string]*inflightJob
+	store             store.JobStore
+	handlers          Registry
+	reconcilers       Reconcilers
+	reconcileInterval time.Duration
+	workers           int
+	poke              chan struct{}
+	wg                sync.WaitGroup
+	mu                sync.Mutex
+	inflight          map[string]*inflightJob
 }
 
 // inflightJob tracks a currently-running job so an operator request can cancel
@@ -79,7 +106,32 @@ func NewRunner(js store.JobStore, h Registry, workers int) *Runner {
 	if workers <= 0 {
 		workers = DefaultWorkers
 	}
-	return &Runner{store: js, handlers: h, workers: workers, poke: make(chan struct{}, 1), inflight: map[string]*inflightJob{}}
+	return &Runner{
+		store:             js,
+		handlers:          h,
+		reconcileInterval: defaultReconcileInterval,
+		workers:           workers,
+		poke:              make(chan struct{}, 1),
+		inflight:          map[string]*inflightJob{},
+	}
+}
+
+// SetReconcilers registers the per-kind reconcilers used for boot recovery. Call
+// before Start; the map must not be modified afterwards. A kind with a registered
+// reconciler is moved to reconciling (and later resolved) on restart instead of
+// being failed.
+func (r *Runner) SetReconcilers(rec Reconcilers) { r.reconcilers = rec }
+
+// reconcilableKinds returns the kinds that have a registered reconciler.
+func (r *Runner) reconcilableKinds() []string {
+	if len(r.reconcilers) == 0 {
+		return nil
+	}
+	kinds := make([]string, 0, len(r.reconcilers))
+	for k := range r.reconcilers {
+		kinds = append(kinds, k)
+	}
+	return kinds
 }
 
 // Notify wakes a worker to check for new work; call after an Enqueue. Non-blocking.
@@ -112,10 +164,19 @@ func (r *Runner) Cancel(id string) bool {
 // immediately; the pool runs until ctx is cancelled. Use Wait to block for exit.
 // It must be called exactly once.
 func (r *Runner) Start(ctx context.Context) {
+	if n, err := r.store.MarkReconciling(ctx, r.reconcilableKinds()); err != nil {
+		log.Printf("jobs: boot reconcile mark failed: %v", err)
+	} else if n > 0 {
+		log.Printf("jobs: marked %d interrupted job(s) reconciling on startup", n)
+	}
 	if n, err := r.store.FailRunning(ctx, "interrupted by daemon restart"); err != nil {
 		log.Printf("jobs: boot recovery failed: %v", err)
 	} else if n > 0 {
 		log.Printf("jobs: marked %d interrupted job(s) failed on startup", n)
+	}
+	if len(r.reconcilers) > 0 {
+		r.wg.Add(1)
+		go r.reconcileLoop(ctx)
 	}
 	for i := 0; i < r.workers; i++ {
 		r.wg.Add(1)
@@ -162,6 +223,90 @@ func (r *Runner) StartRetention(ctx context.Context, retention time.Duration) {
 			}
 		}
 	}()
+}
+
+// reconcileLoop periodically drives reconciling jobs to a terminal state via
+// their registered reconciler, retrying any left inconclusive. It runs until ctx
+// is cancelled. An immediate first sweep cleans up promptly after a restart.
+func (r *Runner) reconcileLoop(ctx context.Context) {
+	defer r.wg.Done()
+	r.reconcileSweep(ctx)
+	t := time.NewTicker(r.reconcileInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			r.reconcileSweep(ctx)
+		}
+	}
+}
+
+// reconcileSweep processes every reconciling job once, with concurrency bounded
+// by the worker count so one unreachable host cannot block the others.
+func (r *Runner) reconcileSweep(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
+	jobsToDo, err := r.store.ListJobs(ctx, store.JobFilter{State: store.JobReconciling, Limit: store.MaxJobLimit})
+	if err != nil {
+		log.Printf("jobs: reconcile list failed: %v", err)
+		return
+	}
+	// Limit: at most MaxJobLimit (1000) reconciling jobs are processed per sweep;
+	// any beyond that are picked up on the next sweep.
+	sem := make(chan struct{}, r.workers)
+	var wg sync.WaitGroup
+	for _, job := range jobsToDo {
+		rec, ok := r.reconcilers[job.Kind]
+		if !ok {
+			log.Printf("jobs: no reconciler for reconciling job %s (kind %s)", job.ID, job.Kind)
+			continue
+		}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait() // let in-flight reconciles finish, then stop launching new ones
+			return
+		}
+		wg.Add(1)
+		go func(job store.Job, rec Reconciler) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			r.reconcileOne(ctx, job, rec)
+		}(job, rec)
+	}
+	wg.Wait()
+}
+
+// reconcileOne runs a single job's reconciler and records the outcome via CAS.
+func (r *Runner) reconcileOne(ctx context.Context, job store.Job, rec Reconciler) {
+	jctx, cancel := context.WithCancel(ctx)
+	entry := &inflightJob{cancel: cancel}
+	r.mu.Lock()
+	r.inflight[job.ID] = entry
+	r.mu.Unlock()
+
+	state, message, resolved, err := rec.Reconcile(jctx, job, NewJobContext(r.store, job.ID))
+
+	r.mu.Lock()
+	delete(r.inflight, job.ID)
+	r.mu.Unlock()
+	cancel()
+
+	if err != nil {
+		log.Printf("jobs: reconcile %s errored (will retry): %v", job.ID, err)
+		return
+	}
+	if !resolved {
+		return // inconclusive (or interrupted) — retried next sweep, or already terminal
+	}
+	// Use ctx (not the now-cancelled jctx) for the resolve. If an operator cancel
+	// won the race, the job is already canceled and this CAS no-ops.
+	if _, err := r.store.ResolveReconciling(ctx, job.ID, state, message); err != nil {
+		log.Printf("jobs: reconcile resolve %s failed: %v", job.ID, err)
+	}
 }
 
 func (r *Runner) worker(ctx context.Context) {
@@ -227,7 +372,7 @@ func (r *Runner) run(ctx context.Context, job store.Job) {
 	r.inflight[job.ID] = entry
 	r.mu.Unlock()
 
-	err := h.Run(jctx, job, &JobContext{store: r.store, id: job.ID})
+	err := h.Run(jctx, job, NewJobContext(r.store, job.ID))
 
 	r.mu.Lock()
 	canceled := entry.canceled

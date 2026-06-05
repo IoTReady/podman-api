@@ -138,6 +138,23 @@ func (h *handlers) cancelJob(w http.ResponseWriter, r *http.Request) {
 		h.writeCancelConflict(w, r, id)
 		return
 
+	case store.JobReconciling:
+		ok, err := h.jobs.CancelReconciling(r.Context(), id)
+		if err != nil {
+			WriteError(w, err)
+			return
+		}
+		if ok {
+			if h.canceller != nil {
+				h.canceller.Cancel(id) // best-effort: interrupt an in-flight reconcile pass
+			}
+			h.writeAcceptedJob(w, r, id)
+			return
+		}
+		// Lost the CAS to the reconcile loop — it just resolved. Report accurately.
+		h.writeCancelConflict(w, r, id)
+		return
+
 	default: // queued
 		ok, err := h.jobs.CancelQueued(r.Context(), id)
 		if err != nil {

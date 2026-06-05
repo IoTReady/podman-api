@@ -174,6 +174,9 @@ func main() {
 		}
 		runner := jobs.NewRunner(db, registry, workers)
 		canceller = runner
+		runner.SetReconcilers(jobs.Reconcilers{
+			"migrate": &migrate.Reconciler{Svc: svc},
+		})
 		runner.Start(runnerCtx)
 		if *jobsRetention > 0 {
 			runner.StartRetention(runnerCtx, *jobsRetention)

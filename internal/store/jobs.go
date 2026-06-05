@@ -13,12 +13,25 @@ import (
 type JobState string
 
 const (
-	JobQueued    JobState = "queued"
-	JobRunning   JobState = "running"
-	JobSucceeded JobState = "succeeded"
-	JobFailed    JobState = "failed"
-	JobCanceled  JobState = "canceled"
+	JobQueued      JobState = "queued"
+	JobRunning     JobState = "running"
+	JobReconciling JobState = "reconciling"
+	JobSucceeded   JobState = "succeeded"
+	JobFailed      JobState = "failed"
+	JobCanceled    JobState = "canceled"
 )
+
+// Active reports whether the job is in a non-terminal state — queued, running,
+// or reconciling — i.e. work that may still mutate hosts. Guards that must not
+// run concurrently with a migrate-class job should use this so a new
+// non-terminal state cannot silently slip past them.
+func (s JobState) Active() bool {
+	return s == JobQueued || s == JobRunning || s == JobReconciling
+}
+
+// Terminal reports whether the job has reached a final state (succeeded, failed,
+// or canceled).
+func (s JobState) Terminal() bool { return !s.Active() }
 
 // JobStep is one progress entry recorded by a handler.
 type JobStep struct {
@@ -91,6 +104,21 @@ type JobStore interface {
 	// FailRunning marks every job still in running as failed with reason; returns
 	// the count. Called once at startup to reap crash-interrupted jobs.
 	FailRunning(ctx context.Context, reason string) (int, error)
+	// MarkReconciling moves every running job whose kind is in kinds to the
+	// reconciling state (non-terminal); returns the count moved. Called once at
+	// startup, before FailRunning, so reconcilable kinds are recovered rather than
+	// failed. An empty kinds slice is a no-op returning 0.
+	MarkReconciling(ctx context.Context, kinds []string) (int, error)
+	// ResolveReconciling transitions a reconciling job to a terminal state
+	// (succeeded or failed), setting finished + error. Compare-and-swap: it
+	// affects only a row currently in reconciling, so it no-ops (returns false) if
+	// an operator cancel already moved it. Passing any non-terminal state is a
+	// programming error.
+	ResolveReconciling(ctx context.Context, id string, state JobState, errMsg string) (bool, error)
+	// CancelReconciling transitions a reconciling job to canceled, setting
+	// finished. Compare-and-swap: affects only a row currently in reconciling,
+	// returning false otherwise. Used by the cancel endpoint as the escape hatch.
+	CancelReconciling(ctx context.Context, id string) (bool, error)
 	// CancelQueued atomically transitions a still-queued job to canceled (setting
 	// finished). Returns true if it transitioned; false if the job was not in the
 	// queued state (already claimed, terminal, or absent).

@@ -612,6 +612,77 @@ func (s *SQLite) FailRunning(ctx context.Context, reason string) (int, error) {
 	return int(n), nil
 }
 
+func (s *SQLite) MarkReconciling(ctx context.Context, kinds []string) (int, error) {
+	if len(kinds) == 0 {
+		return 0, nil
+	}
+	placeholders := make([]string, len(kinds))
+	args := make([]any, len(kinds))
+	for i, k := range kinds {
+		placeholders[i] = "?"
+		args[i] = k
+	}
+	query := `UPDATE jobs SET state='reconciling' WHERE state='running' AND kind IN (` +
+		strings.Join(placeholders, ",") + `)`
+	var n int64
+	err := s.write(ctx, func() error {
+		res, e := s.db.ExecContext(ctx, query, args...)
+		if e != nil {
+			return e
+		}
+		n, e = res.RowsAffected()
+		return e
+	})
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
+}
+
+func (s *SQLite) ResolveReconciling(ctx context.Context, id string, state JobState, errMsg string) (bool, error) {
+	if state != JobSucceeded && state != JobFailed {
+		return false, fmt.Errorf("store.ResolveReconciling: invalid terminal state %q", state)
+	}
+	now := time.Now().UnixNano()
+	var e any
+	if errMsg != "" {
+		e = errMsg
+	}
+	var n int64
+	err := s.write(ctx, func() error {
+		res, err := s.db.ExecContext(ctx,
+			`UPDATE jobs SET state=?, error=?, finished=? WHERE id=? AND state='reconciling'`,
+			string(state), e, now, id)
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+func (s *SQLite) CancelReconciling(ctx context.Context, id string) (bool, error) {
+	now := time.Now().UnixNano()
+	var n int64
+	err := s.write(ctx, func() error {
+		res, err := s.db.ExecContext(ctx,
+			`UPDATE jobs SET state='canceled', finished=? WHERE id=? AND state='reconciling'`, now, id)
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 func (s *SQLite) CancelQueued(ctx context.Context, id string) (bool, error) {
 	now := time.Now().UnixNano()
 	var n int64

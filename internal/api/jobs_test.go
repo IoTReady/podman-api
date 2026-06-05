@@ -218,3 +218,22 @@ func TestCancelJob(t *testing.T) {
 		}
 	})
 }
+
+func TestCancelJob_Reconciling(t *testing.T) {
+	js := store.NewMemory()
+	ctx := context.Background()
+	j, _ := js.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	_, _, _ = js.ClaimNext(ctx)
+	_, _ = js.MarkReconciling(ctx, []string{"migrate"})
+
+	srv, tok := newSrvWithCancel(t, js, fakeCanceller{running: map[string]bool{}})
+
+	resp := authedReq(t, srv, tok, "POST", "/jobs/"+j.ID+"/cancel")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", resp.StatusCode)
+	}
+	if jb, _ := js.GetJob(ctx, j.ID); jb.State != store.JobCanceled {
+		t.Fatalf("state = %q, want canceled", jb.State)
+	}
+}

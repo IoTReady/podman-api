@@ -243,6 +243,35 @@ func TestTickDropsVolumesScopeWhenMigrateActive(t *testing.T) {
 	}
 }
 
+func TestTickDropsVolumesScopeWhenMigrateReconciling(t *testing.T) {
+	mem := store.NewMemory()
+	f := fake.New()
+	ctx := context.Background()
+	now := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
+
+	// Seed a migrate job and move it to the reconciling state.
+	migArgs, _ := json.Marshal(map[string]string{})
+	_, _ = mem.Enqueue(ctx, "migrate", migArgs, "")
+	mem.ClaimNext(ctx)
+	mem.MarkReconciling(ctx, []string{"migrate"})
+
+	s := &Scheduler{Store: mem, Client: f, Now: func() time.Time { return now }}
+	pol := enabledDanglingPolicy()
+	pol.Scope = []string{ScopeDangling, ScopeVolumes}
+	s.tick(ctx, []HostPolicy{hp("h1", pol)})
+
+	jobs, _ := mem.ListJobs(ctx, store.JobFilter{Kind: "prune", State: store.JobQueued})
+	if len(jobs) != 1 {
+		t.Fatalf("expected 1 prune job, got %d", len(jobs))
+	}
+	p := decodePayload(t, jobs[0])
+	for _, sc := range p.Policy.Scope {
+		if sc == ScopeVolumes {
+			t.Fatal("volumes scope must be dropped while migrate is reconciling")
+		}
+	}
+}
+
 func TestTickSkipsHostWhenInfoErrorsButThresholdNeeded(t *testing.T) {
 	mem := store.NewMemory()
 	f := fake.New()
