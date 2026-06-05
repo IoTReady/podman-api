@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/iotready/podman-api/internal/config"
+	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/store"
 )
@@ -151,4 +152,49 @@ func TestPreflightIssues_PresentOnDestNotProvisioned(t *testing.T) {
 
 	assert.Empty(t, issues)
 	assert.Empty(t, provisionable, "present-on-dest secret is not in the provision list")
+}
+
+// seedHostSecretInstance puts a running instance of needs-host-secret on h1 with
+// a stored spec, so Migrate can load + move it. Mirrors TestMigrate_HappyPath:
+// a Status:"Running" source pod is all the fake needs (this template has no
+// volumes and no healthcheck, so waitRunning is liveness-gated).
+func seedHostSecretInstance(t *testing.T, f *fake.Fake, mem *store.Memory, slug string) {
+	t.Helper()
+	require.NoError(t, mem.PutSpec(context.Background(), store.Spec{
+		Host: "h1", Template: "needs-host-secret", Slug: slug,
+		Parameters: map[string]any{"slug": slug, "image": "img"},
+		Secrets:    map[string]string{},
+	}))
+	f.AddPod("h1", podman.Pod{Name: "needs-host-secret-" + slug, Status: "Running"})
+}
+
+func TestMigrate_ProvisionsPersistedHostSecret(t *testing.T) {
+	svc, f, mem := newHostSecretSvc(t)
+	ctx := context.Background()
+	seedHostSecretInstance(t, f, mem, "s1")
+	require.NoError(t, mem.PutHostSecret(ctx, "h1", "shared-pull-token", []byte("topsecret")))
+
+	err := svc.Migrate(ctx, MigrateRequest{
+		FromHost: "h1", ToHost: "h2", Template: "needs-host-secret", Slug: "s1",
+	}, nil)
+	require.NoError(t, err)
+
+	_, err = f.SecretInspect(ctx, "h2", "shared-pull-token")
+	assert.NoError(t, err, "host secret must be provisioned on the destination")
+}
+
+func TestMigrate_MissingUnpersistedHostSecretFails(t *testing.T) {
+	svc, f, mem := newHostSecretSvc(t)
+	ctx := context.Background()
+	seedHostSecretInstance(t, f, mem, "s1")
+
+	err := svc.Migrate(ctx, MigrateRequest{
+		FromHost: "h1", ToHost: "h2", Template: "needs-host-secret", Slug: "s1",
+	}, nil)
+	assert.ErrorIs(t, err, ErrHostSecretMissing)
+
+	// Source instance untouched (preflight failed before Stop).
+	p, ierr := f.PodInspect(ctx, "h1", "needs-host-secret-s1")
+	require.NoError(t, ierr)
+	assert.Equal(t, "Running", p.Status)
 }

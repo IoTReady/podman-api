@@ -252,7 +252,7 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 	}
 	step("stop-source", req.FromHost)
 
-	if err := s.migratePostStop(ctx, req, eff, spec.Secrets, step); err != nil {
+	if err := s.migratePostStop(ctx, req, eff, tmpl, spec.Secrets, step); err != nil {
 		step("rollback", err.Error())
 		// Compensate on a detached context: migratePostStop may have failed
 		// *because* ctx was cancelled/timed out (the verify poll returns
@@ -280,7 +280,34 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 
 // migratePostStop runs the destination-mutating steps: copy volumes, apply the
 // spec, verify health. Any error here is rolled back by the caller.
-func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, secrets map[string]string, step func(step, detail string)) error {
+func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, tmpl config.Template, secrets map[string]string, step func(step, detail string)) error {
+	// Provision any persisted per-host secrets the destination is missing, from
+	// the source host's stored value. Idempotent: only creates what is absent.
+	// Provisioned secrets are intentionally left in place on rollback — they are
+	// shared, host-scoped, and additive, and other instances on the destination
+	// may rely on them (Delete's PruneSecrets only reaps per-instance secrets).
+	for _, name := range tmpl.Meta.Secrets.PerHostReferenced {
+		if _, err := s.client.SecretInspect(ctx, req.ToHost, name); err == nil {
+			continue // already present on dest
+		}
+		val, err := s.store.GetHostSecret(ctx, req.FromHost, name)
+		if errors.Is(err, store.ErrNotFound) {
+			continue // not provisionable; Apply's own pre-check will reject it
+		}
+		if err != nil {
+			return fmt.Errorf("load host secret %q: %w", name, err)
+		}
+		if err := s.client.SecretCreate(ctx, req.ToHost, name, wrapAsKubeSecret(name, val)); err != nil {
+			// A concurrent move may have created it between inspect and create;
+			// tolerate that, fail on anything else.
+			if _, ie := s.client.SecretInspect(ctx, req.ToHost, name); ie == nil {
+				continue
+			}
+			return fmt.Errorf("provision host secret %q: %w", name, err)
+		}
+		step("provision-secret", name)
+	}
+
 	vols, err := s.InstanceVolumes(ctx, req.FromHost, req.Template, req.Slug)
 	if err != nil {
 		return fmt.Errorf("list source volumes: %w", err)
