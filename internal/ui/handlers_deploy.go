@@ -92,6 +92,21 @@ func formValues(form map[string][]string) (params map[string]any, secrets map[st
 	return params, secrets
 }
 
+// typedValues collects param.* and secret.* fields verbatim, keyed by full field
+// name (e.g. "param.db", "secret.password"), for re-populating the deploy form so
+// a template switch or a failed deploy does not discard what the operator typed.
+// Unlike formValues (the apply path), it does NOT skip empty values. The template
+// prefers a typed value over the parameter's default (see instance-fields.html).
+func typedValues(form map[string][]string) map[string]string {
+	vals := map[string]string{}
+	for k, vs := range form {
+		if strings.HasPrefix(k, "param.") || strings.HasPrefix(k, "secret.") {
+			vals[k] = vs[0]
+		}
+	}
+	return vals
+}
+
 func (u *UI) deployForm(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	if !u.hostExists(host) {
@@ -119,6 +134,7 @@ func (u *UI) deployForm(w http.ResponseWriter, r *http.Request) {
 		"Tmpl":      tmpl,
 		"HostRefs":  refs,
 		"Slug":      r.URL.Query().Get("slug"),
+		"Values":    typedValues(r.URL.Query()),
 	}))
 }
 
@@ -153,6 +169,7 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 			"Tmpl":      tmpl,
 			"HostRefs":  refs,
 			"Slug":      req.Slug,
+			"Values":    typedValues(r.PostForm),
 			"Error":     applyErr.Error(),
 		}))
 		return

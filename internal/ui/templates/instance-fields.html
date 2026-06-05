@@ -2,13 +2,14 @@
 <div class="label">PARAMETERS</div>
 {{range .Tmpl.Meta.Parameters}}
   {{- $label := .Label}}{{if eq $label ""}}{{$label = .Name}}{{end}}
+  {{- $typed := index $.Values (printf "param.%s" .Name)}}
   <label>{{$label}}{{if .Required}} (required){{end}}
-    <input name="param.{{.Name}}"{{if .Required}} required{{end}}{{if .Placeholder}} placeholder="{{.Placeholder}}"{{end}}{{if .Default}} value="{{.Default}}"{{end}}>
+    <input name="param.{{.Name}}"{{if .Required}} required{{end}}{{if .Placeholder}} placeholder="{{.Placeholder}}"{{end}} value="{{if $typed}}{{$typed}}{{else if .Default}}{{.Default}}{{end}}">
   </label>
 {{end}}
 {{if .Tmpl.Meta.Secrets.PerInstance}}
 <div class="label">SECRETS</div>
-{{range .Tmpl.Meta.Secrets.PerInstance}}<label>{{.}} <input type="password" name="secret.{{.}}"></label>{{end}}
+{{range .Tmpl.Meta.Secrets.PerInstance}}<label>{{.}} <input type="password" name="secret.{{.}}" value="{{index $.Values (printf "secret.%s" .)}}"></label>{{end}}
 {{end}}
 {{if .HostRefs}}
 <div class="label">REQUIRED HOST SECRETS</div>

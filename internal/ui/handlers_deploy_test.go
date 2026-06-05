@@ -160,6 +160,35 @@ func TestUpgradeFormRendersImageField(t *testing.T) {
 	}
 }
 
+func TestDeployFormPreservesTypedValuesOnTemplateSwitch(t *testing.T) {
+	u := uiWithTemplate(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&slug=web&param.version=1.2.3&secret.password=hunter2")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `value="1.2.3"`) {
+		t.Error("typed param 'version' should be preserved across template switch")
+	}
+	if !strings.Contains(body, `value="hunter2"`) {
+		t.Error("typed secret 'password' should be preserved across template switch")
+	}
+	if !strings.Contains(body, `value="web"`) {
+		t.Error("typed slug should still round-trip")
+	}
+}
+
+func TestDeployFormDropsValuesForFieldsNotInTemplate(t *testing.T) {
+	u := uiWithTemplate(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&param.bogus=keepme")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "keepme") {
+		t.Error("a value for a field not declared by the selected template must not render")
+	}
+}
+
 func TestUpgradeApplyMissingImageRerendersForm(t *testing.T) {
 	u := uiWithStoredInstance(t)
 	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
