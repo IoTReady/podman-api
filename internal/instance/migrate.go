@@ -257,7 +257,7 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 	}
 	step("stop-source", req.FromHost)
 
-	if err := s.migratePostStop(ctx, req, eff, tmpl, spec.Secrets, step); err != nil {
+	if err := s.migratePostStop(ctx, req, eff, tmpl, spec.Secrets, spec.Domains, step); err != nil {
 		step("rollback", err.Error())
 		// Compensate on a detached context: migratePostStop may have failed
 		// *because* ctx was cancelled/timed out (the verify poll returns
@@ -284,8 +284,11 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 }
 
 // migratePostStop runs the destination-mutating steps: copy volumes, apply the
-// spec, verify health. Any error here is rolled back by the caller.
-func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, tmpl config.Template, secrets map[string]string, step func(step, detail string)) error {
+// spec, verify health. Any error here is rolled back by the caller. domains are
+// the source spec's public hostnames, threaded through so an ingress instance
+// keeps its route on the destination (Apply re-validates host-wide uniqueness
+// and serializes the claim per host — #82 — so passing them here is sufficient).
+func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, tmpl config.Template, secrets map[string]string, domains []string, step func(step, detail string)) error {
 	// Provision any persisted per-host secrets the destination is missing, from
 	// the source host's stored value. Idempotent: only creates what is absent.
 	// Provisioned secrets are intentionally left in place on rollback — they are
@@ -354,7 +357,7 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 	}
 
 	if err := s.Apply(ctx, req.ToHost, ApplyRequest{
-		Template: req.Template, Slug: req.Slug, Parameters: eff, Secrets: secrets,
+		Template: req.Template, Slug: req.Slug, Parameters: eff, Secrets: secrets, Domains: domains,
 	}, ApplyOptions{Replace: false}); err != nil {
 		return fmt.Errorf("apply on dest: %w", err)
 	}
