@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// ErrNotFound is returned when no row matches a lookup (specs or jobs).
+// ErrNotFound is returned when no row matches a lookup (specs, jobs, or host secrets).
 var ErrNotFound = errors.New("store: not found")
 
 // Spec is the desired state of one instance.
