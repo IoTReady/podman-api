@@ -585,6 +585,9 @@ func (s *Service) HostSecrets(ctx context.Context, host string) ([]podman.Secret
 // migrate/evacuate can re-provision it on a destination. We "rotate" by
 // removing then recreating, since podman secrets are immutable. Push happens
 // before persist: we never store a value we failed to apply to the host.
+// The store write is a non-atomic tail — if it fails the host already holds the
+// new value while the store lags; the caller's retry re-rotates and re-persists
+// idempotently, so the divergence is self-healing.
 func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []byte, persist bool) error {
 	if _, ok := s.host(host); !ok {
 		return ErrUnknownHost
@@ -605,6 +608,11 @@ func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []
 	return nil
 }
 
+// DeleteHostSecret removes a host secret from the host and (when the store is
+// enabled) from the store. Like PutHostSecret, the store write is a non-atomic
+// tail: a store-delete failure surfaces after the host removal succeeded, but a
+// retry skips the already-gone host secret and re-deletes the store row, so the
+// divergence is self-healing.
 func (s *Service) DeleteHostSecret(ctx context.Context, host, name string) error {
 	if _, ok := s.host(host); !ok {
 		return ErrUnknownHost
