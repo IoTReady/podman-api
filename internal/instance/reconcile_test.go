@@ -28,7 +28,11 @@ func reconcileSvc(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
 		{ID: "h1", Addr: "unix", Socket: "/a"},
 		{ID: "h2", Addr: "unix", Socket: "/b"},
 	}
-	tmpls := []config.Template{{Meta: render.Meta{ID: "web"}}}
+	tmpls := []config.Template{{Meta: render.Meta{
+		ID:      "web",
+		Volumes: []render.Volume{{Name: "data"}},
+		Secrets: render.Secrets{PerInstance: []string{"password"}},
+	}}}
 	svc := NewService(fc, hosts, tmpls)
 	st := store.NewMemory()
 	svc.SetStore(st)
@@ -224,6 +228,36 @@ func TestReconcileMigrate_BothAbsent_NotFound(t *testing.T) {
 	}
 	if !strings.Contains(msg, "not found on either host") {
 		t.Fatalf("message %q should contain 'not found on either host'", msg)
+	}
+}
+
+// TestReconcileMigrate_RollForward_SourceGone_ReapsOrphanedResources verifies the
+// round-4 fix: when the source pod is already gone, roll-forward also reaps the
+// instance's orphaned per-instance volumes/secrets (left by a commit interrupted
+// mid-Delete after PodRemove), not just the spec row — otherwise a future deploy
+// of the same slug would silently remount the stale named volume.
+func TestReconcileMigrate_RollForward_SourceGone_ReapsOrphanedResources(t *testing.T) {
+	svc, fc, st := reconcileSvc(t)
+	ctx := context.Background()
+	fc.AddPod("h2", healthyPod("web-x"))                                // dest healthy, source pod gone
+	st.PutSpec(ctx, store.Spec{Host: "h2", Template: "web", Slug: "x"}) // dest committed
+	st.PutSpec(ctx, store.Spec{Host: "h1", Template: "web", Slug: "x"}) // orphaned source spec
+	// Orphaned source resources left by an interrupted commit.
+	fc.AddVolume("h1", podman.Volume{Name: "web-x-data"})
+	_ = fc.SecretCreate(ctx, "h1", instanceSecretName("web", "x", "password"), nil)
+
+	resolved, ok, _, err := svc.ReconcileMigrate(ctx, req(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resolved || !ok {
+		t.Fatalf("got resolved=%v ok=%v, want true/true (roll forward)", resolved, ok)
+	}
+	if _, err := fc.VolumeInspect(ctx, "h1", "web-x-data"); !errors.Is(err, podman.ErrNotFound) {
+		t.Fatalf("orphaned source volume not reaped: %v", err)
+	}
+	if _, err := fc.SecretInspect(ctx, "h1", instanceSecretName("web", "x", "password")); !errors.Is(err, podman.ErrNotFound) {
+		t.Fatalf("orphaned source secret not reaped: %v", err)
 	}
 }
 

@@ -551,6 +551,27 @@ func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image stri
 // upgrades, which reuse stored secrets, are available).
 func (s *Service) HasStore() bool { return s.store != nil }
 
+// pruneInstanceResources best-effort removes an instance's per-instance secrets
+// and/or named volumes on a host. Both names are deterministic from
+// template+slug, so leaving them behind risks a future deploy of the same slug
+// silently reusing stale data (play kube reuses an existing named volume) or
+// stale on-disk credentials. Errors are ignored — this is an idempotent
+// reconcile toward "gone"; callers that need durability handle the spec row
+// separately.
+func (s *Service) pruneInstanceResources(ctx context.Context, host, tmpl, slug string, secrets, volumes bool) {
+	t := s.templates[tmpl]
+	if secrets {
+		for _, name := range t.Meta.Secrets.PerInstance {
+			_ = s.client.SecretRemove(ctx, host, instanceSecretName(tmpl, slug, name))
+		}
+	}
+	if volumes {
+		for _, v := range t.Meta.Volumes {
+			_ = s.client.VolumeRemove(ctx, host, tmpl+"-"+slug+"-"+v.Name, true)
+		}
+	}
+}
+
 // Delete removes the pod and optionally its volumes and per-instance secrets.
 func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts DeleteOptions) error {
 	if _, err := s.lookup(host, tmpl); err != nil {
@@ -571,19 +592,7 @@ func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts Dele
 		podExisted = false
 	}
 
-	t := s.templates[tmpl]
-	if opts.PruneSecrets {
-		for _, name := range t.Meta.Secrets.PerInstance {
-			full := instanceSecretName(tmpl, slug, name)
-			_ = s.client.SecretRemove(ctx, host, full)
-		}
-	}
-	if opts.PruneVolumes {
-		for _, v := range t.Meta.Volumes {
-			full := tmpl + "-" + slug + "-" + v.Name
-			_ = s.client.VolumeRemove(ctx, host, full, true)
-		}
-	}
+	s.pruneInstanceResources(ctx, host, tmpl, slug, opts.PruneSecrets, opts.PruneVolumes)
 	// Reconcile away the desired-state row. This runs even when the pod was
 	// already gone (so a stale spec doesn't linger); ErrNotFound — never stored,
 	// or an idempotent double-delete — is not an error. Note this happens before

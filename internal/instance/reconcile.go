@@ -122,15 +122,23 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 					step("reconcile-inconclusive", "reap source: "+derr.Error())
 					return false, false, "", nil
 				}
-			} else if s.store != nil {
+			} else {
+				// Reap any orphaned per-instance volumes/secrets a commit interrupted
+				// mid-Delete (after PodRemove) left on the source. Their names are
+				// deterministic from template+slug, so a future deploy of the same
+				// slug would otherwise silently remount stale data. Best-effort, like
+				// Delete's own prune — cannot reintroduce the source-proxy coupling.
+				s.pruneInstanceResources(mctx, req.FromHost, req.Template, req.Slug, true, true)
 				// A store write is local and reliable; a failure is worth retrying so
-				// the orphan row is cleaned. The source ingress refresh is best-effort
-				// — if it fails, the periodic ingress loop reconciles from the now
-				// row-less state.
-				if derr := s.store.DeleteSpec(mctx, req.FromHost, req.Template, req.Slug); derr != nil && !errors.Is(derr, store.ErrNotFound) {
-					step("reconcile-inconclusive", "clean source spec: "+derr.Error())
-					return false, false, "", nil
+				// the orphan spec row is cleaned.
+				if s.store != nil {
+					if derr := s.store.DeleteSpec(mctx, req.FromHost, req.Template, req.Slug); derr != nil && !errors.Is(derr, store.ErrNotFound) {
+						step("reconcile-inconclusive", "clean source spec: "+derr.Error())
+						return false, false, "", nil
+					}
 				}
+				// Source ingress refresh is best-effort — if it fails, the periodic
+				// ingress loop reconciles from the now row-less state.
 				if s.ingressEnabled() {
 					if rerr := s.ingress.Reconcile(mctx, req.FromHost); rerr != nil {
 						step("reconcile-source-ingress-cleanup-failed", rerr.Error())
