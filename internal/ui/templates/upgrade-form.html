@@ -1,0 +1,10 @@
+{{define "upgrade-form"}}
+<h2>Upgrade {{.Template}} / {{.Slug}} on {{.Host}}</h2>
+{{if .Error}}<p class="error">{{.Error}}</p>{{end}}
+<form hx-post="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/upgrade" hx-target="#main" hx-push-url="true" class="pure-form pure-form-stacked">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <label>New image <input name="image" placeholder="docker.io/library/postgres:16" required></label>
+  {{template "instance-fields" .}}
+  <button type="submit" class="pure-button pure-button-primary">Upgrade</button>
+</form>
+{{end}}

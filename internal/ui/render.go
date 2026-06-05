@@ -8,6 +8,7 @@ import (
 	"net/http"
 
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/render"
 )
 
 // render writes block either wrapped in the layout (normal navigation) or bare
@@ -90,7 +91,8 @@ func errorStatus(err error) int {
 		errors.Is(err, instance.ErrHostDraining),
 		errors.Is(err, instance.ErrPortConflict):
 		return http.StatusConflict
-	case errors.Is(err, instance.ErrHostSecretMissing):
+	case errors.Is(err, instance.ErrHostSecretMissing),
+		errors.Is(err, render.ErrInvalidParameters):
 		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError

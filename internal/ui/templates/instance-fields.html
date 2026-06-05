@@ -1,0 +1,13 @@
+{{define "instance-fields"}}
+<div class="label">PARAMETERS</div>
+{{range .Tmpl.Meta.Parameters.Required}}<label>{{.}} (required) <input name="param.{{.}}" required></label>{{end}}
+{{range .Tmpl.Meta.Parameters.Optional}}<label>{{.}} <input name="param.{{.}}"></label>{{end}}
+{{if .Tmpl.Meta.Secrets.PerInstance}}
+<div class="label">SECRETS</div>
+{{range .Tmpl.Meta.Secrets.PerInstance}}<label>{{.}} <input type="password" name="secret.{{.}}"></label>{{end}}
+{{end}}
+{{if .HostRefs}}
+<div class="label">REQUIRED HOST SECRETS</div>
+{{range .HostRefs}}<div>{{.Name}} — {{if .Present}}present{{else}}<strong>MISSING</strong>{{end}}</div>{{end}}
+{{end}}
+{{end}}
