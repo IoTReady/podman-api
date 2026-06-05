@@ -53,11 +53,11 @@ func NewOperatorAuthenticator(op config.Operator) *OperatorAuthenticator {
 }
 
 func (a *OperatorAuthenticator) Authenticate(user, password string) (Identity, error) {
-	if user != a.op.Username {
-		return Identity{}, ErrAuth
-	}
+	// Always run the (expensive) argon2id verification regardless of whether the
+	// username matches, so a wrong username and a wrong password are
+	// indistinguishable by response time (no user enumeration via timing).
 	ok, err := config.VerifyToken(password, a.op.PasswordHash)
-	if err != nil || !ok {
+	if err != nil || !ok || user != a.op.Username {
 		return Identity{}, ErrAuth
 	}
 	return Identity{Subject: a.op.Username, Scopes: []string{"*"}}, nil

@@ -59,7 +59,11 @@ func (u *UI) pageData(data map[string]any) map[string]any {
 	if data == nil {
 		data = map[string]any{}
 	}
-	data["Hosts"] = u.cfg.Svc.Hosts()
+	// Svc is nil only in template-only construction (tests that never reach an
+	// authenticated handler); guard so pageData can't panic there.
+	if u.cfg.Svc != nil {
+		data["Hosts"] = u.cfg.Svc.Hosts()
+	}
 	return data
 }
 

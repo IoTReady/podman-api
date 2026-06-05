@@ -57,6 +57,11 @@ func TestHostInstancesUnknownHostIs404(t *testing.T) {
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 for unknown host", w.Code)
 	}
+	// A full-page authenticated error still renders the shell (sidebar hosts),
+	// not a chrome-free naked error.
+	if !strings.Contains(w.Body.String(), "edge-1") {
+		t.Error("full-page error should keep the sidebar shell")
+	}
 }
 
 func TestHostInstancesPageRenders(t *testing.T) {
