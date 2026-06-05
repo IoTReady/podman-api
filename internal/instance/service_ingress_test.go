@@ -100,6 +100,10 @@ func TestApplyAttachesNetworkAndReconcilesWhenEnabled(t *testing.T) {
 
 	require.Len(t, f.PlayCalls, 1)
 	assert.Equal(t, []string{"podman-api-ingress"}, f.PlayCalls[0].Networks)
+	// The ingress network must be ensured BEFORE the app pod joins it, or the
+	// first deploy on a host fails ("network not found"). The fake now rejects a
+	// play onto an un-ensured network, so a missing ensure would fail Apply above.
+	assert.Contains(t, f.NetworkEnsureCalls["h1"], "podman-api-ingress")
 	assert.Equal(t, []string{"h1"}, rec.hosts)
 }
 

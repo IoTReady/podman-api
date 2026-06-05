@@ -12,9 +12,19 @@ import (
 func TestPlayKubeRecordsNetworks(t *testing.T) {
 	f := New()
 	yaml := "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web-a\nspec:\n  containers:\n    - name: web\n      image: nginx\n"
+	// The network must exist first — the fake models podman's "network not found".
+	require.NoError(t, f.NetworkEnsure(context.Background(), "h1", "podman-api-ingress"))
 	require.NoError(t, f.PlayKube(context.Background(), "h1", yaml, false, "podman-api-ingress"))
 	require.Len(t, f.PlayCalls, 1)
 	require.Equal(t, []string{"podman-api-ingress"}, f.PlayCalls[0].Networks)
+}
+
+func TestPlayKubeRejectsUnknownNetwork(t *testing.T) {
+	f := New()
+	yaml := "apiVersion: v1\nkind: Pod\nmetadata:\n  name: web-a\nspec:\n  containers:\n    - name: web\n      image: nginx\n"
+	err := f.PlayKube(context.Background(), "h1", yaml, false, "not-ensured")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "network not found")
 }
 
 func TestNetworkEnsureRecords(t *testing.T) {

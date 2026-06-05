@@ -1,8 +1,6 @@
 package ingress
 
 import (
-	"archive/tar"
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -32,7 +30,25 @@ const (
 // caddyPodYAML renders the kube manifest for the Caddy system pod. PVC
 // claimNames map to podman named volumes. hostPort publishes :80/:443 to the
 // host (rootless: requires net.ipv4.ip_unprivileged_port_start <= 80).
-func caddyPodYAML(image string) string {
+//
+// The container seeds its own config on first boot: a small sh wrapper writes
+// caddyfile (passed through the CADDY_SEED env) to the config volume only when
+// the file is absent, then execs caddy. Writing only-when-absent means a live
+// `caddy reload` (which rewrites the file on the persistent volume) survives a
+// container restart instead of being clobbered by a now-stale seed.
+//
+// Caveat: if the pod is destroyed and recreated while the config volume persists
+// with an OLD Caddyfile, the wrapper keeps that file (it exists) and ignores the
+// fresh seed, so Caddy can boot stale routes until the next change-triggered
+// Reconcile runs the cp+reload path. This self-heals on the next deploy/delete.
+//
+// This avoids the volume-import REST API, which podman only serves at >= 5.6.0;
+// the env+wrapper works on any version (the image must ship /bin/sh).
+func caddyPodYAML(image, caddyfile string) string {
+	cfgPath := caddyConfigDir + "/" + caddyConfigFile
+	boot := fmt.Sprintf(
+		`[ -f %s ] || printf '%%s' "$CADDY_SEED" > %s; exec caddy run --config %s --adapter caddyfile`,
+		cfgPath, cfgPath, cfgPath)
 	return fmt.Sprintf(`apiVersion: v1
 kind: Pod
 metadata:
@@ -43,7 +59,10 @@ spec:
   containers:
     - name: caddy
       image: %s
-      args: ["caddy", "run", "--config", "%s/%s", "--adapter", "caddyfile"]
+      command: ["sh", "-c", %q]
+      env:
+        - name: CADDY_SEED
+          value: %q
       ports:
         - containerPort: 80
           hostPort: 80
@@ -61,30 +80,14 @@ spec:
     - name: data
       persistentVolumeClaim:
         claimName: %s
-`, caddyPodName, image, caddyConfigDir, caddyConfigFile, caddyConfigDir, caddyConfigVolume, caddyDataVolume)
-}
-
-// tarFile builds an uncompressed tar containing one file at `name`.
-func tarFile(name string, content []byte) (*bytes.Buffer, error) {
-	var buf bytes.Buffer
-	tw := tar.NewWriter(&buf)
-	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(content))}); err != nil {
-		return nil, err
-	}
-	if _, err := tw.Write(content); err != nil {
-		return nil, err
-	}
-	if err := tw.Close(); err != nil {
-		return nil, err
-	}
-	return &buf, nil
+`, caddyPodName, image, boot, caddyfile, caddyConfigDir, caddyConfigVolume, caddyDataVolume)
 }
 
 // ensureProxy makes the network + Caddy pod exist on host. When it creates the
-// pod it seeds the config volume with initialCaddyfile (so Caddy boots with a
-// valid config) and returns created=true; when the pod already exists it does
-// nothing and returns created=false. Reconcile uses created to decide whether a
-// live cp+reload is needed.
+// pod it passes initialCaddyfile as the boot seed (see caddyPodYAML) so Caddy
+// starts with a valid config, and returns created=true; when the pod already
+// exists it does nothing and returns created=false. Reconcile uses created to
+// decide whether a live cp+reload is needed.
 func (c *CaddyController) ensureProxy(ctx context.Context, host, initialCaddyfile string) (bool, error) {
 	if _, err := c.client.PodInspect(ctx, host, caddyPodName); err == nil {
 		return false, nil // already present
@@ -100,16 +103,9 @@ func (c *CaddyController) ensureProxy(ctx context.Context, host, initialCaddyfil
 	if err := c.client.VolumeCreate(ctx, host, caddyDataVolume); err != nil {
 		return false, fmt.Errorf("ingress: create data volume: %w", err)
 	}
-	// Seed the config volume so Caddy's `caddy run --config` finds a valid file
-	// on first boot. VolumeImport unpacks an uncompressed tar into the volume.
-	seed, err := tarFile(caddyConfigFile, []byte(initialCaddyfile))
-	if err != nil {
-		return false, err
-	}
-	if err := c.client.VolumeImport(ctx, host, caddyConfigVolume, seed); err != nil {
-		return false, fmt.Errorf("ingress: seed config volume: %w", err)
-	}
-	if err := c.client.PlayKube(ctx, host, caddyPodYAML(c.cfg.CaddyImage), false, c.cfg.Network); err != nil {
+	// The Caddy pod seeds its own config from initialCaddyfile on first boot
+	// (see caddyPodYAML), so we don't need the volume-import API (podman >=5.6.0).
+	if err := c.client.PlayKube(ctx, host, caddyPodYAML(c.cfg.CaddyImage, initialCaddyfile), false, c.cfg.Network); err != nil {
 		return false, fmt.Errorf("ingress: play caddy pod: %w", err)
 	}
 	return true, nil

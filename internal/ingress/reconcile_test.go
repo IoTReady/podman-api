@@ -24,9 +24,13 @@ func TestReconcileFreshHostSeedsAndPlays(t *testing.T) {
 
 	require.NoError(t, c.Reconcile(context.Background(), "h1"))
 
-	require.Contains(t, string(f.VolumeData("h1", caddyConfigVolume)), "blog.example.com")
-	require.Contains(t, string(f.VolumeData("h1", caddyConfigVolume)), "reverse_proxy web-blog:8080")
-	require.Empty(t, f.ExecCalls, "fresh pod boots from the seeded volume; no reload")
+	// The fresh Caddy pod is seeded with the rendered route via its boot env, so
+	// the route rides in the played manifest (not the volume-import API).
+	require.NotEmpty(t, f.PlayCalls)
+	caddyYAML := f.PlayCalls[len(f.PlayCalls)-1].YAML
+	require.Contains(t, caddyYAML, "blog.example.com")
+	require.Contains(t, caddyYAML, "reverse_proxy web-blog:8080")
+	require.Empty(t, f.ExecCalls, "fresh pod boots from the seeded config; no reload")
 }
 
 func TestReconcileExistingHostCopiesAndReloads(t *testing.T) {

@@ -434,15 +434,37 @@ func (r *Real) VolumeCreate(ctx context.Context, id, name string) error {
 	return nil
 }
 
-// NetworkEnsure creates the named network if absent. An already-existing
-// network is treated as success so callers can call this idempotently.
+// NetworkEnsure creates the named network if absent, with aardvark DNS enabled.
+//
+// DNS must be on: the `podman network create` CLI defaults it true, but the REST
+// API does not, and ingress backend routing resolves pods by name on this
+// network — without DNS the proxy can't reach the backend (502).
+//
+// An existing network is only accepted if its DNS is already on. A network left
+// by a pre-DNS build has it off, and DNS can't be flipped on an existing network
+// via the API, so we fail with the one-time fix instead of silently keeping it
+// disabled (which IgnoreIfExists would do).
 func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
 	c, err := r.ctxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	if exists, err := network.Exists(c, name, nil); err != nil {
+		return err
+	} else if exists {
+		rep, err := network.Inspect(c, name, nil)
+		if err != nil {
+			return err
+		}
+		if !rep.DNSEnabled {
+			return fmt.Errorf("network %q exists with DNS disabled (from an older build); remove it and retry: podman network rm %s", name, name)
+		}
+		return nil
+	}
+	// IgnoreIfExists guards the create against a concurrent ensure racing in
+	// after the Exists check above.
 	ignore := true
-	_, err = network.CreateWithOptions(c, &nettypes.Network{Name: name},
+	_, err = network.CreateWithOptions(c, &nettypes.Network{Name: name, DNSEnabled: true},
 		&network.ExtraCreateOptions{IgnoreIfExists: &ignore})
 	return err
 }
