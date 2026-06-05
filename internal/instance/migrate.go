@@ -139,8 +139,8 @@ func (s *Service) hostSecretProvisionable(ctx context.Context, fromHost, name st
 // host's persisted value. A nil/empty issues slice means the destination would
 // accept the instance (after provisioning any returned secrets). Each issue is a
 // sentinel-wrapped blocking condition or an infrastructure error that made a
-// check inconclusive. preflightDest (executor), migratePostStop (executor), and
-// PlanEvacuation (preview) all build on this, so they never disagree.
+// check inconclusive. preflightDest (the executor's fail-fast gate) and
+// PlanEvacuation (the collect-all preview) both build on this, so they never disagree.
 func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl config.Template, eff map[string]any) ([]error, []string) {
 	var issues []error
 	var provisionable []string
