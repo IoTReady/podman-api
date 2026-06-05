@@ -86,36 +86,6 @@ func NormalizeParams(m *Meta) error {
 	return nil
 }
 
-// RequiredParams returns the names of all required parameters.
-func (m Meta) RequiredParams() []string {
-	var out []string
-	for _, p := range m.Parameters {
-		if p.Required {
-			out = append(out, p.Name)
-		}
-	}
-	return out
-}
-
-// ParamNames returns the names of all parameters in declaration order.
-func (m Meta) ParamNames() []string {
-	out := make([]string, 0, len(m.Parameters))
-	for _, p := range m.Parameters {
-		out = append(out, p.Name)
-	}
-	return out
-}
-
-// Param looks up a ParamDef by name.
-func (m Meta) Param(name string) (ParamDef, bool) {
-	for _, p := range m.Parameters {
-		if p.Name == name {
-			return p, true
-		}
-	}
-	return ParamDef{}, false
-}
-
 // ParseMeta extracts the template-meta block from the head of the file
 // and returns the rest of the file as the renderable body.
 //

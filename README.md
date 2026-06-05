@@ -114,7 +114,7 @@ keys:
     scopes: [hosts:read]
 ```
 
-The defined scopes are `hosts:read`, `hosts:write`, `instances:read`, `instances:write`, `secrets:read`, `secrets:write`, `jobs:read` (and `instances:*` / `secrets:*` as shorthand).
+The defined scopes are `hosts:read`, `hosts:write`, `templates:read`, `templates:write`, `instances:read`, `instances:write`, `secrets:read`, `secrets:write`, `jobs:read` (and `instances:*` / `secrets:*` / `templates:*` as shorthand).
 
 **Live key rotation:** edit `auth/keys.yaml`, then `kill -HUP $(pidof podman-api)`. The new key list takes effect on the next inbound request — in-flight log streams are not interrupted. A bad reload (parse error or zero keys) is logged and the previous list stays live, so a fat-fingered edit can't lock you out.
 
@@ -125,8 +125,26 @@ Templates are Kubernetes-style YAML with a small metadata header in a YAML comme
 ```yaml
 # template-meta:
 #   id: postgres
+#   display:
+#     name: PostgreSQL
+#     description: PostgreSQL relational database.
+#     category: Database
 #   parameters:
-#     required: [slug, image, port, db, user]
+#     - name: slug
+#       type: string
+#       required: true
+#     - name: image
+#       type: string
+#       required: true
+#     - name: port
+#       type: int
+#       required: true
+#     - name: db
+#       type: string
+#       required: true
+#     - name: user
+#       type: string
+#       required: true
 #   secrets:
 #     per_instance: [password]
 #   volumes:
@@ -149,7 +167,7 @@ spec:
 
 Identifier fields (slug, template id, secret name, container name) must match `^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$` — DNS-label style, 2–40 chars, lowercase ASCII + digits + hyphen, no leading/trailing dash. This is enforced at every API edge to prevent injection into pod/secret/volume names or rendered YAML.
 
-To use external templates, pass `-templates-dir=/etc/podman-api/templates`. The bundled set is then ignored.
+Templates live in the always-on store. The bundled set (`templates/postgres.yaml`, `templates/basic-web.yaml`) seeds the catalog only when it is empty; thereafter manage templates through the `/templates` API — create one with `POST /templates`, or clone the `basic-web` starter via `POST /templates/{id}/clone` and edit it.
 
 ## Run
 
@@ -160,8 +178,7 @@ The opinionated layout for a production host:
 ├── hosts/
 │   └── prod-1.yaml
 ├── keys.yaml
-├── spec.key           # 32-byte AES-256 key; required when -state-db is set
-└── templates/         # optional override
+└── spec.key           # 32-byte AES-256 key; optional, gates secret operations only
 ```
 
 Then run:
@@ -174,7 +191,7 @@ podman-api \
   -keys-file=/etc/podman-api/keys.yaml
 ```
 
-To enable the desired-state store (required for migrate/evacuate):
+The desired-state store is always on (it backs the template catalog as well as migrate/evacuate), defaulting to `-state-db=/var/lib/podman-api/state.db`. Override the path, and add an optional `-spec-key-file` if you deploy secret-bearing instances:
 
 ```sh
 podman-api \
@@ -205,7 +222,7 @@ An optional, embedded, server-rendered admin UI (HTMX + PureCSS) is served at `/
    ```
 3. Start the daemon with `-operator-file auth/operator.yaml`.
 
-The UI provides a single-operator login, a host list, template-based deployment, and instance lifecycle from the browser: start, stop, restart, delete, and a static log tail (last 200 lines on request; live streaming is a later slice) — all without touching the API directly. **Upgrade** is image-only: it reuses the instance's stored parameters and secrets and asks only for a new image, so it requires the desired-state store (`-state-db`) and is hidden when the store is off; rotating a secret is a separate operation (a per-instance secret-management UI is future work).
+The UI provides a single-operator login, a host list, template-based deployment, and instance lifecycle from the browser: start, stop, restart, delete, and a static log tail (last 200 lines on request; live streaming is a later slice) — all without touching the API directly. **Upgrade** is image-only: it reuses the instance's stored parameters and secrets and asks only for a new image. The desired-state store is always on, so upgrade is always available; rotating a secret is a separate operation (a per-instance secret-management UI is future work).
 
 **Flags:**
 
@@ -224,12 +241,12 @@ Design spec: [`docs/superpowers/specs/2026-06-04-admin-ui-shell-design.md`](docs
 - **Slug/template/secret name validation** happens at the API edge (see "Templates" above) — bad inputs never reach the renderer or podman.
 - **Secrets** flow through the API in the JSON body of `POST /instances`, are stored as Kubernetes Secret objects on the target host, and are zeroed in the in-memory request struct after use.
 
-### State store (optional)
+### State store (always on)
 
-When `-state-db=<path>` is set, the daemon persists each instance's parameters and AES-256-GCM-encrypted secrets to a local SQLite database. This is off by default and is required for the migrate/evacuate features. With it the daemon becomes a **stateful controller**: it holds desired state (the store) beside the podman actuator, so it can move an instance to another host by name without the client re-supplying secrets.
+The daemon always persists desired state — the template catalog, each instance's parameters, and AES-256-GCM-encrypted secrets — to a local SQLite database. The store backs the `/templates` catalog as well as the migrate/evacuate features, so it is never off; it defaults to `/var/lib/podman-api/state.db`. With it the daemon is a **stateful controller**: it holds desired state beside the podman actuator, so it can move an instance to another host by name without the client re-supplying secrets.
 
-- **`-state-db <path>`** — enables the desired-state store at this path.
-- **`-spec-key-file <path>`** — 32-byte AES-256-GCM key used to encrypt stored secrets. Required when `-state-db` is set; the daemon refuses to start without a readable, valid key. Loaded once at startup (no runtime reload — see the rotation caveat below). Keep the file `0600` and **separate from the database** — leaking secrets requires compromise of both.
+- **`-state-db <path>`** — location of the desired-state store (default `/var/lib/podman-api/state.db`).
+- **`-spec-key-file <path>`** — **optional** 32-byte AES-256-GCM key that gates **secret values only**. Key-less operation works fine for templates and for specs that carry no secrets; a secret-bearing deploy without a key returns a clear error. When set, the key is loaded once at startup (no runtime reload — see the rotation caveat below). Keep the file `0600` and **separate from the database** — leaking secrets requires compromise of both.
 - **`-jobs-retention <dur>`** — when set (e.g. `168h`), a background sweep prunes terminal (`succeeded`/`failed`) jobs older than the duration, keeping parent/child families intact (a parent is removed only once it has no surviving child). Default `0` (disabled; the `jobs` table accumulates until manual cleanup).
 - **`-evacuate-concurrency <n>`** — max child migrations an evacuate runs at once (default `2`, clamped to `1..32`). A request body's `"concurrency"` overrides it per call.
 - **`-job-workers <n>`** — size of the background job worker pool (default `8`). A parent evacuate occupies one worker for its entire fan-out, so this is the headroom that keeps a few concurrent evacuates from starving plain migrate/other jobs; raise it if you run many concurrent evacuates. Values `<=0` fall back to the built-in default.
@@ -409,9 +426,13 @@ GET    /hosts/{host}                                                 hosts:read
 GET    /hosts/{host}/healthz                                         hosts:read
 GET    /hosts/{host}/ports-in-use                                    hosts:read
 
-GET    /templates                                                    instances:read
-GET    /templates/{id}                                               instances:read
-GET    /templates/{id}/render?<params>                               instances:read
+GET    /templates                                                    templates:read
+GET    /templates/{id}                                               templates:read
+GET    /templates/{id}/render?<params>                               templates:read
+POST   /templates                            body: {id, body, ...}    templates:write
+PUT    /templates/{id}                       body: {body, ...}        templates:write
+DELETE /templates/{id}?force=                                         templates:write
+POST   /templates/{id}/clone                 body: {new_id}           templates:write
 
 GET    /hosts/{host}/secrets                                         secrets:read
 PUT    /hosts/{host}/secrets/{name}      body: {"value": "..."}      secrets:write
@@ -454,7 +475,7 @@ Smaller blast radius. One binary, one socket per host, no clustered control plan
 It doesn't. SSH tunnel to the remote `podman.sock` is the default. Run podman-api wherever your CMS is — it just needs the SSH key.
 
 **How do I add a new template?**
-Drop a YAML file into the directory you point `-templates-dir` at, with the `# template-meta:` header. The next inbound `GET /templates` reflects it. The bundled set in `templates/` is the easiest place to copy from.
+`POST /templates` with the template `body` and its metadata (or clone the `basic-web` starter via `POST /templates/{id}/clone`, then `PUT /templates/{id}` to edit). Templates live in the store; the bundled set in `templates/` only seeds an empty catalog, but it's the easiest shape to copy from. Both routes need the `templates:write` scope.
 
 **How do I rotate a bearer token without dropping log streams?**
 Edit `auth/keys.yaml`, then `kill -HUP $(pidof podman-api)`. The middleware re-reads on the next request.

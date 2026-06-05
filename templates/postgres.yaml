@@ -1,5 +1,9 @@
 # template-meta:
 #   id: postgres
+#   display:
+#     name: PostgreSQL
+#     description: PostgreSQL relational database.
+#     category: Database
 #   parameters:
 #     - name: slug
 #       type: string
