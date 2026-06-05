@@ -13,6 +13,8 @@ import (
 	"time"
 
 	sqlite "modernc.org/sqlite"
+
+	"github.com/iotready/podman-api/internal/render"
 )
 
 const schemaSQL = `
@@ -746,6 +748,133 @@ WHERE state IN ('succeeded','failed','canceled') AND finished IS NOT NULL AND fi
 		return 0, err
 	}
 	return int(total), nil
+}
+
+// ---------------------------------------------------------------------------
+// TemplateStore implementation
+// ---------------------------------------------------------------------------
+
+const templateSchemaSQL = `
+CREATE TABLE IF NOT EXISTS templates (
+  id      TEXT PRIMARY KEY,
+  meta    TEXT NOT NULL,
+  body    TEXT NOT NULL,
+  origin  TEXT NOT NULL,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL
+);`
+
+// ensureTemplatesTable creates the templates table if it does not yet exist.
+// Called lazily on first template write so existing DBs are upgraded without a
+// schema-version bump for this purely-additive change.
+func (s *SQLite) ensureTemplatesTable(ctx context.Context) error {
+	return s.write(ctx, func() error {
+		_, err := s.db.ExecContext(ctx, templateSchemaSQL)
+		return err
+	})
+}
+
+func (s *SQLite) ListTemplates(ctx context.Context) ([]Template, error) {
+	if _, err := s.db.ExecContext(ctx, templateSchemaSQL); err != nil {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, meta, body, origin, created, updated FROM templates ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Template
+	for rows.Next() {
+		t, err := scanTemplate(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	if out == nil {
+		out = []Template{}
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) GetTemplate(ctx context.Context, id string) (Template, error) {
+	if _, err := s.db.ExecContext(ctx, templateSchemaSQL); err != nil {
+		return Template{}, err
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, meta, body, origin, created, updated FROM templates WHERE id=?`, id)
+	t, err := scanTemplate(row)
+	if errors.Is(err, ErrNotFound) {
+		return Template{}, ErrNotFound
+	}
+	return t, err
+}
+
+func (s *SQLite) PutTemplate(ctx context.Context, t Template) error {
+	if err := s.ensureTemplatesTable(ctx); err != nil {
+		return err
+	}
+	metaJSON, err := json.Marshal(t.Meta)
+	if err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	return s.write(ctx, func() error {
+		_, err := s.db.ExecContext(ctx, `
+INSERT INTO templates (id, meta, body, origin, created, updated)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  meta    = excluded.meta,
+  body    = excluded.body,
+  origin  = excluded.origin,
+  updated = excluded.updated`,
+			t.Meta.ID, string(metaJSON), t.Body, t.Origin, now, now)
+		return err
+	})
+}
+
+func (s *SQLite) DeleteTemplate(ctx context.Context, id string) error {
+	if err := s.ensureTemplatesTable(ctx); err != nil {
+		return err
+	}
+	return s.write(ctx, func() error {
+		_, err := s.db.ExecContext(ctx, `DELETE FROM templates WHERE id=?`, id)
+		return err
+	})
+}
+
+func (s *SQLite) CountTemplates(ctx context.Context) (int, error) {
+	if _, err := s.db.ExecContext(ctx, templateSchemaSQL); err != nil {
+		return 0, err
+	}
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM templates`).Scan(&n)
+	return n, err
+}
+
+func scanTemplate(sc rowScanner) (Template, error) {
+	var (
+		id, metaJSON, body, origin string
+		created, updated           int64
+	)
+	if err := sc.Scan(&id, &metaJSON, &body, &origin, &created, &updated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Template{}, ErrNotFound
+		}
+		return Template{}, err
+	}
+	var meta render.Meta
+	if err := json.Unmarshal([]byte(metaJSON), &meta); err != nil {
+		return Template{}, err
+	}
+	return Template{
+		Meta:    meta,
+		Body:    body,
+		Origin:  origin,
+		Created: time.Unix(created, 0),
+		Updated: time.Unix(updated, 0),
+	}, nil
 }
 
 var _ DB = (*SQLite)(nil)
