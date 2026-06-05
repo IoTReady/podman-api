@@ -9,6 +9,7 @@ import (
 
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // render writes block either wrapped in the layout (normal navigation) or bare
@@ -85,7 +86,8 @@ func errorStatus(err error) int {
 	switch {
 	case errors.Is(err, instance.ErrUnknownHost),
 		errors.Is(err, instance.ErrUnknownTemplate),
-		errors.Is(err, instance.ErrInstanceNotFound):
+		errors.Is(err, instance.ErrInstanceNotFound),
+		errors.Is(err, store.ErrNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, instance.ErrInstanceExists),
 		errors.Is(err, instance.ErrHostDraining),

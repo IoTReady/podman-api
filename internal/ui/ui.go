@@ -86,6 +86,8 @@ func (u *UI) Handler() http.Handler {
 	mux.Handle("GET /ui/hosts/{host}/instances/{template}/{slug}/logs", guard(u.logsTail))
 	mux.Handle("POST /ui/hosts/{host}/instances/{template}/{slug}/{action}", guardW(u.lifecycle))
 	mux.Handle("POST /ui/logout", guardW(u.logout))
+	mux.Handle("GET /ui/jobs", guard(u.jobsList))
+	mux.Handle("GET /ui/jobs/{id}", guard(u.jobDetail))
 
 	return mux
 }

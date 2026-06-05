@@ -1,0 +1,6 @@
+{{define "job-detail"}}
+<h2>Job {{.Job.ID}} — {{.Job.State}}</h2>
+<div>kind: {{.Job.Kind}}</div>
+{{if .Job.Error}}<div class="error">{{.Job.Error}}</div>{{end}}
+<ol>{{range .Job.Steps}}<li>{{.Step}} {{.Detail}}</li>{{end}}</ol>
+{{end}}
