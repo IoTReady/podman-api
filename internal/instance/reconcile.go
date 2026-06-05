@@ -39,6 +39,17 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	lk.Lock()
 	defer lk.Unlock()
 
+	// Terminate immediately if either host has been removed from config — a
+	// missing host makes PodInspect fail with an opaque "unknown host" error, which
+	// sourcePresent/destState classify as unreachable, causing an infinite retry
+	// loop that can never be resolved automatically.
+	if _, ok := s.host(req.FromHost); !ok {
+		return true, false, "source host " + req.FromHost + " is no longer configured; manual cleanup required", nil
+	}
+	if _, ok := s.host(req.ToHost); !ok {
+		return true, false, "destination host " + req.ToHost + " is no longer configured; manual cleanup required", nil
+	}
+
 	// Check source reachability first: it is a single cheap inspect, whereas
 	// destState may poll for up to verifyTimeout. This avoids burning the verify
 	// window when the source host is unreachable.
@@ -58,8 +69,16 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	// strand a half-finished compensation, mirroring Migrate's rollback/commit.
 	mctx := context.WithoutCancel(ctx)
 
-	if ds == destHealthy {
-		// Roll forward: dest is truth. Reap the source if it still exists.
+	if ds == destHealthy && s.destSpecPersisted(ctx, req.ToHost, req.Template, req.Slug) {
+		// Dest is a complete, committed replacement. Repair its ingress routes
+		// (idempotent; covers a crash between PutSpec and ingress.Reconcile),
+		// then reap the source.
+		if s.ingressEnabled() {
+			if rerr := s.ingress.Reconcile(mctx, req.ToHost); rerr != nil {
+				step("reconcile-inconclusive", "dest ingress reconcile: "+rerr.Error())
+				return false, false, "", nil
+			}
+		}
 		if srcPresent {
 			if derr := s.Delete(mctx, req.FromHost, req.Template, req.Slug, DeleteOptions{PruneVolumes: true, PruneSecrets: true}); derr != nil {
 				step("reconcile-inconclusive", "reap source: "+derr.Error())
@@ -70,7 +89,8 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 		return true, true, "", nil
 	}
 
-	// dest absent or unhealthy.
+	// dest absent or unhealthy, OR dest healthy but spec not persisted (Apply
+	// interrupted before commit — dest must not be treated as source of truth).
 	if srcPresent {
 		// Roll back: restore source, reap any partial dest.
 		if rerr := s.Start(mctx, req.FromHost, req.Template, req.Slug); rerr != nil {
@@ -85,10 +105,25 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 		return true, false, "rolled back: destination unverified, source restored", nil
 	}
 
-	// Source gone and dest not healthy: never destroy the only copy. Leave the
-	// dest in place for the operator and record a needs-attention failure.
+	// Source gone and dest not committable.
+	if ds == destAbsent {
+		step("reconcile-not-found", "instance absent on both hosts")
+		return true, false, "instance not found on either host", nil
+	}
 	step("reconcile-orphan-dest", req.ToHost+" left in place; source already removed")
 	return true, false, "destination left in place; source already removed — manual cleanup required", nil
+}
+
+// destSpecPersisted reports whether the destination's desired-state spec was
+// stored — the last durable step of a migrate's Apply (PlayKube → PutSpec →
+// ingress). A healthy dest pod whose spec is missing means Apply was interrupted
+// before it committed; that dest must NOT be treated as the source of truth.
+func (s *Service) destSpecPersisted(ctx context.Context, host, tmpl, slug string) bool {
+	if s.store == nil {
+		return true // no persistence layer; pod liveness is all there is
+	}
+	_, err := s.store.GetSpec(ctx, host, tmpl, slug)
+	return err == nil
 }
 
 // destState classifies the destination, distinguishing absent from unreachable
