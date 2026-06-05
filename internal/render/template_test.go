@@ -11,7 +11,9 @@ func TestRender_SubstitutesParams(t *testing.T) {
 	src := `# template-meta:
 #   id: x
 #   parameters:
-#     required: [slug]
+#     - name: slug
+#       type: string
+#       required: true
 ---
 apiVersion: v1
 kind: Pod
@@ -28,7 +30,9 @@ func TestRender_MissingParamErrors(t *testing.T) {
 	src := `# template-meta:
 #   id: x
 #   parameters:
-#     required: [slug]
+#     - name: slug
+#       type: string
+#       required: true
 ---
 metadata:
   name: x-{{.slug}}
@@ -42,7 +46,9 @@ func TestRender_PreservesMultipleDocs(t *testing.T) {
 	src := `# template-meta:
 #   id: x
 #   parameters:
-#     required: [slug]
+#     - name: slug
+#       type: string
+#       required: true
 ---
 apiVersion: v1
 kind: ConfigMap

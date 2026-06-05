@@ -13,15 +13,32 @@ import (
 // It is parsed from the leading "# template-meta:" comment block.
 type Meta struct {
 	ID         string     `yaml:"id"`
-	Parameters Parameters `yaml:"parameters"`
+	Display    Display    `yaml:"display"`
+	Parameters []ParamDef `yaml:"parameters"`
 	Secrets    Secrets    `yaml:"secrets"`
 	Volumes    []Volume   `yaml:"volumes"`
 	Ingress    *Ingress   `yaml:"ingress"`
 }
 
-type Parameters struct {
-	Required []string `yaml:"required"`
-	Optional []string `yaml:"optional"`
+// Display holds human-readable presentation metadata for a template.
+type Display struct {
+	Name        string `yaml:"name,omitempty" json:"name,omitempty"`
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+	Category    string `yaml:"category,omitempty" json:"category,omitempty"`
+	Icon        string `yaml:"icon,omitempty" json:"icon,omitempty"`
+}
+
+// ParamDef describes a single template parameter, its type, and constraints.
+type ParamDef struct {
+	Name        string   `yaml:"name" json:"name"`
+	Type        string   `yaml:"type" json:"type"`
+	Required    bool     `yaml:"required,omitempty" json:"required,omitempty"`
+	Label       string   `yaml:"label,omitempty" json:"label,omitempty"`
+	Description string   `yaml:"description,omitempty" json:"description,omitempty"`
+	Default     any      `yaml:"default,omitempty" json:"default,omitempty"`
+	Placeholder string   `yaml:"placeholder,omitempty" json:"placeholder,omitempty"`
+	Options     []string `yaml:"options,omitempty" json:"options,omitempty"`
+	Secret      bool     `yaml:"secret,omitempty" json:"secret,omitempty"`
 }
 
 type Secrets struct {
@@ -39,6 +56,44 @@ type Volume struct {
 type Ingress struct {
 	Container string `yaml:"container"`
 	Port      int    `yaml:"port"`
+}
+
+// validParamTypes is the set of recognised ParamDef.Type values.
+var validParamTypes = map[string]bool{
+	"string": true,
+	"int":    true,
+	"bool":   true,
+	"select": true,
+}
+
+// RequiredParams returns the names of all required parameters.
+func (m Meta) RequiredParams() []string {
+	var out []string
+	for _, p := range m.Parameters {
+		if p.Required {
+			out = append(out, p.Name)
+		}
+	}
+	return out
+}
+
+// ParamNames returns the names of all parameters in declaration order.
+func (m Meta) ParamNames() []string {
+	out := make([]string, 0, len(m.Parameters))
+	for _, p := range m.Parameters {
+		out = append(out, p.Name)
+	}
+	return out
+}
+
+// Param looks up a ParamDef by name.
+func (m Meta) Param(name string) (ParamDef, bool) {
+	for _, p := range m.Parameters {
+		if p.Name == name {
+			return p, true
+		}
+	}
+	return ParamDef{}, false
 }
 
 // ParseMeta extracts the template-meta block from the head of the file
@@ -117,6 +172,15 @@ func ParseMeta(src string) (Meta, string, error) {
 	}
 	if wrapper.Meta.ID == "" {
 		return Meta{}, "", errors.New("template-meta: id is required")
+	}
+
+	// Validate and normalise parameter types.
+	for i, p := range wrapper.Meta.Parameters {
+		if p.Type == "" {
+			wrapper.Meta.Parameters[i].Type = "string"
+		} else if !validParamTypes[p.Type] {
+			return Meta{}, "", fmt.Errorf("template-meta: parameter %q has unknown type %q", p.Name, p.Type)
+		}
 	}
 
 	if ing := wrapper.Meta.Ingress; ing != nil {
