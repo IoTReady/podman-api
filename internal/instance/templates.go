@@ -36,6 +36,8 @@ func (s *Service) GetTemplate(ctx context.Context, id string) (store.Template, e
 // CreateTemplate validates t and persists it; ErrTemplateExists if the id
 // already exists. Origin defaults to "user" when the caller leaves it blank.
 func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
+	s.tmplMu.Lock()
+	defer s.tmplMu.Unlock()
 	if err := render.NormalizeParams(&t.Meta); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
@@ -57,6 +59,8 @@ func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
 // (ErrUnknownTemplate otherwise). The stored Origin is preserved so an edit
 // cannot silently flip a "seed" template to "user".
 func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
+	s.tmplMu.Lock()
+	defer s.tmplMu.Unlock()
 	if err := render.NormalizeParams(&t.Meta); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
@@ -74,6 +78,8 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 // CloneTemplate copies srcID to a new template with id newID and Origin "user".
 // ErrUnknownTemplate if src is absent; ErrTemplateExists if newID is taken.
 func (s *Service) CloneTemplate(ctx context.Context, srcID, newID string) (store.Template, error) {
+	s.tmplMu.Lock()
+	defer s.tmplMu.Unlock()
 	src, err := s.GetTemplate(ctx, srcID)
 	if err != nil {
 		return store.Template{}, err
@@ -105,6 +111,8 @@ func (s *Service) CloneTemplate(ctx context.Context, srcID, newID string) (store
 // DeleteTemplate removes a template. Unless force is set it is rejected with
 // ErrTemplateInUse when any instance on any host references it.
 func (s *Service) DeleteTemplate(ctx context.Context, id string, force bool) error {
+	s.tmplMu.Lock()
+	defer s.tmplMu.Unlock()
 	if !force {
 		for _, h := range s.hostsSnap() {
 			keys, err := s.store.ListSpecKeys(ctx, h.ID)
@@ -127,11 +135,19 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string, force bool) err
 //  2. A dry-run render of the body (with a dummy value for every declared
 //     parameter) must succeed — this catches template syntax errors and
 //     references to undeclared parameters (missingkey=error).
-//  3. If the template declares ingress, the rendered pod must contain a
-//     container whose name matches Ingress.Container.
+//  3. If the template declares ingress, its container must be non-empty and its
+//     port in 1..65535 (render.ValidateIngress), AND the rendered pod must
+//     contain a container whose name matches Ingress.Container.
 func validateTemplate(t store.Template) error {
 	if !render.ValidName(t.Meta.ID) {
 		return fmt.Errorf("%w: id %q must match %s", ErrInvalidTemplate, t.Meta.ID, render.NameRe.String())
+	}
+
+	// Validate the ingress declaration (container non-empty, port in range)
+	// before rendering. API-created templates build render.Meta directly and so
+	// skip ParseMeta's checks; this re-runs the same validation (#61).
+	if err := render.ValidateIngress(t.Meta.Ingress); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
 
 	rendered, err := render.RenderBody(t.Body, dummyParams(t.Meta))

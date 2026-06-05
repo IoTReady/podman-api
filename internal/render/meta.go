@@ -65,6 +65,21 @@ type Ingress struct {
 	Port      int    `yaml:"port" json:"port"`
 }
 
+// ValidateIngress checks an ingress declaration: container non-empty and
+// port in 1..65535. nil is valid (no ingress).
+func ValidateIngress(ing *Ingress) error {
+	if ing == nil {
+		return nil
+	}
+	if ing.Container == "" {
+		return errors.New("template-meta: ingress.container is required")
+	}
+	if ing.Port <= 0 || ing.Port > 65535 {
+		return fmt.Errorf("template-meta: ingress.port %d out of range", ing.Port)
+	}
+	return nil
+}
+
 // validParamTypes is the set of recognised ParamDef.Type values.
 var validParamTypes = map[string]bool{
 	"string": true,
@@ -169,13 +184,8 @@ func ParseMeta(src string) (Meta, string, error) {
 		return Meta{}, "", err
 	}
 
-	if ing := wrapper.Meta.Ingress; ing != nil {
-		if ing.Container == "" {
-			return Meta{}, "", errors.New("template-meta: ingress.container is required")
-		}
-		if ing.Port <= 0 || ing.Port > 65535 {
-			return Meta{}, "", fmt.Errorf("template-meta: ingress.port %d out of range", ing.Port)
-		}
+	if err := ValidateIngress(wrapper.Meta.Ingress); err != nil {
+		return Meta{}, "", err
 	}
 
 	body := bodyAfterLine(src, bodyStart)

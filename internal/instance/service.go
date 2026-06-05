@@ -75,6 +75,7 @@ type Service struct {
 	mu        sync.Mutex
 	locks     map[string]*sync.Mutex // key = host|template|slug
 	hostLocks map[string]*sync.Mutex // key = host; serializes host-wide domain claims (#82)
+	tmplMu    sync.Mutex             // serializes all template mutations (create/update/clone/delete) so check-then-act is atomic (#61)
 }
 
 func NewService(client podman.Client, hosts []config.Host) *Service {

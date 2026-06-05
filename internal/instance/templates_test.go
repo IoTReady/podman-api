@@ -2,6 +2,9 @@ package instance
 
 import (
 	"context"
+	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -260,6 +263,76 @@ spec:
 	err := svc.CreateTemplate(ctx, tpl)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "float")
+}
+
+// TestCreateTemplate_Concurrent launches N goroutines all creating the SAME
+// template id; exactly one must succeed and the rest must get ErrTemplateExists.
+// Run under -race to catch the check-then-act race the tmplMu mutex closes (#61).
+func TestCreateTemplate_Concurrent(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := tmplSvc(t)
+
+	const n = 16
+	var (
+		wg       sync.WaitGroup
+		okCount  int32
+		dupCount int32
+		start    = make(chan struct{})
+	)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start // line everyone up so the creates truly race
+			err := svc.CreateTemplate(ctx, webTemplate())
+			switch {
+			case err == nil:
+				atomic.AddInt32(&okCount, 1)
+			case errors.Is(err, ErrTemplateExists):
+				atomic.AddInt32(&dupCount, 1)
+			default:
+				t.Errorf("unexpected error: %v", err)
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+
+	assert.Equal(t, int32(1), okCount, "exactly one create should succeed")
+	assert.Equal(t, int32(n-1), dupCount, "all other creates should get ErrTemplateExists")
+}
+
+// TestCreateTemplate_IngressPortZero / High / EmptyContainer verify that the
+// ingress declaration is validated (port range, non-empty container) on
+// API-created templates that bypass render.ParseMeta (#61).
+func TestCreateTemplate_IngressPortZero(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := tmplSvc(t)
+
+	tpl := webTemplate()
+	tpl.Meta.Ingress.Port = 0
+	err := svc.CreateTemplate(ctx, tpl)
+	require.ErrorIs(t, err, ErrInvalidTemplate)
+}
+
+func TestCreateTemplate_IngressPortTooHigh(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := tmplSvc(t)
+
+	tpl := webTemplate()
+	tpl.Meta.Ingress.Port = 70000
+	err := svc.CreateTemplate(ctx, tpl)
+	require.ErrorIs(t, err, ErrInvalidTemplate)
+}
+
+func TestCreateTemplate_IngressEmptyContainer(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := tmplSvc(t)
+
+	tpl := webTemplate()
+	tpl.Meta.Ingress.Container = ""
+	err := svc.CreateTemplate(ctx, tpl)
+	require.ErrorIs(t, err, ErrInvalidTemplate)
 }
 
 // TestCloneTemplate_TimestampsNonZero verifies that the returned clone has
