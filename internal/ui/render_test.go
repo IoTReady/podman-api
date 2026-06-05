@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 func TestRenderFullPageVsFragment(t *testing.T) {
@@ -57,6 +58,7 @@ func TestErrorStatus(t *testing.T) {
 		instance.ErrImagePull:         http.StatusBadGateway,
 		instance.ErrStoreDisabled:     http.StatusNotImplemented,
 		instance.ErrSameHost:          http.StatusBadRequest,
+		store.ErrSecretsNeedKey:       http.StatusBadRequest,
 		errors.New("boom"):            http.StatusInternalServerError,
 	}
 	for err, want := range cases {

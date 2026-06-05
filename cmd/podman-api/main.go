@@ -8,10 +8,12 @@ import (
 	"encoding/hex"
 	"flag"
 	"fmt"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -40,10 +42,9 @@ func main() {
 		metricsAddr   = flag.String("metrics-addr", "", "if set, expose /metrics on this address (e.g. 127.0.0.1:9090); empty means no metrics endpoint")
 		hostsDir      = flag.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
 		keysFile      = flag.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
-		tmplDir       = flag.String("templates-dir", "", "if set, load templates from this dir instead of embedded")
 		auditLogFile  = flag.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
-		stateDB       = flag.String("state-db", "", "if set, enable the desired-state store at this SQLite path (required for migrate/evacuate)")
-		specKeyFile   = flag.String("spec-key-file", "", "path to the 32-byte secret encryption key (required when -state-db is set)")
+		stateDB       = flag.String("state-db", "/var/lib/podman-api/state.db", "SQLite path for the always-on template catalog + desired-state store")
+		specKeyFile   = flag.String("spec-key-file", "", "path to the 32-byte secret encryption key; optional — without it the store runs key-less (templates and no-secret specs work, secret ops are refused)")
 		jobsRetention = flag.Duration("jobs-retention", 0, "if >0, prune terminal jobs older than this (e.g. 168h); 0 disables")
 		evacConc      = flag.Int("evacuate-concurrency", 2, "max child migrations an evacuate runs at once (1..32); a request's \"concurrency\" overrides per call")
 		jobWorkers    = flag.Int("job-workers", jobs.DefaultWorkers, "size of the background job worker pool (<=0 uses the built-in default)")
@@ -51,13 +52,13 @@ func main() {
 		migrateVerifyTimeout = flag.Duration("migrate-verify-timeout", 60*time.Second, "max wait for a migrated instance to become ready (running + declared healthchecks healthy) before reaping the source")
 		migrateVerifyVolumes = flag.Bool("migrate-verify-volumes", true, "verify each copied volume's content against the source before reaping the source (adds a re-export of source and dest per volume); false disables it")
 
-		pruneEnabled   = flag.Bool("prune-enabled", false, "enable scheduled host-health prune/cleanup (requires -state-db)")
+		pruneEnabled   = flag.Bool("prune-enabled", false, "enable scheduled host-health prune/cleanup")
 		pruneInterval  = flag.Duration("prune-interval", 24*time.Hour, "default interval between scheduled prunes per host")
 		pruneThreshold = flag.Int("prune-disk-threshold", 85, "disk used% high-water that triggers an early prune; 0 disables the threshold trigger")
 		pruneScope     = flag.String("prune-scope", "dangling", "default prune scopes, comma-separated: dangling,all-images,containers,build-cache,volumes")
 		pruneDryRun    = flag.Bool("prune-dry-run", false, "default dry-run: report reclaimable space without removing anything")
 
-		ingressEnabled  = flag.Bool("ingress-enabled", false, "enable per-host Caddy ingress + auto-TLS (requires -state-db)")
+		ingressEnabled  = flag.Bool("ingress-enabled", false, "enable per-host Caddy ingress + auto-TLS")
 		ingressNetwork  = flag.String("ingress-network", "podman-api-ingress", "shared podman network app pods join for ingress")
 		ingressImage    = flag.String("ingress-caddy-image", "docker.io/library/caddy:2", "Caddy image for the per-host ingress pod; must include /bin/sh (the pod seeds its config via a small shell wrapper), so a shell-less distroless/scratch variant won't work")
 		ingressACME     = flag.String("ingress-acme-email", "", "ACME account email for Let's Encrypt (required when -ingress-enabled)")
@@ -81,13 +82,8 @@ func main() {
 		return
 	}
 
-	if *ingressEnabled {
-		if *stateDB == "" {
-			log.Fatalf("ingress: -ingress-enabled requires -state-db (routes are derived from the desired-state store)")
-		}
-		if *ingressACME == "" {
-			log.Fatalf("ingress: -ingress-enabled requires -ingress-acme-email")
-		}
+	if *ingressEnabled && *ingressACME == "" {
+		log.Fatalf("ingress: -ingress-enabled requires -ingress-acme-email")
 	}
 
 	hosts, err := config.LoadHosts(*hostsDir)
@@ -105,32 +101,37 @@ func main() {
 	keyStore := auth.NewKeyStore(keys)
 	log.Printf("keys loaded: %d entries, fingerprint=%s", len(keys), fp)
 
-	var tmpls []config.Template
-	if *tmplDir != "" {
-		tmpls, err = config.LoadTemplates(os.DirFS(*tmplDir), ".")
-	} else {
-		tmpls, err = config.LoadTemplates(templates.Files, ".")
-	}
-	if err != nil {
-		log.Fatalf("templates: %v", err)
-	}
-
 	client, err := podman.NewReal(hosts)
 	if err != nil {
 		log.Fatalf("podman: %v", err)
 	}
 
-	svc := instance.NewService(client, hosts, tmpls)
+	svc := instance.NewService(client, hosts)
 	instance.SetVerifyTimeout(*migrateVerifyTimeout)
 	svc.SetVerifyVolumes(*migrateVerifyVolumes)
 
+	// The store is the always-on backbone: it holds the template catalog and the
+	// desired-state. Open it, wire it into the Service, and seed the embedded
+	// templates on a fresh (empty) catalog.
 	db, err := openStore(*stateDB, *specKeyFile)
 	if err != nil {
 		log.Fatalf("store: %v", err)
 	}
-	if *pruneEnabled && db == nil {
-		log.Fatalf("-prune-enabled requires -state-db")
+	defer db.Close()
+	svc.SetStore(db)
+
+	seedCtx := context.Background()
+	if n, err := seedTemplates(seedCtx, db, templates.Files); err != nil {
+		log.Fatalf("seed templates: %v", err)
+	} else if n > 0 {
+		log.Printf("seeded %d templates into empty catalog", n)
 	}
+
+	tmplCount, err := db.CountTemplates(seedCtx)
+	if err != nil {
+		log.Fatalf("templates: count: %v", err)
+	}
+
 	// runnerCtx is cancelled by the shutdown handler to stop the job runner.
 	runnerCtx, cancelRunner := context.WithCancel(context.Background())
 	defer cancelRunner()
@@ -138,71 +139,62 @@ func main() {
 	var canceller api.JobCanceller
 	var pruneSched *prune.Scheduler
 	var ingressCtl *ingress.CaddyController
-	if db != nil {
-		defer db.Close()
-		svc.SetStore(db)
 
-		if *ingressEnabled {
-			tmplIngress := map[string]ingress.TemplateIngress{}
-			for _, t := range tmpls {
-				if t.Meta.Ingress != nil {
-					tmplIngress[t.Meta.ID] = ingress.TemplateIngress{
-						Container: t.Meta.Ingress.Container,
-						Port:      t.Meta.Ingress.Port,
-					}
-				}
-			}
-			ctl := ingress.NewCaddyController(client, db, tmplIngress, ingress.Config{
-				Network:    *ingressNetwork,
-				CaddyImage: *ingressImage,
-				ACMEEmail:  *ingressACME,
-			})
-			svc.SetIngress(ctl, *ingressNetwork)
-			ingressCtl = ctl
-			log.Printf("ingress enabled (network %s, image %s, reconcile interval %s)", *ingressNetwork, *ingressImage, *ingressInterval)
-		}
-		jobStore = db
-		pruneMetrics := obs.NewPruneMetrics(prometheus.DefaultRegisterer)
-		registry := jobs.Registry{
-			"migrate":  &migrate.Handler{Svc: svc},
-			"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: *evacConc},
-			"prune":    &prune.Handler{Client: client, Jobs: db, Metrics: pruneMetrics},
-		}
-		workers := *jobWorkers
-		if workers <= 0 {
-			workers = jobs.DefaultWorkers
-		}
-		runner := jobs.NewRunner(db, registry, workers)
-		canceller = runner
-		runner.SetReconcilers(jobs.Reconcilers{
-			"migrate": &migrate.Reconciler{Svc: svc},
+	if *ingressEnabled {
+		// The controller resolves each instance's ingress declaration from the
+		// store at reconcile time (db serves both specs and template lookups),
+		// so templates created or edited after boot take effect without a
+		// restart.
+		ctl := ingress.NewCaddyController(client, db, ingress.Config{
+			Network:    *ingressNetwork,
+			CaddyImage: *ingressImage,
+			ACMEEmail:  *ingressACME,
 		})
-		runner.Start(runnerCtx)
-		if *jobsRetention > 0 {
-			runner.StartRetention(runnerCtx, *jobsRetention)
-			log.Printf("jobs retention enabled: pruning terminal jobs older than %s", *jobsRetention)
-		}
-		log.Printf("desired-state store enabled: %s (job runner started, %d workers)", *stateDB, workers)
+		svc.SetIngress(ctl, *ingressNetwork)
+		ingressCtl = ctl
+		log.Printf("ingress enabled (network %s, image %s, reconcile interval %s)", *ingressNetwork, *ingressImage, *ingressInterval)
+	}
+	jobStore = db
+	pruneMetrics := obs.NewPruneMetrics(prometheus.DefaultRegisterer)
+	registry := jobs.Registry{
+		"migrate":  &migrate.Handler{Svc: svc},
+		"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: *evacConc},
+		"prune":    &prune.Handler{Client: client, Jobs: db, Metrics: pruneMetrics},
+	}
+	workers := *jobWorkers
+	if workers <= 0 {
+		workers = jobs.DefaultWorkers
+	}
+	runner := jobs.NewRunner(db, registry, workers)
+	canceller = runner
+	runner.SetReconcilers(jobs.Reconcilers{
+		"migrate": &migrate.Reconciler{Svc: svc},
+	})
+	runner.Start(runnerCtx)
+	if *jobsRetention > 0 {
+		runner.StartRetention(runnerCtx, *jobsRetention)
+		log.Printf("jobs retention enabled: pruning terminal jobs older than %s", *jobsRetention)
+	}
+	log.Printf("desired-state store enabled: %s (job runner started, %d workers)", *stateDB, workers)
 
-		if *pruneEnabled {
-			def := prune.Defaults{
-				Enabled:       true,
-				Interval:      *pruneInterval,
-				DiskThreshold: *pruneThreshold,
-				Scope:         splitScopes(*pruneScope),
-				DryRun:        *pruneDryRun,
-			}
-			// Validate the startup set once so a misconfigured policy fails loudly at boot.
-			if _, err := buildHostPolicies(*hostsHolder.Load(), def); err != nil {
-				log.Fatalf("prune policy: %v", err)
-			}
-			pruneSched = &prune.Scheduler{Store: db, Client: client, Now: time.Now}
-			pruneSched.Start(runnerCtx, func() []prune.HostPolicy {
-				policies, _ := buildHostPolicies(*hostsHolder.Load(), def)
-				return policies
-			})
-			log.Printf("prune scheduler enabled (interval %s, disk threshold %d%%, scopes %v)", *pruneInterval, *pruneThreshold, def.Scope)
+	if *pruneEnabled {
+		def := prune.Defaults{
+			Enabled:       true,
+			Interval:      *pruneInterval,
+			DiskThreshold: *pruneThreshold,
+			Scope:         splitScopes(*pruneScope),
+			DryRun:        *pruneDryRun,
 		}
+		// Validate the startup set once so a misconfigured policy fails loudly at boot.
+		if _, err := buildHostPolicies(*hostsHolder.Load(), def); err != nil {
+			log.Fatalf("prune policy: %v", err)
+		}
+		pruneSched = &prune.Scheduler{Store: db, Client: client, Now: time.Now}
+		pruneSched.Start(runnerCtx, func() []prune.HostPolicy {
+			policies, _ := buildHostPolicies(*hostsHolder.Load(), def)
+			return policies
+		})
+		log.Printf("prune scheduler enabled (interval %s, disk threshold %d%%, scopes %v)", *pruneInterval, *pruneThreshold, def.Scope)
 	}
 
 	metrics := obs.New()
@@ -384,7 +376,7 @@ func main() {
 	}
 
 	log.Printf("podman-api listening on %s with %d hosts, %d templates, %d keys",
-		*addr, len(hosts), len(tmpls), len(keyStore.Load()))
+		*addr, len(hosts), tmplCount, len(keyStore.Load()))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
@@ -440,29 +432,62 @@ func loadKeys(path string) ([]config.APIKey, string, error) {
 	return keys, hex.EncodeToString(sum[:8]), nil
 }
 
-// openStore wires the optional desired-state store from the two flags. It
-// returns (nil, nil) when stateDB is empty (store disabled). When stateDB is
-// set it requires a readable, valid key file; any problem is an error so the
-// caller can refuse to start. The spec key is loaded ONCE at startup — there is
-// deliberately no runtime hot-reload, because rotating to a different key would
-// silently make existing (un-re-encrypted) rows undecryptable (#41). Real
-// re-encrypting rotation is a future, separate capability.
-func openStore(stateDB, keyFile string) (store.DB, error) {
-	if stateDB == "" {
-		return nil, nil
+// openStore opens the always-on SQLite store at path, creating its parent
+// directory if needed. When keyFile is set it loads the 32-byte secret key and
+// opens the store with it; when empty the store runs key-less (the template
+// catalog and no-secret specs work, but secret ops return ErrSecretsNeedKey).
+// The spec key is loaded ONCE at startup — there is deliberately no runtime
+// hot-reload, because rotating to a different key would silently make existing
+// (un-re-encrypted) rows undecryptable (#41). Real re-encrypting rotation is a
+// future, separate capability.
+func openStore(path, keyFile string) (store.DB, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+		return nil, fmt.Errorf("state db dir: %w", err)
 	}
-	if keyFile == "" {
-		return nil, fmt.Errorf("-state-db requires -spec-key-file")
+	var keys *store.KeyStore
+	if keyFile != "" {
+		key, err := store.LoadKeyFile(keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("spec key: %w", err)
+		}
+		keys = store.NewKeyStore(key)
 	}
-	key, err := store.LoadKeyFile(keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("spec key: %w", err)
-	}
-	st, err := store.OpenSQLite(stateDB, store.NewKeyStore(key))
+	st, err := store.OpenSQLite(path, keys)
 	if err != nil {
 		return nil, fmt.Errorf("state db: %w", err)
 	}
 	return st, nil
+}
+
+// seedTemplates loads the embedded seed templates into the store, but only when
+// the catalog is empty — a populated store is never re-seeded, so operator edits
+// and deletions survive restarts. Returns the number of templates seeded.
+func seedTemplates(ctx context.Context, db store.TemplateStore, fsys fs.FS) (int, error) {
+	n, err := db.CountTemplates(ctx)
+	if err != nil || n > 0 {
+		return 0, err
+	}
+	seeds, err := store.ParseSeeds(fsys)
+	if err != nil {
+		return 0, err
+	}
+	// Two-pass, all-or-nothing: validate EVERY seed before persisting ANY. A
+	// single-loop validate+put would leave a partial catalog in the store if a
+	// later seed is invalid — and because the next boot sees CountTemplates() > 0
+	// it would never re-seed, permanently stranding the catalog half-populated.
+	// Seeds are already param-normalized by ParseSeeds/ParseMeta, so
+	// ValidateTemplate alone is the same gate authored templates pass (#61).
+	for _, t := range seeds {
+		if err := instance.ValidateTemplate(t); err != nil {
+			return 0, fmt.Errorf("seed template %q invalid: %w", t.Meta.ID, err)
+		}
+	}
+	for _, t := range seeds {
+		if err := db.PutTemplate(ctx, t); err != nil {
+			return 0, err
+		}
+	}
+	return len(seeds), nil
 }
 
 // splitScopes parses a comma-separated scope flag, trimming spaces and dropping empties.

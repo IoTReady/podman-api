@@ -1,12 +1,13 @@
 package ui
 
 import (
+	"context"
 	"net/http"
 	"slices"
 	"strings"
 
-	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // hostSecretRef is a per-host-referenced secret name plus whether it currently
@@ -27,20 +28,30 @@ func (u *UI) hostExists(host string) bool {
 }
 
 // sortedTemplates returns the templates ordered by id, so the deploy form's
-// <select> is stable across renders (Service.Templates() iterates a map).
-func (u *UI) sortedTemplates() []config.Template {
-	tmpls := u.cfg.Svc.Templates()
-	slices.SortFunc(tmpls, func(a, b config.Template) int {
+// <select> is stable across renders (Service.Templates() iterates a map). A
+// store error is propagated so the handler can surface it rather than render an
+// empty catalog.
+func (u *UI) sortedTemplates(ctx context.Context) ([]store.Template, error) {
+	tmpls, err := u.cfg.Svc.Templates(ctx)
+	if err != nil {
+		return nil, err
+	}
+	slices.SortFunc(tmpls, func(a, b store.Template) int {
 		return strings.Compare(a.Meta.ID, b.Meta.ID)
 	})
-	return tmpls
+	return tmpls, nil
 }
 
 // fieldData resolves the template by id and computes the present/absent status
-// of each per-host-referenced secret on the host.
-func (u *UI) fieldData(r *http.Request, host, tmplID string) (config.Template, []hostSecretRef) {
-	var tmpl config.Template
-	for _, t := range u.cfg.Svc.Templates() {
+// of each per-host-referenced secret on the host. A store error from the
+// template lookup is propagated so the handler can surface it.
+func (u *UI) fieldData(r *http.Request, host, tmplID string) (store.Template, []hostSecretRef, error) {
+	var tmpl store.Template
+	tmpls, err := u.cfg.Svc.Templates(r.Context())
+	if err != nil {
+		return store.Template{}, nil, err
+	}
+	for _, t := range tmpls {
 		if t.Meta.ID == tmplID {
 			tmpl = t
 			break
@@ -58,7 +69,7 @@ func (u *UI) fieldData(r *http.Request, host, tmplID string) (config.Template, [
 			refs = append(refs, hostSecretRef{Name: name, Present: present[name]})
 		}
 	}
-	return tmpl, refs
+	return tmpl, refs, nil
 }
 
 // formValues collects param.* and secret.* fields, skipping empties so a blank
@@ -87,12 +98,20 @@ func (u *UI) deployForm(w http.ResponseWriter, r *http.Request) {
 		u.renderError(w, r, instance.ErrUnknownHost)
 		return
 	}
-	tmpls := u.sortedTemplates()
+	tmpls, err := u.sortedTemplates(r.Context())
+	if err != nil {
+		u.renderError(w, r, err)
+		return
+	}
 	sel := r.URL.Query().Get("template")
 	if sel == "" && len(tmpls) > 0 {
 		sel = tmpls[0].Meta.ID
 	}
-	tmpl, refs := u.fieldData(r, host, sel)
+	tmpl, refs, err := u.fieldData(r, host, sel)
+	if err != nil {
+		u.renderError(w, r, err)
+		return
+	}
 	u.render(w, r, http.StatusOK, "deploy-form", u.pageData(map[string]any{
 		"Host":      host,
 		"Templates": tmpls,
@@ -116,16 +135,25 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 		Parameters: params,
 		Secrets:    secrets,
 	}
-	if err := u.cfg.Svc.Apply(r.Context(), host, req, instance.ApplyOptions{Replace: false}); err != nil {
-		tmpl, refs := u.fieldData(r, host, req.Template)
-		u.render(w, r, errorStatus(err), "deploy-form", u.pageData(map[string]any{
+	if applyErr := u.cfg.Svc.Apply(r.Context(), host, req, instance.ApplyOptions{Replace: false}); applyErr != nil {
+		tmpl, refs, ferr := u.fieldData(r, host, req.Template)
+		if ferr != nil {
+			u.renderError(w, r, ferr)
+			return
+		}
+		tmpls, terr := u.sortedTemplates(r.Context())
+		if terr != nil {
+			u.renderError(w, r, terr)
+			return
+		}
+		u.render(w, r, errorStatus(applyErr), "deploy-form", u.pageData(map[string]any{
 			"Host":      host,
-			"Templates": u.sortedTemplates(),
+			"Templates": tmpls,
 			"Selected":  req.Template,
 			"Tmpl":      tmpl,
 			"HostRefs":  refs,
 			"Slug":      req.Slug,
-			"Error":     err.Error(),
+			"Error":     applyErr.Error(),
 		}))
 		return
 	}
@@ -139,14 +167,10 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 
 // upgradeForm renders the image-only upgrade form. The upgrade reuses the
 // instance's stored parameters and secrets (the operator supplies only a new
-// image), so it requires the desired-state store; without it, there are no
-// stored secrets to reuse.
+// image). The desired-state store is always present, so upgrade is always
+// available.
 func (u *UI) upgradeForm(w http.ResponseWriter, r *http.Request) {
 	host, tmplID, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
-	if !u.cfg.Svc.HasStore() {
-		u.renderError(w, r, instance.ErrStoreDisabled)
-		return
-	}
 	obs, err := u.cfg.Svc.Get(r.Context(), host, tmplID, slug)
 	if err != nil {
 		u.renderError(w, r, err)

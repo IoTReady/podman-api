@@ -27,7 +27,7 @@ func newSrvWithJobs(t *testing.T, js store.JobStore) (*httptest.Server, string) 
 	}
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"jobs:read"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
-	svc := instance.NewService(fake.New(), hosts, nil)
+	svc := instance.NewService(fake.New(), hosts)
 	srv := httptest.NewServer(NewRouter(svc, js, auth.NewKeyStore(keys), nil, nil, nil))
 	t.Cleanup(srv.Close)
 	return srv, tok
@@ -128,7 +128,7 @@ func newSrvWithCancel(t *testing.T, js store.JobStore, c JobCanceller) (*httptes
 	}
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:write", "jobs:read"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
-	svc := instance.NewService(fake.New(), hosts, nil)
+	svc := instance.NewService(fake.New(), hosts)
 	srv := httptest.NewServer(NewRouter(svc, js, auth.NewKeyStore(keys), nil, nil, c))
 	t.Cleanup(srv.Close)
 	return srv, tok

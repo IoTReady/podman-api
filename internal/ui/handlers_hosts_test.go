@@ -9,6 +9,7 @@ import (
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman/fake"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // uiWithService builds a UI backed by a real instance.Service over the fake
@@ -17,7 +18,8 @@ func uiWithService(t *testing.T) *UI {
 	t.Helper()
 	fc := fake.New()
 	hosts := []config.Host{{ID: "edge-1"}}
-	svc := instance.NewService(fc, hosts, nil)
+	svc := instance.NewService(fc, hosts)
+	svc.SetStore(store.NewMemory())
 	hash, _ := config.HashToken("pw")
 	u, err := New(Config{
 		Svc:  svc,
@@ -52,7 +54,8 @@ func TestDashboardListsHosts(t *testing.T) {
 }
 
 func TestZeroHostsStillRendersShell(t *testing.T) {
-	svc := instance.NewService(fake.New(), nil, nil) // zero configured hosts
+	svc := instance.NewService(fake.New(), nil) // zero configured hosts
+	svc.SetStore(store.NewMemory())
 	hash, _ := config.HashToken("pw")
 	u, err := New(Config{
 		Svc:  svc,

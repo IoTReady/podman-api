@@ -14,16 +14,16 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 )
 
-// failingStore satisfies store.Store but fails every PutHostSecret. Embedding
-// the interface means we only override the one method we care about (the rest
-// panic with nil-pointer if called, which is fine — this test never calls them).
+// failingStore fails every PutHostSecret. It embeds *store.Memory so it still
+// satisfies the full Store + template-catalog surface (and resolves templates),
+// overriding only the one method we care about.
 type failingStore struct {
-	store.Store
+	*store.Memory
 }
 
 // getErrStore makes GetHostSecret fail with a non-NotFound (infra) error, to
 // exercise the store-lookup-error path. Embeds a real Memory so the other
-// store.Store methods still work.
+// store methods (and the template catalog) still work.
 type getErrStore struct {
 	*store.Memory
 	err error
@@ -44,9 +44,7 @@ func newHostSecretSvc(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
 		{ID: "h2", Addr: "unix", Socket: "/b"},
 	}
 	f := fake.New()
-	mem := store.NewMemory()
-	svc := NewService(f, hosts, []config.Template{templateWithHostSecret()})
-	svc.SetStore(mem)
+	svc, mem := newSvcWith(t, f, hosts, templateWithHostSecret())
 	return svc, f, mem
 }
 
@@ -71,16 +69,6 @@ func TestPutHostSecret_PersistFalseSkipsStore(t *testing.T) {
 	require.NoError(t, err)
 	_, err = mem.GetHostSecret(ctx, "h1", "shared-pull-token")
 	assert.ErrorIs(t, err, store.ErrNotFound)
-}
-
-func TestPutHostSecret_NoStoreIsNoOp(t *testing.T) {
-	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/a"}}
-	f := fake.New()
-	svc := NewService(f, hosts, []config.Template{templateWithHostSecret()})
-	ctx := context.Background()
-	require.NoError(t, svc.PutHostSecret(ctx, "h1", "shared-pull-token", []byte("v"), true))
-	_, err := f.SecretInspect(ctx, "h1", "shared-pull-token")
-	require.NoError(t, err)
 }
 
 func TestDeleteHostSecret_RemovesFromStore(t *testing.T) {
@@ -109,8 +97,8 @@ func TestHostSecretProvisionable(t *testing.T) {
 func TestPutHostSecret_PersistError_HostStillUpdated(t *testing.T) {
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/a"}}
 	f := fake.New()
-	svc := NewService(f, hosts, []config.Template{templateWithHostSecret()})
-	svc.SetStore(failingStore{})
+	svc := NewService(f, hosts)
+	svc.SetStore(failingStore{Memory: store.NewMemory()})
 	ctx := context.Background()
 
 	err := svc.PutHostSecret(ctx, "h1", "shared-pull-token", []byte("v"), true)
@@ -250,9 +238,7 @@ func TestMigrate_ProvisionRace_Benign(t *testing.T) {
 	}
 	f := fake.New()
 	client := &raceCreateClient{Fake: f}
-	mem := store.NewMemory()
-	svc := NewService(client, hosts, []config.Template{templateWithHostSecret()})
-	svc.SetStore(mem)
+	svc, mem := newSvcWith(t, client, hosts, templateWithHostSecret())
 
 	seedHostSecretInstance(t, f, mem, "s1")
 	require.NoError(t, mem.PutHostSecret(ctx, "h1", "shared-pull-token", []byte("v")))
@@ -270,8 +256,8 @@ func TestPreflightIssues_StoreErrorCollectsAndContinues(t *testing.T) {
 	ctx := context.Background()
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}, {ID: "h2", Addr: "unix", Socket: "/y"}}
 	f := fake.New()
-	svc := NewService(f, hosts, []config.Template{secretAndPortTemplate()})
-	svc.SetStore(getErrStore{Memory: store.NewMemory(), err: errors.New("store boom")})
+	svc := NewService(f, hosts)
+	svc.SetStore(getErrStore{Memory: seedStore(t, secretAndPortTemplate()), err: errors.New("store boom")})
 	// Occupy port 9090 on the dest so the port check ALSO fails — proving the
 	// scan continued past the store-lookup error rather than early-returning.
 	f.AddPod("h2", podman.Pod{Name: "occupier", Status: "Running",

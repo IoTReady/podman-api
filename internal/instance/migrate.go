@@ -11,7 +11,6 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
@@ -61,11 +60,8 @@ func (s *Service) CheckMigratable(ctx context.Context, req MigrateRequest) error
 	if _, ok := s.host(req.ToHost); !ok {
 		return ErrUnknownHost
 	}
-	if _, err := s.lookup(req.ToHost, req.Template); err != nil {
+	if _, err := s.lookup(ctx, req.ToHost, req.Template); err != nil {
 		return err
-	}
-	if s.store == nil {
-		return ErrStoreDisabled
 	}
 	if _, err := s.store.GetSpec(ctx, req.FromHost, req.Template, req.Slug); err != nil {
 		return err
@@ -75,8 +71,8 @@ func (s *Service) CheckMigratable(ctx context.Context, req MigrateRequest) error
 
 // requiredHostPorts renders the template with eff params and returns the host
 // ports its Pod(s) bind.
-func (s *Service) requiredHostPorts(tmpl config.Template, params map[string]any) ([]int, error) {
-	rendered, err := render.Render(rawTemplate(tmpl), params)
+func (s *Service) requiredHostPorts(tmpl store.Template, params map[string]any) ([]int, error) {
+	rendered, err := render.RenderBody(tmpl.Body, params)
 	if err != nil {
 		return nil, fmt.Errorf("render: %w", err)
 	}
@@ -117,12 +113,9 @@ func (s *Service) requiredHostPorts(tmpl config.Template, params map[string]any)
 // hostSecretProvisionable reports whether per-host secret `name` — already known
 // absent on the destination — can be auto-provisioned from the source host's
 // persisted value. A non-nil error is an infra/store failure the caller should
-// treat as inconclusive. Returns (false, nil) when the store is disabled or holds
-// no value (i.e. genuinely missing, not an error).
+// treat as inconclusive. Returns (false, nil) when the store holds no value
+// (i.e. genuinely missing, not an error).
 func (s *Service) hostSecretProvisionable(ctx context.Context, fromHost, name string) (bool, error) {
-	if s.store == nil {
-		return false, nil
-	}
 	switch _, err := s.store.GetHostSecret(ctx, fromHost, name); {
 	case err == nil:
 		return true, nil
@@ -141,7 +134,7 @@ func (s *Service) hostSecretProvisionable(ctx context.Context, fromHost, name st
 // sentinel-wrapped blocking condition or an infrastructure error that made a
 // check inconclusive. preflightDest (the executor's fail-fast gate) and
 // PlanEvacuation (the collect-all preview) both build on this, so they never disagree.
-func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl config.Template, eff map[string]any) ([]error, []string) {
+func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl store.Template, eff map[string]any) ([]error, []string) {
 	var issues []error
 	var provisionable []string
 	hostCfg, _ := s.host(req.ToHost)
@@ -205,7 +198,7 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 // the first blocking condition or infrastructure error encountered, in check
 // order. It is the executor's guard; PlanEvacuation uses preflightIssues to
 // collect every problem instead.
-func (s *Service) preflightDest(ctx context.Context, req MigrateRequest, tmpl config.Template, eff map[string]any) error {
+func (s *Service) preflightDest(ctx context.Context, req MigrateRequest, tmpl store.Template, eff map[string]any) error {
 	if errs, _ := s.preflightIssues(ctx, req, tmpl, eff); len(errs) > 0 {
 		return errs[0]
 	}
@@ -231,12 +224,9 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 		return ErrUnknownHost
 	}
 
-	tmpl, err := s.lookup(req.ToHost, req.Template)
+	tmpl, err := s.lookup(ctx, req.ToHost, req.Template)
 	if err != nil {
 		return err
-	}
-	if s.store == nil {
-		return ErrStoreDisabled
 	}
 	spec, err := s.store.GetSpec(ctx, req.FromHost, req.Template, req.Slug)
 	if err != nil {
@@ -288,7 +278,7 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 // the source spec's public hostnames, threaded through so an ingress instance
 // keeps its route on the destination (Apply re-validates host-wide uniqueness
 // and serializes the claim per host — #82 — so passing them here is sufficient).
-func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, tmpl config.Template, secrets map[string]string, domains []string, step func(step, detail string)) error {
+func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, tmpl store.Template, secrets map[string]string, domains []string, step func(step, detail string)) error {
 	// Provision any persisted per-host secrets the destination is missing, from
 	// the source host's stored value. Idempotent: only creates what is absent.
 	// Provisioned secrets are intentionally left in place on rollback — they are

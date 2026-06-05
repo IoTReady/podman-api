@@ -13,6 +13,8 @@ import (
 	"time"
 
 	sqlite "modernc.org/sqlite"
+
+	"github.com/iotready/podman-api/internal/render"
 )
 
 const schemaSQL = `
@@ -21,7 +23,7 @@ CREATE TABLE IF NOT EXISTS specs (
   template   TEXT NOT NULL,
   slug       TEXT NOT NULL,
   parameters TEXT NOT NULL,
-  secrets    BLOB NOT NULL,
+  secrets    BLOB,
   domains    TEXT NOT NULL DEFAULT '[]',
   created    INTEGER NOT NULL,
   updated    INTEGER NOT NULL,
@@ -47,6 +49,14 @@ CREATE TABLE IF NOT EXISTS host_secrets (
   created INTEGER NOT NULL,
   updated INTEGER NOT NULL,
   PRIMARY KEY (host, name)
+);
+CREATE TABLE IF NOT EXISTS templates (
+  id      TEXT PRIMARY KEY,
+  body    TEXT NOT NULL,
+  meta    TEXT NOT NULL,
+  origin  TEXT NOT NULL,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL
 );`
 
 // maxOpenConns bounds the SQLite connection pool. WAL allows many concurrent
@@ -181,10 +191,10 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 	return &SQLite{db: db, keys: keys}, nil
 }
 
-// migrateSchema brings an existing specs table up to the current schema. v4
-// added specs.domains. The ALTER is guarded by user_version, and the
-// duplicate-column case (fresh DB where schemaSQL already created the column)
-// is tolerated so OpenSQLite is idempotent.
+// migrateSchema brings an existing DB up to the current schema version.
+// v4 added specs.domains. v5 added the templates table.
+// v6 made specs.secrets nullable (NULL = no secrets; key-less open allowed).
+// Each step is guarded by user_version so OpenSQLite is idempotent.
 func migrateSchema(db *sql.DB) error {
 	var v int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
@@ -205,6 +215,65 @@ func migrateSchema(db *sql.DB) error {
 		}
 		if _, err := db.Exec(`PRAGMA user_version = 4`); err != nil {
 			return fmt.Errorf("migrateSchema: set user_version: %w", err)
+		}
+		v = 4
+	}
+	if v < 5 {
+		// templates table is created by schemaSQL on a fresh DB but absent on a
+		// pre-v5 DB. CREATE TABLE IF NOT EXISTS is safe for both cases.
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS templates (
+  id      TEXT PRIMARY KEY,
+  body    TEXT NOT NULL,
+  meta    TEXT NOT NULL,
+  origin  TEXT NOT NULL,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL
+)`); err != nil {
+			return fmt.Errorf("migrateSchema: create templates table: %w", err)
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
+			return fmt.Errorf("migrateSchema: set user_version: %w", err)
+		}
+		v = 5
+	}
+	if v < 6 {
+		// specs.secrets changes from BLOB NOT NULL to BLOB (nullable).
+		// SQLite does not support DROP NOT NULL via ALTER COLUMN; recreate the
+		// table using the standard rename-copy-drop sequence.
+		// All DDL steps run inside a single transaction so a crash mid-migration
+		// cannot leave the DB without a specs table.
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("migrateSchema v6: begin: %w", err)
+		}
+		steps := []string{
+			`ALTER TABLE specs RENAME TO specs_v5`,
+			`CREATE TABLE specs (
+  host       TEXT NOT NULL,
+  template   TEXT NOT NULL,
+  slug       TEXT NOT NULL,
+  parameters TEXT NOT NULL,
+  secrets    BLOB,
+  domains    TEXT NOT NULL DEFAULT '[]',
+  created    INTEGER NOT NULL,
+  updated    INTEGER NOT NULL,
+  PRIMARY KEY (host, template, slug)
+)`,
+			`INSERT INTO specs SELECT host, template, slug, parameters, secrets, domains, created, updated FROM specs_v5`,
+			`DROP TABLE specs_v5`,
+		}
+		for _, stmt := range steps {
+			if _, err := tx.Exec(stmt); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migrateSchema v6: %w", err)
+			}
+		}
+		if _, err := tx.Exec(`PRAGMA user_version = 6`); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("migrateSchema v6: set user_version: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("migrateSchema v6: commit: %w", err)
 		}
 	}
 	return nil
@@ -228,14 +297,19 @@ func (s *SQLite) PutSpec(ctx context.Context, sp Spec) error {
 	if err != nil {
 		return err
 	}
-	secJSON, err := json.Marshal(sp.Secrets)
-	if err != nil {
-		return err
-	}
-	key := s.keys.Load()
-	blob, err := seal(key, secJSON)
-	if err != nil {
-		return err
+	var blob []byte
+	if len(sp.Secrets) > 0 {
+		if s.keys == nil {
+			return ErrSecretsNeedKey
+		}
+		secJSON, err := json.Marshal(sp.Secrets)
+		if err != nil {
+			return err
+		}
+		blob, err = seal(s.keys.Load(), secJSON)
+		if err != nil {
+			return err
+		}
 	}
 	if sp.Domains == nil {
 		sp.Domains = []string{}
@@ -279,13 +353,18 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 	if err := json.Unmarshal([]byte(paramsJSON), &params); err != nil {
 		return Spec{}, err
 	}
-	secJSON, err := open(s.keys.Load(), blob)
-	if err != nil {
-		return Spec{}, err
-	}
 	var secrets map[string]string
-	if err := json.Unmarshal(secJSON, &secrets); err != nil {
-		return Spec{}, err
+	if len(blob) > 0 {
+		if s.keys == nil {
+			return Spec{}, ErrSecretsNeedKey
+		}
+		secJSON, err := open(s.keys.Load(), blob)
+		if err != nil {
+			return Spec{}, err
+		}
+		if err := json.Unmarshal(secJSON, &secrets); err != nil {
+			return Spec{}, err
+		}
 	}
 	var domains []string
 	if err := json.Unmarshal([]byte(domainsJSON), &domains); err != nil {
@@ -335,6 +414,9 @@ func (s *SQLite) ListSpecKeys(ctx context.Context, host string) ([]SpecKey, erro
 }
 
 func (s *SQLite) PutHostSecret(ctx context.Context, host, name string, value []byte) error {
+	if s.keys == nil {
+		return ErrSecretsNeedKey
+	}
 	blob, err := seal(s.keys.Load(), value)
 	if err != nil {
 		return err
@@ -353,6 +435,9 @@ ON CONFLICT(host, name) DO UPDATE SET
 }
 
 func (s *SQLite) GetHostSecret(ctx context.Context, host, name string) ([]byte, error) {
+	if s.keys == nil {
+		return nil, ErrSecretsNeedKey
+	}
 	var blob []byte
 	err := s.db.QueryRowContext(ctx,
 		`SELECT value FROM host_secrets WHERE host=? AND name=?`, host, name).Scan(&blob)
@@ -372,6 +457,10 @@ func (s *SQLite) DeleteHostSecret(ctx context.Context, host, name string) error 
 		return err
 	})
 }
+
+// SecretsEnabled reports whether this store can persist secrets — true only when
+// it was opened with an encryption key (-spec-key-file).
+func (s *SQLite) SecretsEnabled() bool { return s.keys != nil }
 
 // ---------------------------------------------------------------------------
 // JobStore implementation
@@ -746,6 +835,95 @@ WHERE state IN ('succeeded','failed','canceled') AND finished IS NOT NULL AND fi
 		return 0, err
 	}
 	return int(total), nil
+}
+
+// ---------------------------------------------------------------------------
+// TemplateStore implementation
+// ---------------------------------------------------------------------------
+
+func (s *SQLite) ListTemplates(ctx context.Context) ([]Template, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, meta, body, origin, created, updated FROM templates ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Template{}
+	for rows.Next() {
+		t, err := scanTemplate(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) GetTemplate(ctx context.Context, id string) (Template, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, meta, body, origin, created, updated FROM templates WHERE id=?`, id)
+	t, err := scanTemplate(row)
+	if errors.Is(err, ErrNotFound) {
+		return Template{}, ErrNotFound
+	}
+	return t, err
+}
+
+func (s *SQLite) PutTemplate(ctx context.Context, t Template) error {
+	metaJSON, err := json.Marshal(t.Meta)
+	if err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	return s.write(ctx, func() error {
+		_, err := s.db.ExecContext(ctx, `
+INSERT INTO templates (id, body, meta, origin, created, updated)
+VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT(id) DO UPDATE SET
+  body    = excluded.body,
+  meta    = excluded.meta,
+  origin  = excluded.origin,
+  updated = excluded.updated`,
+			t.Meta.ID, t.Body, string(metaJSON), t.Origin, now, now)
+		return err
+	})
+}
+
+func (s *SQLite) DeleteTemplate(ctx context.Context, id string) error {
+	return s.write(ctx, func() error {
+		_, err := s.db.ExecContext(ctx, `DELETE FROM templates WHERE id=?`, id)
+		return err
+	})
+}
+
+func (s *SQLite) CountTemplates(ctx context.Context) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM templates`).Scan(&n)
+	return n, err
+}
+
+func scanTemplate(sc rowScanner) (Template, error) {
+	var (
+		id, metaJSON, body, origin string
+		created, updated           int64
+	)
+	if err := sc.Scan(&id, &metaJSON, &body, &origin, &created, &updated); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return Template{}, ErrNotFound
+		}
+		return Template{}, err
+	}
+	var meta render.Meta
+	if err := json.Unmarshal([]byte(metaJSON), &meta); err != nil {
+		return Template{}, err
+	}
+	return Template{
+		Meta:    meta,
+		Body:    body,
+		Origin:  origin,
+		Created: time.Unix(created, 0),
+		Updated: time.Unix(updated, 0),
+	}, nil
 }
 
 var _ DB = (*SQLite)(nil)

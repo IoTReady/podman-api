@@ -15,16 +15,46 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 )
 
+// requiredParams turns a list of names into required ParamDefs of type string —
+// the typed equivalent of the old render.Parameters{Required: ...} fixtures.
+func requiredParams(names ...string) []render.ParamDef {
+	out := make([]render.ParamDef, 0, len(names))
+	for _, n := range names {
+		out = append(out, render.ParamDef{Name: n, Type: "string", Required: true})
+	}
+	return out
+}
+
+// seedStore returns a Memory store pre-loaded with the given templates, ready to
+// hand to svc.SetStore. The instance Service always resolves templates from its
+// store, so every test seeds the catalog this way.
+func seedStore(t *testing.T, tmpls ...store.Template) *store.Memory {
+	t.Helper()
+	mem := store.NewMemory()
+	for _, tm := range tmpls {
+		require.NoError(t, mem.PutTemplate(context.Background(), tm))
+	}
+	return mem
+}
+
+// newSvcWith builds a Service whose catalog is seeded with tmpls and returns it
+// alongside the backing Memory store (for tests that also assert on specs).
+func newSvcWith(t *testing.T, client podman.Client, hosts []config.Host, tmpls ...store.Template) (*Service, *store.Memory) {
+	t.Helper()
+	mem := seedStore(t, tmpls...)
+	svc := NewService(client, hosts)
+	svc.SetStore(mem)
+	return svc, mem
+}
+
 // pgTemplate is the postgres-shaped fixture used across these tests. It mirrors
 // the bundled templates/postgres.yaml but is inlined so the test doesn't depend
 // on the embedded FS.
-func pgTemplate() config.Template {
-	return config.Template{
+func pgTemplate() store.Template {
+	return store.Template{
 		Meta: render.Meta{
-			ID: "postgres",
-			Parameters: render.Parameters{
-				Required: []string{"slug", "image", "port", "db", "user"},
-			},
+			ID:         "postgres",
+			Parameters: requiredParams("slug", "image", "port", "db", "user"),
 			Secrets: render.Secrets{
 				PerInstance: []string{"password"},
 			},
@@ -42,19 +72,17 @@ spec:
     - name: db
       image: {{.image}}
 `,
-		Source: "postgres.yaml",
+		Origin: "seed",
 	}
 }
 
 // templateWithHostSecret returns a synthetic template that declares a per-host
 // secret reference, used to exercise the ErrHostSecretMissing path.
-func templateWithHostSecret() config.Template {
-	return config.Template{
+func templateWithHostSecret() store.Template {
+	return store.Template{
 		Meta: render.Meta{
-			ID: "needs-host-secret",
-			Parameters: render.Parameters{
-				Required: []string{"slug", "image"},
-			},
+			ID:         "needs-host-secret",
+			Parameters: requiredParams("slug", "image"),
 			Secrets: render.Secrets{
 				PerHostReferenced: []string{"shared-pull-token"},
 			},
@@ -68,16 +96,25 @@ spec:
     - name: app
       image: {{.image}}
 `,
-		Source: "needs-host-secret.yaml",
+		Origin: "seed",
 	}
 }
 
 func newSvc(t *testing.T) (*Service, *fake.Fake) {
 	t.Helper()
+	svc, f, _ := newSvcMem(t)
+	return svc, f
+}
+
+// newSvcMem is newSvc but also returns the backing Memory store, already seeded
+// with the pg + host-secret templates. Tests that assert on persisted specs use
+// this rather than wiring a fresh (template-less) store.
+func newSvcMem(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
+	t.Helper()
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	f := fake.New()
-	svc := NewService(f, hosts, []config.Template{pgTemplate(), templateWithHostSecret()})
-	return svc, f
+	svc, mem := newSvcWith(t, f, hosts, pgTemplate(), templateWithHostSecret())
+	return svc, f, mem
 }
 
 func pgApply(slug string) ApplyRequest {
@@ -240,9 +277,7 @@ func TestService_Apply_SkipPull(t *testing.T) {
 var _ = podman.ErrNotFound
 
 func TestService_Apply_PersistsSpec(t *testing.T) {
-	svc, _ := newSvc(t)
-	mem := store.NewMemory()
-	svc.SetStore(mem)
+	svc, _, mem := newSvcMem(t)
 	ctx := context.Background()
 
 	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
@@ -254,9 +289,7 @@ func TestService_Apply_PersistsSpec(t *testing.T) {
 }
 
 func TestService_Apply_PlayKubeFail_NoSpec(t *testing.T) {
-	svc, f := newSvc(t)
-	mem := store.NewMemory()
-	svc.SetStore(mem)
+	svc, f, mem := newSvcMem(t)
 	f.PlayKubeErr = errors.New("boom")
 	ctx := context.Background()
 
@@ -266,11 +299,40 @@ func TestService_Apply_PlayKubeFail_NoSpec(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrNotFound)
 }
 
+// keylessStore wraps a Memory store but reports SecretsEnabled()==false, the way
+// a SQLite store opened without -spec-key-file behaves.
+type keylessStore struct{ *store.Memory }
+
+func (keylessStore) SecretsEnabled() bool { return false }
+
+// On a key-less store, a secret-bearing Apply must be rejected with
+// ErrSecretsNeedKey BEFORE any host mutation — no pod played, no secret created —
+// so the host is never left with an orphaned pod/secrets the missing spec can't
+// account for. (#61)
+func TestService_Apply_SecretBearing_KeylessStore_NoMutation(t *testing.T) {
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	f := fake.New()
+	mem := seedStore(t, pgTemplate())
+	svc := NewService(f, hosts)
+	svc.SetStore(keylessStore{mem})
+	ctx := context.Background()
+
+	err := svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true})
+	require.ErrorIs(t, err, store.ErrSecretsNeedKey)
+
+	// No host mutation happened: no pod played, no secret created.
+	assert.Empty(t, f.PlayCalls, "PlayKube must not be called")
+	secs, lerr := f.SecretList(ctx, "h1")
+	require.NoError(t, lerr)
+	assert.Empty(t, secs, "no secrets must be created")
+	// And of course no spec row.
+	_, gerr := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	assert.ErrorIs(t, gerr, store.ErrNotFound)
+}
+
 func TestService_Apply_StorePutError_Fatal(t *testing.T) {
-	svc, _ := newSvc(t)
-	mem := store.NewMemory()
+	svc, _, mem := newSvcMem(t)
 	mem.PutErr = errors.New("db down")
-	svc.SetStore(mem)
 
 	err := svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true})
 	require.Error(t, err)
@@ -278,9 +340,7 @@ func TestService_Apply_StorePutError_Fatal(t *testing.T) {
 }
 
 func TestService_Delete_RemovesSpec(t *testing.T) {
-	svc, _ := newSvc(t)
-	mem := store.NewMemory()
-	svc.SetStore(mem)
+	svc, _, mem := newSvcMem(t)
 	ctx := context.Background()
 	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
 
@@ -290,17 +350,8 @@ func TestService_Delete_RemovesSpec(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrNotFound)
 }
 
-func TestService_Delete_NilStore_OK(t *testing.T) {
-	svc, _ := newSvc(t) // no SetStore
-	ctx := context.Background()
-	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
-	require.NoError(t, svc.Delete(ctx, "h1", "postgres", "demo", DeleteOptions{}))
-}
-
 func TestService_Delete_StoreDeleteError_Fatal(t *testing.T) {
-	svc, _ := newSvc(t)
-	mem := store.NewMemory()
-	svc.SetStore(mem)
+	svc, _, mem := newSvcMem(t)
 	ctx := context.Background()
 	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
 
@@ -311,9 +362,7 @@ func TestService_Delete_StoreDeleteError_Fatal(t *testing.T) {
 }
 
 func TestService_UpgradeImage_ReusesStoredSecrets(t *testing.T) {
-	svc, _ := newSvc(t)
-	mem := store.NewMemory()
-	svc.SetStore(mem)
+	svc, _, mem := newSvcMem(t)
 	ctx := context.Background()
 
 	// Initial deploy persists params + the per-instance secret.
@@ -331,22 +380,14 @@ func TestService_UpgradeImage_ReusesStoredSecrets(t *testing.T) {
 	assert.Equal(t, "app", sp.Parameters["db"])
 }
 
-func TestService_UpgradeImage_RequiresStore(t *testing.T) {
-	svc, _ := newSvc(t)
-	err := svc.UpgradeImage(context.Background(), "h1", "postgres", "demo", "x:1")
-	assert.ErrorIs(t, err, ErrStoreDisabled)
-}
-
 func TestService_UpgradeImage_MissingSpecIsNotFound(t *testing.T) {
 	svc, _ := newSvc(t)
-	svc.SetStore(store.NewMemory())
 	err := svc.UpgradeImage(context.Background(), "h1", "postgres", "ghost", "x:1")
 	assert.ErrorIs(t, err, ErrInstanceNotFound)
 }
 
 func TestService_UpgradeImage_EmptyImageRejected(t *testing.T) {
 	svc, _ := newSvc(t)
-	svc.SetStore(store.NewMemory())
 	err := svc.UpgradeImage(context.Background(), "h1", "postgres", "demo", "")
 	require.Error(t, err)
 }

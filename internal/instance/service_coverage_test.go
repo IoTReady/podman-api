@@ -51,8 +51,10 @@ func TestService_HostsAndTemplates(t *testing.T) {
 	require.Len(t, hosts, 1)
 	assert.Equal(t, "h1", hosts[0].ID)
 
+	tmpls, err := svc.Templates(context.Background())
+	require.NoError(t, err)
 	ids := map[string]bool{}
-	for _, tm := range svc.Templates() {
+	for _, tm := range tmpls {
 		ids[tm.Meta.ID] = true
 	}
 	assert.True(t, ids["postgres"])

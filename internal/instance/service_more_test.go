@@ -8,7 +8,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/podman/fake"
+	"github.com/iotready/podman-api/internal/render"
 )
 
 // --- Ping / Version ---------------------------------------------------------
@@ -183,6 +186,38 @@ func TestService_HostCounts_UnknownHost(t *testing.T) {
 	svc, _ := newSvc(t)
 	_, _, err := svc.HostCounts(context.Background(), "nope")
 	assert.ErrorIs(t, err, ErrUnknownHost)
+}
+
+// --- Apply: parameter default-fill (one-click deploy) -----------------------
+
+// TestApply_FillsParameterDefaults verifies that Apply fills omitted params
+// from their ParamDef.Default before rendering and persisting the spec, so a
+// caller can omit any optional parameter and still get a valid deploy.
+func TestApply_FillsParameterDefaults(t *testing.T) {
+	ctx := context.Background()
+	// Build a "web" template whose body only references {{.slug}} and {{.image}};
+	// "replicas" has a default of 1 and is not used in the body (extra params are
+	// allowed). Re-use webTemplate()'s body so the render succeeds.
+	tmpl := webTemplate()
+	// Extend the parameter list to add an optional "replicas" param with a default.
+	tmpl.Meta.Parameters = append(tmpl.Meta.Parameters,
+		render.ParamDef{Name: "replicas", Type: "int", Default: 1},
+	)
+
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	f := fake.New()
+	svc, mem := newSvcWith(t, f, hosts, tmpl)
+
+	// Apply WITHOUT supplying "replicas" — it must be filled from the default.
+	require.NoError(t, svc.Apply(ctx, "h1", ApplyRequest{
+		Template:   "web",
+		Slug:       "demo",
+		Parameters: map[string]any{"slug": "demo", "image": "nginx:1"},
+	}, ApplyOptions{Replace: true}))
+
+	spec, err := mem.GetSpec(ctx, "h1", "web", "demo")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, spec.Parameters["replicas"], "default must be persisted in the spec")
 }
 
 // --- hostsSnap: nil guard (white-box) ---------------------------------------

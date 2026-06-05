@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -16,18 +17,23 @@ import (
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 func newSrvFull(t *testing.T) (*httptest.Server, string, *fake.Fake) {
 	tok := "t"
 	hash, _ := config.HashToken(tok)
-	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*", "secrets:*", "hosts:read"}}}
-	tmpls := []config.Template{
-		{Meta: render.Meta{
-			ID:         "app",
-			Parameters: render.Parameters{Required: []string{"slug", "image"}},
-			Secrets:    render.Secrets{PerInstance: []string{"auth_secret"}},
-		}, Body: `apiVersion: v1
+	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*", "secrets:*", "hosts:read", "templates:*"}}}
+	tmpl := store.Template{
+		Meta: render.Meta{
+			ID: "app",
+			Parameters: []render.ParamDef{
+				{Name: "slug", Type: "string", Required: true},
+				{Name: "image", Type: "string", Required: true},
+			},
+			Secrets: render.Secrets{PerInstance: []string{"auth_secret"}},
+		},
+		Body: `apiVersion: v1
 kind: Pod
 metadata:
   name: app-{{.slug}}
@@ -38,12 +44,16 @@ spec:
   containers:
     - name: app
       image: {{.image}}
-`},
+`,
+		Origin: "seed",
 	}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	f := fake.New()
-	svc := instance.NewService(f, hosts, tmpls)
-	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
+	mem := store.NewMemory()
+	require.NoError(t, mem.PutTemplate(context.Background(), tmpl))
+	svc := instance.NewService(f, hosts)
+	svc.SetStore(mem)
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
 	t.Cleanup(srv.Close)
 	return srv, tok, f
 }

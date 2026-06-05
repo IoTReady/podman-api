@@ -3,7 +3,8 @@ package api
 import (
 	"fmt"
 	"net/http"
-	"regexp"
+
+	"github.com/iotready/podman-api/internal/render"
 )
 
 // nameRe is the DNS-label-style allowlist used for slug, template-id, and
@@ -16,9 +17,12 @@ import (
 //   - 2-40 characters
 //   - lowercase ASCII letters, digits, hyphen
 //   - must start and end with [a-z0-9]
-var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$`)
+//
+// It aliases render.NameRe so the API edge and the template validator share
+// one definition.
+var nameRe = render.NameRe
 
-func validName(s string) bool { return nameRe.MatchString(s) }
+func validName(s string) bool { return render.ValidName(s) }
 
 // writeInvalidName writes a 400 invalid_parameters response describing
 // which named field had an invalid value.

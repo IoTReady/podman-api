@@ -1,9 +1,7 @@
 package config
 
 import (
-	"strings"
 	"testing"
-	"testing/fstest"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -55,48 +53,6 @@ func TestVerifyToken_MalformedEncodings(t *testing.T) {
 			assert.Contains(t, err.Error(), c.errSub)
 		})
 	}
-}
-
-// --- LoadTemplates error paths (in-memory fs) -------------------------------
-
-const validMeta = "# template-meta:\n#   id: %s\n---\nbody\n"
-
-func TestLoadTemplates_BadMeta(t *testing.T) {
-	fsys := fstest.MapFS{
-		"broken.yaml": {Data: []byte("not-a-template: true\n")},
-	}
-	_, err := LoadTemplates(fsys, ".")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "broken.yaml")
-}
-
-func TestLoadTemplates_DuplicateID(t *testing.T) {
-	doc := strings.Replace(validMeta, "%s", "dup", 1)
-	fsys := fstest.MapFS{
-		"a.yaml": {Data: []byte(doc)},
-		"b.yaml": {Data: []byte(doc)},
-	}
-	_, err := LoadTemplates(fsys, ".")
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "duplicate")
-}
-
-func TestLoadTemplates_NonYAMLFilesIgnored(t *testing.T) {
-	fsys := fstest.MapFS{
-		"README.md":  {Data: []byte("# not a template")},
-		"good.yaml":  {Data: []byte(strings.Replace(validMeta, "%s", "ok", 1))},
-		"sub/nested": {Data: []byte("ignored")},
-	}
-	tmpls, err := LoadTemplates(fsys, ".")
-	require.NoError(t, err)
-	require.Len(t, tmpls, 1)
-	assert.Equal(t, "ok", tmpls[0].Meta.ID)
-}
-
-func TestLoadTemplates_WalkError(t *testing.T) {
-	// Walking a root that does not exist surfaces the WalkDir error.
-	_, err := LoadTemplates(fstest.MapFS{}, "no-such-root")
-	require.Error(t, err)
 }
 
 // --- LoadHosts error paths --------------------------------------------------

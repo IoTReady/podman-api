@@ -12,8 +12,12 @@ func TestParseMeta_Minimal(t *testing.T) {
 	src := `# template-meta:
 #   id: example
 #   parameters:
-#     required: [slug, image]
-#     optional: []
+#     - name: slug
+#       type: string
+#       required: true
+#     - name: image
+#       type: string
+#       required: true
 #   secrets:
 #     per_instance: [password]
 #     per_host_referenced: [registry-pull-token]
@@ -28,8 +32,11 @@ kind: Pod
 	require.NoError(t, err)
 
 	assert.Equal(t, "example", meta.ID)
-	assert.Equal(t, []string{"slug", "image"}, meta.Parameters.Required)
-	assert.Empty(t, meta.Parameters.Optional)
+	require.Len(t, meta.Parameters, 2)
+	assert.Equal(t, "slug", meta.Parameters[0].Name)
+	assert.True(t, meta.Parameters[0].Required)
+	assert.Equal(t, "image", meta.Parameters[1].Name)
+	assert.True(t, meta.Parameters[1].Required)
 	assert.Equal(t, []string{"password"}, meta.Secrets.PerInstance)
 	assert.Equal(t, []string{"registry-pull-token"}, meta.Secrets.PerHostReferenced)
 	require.Len(t, meta.Volumes, 1)
@@ -54,8 +61,6 @@ kind: Pod
 func TestParseMeta_EmptyBody(t *testing.T) {
 	src := `# template-meta:
 #   id: x
-#   parameters:
-#     required: []
 `
 	_, body, err := ParseMeta(src)
 	require.NoError(t, err)
@@ -65,7 +70,8 @@ func TestParseMeta_EmptyBody(t *testing.T) {
 func TestParseMeta_MissingID(t *testing.T) {
 	src := `# template-meta:
 #   parameters:
-#     required: []
+#     - name: slug
+#       type: string
 ---
 apiVersion: v1
 `
@@ -115,4 +121,53 @@ kind: Pod
 `
 	_, _, err := ParseMeta(src)
 	require.Error(t, err)
+}
+
+func TestParseMeta_TypedParameters(t *testing.T) {
+	src := `# template-meta:
+#   id: web
+#   display:
+#     name: Web
+#     category: Apps
+#   parameters:
+#     - name: image
+#       type: string
+#       required: true
+#       default: "nginx:1"
+#     - name: port
+#       type: int
+#       label: HTTP port
+#       default: 8080
+---
+apiVersion: v1
+kind: Pod
+`
+	m, body, err := ParseMeta(src)
+	require.NoError(t, err)
+	require.Equal(t, "web", m.ID)
+	require.Equal(t, "Web", m.Display.Name)
+	require.Equal(t, "Apps", m.Display.Category)
+	require.Len(t, m.Parameters, 2)
+	require.Equal(t, "image", m.Parameters[0].Name)
+	require.True(t, m.Parameters[0].Required)
+	require.Equal(t, "string", m.Parameters[0].Type)
+	require.Equal(t, "port", m.Parameters[1].Name)
+	require.False(t, m.Parameters[1].Required)
+	require.Contains(t, body, "kind: Pod")
+	require.Equal(t, "nginx:1", m.Parameters[0].Default)
+	require.EqualValues(t, 8080, m.Parameters[1].Default)
+}
+
+func TestParseMeta_RejectsUnknownType(t *testing.T) {
+	src := `# template-meta:
+#   id: x
+#   parameters:
+#     - name: foo
+#       type: float
+---
+kind: Pod
+`
+	_, _, err := ParseMeta(src)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "float")
 }

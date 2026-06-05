@@ -6,13 +6,11 @@ import (
 	"text/template"
 )
 
-// Render parses src with ParseMeta, substitutes params into the body using
-// text/template (with missingkey=error), and returns the final YAML.
-func Render(src string, params map[string]any) (string, error) {
-	_, body, err := ParseMeta(src)
-	if err != nil {
-		return "", err
-	}
+// RenderBody substitutes params into an already-separated template body using
+// text/template (with missingkey=error) and returns the final YAML. Callers
+// that hold the full source (meta + body) split it with ParseMeta first; a
+// store.Template keeps Meta and Body apart and renders the body directly.
+func RenderBody(body string, params map[string]any) (string, error) {
 	tmpl, err := template.New("template").
 		Option("missingkey=error").
 		Parse(body)

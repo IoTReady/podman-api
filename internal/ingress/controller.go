@@ -23,12 +23,14 @@ type Disabled struct{}
 
 func (Disabled) Reconcile(context.Context, string) error { return nil }
 
-// TemplateIngress is a template's ingress declaration, supplied to the
-// controller so it can compute backends without importing the template loader.
-// Only templates whose meta declares ingress: appear in the controller's map.
-type TemplateIngress struct {
-	Container string // declared HTTP container name (informational)
-	Port      int    // container port the backend points at
+// Store is the controller's view of the durable state. It is the spec store
+// plus template lookups: templates are mutable (created/edited at runtime), so
+// the controller resolves each instance's ingress declaration from the store at
+// reconcile time rather than caching a boot-time snapshot. *store.DB satisfies
+// this; so does *store.Memory.
+type Store interface {
+	store.Store
+	GetTemplate(ctx context.Context, id string) (store.Template, error)
 }
 
 // Config holds the operator-set knobs for the Caddy controller.
@@ -41,24 +43,23 @@ type Config struct {
 // CaddyController is the production Controller. It drives a per-host Caddy pod
 // over the existing podman socket.
 type CaddyController struct {
-	client    podman.Client
-	store     store.Store
-	templates map[string]TemplateIngress // template id -> ingress decl
-	cfg       Config
+	client podman.Client
+	store  Store
+	cfg    Config
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex // per-host serialization
 }
 
-// NewCaddyController builds a controller. templates must include an entry for
-// every template that declares ingress: in its meta.
-func NewCaddyController(client podman.Client, st store.Store, templates map[string]TemplateIngress, cfg Config) *CaddyController {
+// NewCaddyController builds a controller. st serves both spec storage and
+// template lookups, so ingress declarations are always read fresh from the
+// store (no stale boot-time template snapshot).
+func NewCaddyController(client podman.Client, st Store, cfg Config) *CaddyController {
 	return &CaddyController{
-		client:    client,
-		store:     st,
-		templates: templates,
-		cfg:       cfg,
-		locks:     map[string]*sync.Mutex{},
+		client: client,
+		store:  st,
+		cfg:    cfg,
+		locks:  map[string]*sync.Mutex{},
 	}
 }
 

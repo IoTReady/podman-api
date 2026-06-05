@@ -13,12 +13,14 @@ import (
 // timestamps are NOT stamped (unlike the SQLite store) — it is a test double,
 // not a production backend. PutErr/DeleteErr, when non-nil, make the
 // corresponding call fail, to exercise callers' fatal-failure paths.
-// It also implements JobStore with an in-memory []Job slice.
+// It also implements JobStore with an in-memory []Job slice and TemplateStore
+// with an in-memory map.
 type Memory struct {
 	mu          sync.Mutex
 	specs       map[string]Spec
 	jobs        []Job             // insertion order; newest last
 	hostSecrets map[string][]byte // "host\x00name" -> value
+	templates   map[string]Template
 
 	PutErr    error
 	DeleteErr error
@@ -29,6 +31,7 @@ func NewMemory() *Memory {
 	return &Memory{
 		specs:       map[string]Spec{},
 		hostSecrets: map[string][]byte{},
+		templates:   map[string]Template{},
 	}
 }
 
@@ -113,6 +116,10 @@ func (m *Memory) DeleteHostSecret(_ context.Context, host, name string) error {
 	delete(m.hostSecrets, host+"\x00"+name)
 	return nil
 }
+
+// SecretsEnabled reports whether this store can persist secrets. The in-memory
+// double is keyed-by-default for tests, so it always returns true.
+func (m *Memory) SecretsEnabled() bool { return true }
 
 func (m *Memory) Enqueue(_ context.Context, kind string, args json.RawMessage, parentID string) (Job, error) {
 	m.mu.Lock()
@@ -363,3 +370,59 @@ func cloneJob(j Job) Job {
 }
 
 var _ JobStore = (*Memory)(nil)
+var _ Store = (*Memory)(nil)
+
+// ---------------------------------------------------------------------------
+// TemplateStore implementation
+// ---------------------------------------------------------------------------
+
+func (m *Memory) ListTemplates(_ context.Context) ([]Template, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]Template, 0, len(m.templates))
+	for _, t := range m.templates {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Meta.ID < out[j].Meta.ID })
+	return out, nil
+}
+
+func (m *Memory) GetTemplate(_ context.Context, id string) (Template, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	t, ok := m.templates[id]
+	if !ok {
+		return Template{}, ErrNotFound
+	}
+	return t, nil
+}
+
+func (m *Memory) PutTemplate(_ context.Context, t Template) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := time.Now()
+	existing, exists := m.templates[t.Meta.ID]
+	if exists {
+		t.Created = existing.Created
+	} else {
+		t.Created = now
+	}
+	t.Updated = now
+	m.templates[t.Meta.ID] = t
+	return nil
+}
+
+func (m *Memory) DeleteTemplate(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.templates, id)
+	return nil
+}
+
+func (m *Memory) CountTemplates(_ context.Context) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.templates), nil
+}
+
+var _ TemplateStore = (*Memory)(nil)

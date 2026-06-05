@@ -46,10 +46,14 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 	mux.Handle("GET /hosts/{host}/healthz", guard("hosts:read", http.HandlerFunc(h.hostHealthz)))
 	mux.Handle("GET /hosts/{host}/ports-in-use", guard("hosts:read", http.HandlerFunc(h.portsInUse)))
 
-	// Templates (read).
-	mux.Handle("GET /templates", guard("instances:read", http.HandlerFunc(h.listTemplates)))
-	mux.Handle("GET /templates/{id}", guard("instances:read", http.HandlerFunc(h.getTemplate)))
-	mux.Handle("GET /templates/{id}/render", guard("instances:read", http.HandlerFunc(h.renderTemplate)))
+	// Templates (catalog CRUD + clone).
+	mux.Handle("GET /templates", guard("templates:read", http.HandlerFunc(h.listTemplates)))
+	mux.Handle("POST /templates", guard("templates:write", http.HandlerFunc(h.createTemplate)))
+	mux.Handle("GET /templates/{id}", guard("templates:read", http.HandlerFunc(h.getTemplate)))
+	mux.Handle("PUT /templates/{id}", guard("templates:write", http.HandlerFunc(h.updateTemplate)))
+	mux.Handle("DELETE /templates/{id}", guard("templates:write", http.HandlerFunc(h.deleteTemplate)))
+	mux.Handle("POST /templates/{id}/clone", guard("templates:write", http.HandlerFunc(h.cloneTemplate)))
+	mux.Handle("GET /templates/{id}/render", guard("templates:read", http.HandlerFunc(h.renderTemplate)))
 
 	// Host secrets.
 	mux.Handle("GET /hosts/{host}/secrets", guard("secrets:read", http.HandlerFunc(h.listSecrets)))

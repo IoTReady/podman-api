@@ -13,6 +13,7 @@ import (
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman/fake"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 func authedReq(t *testing.T, srv *httptest.Server, tok, method, path string) *http.Response {
@@ -32,7 +33,8 @@ func TestListHosts(t *testing.T) {
 	hosts := []config.Host{
 		{ID: "h1", Addr: "unix", Socket: "/x", Labels: map[string]string{"env": "dev"}},
 	}
-	svc := instance.NewService(fake.New(), hosts, nil)
+	svc := instance.NewService(fake.New(), hosts)
+	svc.SetStore(store.NewMemory())
 	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
 	defer srv.Close()
 
@@ -52,7 +54,8 @@ func TestHostHealthz(t *testing.T) {
 	hash, _ := config.HashToken(tok)
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"hosts:read"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
-	svc := instance.NewService(fake.New(), hosts, nil)
+	svc := instance.NewService(fake.New(), hosts)
+	svc.SetStore(store.NewMemory())
 	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
 	defer srv.Close()
 

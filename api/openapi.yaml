@@ -84,6 +84,7 @@ components:
             missing_token, invalid_token, missing_scope,
             unknown_host, unknown_template, instance_not_found,
             instance_already_exists, host_secret_missing, host_draining,
+            template_already_exists, template_in_use, invalid_template,
             upstream_error, too_many_ops, internal,
             invalid_request, port_conflict, not_found, not_implemented,
           ]
@@ -141,19 +142,20 @@ components:
 
     Template:
       type: object
-      required: [id, parameters, secrets, volumes]
+      required: [id]
       properties:
         id: {type: string}
-        parameters:
+        display:
           type: object
-          required: [required, optional]
+          description: human-readable presentation metadata for catalog UIs
           properties:
-            required:
-              type: array
-              items: {type: string}
-            optional:
-              type: array
-              items: {type: string}
+            name: {type: string}
+            description: {type: string}
+            category: {type: string}
+            icon: {type: string}
+        parameters:
+          type: array
+          items: {$ref: '#/components/schemas/ParamDef'}
         secrets:
           type: object
           properties:
@@ -170,6 +172,87 @@ components:
             properties:
               name: {type: string}
               backup: {type: string}
+        ingress:
+          type: object
+          nullable: true
+          description: which container+port serves HTTP; null on non-web templates
+          properties:
+            container: {type: string}
+            port: {type: integer}
+        body:
+          type: string
+          description: the renderable template body (Go text/template over YAML)
+        origin:
+          type: string
+          description: provenance of the stored template (e.g. "seed" or "api")
+        created: {type: string, format: date-time}
+        updated: {type: string, format: date-time}
+
+    ParamDef:
+      type: object
+      required: [name, type]
+      properties:
+        name: {type: string}
+        type:
+          type: string
+          enum: [string, int, bool, select]
+        required: {type: boolean}
+        label: {type: string}
+        description: {type: string}
+        default:
+          description: value used when the parameter is omitted on deploy
+        placeholder: {type: string}
+        options:
+          type: array
+          description: allowed values when type is "select"
+          items: {type: string}
+        secret:
+          type: boolean
+          description: true when this parameter carries a secret value
+
+    TemplateInput:
+      type: object
+      description: >-
+        Request body for create/update. On create, id names the new template; on
+        update the path id wins and any id in the body is ignored.
+      required: [body]
+      properties:
+        id: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+        body:
+          type: string
+          description: the renderable template body (Go text/template over YAML)
+        display:
+          type: object
+          properties:
+            name: {type: string}
+            description: {type: string}
+            category: {type: string}
+            icon: {type: string}
+        parameters:
+          type: array
+          items: {$ref: '#/components/schemas/ParamDef'}
+        secrets:
+          type: object
+          properties:
+            per_instance:
+              type: array
+              items: {type: string}
+            per_host_referenced:
+              type: array
+              items: {type: string}
+        volumes:
+          type: array
+          items:
+            type: object
+            properties:
+              name: {type: string}
+              backup: {type: string}
+        ingress:
+          type: object
+          nullable: true
+          properties:
+            container: {type: string}
+            port: {type: integer}
 
     Container:
       type: object
@@ -533,14 +616,31 @@ paths:
   /templates:
     get:
       tags: [templates]
-      summary: list loaded templates
+      summary: list templates from the store
       responses:
         '200':
           description: list
           content:
             application/json:
               schema: {type: array, items: {$ref: '#/components/schemas/Template'}}
-      x-required-scope: instances:read
+      x-required-scope: templates:read
+    post:
+      tags: [templates]
+      summary: create a new template in the store
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TemplateInput'}}}
+      responses:
+        '201':
+          description: created
+          content: {application/json: {schema: {$ref: '#/components/schemas/Template'}}}
+        '400':
+          description: invalid body or invalid template (bad id, meta, or render)
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+        '409':
+          description: a template with this id already exists (template_already_exists)
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      x-required-scope: templates:write
 
   /templates/{id}:
     get:
@@ -556,7 +656,82 @@ paths:
           description: template
           content: {application/json: {schema: {$ref: '#/components/schemas/Template'}}}
         '404': {$ref: '#/components/responses/NotFound'}
-      x-required-scope: instances:read
+      x-required-scope: templates:read
+    put:
+      tags: [templates]
+      summary: update an existing template (id is taken from the path)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/TemplateInput'}}}
+      responses:
+        '200':
+          description: updated
+          content: {application/json: {schema: {$ref: '#/components/schemas/Template'}}}
+        '400':
+          description: invalid body or invalid template (bad meta or render)
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+      x-required-scope: templates:write
+    delete:
+      tags: [templates]
+      summary: delete a template
+      description: >-
+        Fails with 409 (template_in_use) when instances are still deployed from
+        this template, unless force=true is passed.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+        - name: force
+          in: query
+          required: false
+          description: delete even when instances are still deployed from this template
+          schema: {type: boolean, default: false}
+      responses:
+        '204': {description: removed}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: instances are still deployed from this template (template_in_use)
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      x-required-scope: templates:write
+
+  /templates/{id}/clone:
+    post:
+      tags: [templates]
+      summary: clone an existing template under a new id
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: id of the source template to clone
+          schema: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_id]
+              properties:
+                new_id: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+      responses:
+        '201':
+          description: created
+          content: {application/json: {schema: {$ref: '#/components/schemas/Template'}}}
+        '400':
+          description: invalid body or invalid new_id
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '409':
+          description: a template with new_id already exists (template_already_exists)
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      x-required-scope: templates:write
 
   /templates/{id}/render:
     get:
@@ -571,7 +746,7 @@ paths:
         '200':
           description: rendered YAML
           content: {text/yaml: {schema: {type: string}}}
-      x-required-scope: instances:read
+      x-required-scope: templates:read
 
   /hosts/{host}/secrets:
     get:

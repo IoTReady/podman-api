@@ -20,15 +20,21 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 )
 
-func migrateTmpl() config.Template {
-	return config.Template{
+func migrateTmpl() store.Template {
+	return store.Template{
 		Meta: render.Meta{
-			ID:         "postgres",
-			Parameters: render.Parameters{Required: []string{"slug", "image", "port", "db", "user"}},
-			Volumes:    []render.Volume{{Name: "data"}},
+			ID: "postgres",
+			Parameters: []render.ParamDef{
+				{Name: "slug", Type: "string", Required: true},
+				{Name: "image", Type: "string", Required: true},
+				{Name: "port", Type: "int", Required: true},
+				{Name: "db", Type: "string", Required: true},
+				{Name: "user", Type: "string", Required: true},
+			},
+			Volumes: []render.Volume{{Name: "data"}},
 		},
 		Body:   "apiVersion: v1\nkind: Pod\nmetadata:\n  name: postgres-{{.slug}}\nspec:\n  containers:\n    - name: db\n      image: {{.image}}\n",
-		Source: "postgres.yaml",
+		Origin: "seed",
 	}
 }
 
@@ -41,7 +47,8 @@ func newMigrateSrv(t *testing.T) (*httptest.Server, string, *fake.Fake, *store.M
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}, {ID: "h2", Addr: "unix", Socket: "/y"}}
 	f := fake.New()
 	mem := store.NewMemory()
-	svc := instance.NewService(f, hosts, []config.Template{migrateTmpl()})
+	require.NoError(t, mem.PutTemplate(context.Background(), migrateTmpl()))
+	svc := instance.NewService(f, hosts)
 	svc.SetStore(mem)
 	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
 	t.Cleanup(srv.Close)
@@ -102,7 +109,7 @@ func TestMigrate_API_StoreDisabled_501(t *testing.T) {
 	require.NoError(t, err)
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}, {ID: "h2", Addr: "unix", Socket: "/y"}}
-	svc := instance.NewService(fake.New(), hosts, []config.Template{migrateTmpl()})
+	svc := instance.NewService(fake.New(), hosts)
 	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
 	t.Cleanup(srv.Close)
 

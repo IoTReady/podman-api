@@ -4,41 +4,101 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
 
+// NameRe is the DNS-label constraint for template ids and instance slugs.
+var NameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$`)
+
+// ValidName reports whether s is a valid template id / name.
+func ValidName(s string) bool { return NameRe.MatchString(s) }
+
 // Meta describes a template's parameter and secret contract.
 // It is parsed from the leading "# template-meta:" comment block.
 type Meta struct {
-	ID         string     `yaml:"id"`
-	Parameters Parameters `yaml:"parameters"`
-	Secrets    Secrets    `yaml:"secrets"`
-	Volumes    []Volume   `yaml:"volumes"`
-	Ingress    *Ingress   `yaml:"ingress"`
+	ID         string     `yaml:"id" json:"id"`
+	Display    Display    `yaml:"display,omitempty" json:"display,omitempty"`
+	Parameters []ParamDef `yaml:"parameters" json:"parameters,omitempty"`
+	Secrets    Secrets    `yaml:"secrets" json:"secrets,omitempty"`
+	Volumes    []Volume   `yaml:"volumes" json:"volumes,omitempty"`
+	Ingress    *Ingress   `yaml:"ingress" json:"ingress,omitempty"`
 }
 
-type Parameters struct {
-	Required []string `yaml:"required"`
-	Optional []string `yaml:"optional"`
+// Display holds human-readable presentation metadata for a template.
+type Display struct {
+	Name        string `yaml:"name,omitempty" json:"name,omitempty"`
+	Description string `yaml:"description,omitempty" json:"description,omitempty"`
+	Category    string `yaml:"category,omitempty" json:"category,omitempty"`
+	Icon        string `yaml:"icon,omitempty" json:"icon,omitempty"`
+}
+
+// ParamDef describes a single template parameter, its type, and constraints.
+type ParamDef struct {
+	Name        string   `yaml:"name" json:"name"`
+	Type        string   `yaml:"type" json:"type"`
+	Required    bool     `yaml:"required,omitempty" json:"required,omitempty"`
+	Label       string   `yaml:"label,omitempty" json:"label,omitempty"`
+	Description string   `yaml:"description,omitempty" json:"description,omitempty"`
+	Default     any      `yaml:"default,omitempty" json:"default,omitempty"`
+	Placeholder string   `yaml:"placeholder,omitempty" json:"placeholder,omitempty"`
+	Options     []string `yaml:"options,omitempty" json:"options,omitempty"`
+	Secret      bool     `yaml:"secret,omitempty" json:"secret,omitempty"`
 }
 
 type Secrets struct {
-	PerInstance       []string `yaml:"per_instance"`
-	PerHostReferenced []string `yaml:"per_host_referenced"`
+	PerInstance       []string `yaml:"per_instance" json:"per_instance,omitempty"`
+	PerHostReferenced []string `yaml:"per_host_referenced" json:"per_host_referenced,omitempty"`
 }
 
 type Volume struct {
-	Name   string `yaml:"name"`
-	Backup string `yaml:"backup,omitempty"`
+	Name   string `yaml:"name" json:"name"`
+	Backup string `yaml:"backup,omitempty" json:"backup,omitempty"`
 }
 
 // Ingress declares which container+port in the rendered pod serves HTTP, so the
 // ingress layer can route a domain to it. Absent on non-web templates.
 type Ingress struct {
-	Container string `yaml:"container"`
-	Port      int    `yaml:"port"`
+	Container string `yaml:"container" json:"container"`
+	Port      int    `yaml:"port" json:"port"`
+}
+
+// ValidateIngress checks an ingress declaration: container non-empty and
+// port in 1..65535. nil is valid (no ingress).
+func ValidateIngress(ing *Ingress) error {
+	if ing == nil {
+		return nil
+	}
+	if ing.Container == "" {
+		return errors.New("template-meta: ingress.container is required")
+	}
+	if ing.Port <= 0 || ing.Port > 65535 {
+		return fmt.Errorf("template-meta: ingress.port %d out of range", ing.Port)
+	}
+	return nil
+}
+
+// validParamTypes is the set of recognised ParamDef.Type values.
+var validParamTypes = map[string]bool{
+	"string": true,
+	"int":    true,
+	"bool":   true,
+	"select": true,
+}
+
+// NormalizeParams normalizes each parameter's Type (blank → "string") and
+// returns an error for an unknown type (allowed: string|int|bool|select).
+func NormalizeParams(m *Meta) error {
+	for i, p := range m.Parameters {
+		if p.Type == "" {
+			m.Parameters[i].Type = "string"
+		} else if !validParamTypes[p.Type] {
+			return fmt.Errorf("template-meta: parameter %q has unknown type %q", p.Name, p.Type)
+		}
+	}
+	return nil
 }
 
 // ParseMeta extracts the template-meta block from the head of the file
@@ -119,13 +179,13 @@ func ParseMeta(src string) (Meta, string, error) {
 		return Meta{}, "", errors.New("template-meta: id is required")
 	}
 
-	if ing := wrapper.Meta.Ingress; ing != nil {
-		if ing.Container == "" {
-			return Meta{}, "", errors.New("template-meta: ingress.container is required")
-		}
-		if ing.Port <= 0 || ing.Port > 65535 {
-			return Meta{}, "", fmt.Errorf("template-meta: ingress.port %d out of range", ing.Port)
-		}
+	// Validate and normalise parameter types.
+	if err := NormalizeParams(&wrapper.Meta); err != nil {
+		return Meta{}, "", err
+	}
+
+	if err := ValidateIngress(wrapper.Meta.Ingress); err != nil {
+		return Meta{}, "", err
 	}
 
 	body := bodyAfterLine(src, bodyStart)

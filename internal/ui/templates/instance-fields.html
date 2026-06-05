@@ -1,7 +1,11 @@
 {{define "instance-fields"}}
 <div class="label">PARAMETERS</div>
-{{range .Tmpl.Meta.Parameters.Required}}<label>{{.}} (required) <input name="param.{{.}}" required></label>{{end}}
-{{range .Tmpl.Meta.Parameters.Optional}}<label>{{.}} <input name="param.{{.}}"></label>{{end}}
+{{range .Tmpl.Meta.Parameters}}
+  {{- $label := .Label}}{{if eq $label ""}}{{$label = .Name}}{{end}}
+  <label>{{$label}}{{if .Required}} (required){{end}}
+    <input name="param.{{.Name}}"{{if .Required}} required{{end}}{{if .Placeholder}} placeholder="{{.Placeholder}}"{{end}}{{if .Default}} value="{{.Default}}"{{end}}>
+  </label>
+{{end}}
 {{if .Tmpl.Meta.Secrets.PerInstance}}
 <div class="label">SECRETS</div>
 {{range .Tmpl.Meta.Secrets.PerInstance}}<label>{{.}} <input type="password" name="secret.{{.}}"></label>{{end}}

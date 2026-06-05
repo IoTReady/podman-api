@@ -53,38 +53,45 @@ type DeleteOptions struct {
 	PruneSecrets bool
 }
 
+// Store is the persistence surface the instance Service needs: the desired-state
+// spec/host-secret store plus the template catalog. main wires a single
+// store.DB, which satisfies this; tests pass a store.Memory. The Service always
+// has a store — callers MUST SetStore before use.
+type Store interface {
+	store.Store
+	store.TemplateStore
+}
+
 // Service orchestrates instance operations against podman hosts.
 type Service struct {
 	client     podman.Client
 	hosts      atomic.Pointer[map[string]config.Host] // hot-swappable on SIGHUP
-	templates  map[string]config.Template
-	secretEnvs map[string]map[string]bool // template id -> set of secret-sourced env var names
-	store      store.Store                // nil = store disabled (stateless proxy behaviour)
-	ingress    ingress.Controller         // never nil; ingress.Disabled{} when off
-	ingressNet string                     // shared ingress network; "" when ingress disabled
+	store      Store                                  // template catalog + desired-state store; set via SetStore before use
+	ingress    ingress.Controller                     // never nil; ingress.Disabled{} when off
+	ingressNet string                                 // shared ingress network; "" when ingress disabled
 
 	verifyVolumes bool // verify each migrated volume's content before reaping the source
 
 	mu        sync.Mutex
 	locks     map[string]*sync.Mutex // key = host|template|slug
 	hostLocks map[string]*sync.Mutex // key = host; serializes host-wide domain claims (#82)
+	// tmplMu serializes template mutations (create/update/clone/delete) so each
+	// check-then-act is atomic (#61). Apply takes it as a *read* lock only around
+	// its final template-existence recheck + PutSpec, so a concurrent
+	// DeleteTemplate (write lock) cannot delete a template between Apply's recheck
+	// and its spec persist — closing the delete-vs-Apply orphan race (#61 review-2).
+	tmplMu sync.RWMutex
 }
 
-func NewService(client podman.Client, hosts []config.Host, tmpls []config.Template) *Service {
+func NewService(client podman.Client, hosts []config.Host) *Service {
 	s := &Service{
 		client:        client,
-		templates:     map[string]config.Template{},
-		secretEnvs:    map[string]map[string]bool{},
 		locks:         map[string]*sync.Mutex{},
 		hostLocks:     map[string]*sync.Mutex{},
 		verifyVolumes: true,
 	}
 	s.ingress = ingress.Disabled{}
 	s.SetHosts(hosts)
-	for _, t := range tmpls {
-		s.templates[t.Meta.ID] = t
-		s.secretEnvs[t.Meta.ID] = secretEnvNames(t.Body)
-	}
 	return s
 }
 
@@ -98,12 +105,11 @@ func (s *Service) SetHosts(hosts []config.Host) {
 	s.hosts.Store(&m)
 }
 
-// SetStore wires the optional desired-state store. A nil store (the default)
-// disables persistence and the daemon behaves as a stateless proxy. Called by
-// main after construction, mirroring SetHosts. Unlike SetHosts it is NOT a
-// concurrent hot-swap: it must be called at startup, before the server begins
-// accepting requests.
-func (s *Service) SetStore(st store.Store) { s.store = st }
+// SetStore wires the template catalog + desired-state store. The store is
+// mandatory — every template lookup and spec persist goes through it — so main
+// must call this at startup, before the server begins accepting requests
+// (tests pass a store.Memory). Unlike SetHosts it is NOT a concurrent hot-swap.
+func (s *Service) SetStore(st Store) { s.store = st }
 
 // SetIngress enables ingress reconciliation. network is the shared podman
 // network app pods join; passing a real controller marks ingress enabled so
@@ -121,7 +127,7 @@ func (s *Service) ingressEnabled() bool { return s.ingressNet != "" }
 // other instance on the host. Enforcing them up front keeps an invalid spec out
 // of the store; otherwise it would poison deriveRoutes and fail every later
 // reconcile on the host. A request with no domains is always allowed.
-func (s *Service) validateIngress(ctx context.Context, host string, req ApplyRequest, tmpl config.Template) error {
+func (s *Service) validateIngress(ctx context.Context, host string, req ApplyRequest, tmpl store.Template) error {
 	if len(req.Domains) == 0 {
 		return nil
 	}
@@ -130,9 +136,6 @@ func (s *Service) validateIngress(ctx context.Context, host string, req ApplyReq
 	}
 	if tmpl.Meta.Ingress == nil {
 		return fmt.Errorf("instance %s/%s declares domains but template %q has no ingress", req.Template, req.Slug, req.Template)
-	}
-	if s.store == nil {
-		return nil
 	}
 	keys, err := s.store.ListSpecKeys(ctx, host)
 	if err != nil {
@@ -172,12 +175,20 @@ func (s *Service) host(id string) (config.Host, bool) {
 	return h, ok
 }
 
-// hasTemplate reports whether a template id is configured. A helper (rather than
-// a direct map reach-in) keeps the templates map encapsulated — load-bearing the
-// day templates move to a live-reloadable store.
-func (s *Service) hasTemplate(id string) bool {
-	_, ok := s.templates[id]
-	return ok
+// hasTemplate reports whether a template id is present in the catalog. It
+// distinguishes a genuinely-absent template (store.ErrNotFound → (false, nil))
+// from a transient store error ((false, err)): the caller (ReconcileMigrate)
+// makes a terminal "template gone" decision on absence, so a recoverable lookup
+// failure must NOT be mistaken for absence.
+func (s *Service) hasTemplate(ctx context.Context, id string) (bool, error) {
+	_, err := s.store.GetTemplate(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Service) instanceLock(host, tmpl, slug string) *sync.Mutex {
@@ -209,13 +220,16 @@ func (s *Service) hostLock(host string) *sync.Mutex {
 	return m
 }
 
-func (s *Service) lookup(host, tmpl string) (config.Template, error) {
+func (s *Service) lookup(ctx context.Context, host, tmpl string) (store.Template, error) {
 	if _, ok := s.host(host); !ok {
-		return config.Template{}, ErrUnknownHost
+		return store.Template{}, ErrUnknownHost
 	}
-	t, ok := s.templates[tmpl]
-	if !ok {
-		return config.Template{}, ErrUnknownTemplate
+	t, err := s.store.GetTemplate(ctx, tmpl)
+	if errors.Is(err, store.ErrNotFound) {
+		return store.Template{}, ErrUnknownTemplate
+	}
+	if err != nil {
+		return store.Template{}, fmt.Errorf("lookup template %q: %w", tmpl, err)
 	}
 	return t, nil
 }
@@ -232,12 +246,23 @@ func instanceSecretName(tmpl, slug, name string) string {
 // manifest is played — this surfaces registry errors fast and avoids the
 // opaque timeout from play kube's implicit pull.
 func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts ApplyOptions) error {
-	tmpl, err := s.lookup(host, req.Template)
+	tmpl, err := s.lookup(ctx, host, req.Template)
 	if err != nil {
 		return err
 	}
+	// Fill any omitted parameters from their ParamDef.Default before validation
+	// and render, so callers can omit optional params for a one-click deploy.
+	// Caller-supplied values always win; only absent keys are filled.
+	req.Parameters = render.ApplyDefaults(tmpl.Meta, req.Parameters)
 	if err := render.Validate(tmpl.Meta, req.Parameters, req.Secrets); err != nil {
 		return fmt.Errorf("validate: %w", err)
+	}
+	// Reject a secret-bearing deploy on a key-less store BEFORE any host mutation.
+	// PutSpec (far below) would reject the same request with ErrSecretsNeedKey, but
+	// only after secrets were created and the pod played — leaving an orphaned pod
+	// and secrets with no spec row. Fail fast here so nothing is mutated. (#61)
+	if len(req.Secrets) > 0 && !s.store.SecretsEnabled() {
+		return store.ErrSecretsNeedKey
 	}
 	// Domain claims are checked host-wide (validateIngress) but only become
 	// durable at PutSpec far below; the per-instance lock does not serialize two
@@ -297,7 +322,7 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 		return ErrInstanceExists
 	}
 
-	yaml, err := render.Render(rawTemplate(tmpl), req.Parameters)
+	yaml, err := render.RenderBody(tmpl.Body, req.Parameters)
 	if err != nil {
 		return fmt.Errorf("render: %w", err)
 	}
@@ -315,14 +340,9 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 
 	// Snapshot secrets (zeroed below) and parameters before persisting, so the
 	// stored spec is independent of the caller's request struct.
-	var secretsCopy map[string]string
-	var paramsCopy map[string]any
-	var domainsCopy []string
-	if s.store != nil {
-		secretsCopy = maps.Clone(req.Secrets)
-		paramsCopy = maps.Clone(req.Parameters)
-		domainsCopy = slices.Clone(req.Domains)
-	}
+	secretsCopy := maps.Clone(req.Secrets)
+	paramsCopy := maps.Clone(req.Parameters)
+	domainsCopy := slices.Clone(req.Domains)
 
 	// Push per-instance secrets, then zero the local copies.
 	for k, v := range req.Secrets {
@@ -355,18 +375,42 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	if err := s.client.PlayKube(ctx, host, yaml, opts.Replace, networks...); err != nil {
 		return fmt.Errorf("play kube: %w", err)
 	}
-	if s.store != nil {
-		sp := store.Spec{
-			Host:       host,
-			Template:   req.Template,
-			Slug:       req.Slug,
-			Parameters: paramsCopy,
-			Secrets:    secretsCopy,
-			Domains:    domainsCopy,
+	sp := store.Spec{
+		Host:       host,
+		Template:   req.Template,
+		Slug:       req.Slug,
+		Parameters: paramsCopy,
+		Secrets:    secretsCopy,
+		Domains:    domainsCopy,
+	}
+	// Recheck the template still exists, then persist the spec — both under the
+	// template read lock so a concurrent DeleteTemplate (write lock) cannot slip
+	// its in-use scan + delete between our recheck and our PutSpec. Ordering
+	// guarantee w.r.t. DeleteTemplate: either we PutSpec first (then Delete's
+	// in-use scan sees this spec and blocks with ErrTemplateInUse), or Delete
+	// completes first (then this recheck finds the template gone and we fail
+	// before persisting). Either way no spec ever references a deleted template.
+	//
+	// Lock order: tmplMu.RLock is taken AFTER the hostLock/instanceLock this Apply
+	// already holds; DeleteTemplate takes only tmplMu.Lock (no host/instance
+	// locks), so the lock sets are disjoint and there is no deadlock cycle.
+	//
+	// Residual window (accepted): if the template is deleted DURING the play above
+	// (before this recheck), we will have played the pod yet fail here — a narrow
+	// orphan-pod window of the same class as a mid-deploy crash. We deliberately
+	// do not hold a lock across the slow image-pull/play to close it.
+	s.tmplMu.RLock()
+	if _, err := s.store.GetTemplate(ctx, req.Template); err != nil {
+		s.tmplMu.RUnlock()
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrUnknownTemplate // template deleted mid-deploy
 		}
-		if err := s.store.PutSpec(ctx, sp); err != nil {
-			return fmt.Errorf("persist spec: %w", err)
-		}
+		return fmt.Errorf("recheck template: %w", err)
+	}
+	err = s.store.PutSpec(ctx, sp)
+	s.tmplMu.RUnlock()
+	if err != nil {
+		return fmt.Errorf("persist spec: %w", err)
 	}
 	if s.ingressEnabled() {
 		if err := s.ingress.Reconcile(ctx, host); err != nil {
@@ -376,16 +420,10 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	return nil
 }
 
-// rawTemplate reconstructs a complete template source from a parsed Template.
-// Render needs the full source because ParseMeta strips the meta block before
-// handing the body to text/template.
-func rawTemplate(t config.Template) string {
-	return "# template-meta:\n#   id: " + t.Meta.ID + "\n#   parameters:\n#     required: []\n---\n" + t.Body
-}
-
 // Get returns the observed shape for an instance.
 func (s *Service) Get(ctx context.Context, host, tmpl, slug string) (Observed, error) {
-	if _, err := s.lookup(host, tmpl); err != nil {
+	t, err := s.lookup(ctx, host, tmpl)
+	if err != nil {
 		return Observed{}, err
 	}
 	p, err := s.client.PodInspect(ctx, host, podName(tmpl, slug))
@@ -395,7 +433,6 @@ func (s *Service) Get(ctx context.Context, host, tmpl, slug string) (Observed, e
 		}
 		return Observed{}, err
 	}
-	t := s.templates[tmpl]
 	var vols []podman.Volume
 	for _, v := range t.Meta.Volumes {
 		name := tmpl + "-" + slug + "-" + v.Name
@@ -403,43 +440,51 @@ func (s *Service) Get(ctx context.Context, host, tmpl, slug string) (Observed, e
 			vols = append(vols, vv)
 		}
 	}
-	return Normalize(p, tmpl, slug, vols, s.secretEnvs[tmpl]), nil
+	return Normalize(p, tmpl, slug, vols, secretEnvNames(t.Body)), nil
 }
 
 // List returns all instances of a given template on a host.
 func (s *Service) List(ctx context.Context, host, tmpl string) ([]Observed, error) {
-	if _, err := s.lookup(host, tmpl); err != nil {
+	t, err := s.lookup(ctx, host, tmpl)
+	if err != nil {
 		return nil, err
 	}
 	pods, err := s.client.PodList(ctx, host, map[string]string{"podman-api/template": tmpl})
 	if err != nil {
 		return nil, err
 	}
+	secretEnvs := secretEnvNames(t.Body)
 	out := make([]Observed, 0, len(pods))
 	for _, p := range pods {
 		slug := p.Labels["podman-api/slug"]
-		out = append(out, Normalize(p, tmpl, slug, nil, s.secretEnvs[tmpl]))
+		out = append(out, Normalize(p, tmpl, slug, nil, secretEnvs))
 	}
 	return out, nil
 }
 
 // ListAllInstances returns every podman-api-managed pod on a host across all
-// known templates. The result is the union of List(host, t) for each loaded
+// known templates. The result is the union of List(host, t) for each catalog
 // template id, so a pod for a template the daemon doesn't know about is
 // silently omitted.
 func (s *Service) ListAllInstances(ctx context.Context, host string) ([]Observed, error) {
 	if _, ok := s.host(host); !ok {
 		return nil, ErrUnknownHost
 	}
+	tmpls, err := s.store.ListTemplates(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list templates: %w", err)
+	}
 	var out []Observed
-	for tmplID := range s.templates {
+	for _, t := range tmpls {
+		tmplID := t.Meta.ID
 		pods, err := s.client.PodList(ctx, host, map[string]string{"podman-api/template": tmplID})
 		if err != nil {
 			return nil, fmt.Errorf("list %s: %w", tmplID, err)
 		}
+		secretEnvs := secretEnvNames(t.Body)
 		for _, p := range pods {
 			slug := p.Labels["podman-api/slug"]
-			out = append(out, Normalize(p, tmplID, slug, nil, s.secretEnvs[tmplID]))
+			out = append(out, Normalize(p, tmplID, slug, nil, secretEnvs))
 		}
 	}
 	return out, nil
@@ -480,7 +525,7 @@ func (s *Service) Restart(ctx context.Context, host, tmpl, slug string) error {
 
 func (s *Service) lifecycle(ctx context.Context, host, tmpl, slug string,
 	op func(context.Context, string, string) error) error {
-	if _, err := s.lookup(host, tmpl); err != nil {
+	if _, err := s.lookup(ctx, host, tmpl); err != nil {
 		return err
 	}
 	lock := s.instanceLock(host, tmpl, slug)
@@ -516,15 +561,10 @@ func (s *Service) Upgrade(ctx context.Context, host string, req ApplyRequest, im
 // spec (parameters + secrets), overrides the "image" parameter, and re-applies
 // with Replace. Existing secrets and parameters are reused as-is — the operator
 // supplies only the new image; rotating a secret is a separate operation.
-// Requires the desired-state store (that is where the reused secrets live):
-// returns ErrStoreDisabled when it is not configured, and ErrInstanceNotFound
-// when no spec is stored for the instance.
+// Returns ErrInstanceNotFound when no spec is stored for the instance.
 func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image string) error {
 	if image == "" {
 		return errors.New("upgrade requires an image")
-	}
-	if s.store == nil {
-		return ErrStoreDisabled
 	}
 	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
 	if err != nil {
@@ -547,10 +587,6 @@ func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image stri
 	}, ApplyOptions{Replace: true})
 }
 
-// HasStore reports whether the desired-state store is configured (so image-only
-// upgrades, which reuse stored secrets, are available).
-func (s *Service) HasStore() bool { return s.store != nil }
-
 // pruneInstanceResources best-effort removes an instance's per-instance secrets
 // and/or named volumes on a host. Both names are deterministic from
 // template+slug, so leaving them behind risks a future deploy of the same slug
@@ -559,7 +595,12 @@ func (s *Service) HasStore() bool { return s.store != nil }
 // reconcile toward "gone"; callers that need durability handle the spec row
 // separately.
 func (s *Service) pruneInstanceResources(ctx context.Context, host, tmpl, slug string, secrets, volumes bool) {
-	t := s.templates[tmpl]
+	t, err := s.store.GetTemplate(ctx, tmpl)
+	if err != nil {
+		// Template gone from the catalog: nothing to derive resource names from.
+		// Best-effort prune, so skip rather than fail the caller's reconcile.
+		return
+	}
 	if secrets {
 		for _, name := range t.Meta.Secrets.PerInstance {
 			_ = s.client.SecretRemove(ctx, host, instanceSecretName(tmpl, slug, name))
@@ -574,7 +615,7 @@ func (s *Service) pruneInstanceResources(ctx context.Context, host, tmpl, slug s
 
 // Delete removes the pod and optionally its volumes and per-instance secrets.
 func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts DeleteOptions) error {
-	if _, err := s.lookup(host, tmpl); err != nil {
+	if _, err := s.lookup(ctx, host, tmpl); err != nil {
 		return err
 	}
 	lock := s.instanceLock(host, tmpl, slug)
@@ -598,10 +639,8 @@ func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts Dele
 	// or an idempotent double-delete — is not an error. Note this happens before
 	// the not-found guard below, so a pod-gone Delete still cleans up the spec
 	// even though it reports ErrInstanceNotFound to the caller.
-	if s.store != nil {
-		if err := s.store.DeleteSpec(ctx, host, tmpl, slug); err != nil && !errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("delete spec: %w", err)
-		}
+	if err := s.store.DeleteSpec(ctx, host, tmpl, slug); err != nil && !errors.Is(err, store.ErrNotFound) {
+		return fmt.Errorf("delete spec: %w", err)
 	}
 	// Reconcile ingress so the deleted instance's routes are dropped. Placed
 	// alongside the spec deletion (before the not-found guard below) so the
@@ -646,13 +685,11 @@ func (s *Service) Hosts() []config.Host {
 	return out
 }
 
-// Templates returns the loaded templates' metadata (read-only view).
-func (s *Service) Templates() []config.Template {
-	out := make([]config.Template, 0, len(s.templates))
-	for _, t := range s.templates {
-		out = append(out, t)
-	}
-	return out
+// Templates returns the catalog's templates (read-only view). A store error is
+// propagated so callers can surface it (e.g. an HTTP 500) rather than rendering
+// an empty catalog as if it succeeded.
+func (s *Service) Templates(ctx context.Context) ([]store.Template, error) {
+	return s.store.ListTemplates(ctx)
 }
 
 // HostLoad returns a point-in-time resource snapshot for a host.
@@ -679,14 +716,14 @@ func (s *Service) HostSecrets(ctx context.Context, host string) ([]podman.Secret
 	return s.client.SecretList(ctx, host)
 }
 
-// PutHostSecret creates-or-rotates a host secret on the host, then (when the
-// store is enabled and persist is true) records the value so a later
-// migrate/evacuate can re-provision it on a destination. We "rotate" by
-// removing then recreating, since podman secrets are immutable. Push happens
-// before persist: we never store a value we failed to apply to the host.
-// The store write is a non-atomic tail — if it fails the host already holds the
-// new value while the store lags; the caller's retry re-rotates and re-persists
-// idempotently, so the divergence is self-healing.
+// PutHostSecret creates-or-rotates a host secret on the host, then (when
+// persist is true) records the value so a later migrate/evacuate can
+// re-provision it on a destination. We "rotate" by removing then recreating,
+// since podman secrets are immutable. Push happens before persist: we never
+// store a value we failed to apply to the host. The store write is a non-atomic
+// tail — if it fails the host already holds the new value while the store lags;
+// the caller's retry re-rotates and re-persists idempotently, so the divergence
+// is self-healing.
 func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []byte, persist bool) error {
 	if _, ok := s.host(host); !ok {
 		return ErrUnknownHost
@@ -699,7 +736,7 @@ func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []
 	if err := s.client.SecretCreate(ctx, host, name, wrapAsKubeSecret(name, value)); err != nil {
 		return err
 	}
-	if s.store != nil && persist {
+	if persist {
 		if err := s.store.PutHostSecret(ctx, host, name, value); err != nil {
 			return fmt.Errorf("persist host secret: %w", err)
 		}
@@ -707,11 +744,10 @@ func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []
 	return nil
 }
 
-// DeleteHostSecret removes a host secret from the host and (when the store is
-// enabled) from the store. Like PutHostSecret, the store write is a non-atomic
-// tail: a store-delete failure surfaces after the host removal succeeded, but a
-// retry skips the already-gone host secret and re-deletes the store row, so the
-// divergence is self-healing.
+// DeleteHostSecret removes a host secret from the host and from the store. Like
+// PutHostSecret, the store write is a non-atomic tail: a store-delete failure
+// surfaces after the host removal succeeded, but a retry skips the already-gone
+// host secret and re-deletes the store row, so the divergence is self-healing.
 func (s *Service) DeleteHostSecret(ctx context.Context, host, name string) error {
 	if _, ok := s.host(host); !ok {
 		return ErrUnknownHost
@@ -719,10 +755,8 @@ func (s *Service) DeleteHostSecret(ctx context.Context, host, name string) error
 	if err := s.client.SecretRemove(ctx, host, name); err != nil && !errors.Is(err, podman.ErrNotFound) {
 		return err
 	}
-	if s.store != nil {
-		if err := s.store.DeleteHostSecret(ctx, host, name); err != nil {
-			return fmt.Errorf("delete persisted host secret: %w", err)
-		}
+	if err := s.store.DeleteHostSecret(ctx, host, name); err != nil {
+		return fmt.Errorf("delete persisted host secret: %w", err)
 	}
 	return nil
 }
@@ -730,7 +764,7 @@ func (s *Service) DeleteHostSecret(ctx context.Context, host, name string) error
 // InstanceVolumes returns the named volumes the API believes belong to this instance.
 // Volumes that don't exist on the host are omitted (no error).
 func (s *Service) InstanceVolumes(ctx context.Context, host, tmpl, slug string) ([]podman.Volume, error) {
-	t, err := s.lookup(host, tmpl)
+	t, err := s.lookup(ctx, host, tmpl)
 	if err != nil {
 		return nil, err
 	}
@@ -821,7 +855,7 @@ func (s *Service) CopyVolume(ctx context.Context, fromHost, toHost, name string)
 
 // Logs returns a channel of log lines from one container in an instance.
 func (s *Service) Logs(ctx context.Context, host, tmpl, slug, container string, opts podman.LogOptions) (<-chan podman.LogLine, error) {
-	if _, err := s.lookup(host, tmpl); err != nil {
+	if _, err := s.lookup(ctx, host, tmpl); err != nil {
 		return nil, err
 	}
 	if _, err := s.client.PodInspect(ctx, host, podName(tmpl, slug)); err != nil {

@@ -15,7 +15,7 @@ func newSvcDrainable(t *testing.T) (*Service, *fake.Fake, []config.Host) {
 	t.Helper()
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	f := fake.New()
-	svc := NewService(f, hosts, []config.Template{pgTemplate(), templateWithHostSecret()})
+	svc, _ := newSvcWith(t, f, hosts, pgTemplate(), templateWithHostSecret())
 	return svc, f, hosts
 }
 

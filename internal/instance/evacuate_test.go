@@ -7,8 +7,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/iotready/podman-api/internal/config"
-	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/store"
 )
 
@@ -115,20 +113,5 @@ func TestResolveEvacuation(t *testing.T) {
 			Map:      map[string]string{"dup": "h2"},
 		})
 		assert.ErrorIs(t, err, ErrInvalidEvacuation)
-	})
-
-	t.Run("store disabled", func(t *testing.T) {
-		hosts := []config.Host{
-			{ID: "h1", Addr: "unix", Socket: "/x"},
-			{ID: "h2", Addr: "unix", Socket: "/y"},
-		}
-		svc := NewService(fake.New(), hosts, []config.Template{pgTemplate()})
-		// No SetStore: s.store stays nil.
-
-		_, err := svc.ResolveEvacuation(ctx, EvacuateRequest{
-			FromHost: "h1",
-			Map:      map[string]string{"db1": "h2"},
-		})
-		assert.ErrorIs(t, err, ErrStoreDisabled)
 	})
 }

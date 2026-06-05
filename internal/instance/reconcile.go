@@ -55,7 +55,16 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	// phase and be swallowed as inconclusive — the same infinite loop the host
 	// guards above prevent. (Templates load once at startup, so removal coincides
 	// with the restart that produced these reconciling jobs.)
-	if !s.hasTemplate(req.Template) {
+	present, terr := s.hasTemplate(ctx, req.Template)
+	if terr != nil {
+		// Transient store error (e.g. SQLITE_BUSY, decrypt, cancellation): do NOT
+		// make the terminal "template gone" decision on a recoverable failure, which
+		// would irreversibly fail an otherwise-recoverable migrate. Treat as
+		// inconclusive so the reconcile is retried.
+		step("reconcile-inconclusive", "template lookup failed: "+terr.Error())
+		return false, false, "", nil
+	}
+	if !present {
 		return true, false, "template " + req.Template + " is no longer configured; manual cleanup required", nil
 	}
 
@@ -131,11 +140,9 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 				s.pruneInstanceResources(mctx, req.FromHost, req.Template, req.Slug, true, true)
 				// A store write is local and reliable; a failure is worth retrying so
 				// the orphan spec row is cleaned.
-				if s.store != nil {
-					if derr := s.store.DeleteSpec(mctx, req.FromHost, req.Template, req.Slug); derr != nil && !errors.Is(derr, store.ErrNotFound) {
-						step("reconcile-inconclusive", "clean source spec: "+derr.Error())
-						return false, false, "", nil
-					}
+				if derr := s.store.DeleteSpec(mctx, req.FromHost, req.Template, req.Slug); derr != nil && !errors.Is(derr, store.ErrNotFound) {
+					step("reconcile-inconclusive", "clean source spec: "+derr.Error())
+					return false, false, "", nil
 				}
 				// Source ingress refresh is best-effort — if it fails, the periodic
 				// ingress loop reconciles from the now row-less state.
@@ -194,9 +201,6 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 // explicit commit marker as Apply's final durable action and gates roll-forward
 // on that fact.
 func (s *Service) destSpecState(ctx context.Context, host, tmpl, slug string) (persisted, ok bool) {
-	if s.store == nil {
-		return true, true // no persistence layer; pod liveness is all there is
-	}
 	_, err := s.store.GetSpec(ctx, host, tmpl, slug)
 	if err == nil {
 		return true, true

@@ -10,9 +10,10 @@ import (
 func meta() Meta {
 	return Meta{
 		ID: "x",
-		Parameters: Parameters{
-			Required: []string{"slug", "image"},
-			Optional: []string{"port"},
+		Parameters: []ParamDef{
+			{Name: "slug", Type: "string", Required: true},
+			{Name: "image", Type: "string", Required: true},
+			{Name: "port", Type: "int"},
 		},
 		Secrets: Secrets{
 			PerInstance:       []string{"auth_secret"},
@@ -63,4 +64,29 @@ func TestValidate_UnknownSecret(t *testing.T) {
 	)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "extra")
+}
+
+func TestValidate_TypedRequiredAndUnknown(t *testing.T) {
+	m := Meta{Parameters: []ParamDef{
+		{Name: "image", Type: "string", Required: true},
+		{Name: "port", Type: "int"},
+	}}
+	err := Validate(m, map[string]any{}, nil)
+	require.ErrorIs(t, err, ErrInvalidParameters)
+	require.Contains(t, err.Error(), `missing required parameter "image"`)
+	err = Validate(m, map[string]any{"image": "x", "bogus": 1}, nil)
+	require.Contains(t, err.Error(), `unknown parameter "bogus"`)
+	require.NoError(t, Validate(m, map[string]any{"image": "x"}, nil))
+}
+
+func TestApplyDefaults_FillsOmitted(t *testing.T) {
+	m := Meta{Parameters: []ParamDef{
+		{Name: "image", Type: "string", Required: true},
+		{Name: "port", Type: "int", Default: 8080},
+	}}
+	eff := ApplyDefaults(m, map[string]any{"image": "nginx:1"})
+	require.Equal(t, "nginx:1", eff["image"])
+	require.EqualValues(t, 8080, eff["port"])
+	eff = ApplyDefaults(m, map[string]any{"image": "x", "port": 9090})
+	require.EqualValues(t, 9090, eff["port"])
 }

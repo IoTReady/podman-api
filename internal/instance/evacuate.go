@@ -35,9 +35,6 @@ func (s *Service) ResolveEvacuation(ctx context.Context, req EvacuateRequest) ([
 	if _, ok := s.host(req.FromHost); !ok {
 		return nil, ErrUnknownHost
 	}
-	if s.store == nil {
-		return nil, ErrStoreDisabled
-	}
 	keys, err := s.store.ListSpecKeys(ctx, req.FromHost)
 	if err != nil {
 		return nil, err

@@ -28,14 +28,12 @@ func reconcileSvc(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
 		{ID: "h1", Addr: "unix", Socket: "/a"},
 		{ID: "h2", Addr: "unix", Socket: "/b"},
 	}
-	tmpls := []config.Template{{Meta: render.Meta{
+	webTmpl := store.Template{Meta: render.Meta{
 		ID:      "web",
 		Volumes: []render.Volume{{Name: "data"}},
 		Secrets: render.Secrets{PerInstance: []string{"password"}},
-	}}}
-	svc := NewService(fc, hosts, tmpls)
-	st := store.NewMemory()
-	svc.SetStore(st)
+	}}
+	svc, st := newSvcWith(t, fc, hosts, webTmpl)
 	return svc, fc, st
 }
 
@@ -349,6 +347,38 @@ func TestReconcileMigrate_UnknownTemplate_Terminal(t *testing.T) {
 	}
 	if !strings.Contains(msg, "template") || !strings.Contains(msg, "no longer configured") {
 		t.Fatalf("message %q should mention the template is no longer configured", msg)
+	}
+}
+
+// transientTemplateStore wraps a Store but makes GetTemplate return a fixed
+// non-ErrNotFound error, simulating a transient store failure (SQLITE_BUSY,
+// decrypt, cancellation) during the template lookup.
+type transientTemplateStore struct {
+	Store
+	err error
+}
+
+func (s transientTemplateStore) GetTemplate(context.Context, string) (store.Template, error) {
+	return store.Template{}, s.err
+}
+
+// TestReconcileMigrate_TemplateLookupTransient_Inconclusive verifies the #61
+// review fix: a transient store error during the template-presence check must NOT
+// be mistaken for "template gone" (a terminal, irreversible decision); it must
+// surface as inconclusive so the reconcile is retried.
+func TestReconcileMigrate_TemplateLookupTransient_Inconclusive(t *testing.T) {
+	svc, _, st := reconcileSvc(t)
+	svc.SetStore(transientTemplateStore{Store: st, err: errors.New("db busy")})
+
+	resolved, ok, msg, err := svc.ReconcileMigrate(context.Background(), req(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved || ok {
+		t.Fatalf("got resolved=%v ok=%v, want false/false (transient lookup error must be inconclusive, not terminal)", resolved, ok)
+	}
+	if msg != "" {
+		t.Fatalf("inconclusive result must carry no terminal message, got %q", msg)
 	}
 }
 

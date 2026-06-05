@@ -64,7 +64,7 @@ func (s *Service) PlanEvacuation(ctx context.Context, req EvacuateRequest) (Evac
 // the move is still surfaced rather than blanking the whole plan.
 func (s *Service) planMove(ctx context.Context, m MigrateRequest) PlannedMove {
 	pm := PlannedMove{Slug: m.Slug, Template: m.Template, ToHost: m.ToHost, Issues: []PlanIssue{}, Provisions: []string{}}
-	tmpl, err := s.lookup(m.ToHost, m.Template)
+	tmpl, err := s.lookup(ctx, m.ToHost, m.Template)
 	if err != nil {
 		pm.Issues = append(pm.Issues, PlanIssue{Code: codeCheckError, Message: err.Error()})
 		return pm
@@ -78,7 +78,8 @@ func (s *Service) planMove(ctx context.Context, m MigrateRequest) PlannedMove {
 	eff["slug"] = m.Slug // canonical slug always wins; pod name must match podName()
 	// Predict the executor's Apply-time contract check: Migrate ultimately calls
 	// Apply on the destination, which runs render.Validate. The live port check
-	// below only renders (render.Render tolerates missing keys), so without this
+	// below only renders the body (RenderBody fills defaults but does not run the
+	// contract validation), so without this
 	// a spec stored under an old, looser template contract would preview ok=true
 	// yet fail the real evacuate at apply.
 	if err := render.Validate(tmpl.Meta, eff, spec.Secrets); err != nil {

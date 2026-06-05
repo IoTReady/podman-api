@@ -8,10 +8,10 @@ import (
 	"github.com/iotready/podman-api/internal/podman"
 )
 
-// instanceView builds the instance-detail render data, including whether the
-// image-only Upgrade action is available (it needs the desired-state store).
+// instanceView builds the instance-detail render data. Upgrade is always
+// available since the desired-state store is always present.
 func (u *UI) instanceView(host string, obs instance.Observed) map[string]any {
-	return map[string]any{"Host": host, "Inst": obs, "CanUpgrade": u.cfg.Svc.HasStore()}
+	return map[string]any{"Host": host, "Inst": obs, "CanUpgrade": true}
 }
 
 func (u *UI) instanceDetail(w http.ResponseWriter, r *http.Request) {

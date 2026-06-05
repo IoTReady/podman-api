@@ -11,15 +11,18 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 )
 
-func webSpecStore() *memStore {
-	return &memStore{specs: []store.Spec{
-		{Host: "h1", Template: "web", Slug: "blog", Domains: []string{"blog.example.com"}},
-	}}
+// webSpecStore returns a store seeded with one web instance (with a domain) and
+// the ingress-declaring "web" template the controller resolves its backend from.
+func webSpecStore(t *testing.T) *store.Memory {
+	return newMemStore(t,
+		[]store.Spec{{Host: "h1", Template: "web", Slug: "blog", Domains: []string{"blog.example.com"}}},
+		webTemplate("web", 8080),
+	)
 }
 
 func TestReconcileFreshHostSeedsAndPlays(t *testing.T) {
 	f := fake.New()
-	c := NewCaddyController(f, webSpecStore(), map[string]TemplateIngress{"web": {Port: 8080}},
+	c := NewCaddyController(f, webSpecStore(t),
 		Config{Network: "podman-api-ingress", CaddyImage: "docker.io/library/caddy:2", ACMEEmail: "ops@example.com"})
 
 	require.NoError(t, c.Reconcile(context.Background(), "h1"))
@@ -35,7 +38,7 @@ func TestReconcileFreshHostSeedsAndPlays(t *testing.T) {
 
 func TestReconcileExistingHostCopiesAndReloads(t *testing.T) {
 	f := fake.New()
-	c := NewCaddyController(f, webSpecStore(), map[string]TemplateIngress{"web": {Port: 8080}},
+	c := NewCaddyController(f, webSpecStore(t),
 		Config{Network: "n", CaddyImage: "img", ACMEEmail: "ops@example.com"})
 	require.NoError(t, c.Reconcile(context.Background(), "h1")) // creates the pod
 
@@ -58,8 +61,8 @@ func TestReconcileExistingHostCopiesAndReloads(t *testing.T) {
 
 func TestReconcileNoRoutesNoPodIsNoop(t *testing.T) {
 	f := fake.New()
-	// empty memStore -> zero routes; no Caddy pod exists yet
-	c := NewCaddyController(f, &memStore{}, map[string]TemplateIngress{"web": {Port: 8080}},
+	// empty store -> zero routes; no Caddy pod exists yet
+	c := NewCaddyController(f, store.NewMemory(),
 		Config{Network: "n", CaddyImage: "img", ACMEEmail: "ops@example.com"})
 
 	require.NoError(t, c.Reconcile(context.Background(), "h1"))
@@ -78,7 +81,7 @@ func TestReconcileFailsWhenValidateFails(t *testing.T) {
 		}
 		return podman.ExecResult{}, nil
 	}
-	c := NewCaddyController(f, webSpecStore(), map[string]TemplateIngress{"web": {Port: 8080}},
+	c := NewCaddyController(f, webSpecStore(t),
 		Config{Network: "n", CaddyImage: "img"})
 	require.NoError(t, c.Reconcile(context.Background(), "h1")) // create
 	err := c.Reconcile(context.Background(), "h1")              // cp + failing validate

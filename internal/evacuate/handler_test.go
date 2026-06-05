@@ -22,7 +22,7 @@ import (
 func buildSvc(t *testing.T, slugs ...string) (*instance.Service, *store.Memory) {
 	t.Helper()
 	hosts := []config.Host{{ID: "hostA"}, {ID: "hostB"}, {ID: "hostC"}}
-	svc := instance.NewService(fake.New(), hosts, nil)
+	svc := instance.NewService(fake.New(), hosts)
 	mem := store.NewMemory()
 	svc.SetStore(mem)
 	for _, s := range slugs {
