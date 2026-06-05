@@ -189,6 +189,68 @@ func TestDeployFormDropsValuesForFieldsNotInTemplate(t *testing.T) {
 	}
 }
 
+// TestDeployFormTypedValueBeatsParamDefault locks in the precedence introduced by
+// the #98 typed-parameter model: a one-click default shows on a fresh form, but a
+// value the operator already typed wins over it across a template switch.
+func TestDeployFormTypedValueBeatsParamDefault(t *testing.T) {
+	fc := fake.New()
+	hosts := []config.Host{{ID: "edge-1"}}
+	mem := store.NewMemory()
+	_ = mem.PutTemplate(context.Background(), store.Template{
+		Meta: render.Meta{
+			ID:         "demo",
+			Parameters: []render.ParamDef{{Name: "version", Default: "9.9"}},
+		},
+	})
+	svc := instance.NewService(fc, hosts)
+	svc.SetStore(mem)
+	hash, _ := config.HashToken("pw")
+	u, err := New(Config{
+		Svc:  svc,
+		Auth: NewOperatorAuthenticator(config.Operator{Username: "op", PasswordHash: hash}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fresh form: the parameter default is shown.
+	if body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo").Body.String(); !strings.Contains(body, `value="9.9"`) {
+		t.Error("fresh form should show the parameter default")
+	}
+
+	// Typed value present: it wins over the default.
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&param.version=1.2.3").Body.String()
+	if !strings.Contains(body, `value="1.2.3"`) {
+		t.Error("typed value should be rendered")
+	}
+	if strings.Contains(body, `value="9.9"`) {
+		t.Error("typed value must win over the parameter default")
+	}
+}
+
+func TestDeployCreateErrorPreservesTypedValues(t *testing.T) {
+	u := uiWithTemplate(t)
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{
+		csrfField:         {csrfToken(tok)},
+		"template":        {"demo"},
+		"slug":            {"web"},
+		"secret.password": {"hunter2"},
+		// no param.version → validation fails, form re-renders
+	}
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/deploy", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code == http.StatusOK || w.Code == http.StatusSeeOther {
+		t.Fatalf("expected a non-success status for invalid deploy, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `value="hunter2"`) {
+		t.Error("typed secret should be preserved on a failed-deploy re-render")
+	}
+}
+
 func TestUpgradeApplyMissingImageRerendersForm(t *testing.T) {
 	u := uiWithStoredInstance(t)
 	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
