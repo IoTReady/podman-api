@@ -310,7 +310,7 @@ func (m *Memory) PruneJobs(_ context.Context, olderThan time.Time) (int, error) 
 	defer m.mu.Unlock()
 
 	terminal := func(j Job) bool {
-		return j.State == JobSucceeded || j.State == JobFailed || j.State == JobCanceled
+		return j.State.Terminal()
 	}
 	isOld := func(j Job) bool {
 		return !j.Finished.IsZero() && j.Finished.Before(olderThan)

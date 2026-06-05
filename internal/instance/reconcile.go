@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // destStatus is the destination's reconcile-relevant state.
@@ -49,6 +50,14 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	if _, ok := s.host(req.ToHost); !ok {
 		return true, false, "destination host " + req.ToHost + " is no longer configured; manual cleanup required", nil
 	}
+	// Same for the template: Start/Delete begin with lookup(host, tmpl), so a
+	// template removed from config would otherwise fail inside the compensation
+	// phase and be swallowed as inconclusive — the same infinite loop the host
+	// guards above prevent. (Templates load once at startup, so removal coincides
+	// with the restart that produced these reconciling jobs.)
+	if _, ok := s.templates[req.Template]; !ok {
+		return true, false, "template " + req.Template + " is no longer configured; manual cleanup required", nil
+	}
 
 	// Check source reachability first: it is a single cheap inspect, whereas
 	// destState may poll for up to verifyTimeout. This avoids burning the verify
@@ -78,24 +87,39 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	// strand a half-finished compensation, mirroring Migrate's rollback/commit.
 	mctx := context.WithoutCancel(ctx)
 
-	if ds == destHealthy && s.destSpecPersisted(ctx, req.ToHost, req.Template, req.Slug) {
-		// Dest is a complete, committed replacement. Repair its ingress routes
-		// (idempotent; covers a crash between PutSpec and ingress.Reconcile),
-		// then reap the source.
-		if s.ingressEnabled() {
-			if rerr := s.ingress.Reconcile(mctx, req.ToHost); rerr != nil {
-				step("reconcile-inconclusive", "dest ingress reconcile: "+rerr.Error())
-				return false, false, "", nil
-			}
+	if ds == destHealthy {
+		persisted, ok := s.destSpecState(ctx, req.ToHost, req.Template, req.Slug)
+		if !ok {
+			// The store could not be consulted (transient: cancellation, BUSY,
+			// decrypt). Treat as inconclusive — NOT as "not persisted", which would
+			// wrongly roll back and delete a committed destination.
+			step("reconcile-inconclusive", "destination spec lookup failed")
+			return false, false, "", nil
 		}
-		if srcPresent {
+		if persisted {
+			// Dest is a complete, committed replacement. Repair its ingress routes
+			// (idempotent; covers a crash between PutSpec and ingress.Reconcile),
+			// then reap the source.
+			if s.ingressEnabled() {
+				if rerr := s.ingress.Reconcile(mctx, req.ToHost); rerr != nil {
+					step("reconcile-inconclusive", "dest ingress reconcile: "+rerr.Error())
+					return false, false, "", nil
+				}
+			}
+			// Reap the source unconditionally — pod AND persisted state — even when
+			// the pod is already gone: a crash inside the original commit's Delete
+			// (between PodRemove and DeleteSpec) can leave an orphaned source spec
+			// row that the periodic ingress loop would re-derive into a dead route.
+			// Delete is idempotent toward "gone" (tolerates a missing pod/spec).
 			if derr := s.Delete(mctx, req.FromHost, req.Template, req.Slug, DeleteOptions{PruneVolumes: true, PruneSecrets: true}); derr != nil {
 				step("reconcile-inconclusive", "reap source: "+derr.Error())
 				return false, false, "", nil
 			}
+			step("reconcile-roll-forward", req.ToHost)
+			return true, true, "", nil
 		}
-		step("reconcile-roll-forward", req.ToHost)
-		return true, true, "", nil
+		// dest healthy but spec not persisted (Apply interrupted before commit) —
+		// fall through; the dest must not be treated as the source of truth.
 	}
 
 	// dest absent or unhealthy, OR dest healthy but spec not persisted (Apply
@@ -123,16 +147,34 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	return true, false, "destination left in place; source already removed — manual cleanup required", nil
 }
 
-// destSpecPersisted reports whether the destination's desired-state spec was
-// stored — the last durable step of a migrate's Apply (PlayKube → PutSpec →
-// ingress). A healthy dest pod whose spec is missing means Apply was interrupted
-// before it committed; that dest must NOT be treated as the source of truth.
-func (s *Service) destSpecPersisted(ctx context.Context, host, tmpl, slug string) bool {
+// destSpecState reports whether the destination's desired-state spec was stored
+// — the last durable step of a migrate's Apply (PlayKube → PutSpec → ingress). A
+// healthy dest pod whose spec is missing means Apply was interrupted before it
+// committed; that dest must NOT be treated as the source of truth.
+//
+// ok=false means the store could not be consulted (a transient error: context
+// cancellation, SQLITE_BUSY, a decrypt failure). The caller must treat that as
+// inconclusive and retry — never as "not persisted", which would wrongly roll
+// back (and delete) a committed destination. Only store.ErrNotFound is a
+// definitive "not persisted".
+//
+// TODO(#54): this re-derives Apply's commit point from "a spec row exists", and
+// the ingress repair in the roll-forward branch is evidence the equivalence
+// leaks (a durable step runs after PutSpec). A cleaner design records one
+// explicit commit marker as Apply's final durable action and gates roll-forward
+// on that fact.
+func (s *Service) destSpecState(ctx context.Context, host, tmpl, slug string) (persisted, ok bool) {
 	if s.store == nil {
-		return true // no persistence layer; pod liveness is all there is
+		return true, true // no persistence layer; pod liveness is all there is
 	}
 	_, err := s.store.GetSpec(ctx, host, tmpl, slug)
-	return err == nil
+	if err == nil {
+		return true, true
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		return false, true
+	}
+	return false, false // transient/unknown — caller retries
 }
 
 // destState classifies the destination, distinguishing absent from unreachable
