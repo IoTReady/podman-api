@@ -21,6 +21,18 @@ type failingStore struct {
 	store.Store
 }
 
+// getErrStore makes GetHostSecret fail with a non-NotFound (infra) error, to
+// exercise the store-lookup-error path. Embeds a real Memory so the other
+// store.Store methods still work.
+type getErrStore struct {
+	*store.Memory
+	err error
+}
+
+func (g getErrStore) GetHostSecret(ctx context.Context, host, name string) ([]byte, error) {
+	return nil, g.err
+}
+
 func (failingStore) PutHostSecret(_ context.Context, _, _ string, _ []byte) error {
 	return errors.New("boom")
 }
@@ -252,4 +264,62 @@ func TestMigrate_ProvisionRace_Benign(t *testing.T) {
 
 	_, ierr := f.SecretInspect(ctx, "h2", "shared-pull-token")
 	assert.NoError(t, ierr, "the racing create left the secret present on the dest")
+}
+
+func TestPreflightIssues_StoreErrorCollectsAndContinues(t *testing.T) {
+	ctx := context.Background()
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}, {ID: "h2", Addr: "unix", Socket: "/y"}}
+	f := fake.New()
+	svc := NewService(f, hosts, []config.Template{secretAndPortTemplate()})
+	svc.SetStore(getErrStore{Memory: store.NewMemory(), err: errors.New("store boom")})
+	// Occupy port 9090 on the dest so the port check ALSO fails — proving the
+	// scan continued past the store-lookup error rather than early-returning.
+	f.AddPod("h2", podman.Pod{Name: "occupier", Status: "Running",
+		Containers: []podman.Container{{Name: "c", Ports: []podman.PortMapping{{HostPort: 9090}}}}})
+
+	eff := map[string]any{"slug": "x", "image": "img"}
+	issues, prov := svc.preflightIssues(ctx,
+		MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "needs-both", Slug: "x"},
+		secretAndPortTemplate(), eff)
+
+	assert.Empty(t, prov)
+	require.Len(t, issues, 2, "store-lookup error must not short-circuit the port scan")
+	var sawPort, sawStoreErr bool
+	for _, e := range issues {
+		if errors.Is(e, ErrPortConflict) {
+			sawPort = true
+		} else if !errors.Is(e, ErrHostSecretMissing) {
+			sawStoreErr = true
+		}
+	}
+	assert.True(t, sawPort, "port conflict still reported")
+	assert.True(t, sawStoreErr, "store lookup error reported as its own issue")
+}
+
+func TestMigrate_RecordsDestForChaining(t *testing.T) {
+	svc, f, mem := newHostSecretSvc(t)
+	ctx := context.Background()
+	seedHostSecretInstance(t, f, mem, "s1")
+	require.NoError(t, mem.PutHostSecret(ctx, "h1", "shared-pull-token", []byte("topsecret")))
+
+	require.NoError(t, svc.Migrate(ctx, MigrateRequest{
+		FromHost: "h1", ToHost: "h2", Template: "needs-host-secret", Slug: "s1",
+	}, nil))
+
+	// The destination is now a valid future provisioning source: a later h2->h3
+	// hop must not re-block on ErrHostSecretMissing.
+	got, err := mem.GetHostSecret(ctx, "h2", "shared-pull-token")
+	require.NoError(t, err)
+	assert.Equal(t, []byte("topsecret"), got)
+}
+
+func TestDeleteHostSecret_StoreDeleteFails(t *testing.T) {
+	svc, f, mem := newHostSecretSvc(t)
+	ctx := context.Background()
+	require.NoError(t, f.SecretCreate(ctx, "h1", "shared-pull-token", []byte("v")))
+	mem.DeleteErr = errors.New("store down")
+
+	err := svc.DeleteHostSecret(ctx, "h1", "shared-pull-token")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "delete persisted host secret")
 }

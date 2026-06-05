@@ -86,6 +86,9 @@ func (m *Memory) ListSpecKeys(_ context.Context, host string) ([]SpecKey, error)
 func (m *Memory) PutHostSecret(_ context.Context, host, name string, value []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.PutErr != nil {
+		return m.PutErr
+	}
 	cp := append([]byte(nil), value...)
 	m.hostSecrets[host+"\x00"+name] = cp
 	return nil
@@ -104,6 +107,9 @@ func (m *Memory) GetHostSecret(_ context.Context, host, name string) ([]byte, er
 func (m *Memory) DeleteHostSecret(_ context.Context, host, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.DeleteErr != nil {
+		return m.DeleteErr
+	}
 	delete(m.hostSecrets, host+"\x00"+name)
 	return nil
 }

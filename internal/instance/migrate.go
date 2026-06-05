@@ -166,7 +166,12 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 		// Absent on dest: provisionable from the source host's persisted value?
 		ok, perr := s.hostSecretProvisionable(ctx, req.FromHost, name)
 		if perr != nil {
-			return append(issues, fmt.Errorf("lookup persisted host secret %q: %w", name, perr)), provisionable
+			// A store-lookup failure is a fast local error, not a timeout-prone
+			// RPC: record it as this secret's issue and keep scanning so the
+			// collect-all preview still reports the remaining checks. The executor
+			// (preflightDest) takes the first issue, so it still aborts.
+			issues = append(issues, fmt.Errorf("lookup persisted host secret %q: %w", name, perr))
+			continue
 		}
 		if ok {
 			provisionable = append(provisionable, name)
@@ -289,6 +294,8 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 	for _, name := range tmpl.Meta.Secrets.PerHostReferenced {
 		if _, err := s.client.SecretInspect(ctx, req.ToHost, name); err == nil {
 			continue // already present on dest
+		} else if !errors.Is(err, podman.ErrNotFound) {
+			return fmt.Errorf("inspect dest host secret %q: %w", name, err)
 		}
 		val, err := s.store.GetHostSecret(ctx, req.FromHost, name)
 		if errors.Is(err, store.ErrNotFound) {
@@ -309,6 +316,13 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 			return fmt.Errorf("provision host secret %q: %w", name, err)
 		}
 		step("provision-secret", name)
+		// Record the dest as a valid future provisioning source so multi-hop
+		// evacuations chain (h1->h2->h3). Best-effort: the secret is already on the
+		// dest and the move is sound, so a failed record must not roll back a
+		// healthy migration — a later hop would simply re-provision.
+		if rerr := s.store.PutHostSecret(ctx, req.ToHost, name, val); rerr != nil {
+			step("record-host-secret-failed", name)
+		}
 	}
 
 	vols, err := s.InstanceVolumes(ctx, req.FromHost, req.Template, req.Slug)

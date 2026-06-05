@@ -346,6 +346,9 @@ components:
             When the state store is enabled, also persist this value so a later
             migrate/evacuate can auto-provision the secret on a destination host.
             Set false to push to the host only. No effect when the store is disabled.
+            Note: rotating with persist:false updates the host but not the store,
+            so a later migrate/evacuate would provision the previously-stored
+            (now stale) value onto a destination.
 
     BulkRequest:
       type: object
