@@ -262,6 +262,36 @@ func (m *Memory) MarkReconciling(_ context.Context, kinds []string) (int, error)
 	return n, nil
 }
 
+func (m *Memory) ResolveReconciling(_ context.Context, id string, state JobState, errMsg string) (bool, error) {
+	if state != JobSucceeded && state != JobFailed {
+		return false, fmt.Errorf("store: ResolveReconciling: invalid terminal state %q", state)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.jobs {
+		if m.jobs[i].ID == id && m.jobs[i].State == JobReconciling {
+			m.jobs[i].State = state
+			m.jobs[i].Error = errMsg
+			m.jobs[i].Finished = time.Now()
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (m *Memory) CancelReconciling(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.jobs {
+		if m.jobs[i].ID == id && m.jobs[i].State == JobReconciling {
+			m.jobs[i].State = JobCanceled
+			m.jobs[i].Finished = time.Now()
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (m *Memory) CancelQueued(_ context.Context, id string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

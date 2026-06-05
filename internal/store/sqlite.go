@@ -639,6 +639,50 @@ func (s *SQLite) MarkReconciling(ctx context.Context, kinds []string) (int, erro
 	return int(n), nil
 }
 
+func (s *SQLite) ResolveReconciling(ctx context.Context, id string, state JobState, errMsg string) (bool, error) {
+	if state != JobSucceeded && state != JobFailed {
+		return false, fmt.Errorf("store.ResolveReconciling: invalid terminal state %q", state)
+	}
+	now := time.Now().UnixNano()
+	var e any
+	if errMsg != "" {
+		e = errMsg
+	}
+	var n int64
+	err := s.write(ctx, func() error {
+		res, err := s.db.ExecContext(ctx,
+			`UPDATE jobs SET state=?, error=?, finished=? WHERE id=? AND state='reconciling'`,
+			string(state), e, now, id)
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
+func (s *SQLite) CancelReconciling(ctx context.Context, id string) (bool, error) {
+	now := time.Now().UnixNano()
+	var n int64
+	err := s.write(ctx, func() error {
+		res, err := s.db.ExecContext(ctx,
+			`UPDATE jobs SET state='canceled', finished=? WHERE id=? AND state='reconciling'`, now, id)
+		if err != nil {
+			return err
+		}
+		n, err = res.RowsAffected()
+		return err
+	})
+	if err != nil {
+		return false, err
+	}
+	return n > 0, nil
+}
+
 func (s *SQLite) CancelQueued(ctx context.Context, id string) (bool, error) {
 	now := time.Now().UnixNano()
 	var n int64

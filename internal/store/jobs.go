@@ -97,6 +97,16 @@ type JobStore interface {
 	// startup, before FailRunning, so reconcilable kinds are recovered rather than
 	// failed. An empty kinds slice is a no-op returning 0.
 	MarkReconciling(ctx context.Context, kinds []string) (int, error)
+	// ResolveReconciling transitions a reconciling job to a terminal state
+	// (succeeded or failed), setting finished + error. Compare-and-swap: it
+	// affects only a row currently in reconciling, so it no-ops (returns false) if
+	// an operator cancel already moved it. Passing any non-terminal state is a
+	// programming error.
+	ResolveReconciling(ctx context.Context, id string, state JobState, errMsg string) (bool, error)
+	// CancelReconciling transitions a reconciling job to canceled, setting
+	// finished. Compare-and-swap: affects only a row currently in reconciling,
+	// returning false otherwise. Used by the cancel endpoint as the escape hatch.
+	CancelReconciling(ctx context.Context, id string) (bool, error)
 	// CancelQueued atomically transitions a still-queued job to canceled (setting
 	// finished). Returns true if it transitioned; false if the job was not in the
 	// queued state (already claimed, terminal, or absent).

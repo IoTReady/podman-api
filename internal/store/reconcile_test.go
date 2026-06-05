@@ -90,3 +90,86 @@ func assertState(t *testing.T, js JobStore, id string, want JobState) {
 		t.Fatalf("job %s state = %q, want %q", id, j.State, want)
 	}
 }
+
+func TestResolveReconciling(t *testing.T) {
+	for name, mk := range jobStores(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			js := mk()
+			j, err := js.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := js.ClaimNext(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := js.MarkReconciling(ctx, []string{"migrate"}); err != nil {
+				t.Fatal(err)
+			}
+
+			ok, err := js.ResolveReconciling(ctx, j.ID, JobSucceeded, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("ResolveReconciling returned false, want true")
+			}
+			assertState(t, js, j.ID, JobSucceeded)
+
+			// CAS: a second resolve no-ops (no longer reconciling).
+			ok, err = js.ResolveReconciling(ctx, j.ID, JobFailed, "late")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok {
+				t.Fatal("second ResolveReconciling returned true, want false")
+			}
+			assertState(t, js, j.ID, JobSucceeded) // unchanged
+		})
+	}
+}
+
+func TestResolveReconciling_RejectsNonTerminal(t *testing.T) {
+	js := NewMemory()
+	if _, err := js.ResolveReconciling(context.Background(), "x", JobRunning, ""); err == nil {
+		t.Fatal("ResolveReconciling(running) returned nil error, want rejection")
+	}
+}
+
+func TestCancelReconciling(t *testing.T) {
+	for name, mk := range jobStores(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			js := mk()
+			j, err := js.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := js.ClaimNext(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := js.MarkReconciling(ctx, []string{"migrate"}); err != nil {
+				t.Fatal(err)
+			}
+
+			ok, err := js.CancelReconciling(ctx, j.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ok {
+				t.Fatal("CancelReconciling returned false, want true")
+			}
+			assertState(t, js, j.ID, JobCanceled)
+
+			// CAS: resolving after cancel no-ops (cancel wins).
+			ok, err = js.ResolveReconciling(ctx, j.ID, JobFailed, "loop")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ok {
+				t.Fatal("ResolveReconciling after cancel returned true, want false")
+			}
+			assertState(t, js, j.ID, JobCanceled)
+		})
+	}
+}
