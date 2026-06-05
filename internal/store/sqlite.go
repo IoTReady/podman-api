@@ -239,7 +239,13 @@ func migrateSchema(db *sql.DB) error {
 	if v < 6 {
 		// specs.secrets changes from BLOB NOT NULL to BLOB (nullable).
 		// SQLite does not support DROP NOT NULL via ALTER COLUMN; recreate the
-		// table using the standard rename-copy-drop-rename sequence.
+		// table using the standard rename-copy-drop sequence.
+		// All DDL steps run inside a single transaction so a crash mid-migration
+		// cannot leave the DB without a specs table.
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("migrateSchema v6: begin: %w", err)
+		}
 		steps := []string{
 			`ALTER TABLE specs RENAME TO specs_v5`,
 			`CREATE TABLE specs (
@@ -253,14 +259,21 @@ func migrateSchema(db *sql.DB) error {
   updated    INTEGER NOT NULL,
   PRIMARY KEY (host, template, slug)
 )`,
-			`INSERT INTO specs SELECT host,template,slug,parameters,secrets,domains,created,updated FROM specs_v5`,
+			`INSERT INTO specs SELECT host, template, slug, parameters, secrets, domains, created, updated FROM specs_v5`,
 			`DROP TABLE specs_v5`,
-			`PRAGMA user_version = 6`,
 		}
-		for _, sql := range steps {
-			if _, err := db.Exec(sql); err != nil {
+		for _, stmt := range steps {
+			if _, err := tx.Exec(stmt); err != nil {
+				_ = tx.Rollback()
 				return fmt.Errorf("migrateSchema v6: %w", err)
 			}
+		}
+		if _, err := tx.Exec(`PRAGMA user_version = 6`); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("migrateSchema v6: set user_version: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("migrateSchema v6: commit: %w", err)
 		}
 	}
 	return nil

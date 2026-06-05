@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"path/filepath"
 	"testing"
 
@@ -94,8 +95,8 @@ func TestSQLite_TemplateGetMissing(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 }
 
-// TestMigrateAddsTemplatesTable verifies that a pre-v5 DB (user_version=4,
-// no templates table) is upgraded cleanly to v5 by OpenSQLite.
+// TestMigrateAddsTemplatesTable verifies that a pre-v6 DB (user_version=4,
+// no templates table) is upgraded cleanly to v6 by OpenSQLite.
 func TestMigrateAddsTemplatesTable(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "old.db")
@@ -169,4 +170,51 @@ func TestSQLite_KeylessSpecWithoutSecrets(t *testing.T) {
 	got, err := db.GetSpec(ctx, "h1", "web", "demo")
 	require.NoError(t, err)
 	require.Equal(t, "demo", got.Slug)
+}
+
+// TestMigrateV6_PreservesExistingSecretsBlob verifies that a spec stored in a
+// v5 DB with a real sealed secrets blob is correctly preserved after the v6
+// migration (secrets column made nullable).
+func TestMigrateV6_PreservesExistingSecretsBlob(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "v5.db")
+	ks := NewKeyStore(testKey(0x11))
+
+	// Build a v5 DB by hand: specs table with secrets BLOB NOT NULL, one row
+	// whose secrets column holds a genuinely sealed blob.
+	raw, err := sql.Open("sqlite", "file:"+path)
+	require.NoError(t, err)
+	_, err = raw.Exec(`CREATE TABLE specs (
+  host TEXT NOT NULL, template TEXT NOT NULL, slug TEXT NOT NULL,
+  parameters TEXT NOT NULL, secrets BLOB NOT NULL,
+  domains TEXT NOT NULL DEFAULT '[]',
+  created INTEGER NOT NULL, updated INTEGER NOT NULL,
+  PRIMARY KEY (host, template, slug))`)
+	require.NoError(t, err)
+
+	secJSON, err := json.Marshal(map[string]string{"password": "s3cr3t"})
+	require.NoError(t, err)
+	blob, err := seal(ks.Load(), secJSON)
+	require.NoError(t, err)
+
+	_, err = raw.Exec(`INSERT INTO specs VALUES (?,?,?,?,?,?,?,?)`,
+		"h1", "pg", "demo", `{"user":"app"}`, blob, `[]`, 1000, 1000)
+	require.NoError(t, err)
+	_, err = raw.Exec(`PRAGMA user_version = 5`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	// Reopen via OpenSQLite — this should run the v6 migration.
+	s, err := OpenSQLite(path, ks)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	// Confirm the migration ran.
+	var v int
+	require.NoError(t, s.db.QueryRow(`PRAGMA user_version`).Scan(&v))
+	require.Equal(t, 6, v)
+
+	// The sealed blob must survive the recreate: GetSpec must decrypt it correctly.
+	got, err := s.GetSpec(context.Background(), "h1", "pg", "demo")
+	require.NoError(t, err)
+	require.Equal(t, "s3cr3t", got.Secrets["password"])
 }
