@@ -78,17 +78,17 @@ func TestService_HostSecrets_RoundTrip(t *testing.T) {
 	// Unknown-host guards.
 	_, err := svc.HostSecrets(ctx, "nope")
 	require.ErrorIs(t, err, ErrUnknownHost)
-	require.ErrorIs(t, svc.PutHostSecret(ctx, "nope", "s", []byte("v")), ErrUnknownHost)
+	require.ErrorIs(t, svc.PutHostSecret(ctx, "nope", "s", []byte("v"), true), ErrUnknownHost)
 	require.ErrorIs(t, svc.DeleteHostSecret(ctx, "nope", "s"), ErrUnknownHost)
 
 	// Create.
-	require.NoError(t, svc.PutHostSecret(ctx, "h1", "shared", []byte("v1")))
+	require.NoError(t, svc.PutHostSecret(ctx, "h1", "shared", []byte("v1"), true))
 	secs, err := svc.HostSecrets(ctx, "h1")
 	require.NoError(t, err)
 	require.Len(t, secs, 1)
 
 	// Rotate: existing secret is removed then recreated (still one entry).
-	require.NoError(t, svc.PutHostSecret(ctx, "h1", "shared", []byte("v2")))
+	require.NoError(t, svc.PutHostSecret(ctx, "h1", "shared", []byte("v2"), true))
 	secs, _ = svc.HostSecrets(ctx, "h1")
 	require.Len(t, secs, 1)
 

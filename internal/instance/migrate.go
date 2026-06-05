@@ -14,6 +14,7 @@ import (
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // verify-poll knobs; vars (not consts) so same-package tests can shorten them.
@@ -111,6 +112,25 @@ func (s *Service) requiredHostPorts(tmpl config.Template, params map[string]any)
 		}
 	}
 	return ports, nil
+}
+
+// hostSecretProvisionable reports whether per-host secret `name` — already known
+// absent on the destination — can be auto-provisioned from the source host's
+// persisted value. A non-nil error is an infra/store failure the caller should
+// treat as inconclusive. Returns (false, nil) when the store is disabled or holds
+// no value (i.e. genuinely missing, not an error).
+func (s *Service) hostSecretProvisionable(ctx context.Context, fromHost, name string) (bool, error) {
+	if s.store == nil {
+		return false, nil
+	}
+	switch _, err := s.store.GetHostSecret(ctx, fromHost, name); {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, store.ErrNotFound):
+		return false, nil
+	default:
+		return false, err
+	}
 }
 
 // preflightIssues runs every destination preflight check and returns all

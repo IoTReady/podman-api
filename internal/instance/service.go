@@ -580,9 +580,12 @@ func (s *Service) HostSecrets(ctx context.Context, host string) ([]podman.Secret
 	return s.client.SecretList(ctx, host)
 }
 
-// PutHostSecret creates-or-rotates a host secret. We "rotate" by removing
-// then recreating, since podman secrets are immutable.
-func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []byte) error {
+// PutHostSecret creates-or-rotates a host secret on the host, then (when the
+// store is enabled and persist is true) records the value so a later
+// migrate/evacuate can re-provision it on a destination. We "rotate" by
+// removing then recreating, since podman secrets are immutable. Push happens
+// before persist: we never store a value we failed to apply to the host.
+func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []byte, persist bool) error {
 	if _, ok := s.host(host); !ok {
 		return ErrUnknownHost
 	}
@@ -591,18 +594,30 @@ func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []
 			return err
 		}
 	}
-	return s.client.SecretCreate(ctx, host, name, wrapAsKubeSecret(name, value))
+	if err := s.client.SecretCreate(ctx, host, name, wrapAsKubeSecret(name, value)); err != nil {
+		return err
+	}
+	if s.store != nil && persist {
+		if err := s.store.PutHostSecret(ctx, host, name, value); err != nil {
+			return fmt.Errorf("persist host secret: %w", err)
+		}
+	}
+	return nil
 }
 
 func (s *Service) DeleteHostSecret(ctx context.Context, host, name string) error {
 	if _, ok := s.host(host); !ok {
 		return ErrUnknownHost
 	}
-	err := s.client.SecretRemove(ctx, host, name)
-	if errors.Is(err, podman.ErrNotFound) {
-		return nil
+	if err := s.client.SecretRemove(ctx, host, name); err != nil && !errors.Is(err, podman.ErrNotFound) {
+		return err
 	}
-	return err
+	if s.store != nil {
+		if err := s.store.DeleteHostSecret(ctx, host, name); err != nil {
+			return fmt.Errorf("delete persisted host secret: %w", err)
+		}
+	}
+	return nil
 }
 
 // InstanceVolumes returns the named volumes the API believes belong to this instance.
