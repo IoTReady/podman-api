@@ -129,6 +129,56 @@ func TestReconcileLoop_CancelWins(t *testing.T) {
 	}
 }
 
+// blockingReconciler blocks in Reconcile until ctx is cancelled, then returns
+// resolved=false. It signals started when it has begun blocking.
+type blockingReconciler struct {
+	started chan struct{}
+}
+
+func (b *blockingReconciler) Reconcile(ctx context.Context, _ store.Job, _ *JobContext) (store.JobState, string, bool, error) {
+	close(b.started)
+	<-ctx.Done()
+	return "", "", false, nil
+}
+
+func TestReconcileLoop_CancelInterruptsInFlight(t *testing.T) {
+	ctx := context.Background()
+	js := store.NewMemory()
+	mig, _ := js.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	js.ClaimNext(ctx)
+	js.MarkReconciling(ctx, []string{"migrate"})
+
+	started := make(chan struct{})
+	br := &blockingReconciler{started: started}
+
+	r := NewRunner(js, Registry{}, 2)
+	r.SetReconcilers(Reconcilers{"migrate": br})
+	r.reconcileInterval = 20 * time.Millisecond
+	runCtx, cancel := context.WithCancel(ctx)
+	r.Start(runCtx)
+	t.Cleanup(func() { cancel(); r.Wait() })
+
+	// Wait until the reconciler has started blocking on ctx.Done().
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reconciler never started")
+	}
+
+	// Cancel via the runner's inflight registry.
+	r.Cancel(mig.ID)
+
+	// The reconciler should return promptly now that ctx is cancelled.
+	waitFor(t, func() bool {
+		// The reconciler returned, so inflight entry was removed; job stays
+		// reconciling (resolved=false) but the goroutine is no longer blocking.
+		r.mu.Lock()
+		_, still := r.inflight[mig.ID]
+		r.mu.Unlock()
+		return !still
+	})
+}
+
 func waitForState(t *testing.T, js store.JobStore, id string, want store.JobState) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)

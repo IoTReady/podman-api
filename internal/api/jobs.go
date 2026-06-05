@@ -145,6 +145,9 @@ func (h *handlers) cancelJob(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if ok {
+			if h.canceller != nil {
+				h.canceller.Cancel(id) // best-effort: interrupt an in-flight reconcile pass
+			}
 			h.writeAcceptedJob(w, r, id)
 			return
 		}

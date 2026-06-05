@@ -247,7 +247,7 @@ func migrateOrEvacuateActive(ctx context.Context, js store.JobStore) bool {
 			return true
 		}
 		for _, j := range jobs {
-			if j.State == store.JobQueued || j.State == store.JobRunning {
+			if j.State.Active() {
 				return true
 			}
 		}

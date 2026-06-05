@@ -400,8 +400,9 @@ components:
             only at startup: a migrate that was in flight when the daemon
             restarted is being driven to a consistent end state (rolled forward
             if its destination is already healthy, otherwise rolled back).
-            Cancelling a reconciling job records `canceled` and leaves the source
-            and destination as-is for manual cleanup.
+            Cancelling a reconciling job records `canceled` and signals any
+            in-flight reconciliation pass to stop; a pass that has already begun
+            applying changes may still complete.
         args: {}
         steps:
           type: array
@@ -994,8 +995,9 @@ paths:
         fan-out; child jobs cannot be canceled directly (a child returns 409
         while running). A reconciling job (a migrate restarted mid-flight and
         undergoing startup recovery) can be canceled as an operator escape
-        hatch; the `canceled` state is recorded immediately and the source and
-        destination are left as-is for manual cleanup. A 409 with code
+        hatch; the `canceled` state is recorded immediately and any in-flight
+        reconciliation pass is signaled to stop (a pass already applying changes
+        may still complete). A 409 with code
         `job_not_cancelable` (vs `job_terminal`) is transient — the job was
         just claimed but is not yet cancelable; retry shortly.
       parameters:

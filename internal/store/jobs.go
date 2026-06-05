@@ -21,6 +21,18 @@ const (
 	JobCanceled    JobState = "canceled"
 )
 
+// Active reports whether the job is in a non-terminal state — queued, running,
+// or reconciling — i.e. work that may still mutate hosts. Guards that must not
+// run concurrently with a migrate-class job should use this so a new
+// non-terminal state cannot silently slip past them.
+func (s JobState) Active() bool {
+	return s == JobQueued || s == JobRunning || s == JobReconciling
+}
+
+// Terminal reports whether the job has reached a final state (succeeded, failed,
+// or canceled).
+func (s JobState) Terminal() bool { return !s.Active() }
+
 // JobStep is one progress entry recorded by a handler.
 type JobStep struct {
 	TS     time.Time `json:"ts"`

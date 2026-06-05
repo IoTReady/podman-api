@@ -65,6 +65,15 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 		return false, false, "", nil
 	}
 
+	// An operator cancel (or shutdown) arriving before the compensation phase
+	// aborts without touching the hosts, honoring the cancel "left as-is"
+	// contract. A compensation already begun (below) runs to completion on the
+	// detached context.
+	if ctx.Err() != nil {
+		step("reconcile-canceled", "interrupted before compensation")
+		return false, false, "", nil
+	}
+
 	// Mutations run on a detached context so a sweep/shutdown cancellation cannot
 	// strand a half-finished compensation, mirroring Migrate's rollback/commit.
 	mctx := context.WithoutCancel(ctx)

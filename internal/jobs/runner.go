@@ -282,14 +282,28 @@ func (r *Runner) reconcileSweep(ctx context.Context) {
 
 // reconcileOne runs a single job's reconciler and records the outcome via CAS.
 func (r *Runner) reconcileOne(ctx context.Context, job store.Job, rec Reconciler) {
-	state, message, resolved, err := rec.Reconcile(ctx, job, &JobContext{store: r.store, id: job.ID})
+	jctx, cancel := context.WithCancel(ctx)
+	entry := &inflightJob{cancel: cancel}
+	r.mu.Lock()
+	r.inflight[job.ID] = entry
+	r.mu.Unlock()
+
+	state, message, resolved, err := rec.Reconcile(jctx, job, NewJobContext(r.store, job.ID))
+
+	r.mu.Lock()
+	delete(r.inflight, job.ID)
+	r.mu.Unlock()
+	cancel()
+
 	if err != nil {
 		log.Printf("jobs: reconcile %s errored (will retry): %v", job.ID, err)
 		return
 	}
 	if !resolved {
-		return // inconclusive — retried next sweep
+		return // inconclusive (or interrupted) — retried next sweep, or already terminal
 	}
+	// Use ctx (not the now-cancelled jctx) for the resolve. If an operator cancel
+	// won the race, the job is already canceled and this CAS no-ops.
 	if _, err := r.store.ResolveReconciling(ctx, job.ID, state, message); err != nil {
 		log.Printf("jobs: reconcile resolve %s failed: %v", job.ID, err)
 	}
@@ -358,7 +372,7 @@ func (r *Runner) run(ctx context.Context, job store.Job) {
 	r.inflight[job.ID] = entry
 	r.mu.Unlock()
 
-	err := h.Run(jctx, job, &JobContext{store: r.store, id: job.ID})
+	err := h.Run(jctx, job, NewJobContext(r.store, job.ID))
 
 	r.mu.Lock()
 	canceled := entry.canceled
