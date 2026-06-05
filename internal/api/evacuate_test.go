@@ -181,6 +181,7 @@ type planResp struct {
 			Code    string `json:"code"`
 			Message string `json:"message"`
 		} `json:"issues"`
+		Provisions []string `json:"provisions"`
 	} `json:"moves"`
 }
 
@@ -289,4 +290,19 @@ func TestEvacuatePlan_API_RequiresReadScope(t *testing.T) {
 
 	resp := postEvacuatePlan(t, srv, "t", instance.EvacuateRequest{FromHost: "h1", Map: map[string]string{}})
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
+// provisions is always present in the response (empty when nothing to provision).
+func TestEvacuatePlan_API_ProvisionsSerialized(t *testing.T) {
+	srv, tok, mem, _ := newEvacSrv(t)
+	seedEvacWithParams(t, mem, "db1")
+	resp := postEvacuatePlan(t, srv, tok, instance.EvacuateRequest{
+		FromHost: "h1", Map: map[string]string{"db1": "h2"},
+	})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var out planResp
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	require.Len(t, out.Moves, 1)
+	assert.NotNil(t, out.Moves[0].Provisions, "provisions must serialize as [], not null")
+	assert.Empty(t, out.Moves[0].Provisions)
 }

@@ -32,7 +32,7 @@ type PlannedMove struct {
 	ToHost     string      `json:"to_host"`
 	OK         bool        `json:"ok"` // true iff Issues is empty
 	Issues     []PlanIssue `json:"issues"`
-	Provisions []string    `json:"provisions"` // per-host secrets to be created on dest; [] not null
+	Provisions []string    `json:"provisions"` // per-host secrets auto-provisioned on dest; informational, does not affect ok; [] not null
 }
 
 // PlanIssue is a single reason a move is not clean: a blocking destination

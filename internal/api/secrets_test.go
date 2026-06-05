@@ -26,6 +26,20 @@ func newSrvWithSecrets(t *testing.T) (*httptest.Server, string) {
 	return srv, tok
 }
 
+// The handler accepts the optional "persist" field (default true) and returns 204.
+func TestPutSecret_PersistField(t *testing.T) {
+	srv, tok := newSrvWithSecrets(t)
+	for _, body := range []string{`{"value":"v"}`, `{"value":"v","persist":false}`, `{"value":"v","persist":true}`} {
+		req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/secrets/s1", bytes.NewBufferString(body))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		assert.Equal(t, http.StatusNoContent, resp.StatusCode, "body %s", body)
+	}
+}
+
 func TestPutAndDeleteSecret(t *testing.T) {
 	srv, tok := newSrvWithSecrets(t)
 
