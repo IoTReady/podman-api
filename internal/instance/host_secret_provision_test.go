@@ -198,3 +198,58 @@ func TestMigrate_MissingUnpersistedHostSecretFails(t *testing.T) {
 	require.NoError(t, ierr)
 	assert.Equal(t, "Running", p.Status)
 }
+
+func TestMigrate_ProvisionFails_RollsBack(t *testing.T) {
+	svc, f, mem := newHostSecretSvc(t)
+	ctx := context.Background()
+	seedHostSecretInstance(t, f, mem, "s1")
+	require.NoError(t, mem.PutHostSecret(ctx, "h1", "shared-pull-token", []byte("v")))
+	f.SecretCreateErr = errors.New("disk full") // provisioning the dest secret fails
+
+	err := svc.Migrate(ctx, MigrateRequest{
+		FromHost: "h1", ToHost: "h2", Template: "needs-host-secret", Slug: "s1",
+	}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "provision host secret")
+
+	// Rolled back: source pod restored and still Running.
+	p, ierr := f.PodInspect(ctx, "h1", "needs-host-secret-s1")
+	require.NoError(t, ierr)
+	assert.Equal(t, "Running", p.Status)
+}
+
+// raceCreateClient simulates a concurrent migrate creating the dest host secret
+// in the window between this migrate's inspect and create: SecretCreate records
+// the secret (as the racing sibling would) but still returns an error.
+type raceCreateClient struct {
+	*fake.Fake
+}
+
+func (c *raceCreateClient) SecretCreate(ctx context.Context, h, name string, val []byte) error {
+	_ = c.Fake.SecretCreate(ctx, h, name, val) // the "other" migrate creates it
+	return errors.New("name already in use")
+}
+
+func TestMigrate_ProvisionRace_Benign(t *testing.T) {
+	ctx := context.Background()
+	hosts := []config.Host{
+		{ID: "h1", Addr: "unix", Socket: "/a"},
+		{ID: "h2", Addr: "unix", Socket: "/b"},
+	}
+	f := fake.New()
+	client := &raceCreateClient{Fake: f}
+	mem := store.NewMemory()
+	svc := NewService(client, hosts, []config.Template{templateWithHostSecret()})
+	svc.SetStore(mem)
+
+	seedHostSecretInstance(t, f, mem, "s1")
+	require.NoError(t, mem.PutHostSecret(ctx, "h1", "shared-pull-token", []byte("v")))
+
+	err := svc.Migrate(ctx, MigrateRequest{
+		FromHost: "h1", ToHost: "h2", Template: "needs-host-secret", Slug: "s1",
+	}, nil)
+	require.NoError(t, err, "a benign create race must not fail the migrate")
+
+	_, ierr := f.SecretInspect(ctx, "h2", "shared-pull-token")
+	assert.NoError(t, ierr, "the racing create left the secret present on the dest")
+}

@@ -292,7 +292,10 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 		}
 		val, err := s.store.GetHostSecret(ctx, req.FromHost, name)
 		if errors.Is(err, store.ErrNotFound) {
-			continue // not provisionable; Apply's own pre-check will reject it
+			// Defensive: preflight (same store lookup, before Stop) already gated
+			// this, so it is unreachable in the executor path. Apply's pre-check is
+			// the backstop if it ever is reached.
+			continue
 		}
 		if err != nil {
 			return fmt.Errorf("load host secret %q: %w", name, err)
