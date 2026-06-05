@@ -47,7 +47,18 @@ func (u *UI) lifecycle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		u.renderError(w, r, err)
+		// Keep the detail panel in place and surface the failure as a banner,
+		// rather than replacing #main with a bare error (which would drop the
+		// action buttons). Fall back to a plain error only if the instance is
+		// gone (so we can't render its detail).
+		obs, gerr := u.cfg.Svc.Get(ctx, host, tmpl, slug)
+		if gerr != nil {
+			u.renderError(w, r, err)
+			return
+		}
+		data := u.instanceView(host, obs)
+		data["ActionError"] = err.Error()
+		u.render(w, r, errorStatus(err), "instance-detail", u.pageData(data))
 		return
 	}
 	if action == "delete" {

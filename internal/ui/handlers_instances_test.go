@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -59,6 +60,38 @@ func authedAction(t *testing.T, u *UI, path string) *httptest.ResponseRecorder {
 	w := httptest.NewRecorder()
 	u.Handler().ServeHTTP(w, r)
 	return w
+}
+
+func TestLifecycleFailureKeepsDetailWithBanner(t *testing.T) {
+	fc := fake.New()
+	fc.AddPod("edge-1", podman.Pod{
+		Name:   "postgres-main",
+		Status: "Running",
+		Containers: []podman.Container{
+			{Name: "postgres-main-db", Image: "postgres:16", Status: "Running"},
+		},
+	})
+	fc.LifecycleErr = errors.New("daemon refused")
+	svc := instance.NewService(fc, []config.Host{{ID: "edge-1"}}, []config.Template{{Meta: render.Meta{ID: "postgres"}}})
+	hash, _ := config.HashToken("pw")
+	u, err := New(Config{
+		Svc:  svc,
+		Auth: NewOperatorAuthenticator(config.Operator{Username: "op", PasswordHash: hash}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := authedAction(t, u, "/ui/hosts/edge-1/instances/postgres/main/stop")
+	body := w.Body.String()
+	// The detail panel stays in place (action buttons still present)...
+	if !strings.Contains(body, "Restart") {
+		t.Error("a failed lifecycle action should keep the detail panel, not replace it with a bare error")
+	}
+	// ...with the failure shown as a banner.
+	if !strings.Contains(body, "daemon refused") {
+		t.Error("a failed lifecycle action should surface the error as a banner")
+	}
 }
 
 func TestLifecycleUnknownActionIs400(t *testing.T) {

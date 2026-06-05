@@ -86,6 +86,9 @@ type Fake struct {
 	// SecretCreateErr, if non-nil, makes SecretCreate return this error
 	// instead of recording the secret.
 	SecretCreateErr error
+	// LifecycleErr, if non-nil, makes PodStart/PodStop/PodRestart fail while
+	// leaving the pod in place, to exercise action-failure paths.
+	LifecycleErr error
 	// HostInfoVal is returned by HostInfo when HostInfoErr is nil.
 	HostInfoVal podman.HostInfo
 	// HostInfoErr, if non-nil, makes HostInfo return this error.
@@ -301,6 +304,9 @@ func (f *Fake) PodList(_ context.Context, h string, filters map[string]string) (
 func (f *Fake) setStatus(h, name, status string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.LifecycleErr != nil {
+		return f.LifecycleErr
+	}
 	p, ok := f.hostPods(h)[name]
 	if !ok {
 		return podman.ErrNotFound

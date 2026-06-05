@@ -1,4 +1,5 @@
 {{define "instance-detail"}}
+{{if .ActionError}}<div class="error">{{.ActionError}}</div>{{end}}
 <div class="inst-head">
   <strong>{{.Inst.Template}} / {{.Inst.Slug}}</strong> · {{.Inst.Pod.Status}}
   <span class="actions">
