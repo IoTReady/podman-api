@@ -299,6 +299,13 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 
 	var networks []string
 	if s.ingressEnabled() && tmpl.Meta.Ingress != nil {
+		// The shared ingress network must exist before the app pod can join it.
+		// ensureProxy (during Reconcile, below) also ensures it, but that runs
+		// after this play, so the first ingress deploy on a host would otherwise
+		// fail with "network not found".
+		if err := s.client.NetworkEnsure(ctx, host, s.ingressNet); err != nil {
+			return fmt.Errorf("ensure ingress network: %w", err)
+		}
 		networks = []string{s.ingressNet}
 	}
 	if err := s.client.PlayKube(ctx, host, yaml, opts.Replace, networks...); err != nil {

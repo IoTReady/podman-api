@@ -112,6 +112,7 @@ type PlayCall struct {
 	Host     string
 	Replace  bool
 	Networks []string
+	YAML     string
 }
 
 // ExecCall records one ContainerExec invocation for assertions.
@@ -201,9 +202,17 @@ func (f *Fake) hostVolData(h string) map[string][]byte {
 func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool, networks ...string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.PlayCalls = append(f.PlayCalls, PlayCall{Host: hostID, Replace: replace, Networks: networks})
+	f.PlayCalls = append(f.PlayCalls, PlayCall{Host: hostID, Replace: replace, Networks: networks, YAML: raw})
 	if f.PlayKubeErr != nil {
 		return f.PlayKubeErr
+	}
+	// Model real podman: a pod cannot join a network that does not exist, so the
+	// network must have been created (NetworkEnsure) first. This lets unit tests
+	// catch ordering bugs where an app pod is played before its network exists.
+	for _, n := range networks {
+		if !f.networkEnsuredLocked(hostID, n) {
+			return fmt.Errorf("unable to find network with name or ID %s: network not found", n)
+		}
 	}
 	pods := f.hostPods(hostID)
 	for _, doc := range strings.Split(raw, "\n---\n") {
@@ -433,6 +442,17 @@ func (f *Fake) NetworkEnsure(_ context.Context, host, name string) error {
 	}
 	f.NetworkEnsureCalls[host] = append(f.NetworkEnsureCalls[host], name)
 	return nil
+}
+
+// networkEnsuredLocked reports whether NetworkEnsure has created name on host.
+// Caller must hold f.mu.
+func (f *Fake) networkEnsuredLocked(host, name string) bool {
+	for _, n := range f.NetworkEnsureCalls[host] {
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *Fake) ContainerLogs(_ context.Context, _, _ string, _ podman.LogOptions) (<-chan podman.LogLine, error) {
