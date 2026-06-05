@@ -120,6 +120,9 @@ func TestReconcileLoop_CancelWins(t *testing.T) {
 	t.Cleanup(func() { cancel(); r.Wait() })
 
 	time.Sleep(150 * time.Millisecond) // let a few sweeps run
+	if fr.callCount(mig.ID) != 0 {
+		t.Fatalf("reconciler called %d times for a canceled job, want 0", fr.callCount(mig.ID))
+	}
 	if j, _ := js.GetJob(ctx, mig.ID); j.State != store.JobCanceled {
 		t.Fatalf("state = %q, want canceled (cancel must win the CAS)", j.State)
 	}

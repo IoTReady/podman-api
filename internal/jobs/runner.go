@@ -36,11 +36,16 @@ type Handler interface {
 type Registry map[string]Handler
 
 // Reconciler drives a job that was interrupted by a daemon restart toward a
-// consistent state. It is registered per kind, parallel to Handler. resolved
-// reports whether a terminal state was reached: resolved=false means the attempt
-// was inconclusive (e.g. a host was unreachable) and the job should stay
-// reconciling and be retried on the next sweep. A non-nil err is logged and
-// treated as inconclusive.
+// consistent state. It is registered per kind, parallel to Handler.
+//
+// The implementation should honour ctx for cancellation so that a daemon
+// shutdown does not hang the reconcile sweep.
+//
+// resolved reports whether a terminal state was reached. When resolved is
+// true, state must be a terminal state (JobSucceeded or JobFailed).
+// resolved=false means the attempt was inconclusive (e.g. a host was
+// unreachable) and the job should stay reconciling and be retried on the next
+// sweep. A non-nil err is logged and treated as inconclusive.
 type Reconciler interface {
 	Reconcile(ctx context.Context, job store.Job, jc *JobContext) (state store.JobState, resolved bool, err error)
 }
@@ -246,6 +251,8 @@ func (r *Runner) reconcileSweep(ctx context.Context) {
 		log.Printf("jobs: reconcile list failed: %v", err)
 		return
 	}
+	// Limit: at most MaxJobLimit (1000) reconciling jobs are processed per sweep;
+	// any beyond that are picked up on the next sweep.
 	sem := make(chan struct{}, r.workers)
 	var wg sync.WaitGroup
 	for _, job := range jobsToDo {
@@ -254,8 +261,13 @@ func (r *Runner) reconcileSweep(ctx context.Context) {
 			log.Printf("jobs: no reconciler for reconciling job %s (kind %s)", job.ID, job.Kind)
 			continue
 		}
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			wg.Wait() // let in-flight reconciles finish, then stop launching new ones
+			return
+		}
 		wg.Add(1)
-		sem <- struct{}{}
 		go func(job store.Job, rec Reconciler) {
 			defer wg.Done()
 			defer func() { <-sem }()
