@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"regexp"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -18,11 +17,6 @@ var (
 	ErrTemplateInUse  = errors.New("template is in use by one or more instances")
 	ErrTemplateExists = errors.New("template already exists")
 )
-
-// templateNameRe mirrors the api package's nameRe: a DNS-label-style allowlist
-// used to validate template ids before they flow into pod/secret/volume names
-// and rendered YAML. Kept here because the api copy is unexported.
-var templateNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$`)
 
 // GetTemplate returns a stored template by id (ErrUnknownTemplate if absent).
 func (s *Service) GetTemplate(ctx context.Context, id string) (store.Template, error) {
@@ -39,6 +33,9 @@ func (s *Service) GetTemplate(ctx context.Context, id string) (store.Template, e
 // CreateTemplate validates t and persists it; ErrTemplateExists if the id
 // already exists. Origin defaults to "user" when the caller leaves it blank.
 func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
+	if err := render.NormalizeParams(&t.Meta); err != nil {
+		return err
+	}
 	if err := validateTemplate(t); err != nil {
 		return err
 	}
@@ -57,6 +54,9 @@ func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
 // (ErrUnknownTemplate otherwise). The stored Origin is preserved so an edit
 // cannot silently flip a "seed" template to "user".
 func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
+	if err := render.NormalizeParams(&t.Meta); err != nil {
+		return err
+	}
 	if err := validateTemplate(t); err != nil {
 		return err
 	}
@@ -80,6 +80,9 @@ func (s *Service) CloneTemplate(ctx context.Context, srcID, newID string) (store
 	cl.Origin = "user"
 	cl.Created = time.Time{}
 	cl.Updated = time.Time{}
+	if err := render.NormalizeParams(&cl.Meta); err != nil {
+		return store.Template{}, err
+	}
 	if err := validateTemplate(cl); err != nil {
 		return store.Template{}, err
 	}
@@ -91,7 +94,9 @@ func (s *Service) CloneTemplate(ctx context.Context, srcID, newID string) (store
 	if err := s.store.PutTemplate(ctx, cl); err != nil {
 		return store.Template{}, err
 	}
-	return cl, nil
+	// Re-fetch so the returned value reflects what was actually stored
+	// (including any timestamps set by the store).
+	return s.GetTemplate(ctx, newID)
 }
 
 // DeleteTemplate removes a template. Unless force is set it is rejected with
@@ -122,8 +127,8 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string, force bool) err
 //  3. If the template declares ingress, the rendered pod must contain a
 //     container whose name matches Ingress.Container.
 func validateTemplate(t store.Template) error {
-	if !templateNameRe.MatchString(t.Meta.ID) {
-		return fmt.Errorf("invalid template id %q: must match %s", t.Meta.ID, templateNameRe.String())
+	if !render.ValidName(t.Meta.ID) {
+		return fmt.Errorf("invalid template id %q: must match %s", t.Meta.ID, render.NameRe.String())
 	}
 
 	rendered, err := render.RenderBody(t.Body, dummyParams(t.Meta))

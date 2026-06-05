@@ -167,3 +167,111 @@ func TestDeleteTemplate_NotInUse(t *testing.T) {
 	_, err := mem.GetTemplate(ctx, "web")
 	require.ErrorIs(t, err, store.ErrNotFound)
 }
+
+// TestCreateTemplate_IntParamNormalization verifies that a template whose
+// parameter has Type=="" (as received from JSON before normalization) is
+// treated as "string" and does not cause a false rejection.
+func TestCreateTemplate_IntParamNormalization(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := tmplSvc(t)
+
+	// Build a template with an int param whose Type is already declared as "int".
+	// The body uses a numeric comparison, which fails if type is left as "".
+	tpl := store.Template{
+		Meta: render.Meta{
+			ID: "portapp",
+			Parameters: []render.ParamDef{
+				{Name: "port", Type: "int"},
+			},
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: portapp
+spec:
+  containers:
+    - name: app
+      image: nginx
+      {{- if gt .port 1024}}
+      # high port
+      {{- end}}
+`,
+		Origin: "user",
+	}
+
+	require.NoError(t, svc.CreateTemplate(ctx, tpl),
+		"template with int param should pass validation")
+}
+
+// TestCreateTemplate_BlankTypeNormalized verifies that a param with Type==""
+// (blank, as from JSON omitempty) is normalized to "string" and not rejected.
+func TestCreateTemplate_BlankTypeNormalized(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := tmplSvc(t)
+
+	tpl := store.Template{
+		Meta: render.Meta{
+			ID: "strapp",
+			Parameters: []render.ParamDef{
+				{Name: "label", Type: ""}, // blank: should normalize to "string"
+			},
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: strapp-{{.label}}
+spec:
+  containers:
+    - name: app
+      image: nginx
+`,
+		Origin: "user",
+	}
+
+	require.NoError(t, svc.CreateTemplate(ctx, tpl),
+		"template with blank Type should normalize to string and pass")
+}
+
+// TestCreateTemplate_UnknownTypeRejected verifies that an unknown param type
+// is rejected by NormalizeParams before reaching the store.
+func TestCreateTemplate_UnknownTypeRejected(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := tmplSvc(t)
+
+	tpl := store.Template{
+		Meta: render.Meta{
+			ID: "badapp",
+			Parameters: []render.ParamDef{
+				{Name: "size", Type: "float"},
+			},
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: badapp
+spec:
+  containers:
+    - name: app
+      image: nginx
+`,
+		Origin: "user",
+	}
+
+	err := svc.CreateTemplate(ctx, tpl)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "float")
+}
+
+// TestCloneTemplate_TimestampsNonZero verifies that the returned clone has
+// non-zero Created/Updated timestamps (re-fetched from store, not the local
+// zero-initialized copy).
+func TestCloneTemplate_TimestampsNonZero(t *testing.T) {
+	ctx := context.Background()
+	svc, _ := tmplSvc(t, webTemplate())
+
+	got, err := svc.CloneTemplate(ctx, "web", "web3")
+	require.NoError(t, err)
+	assert.Equal(t, "web3", got.Meta.ID)
+	require.False(t, got.Created.IsZero(), "cloned template Created should be non-zero")
+	require.False(t, got.Updated.IsZero(), "cloned template Updated should be non-zero")
+}

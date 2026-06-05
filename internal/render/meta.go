@@ -4,10 +4,17 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
 )
+
+// NameRe is the DNS-label constraint for template ids and instance slugs.
+var NameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$`)
+
+// ValidName reports whether s is a valid template id / name.
+func ValidName(s string) bool { return NameRe.MatchString(s) }
 
 // Meta describes a template's parameter and secret contract.
 // It is parsed from the leading "# template-meta:" comment block.
@@ -64,6 +71,19 @@ var validParamTypes = map[string]bool{
 	"int":    true,
 	"bool":   true,
 	"select": true,
+}
+
+// NormalizeParams normalizes each parameter's Type (blank → "string") and
+// returns an error for an unknown type (allowed: string|int|bool|select).
+func NormalizeParams(m *Meta) error {
+	for i, p := range m.Parameters {
+		if p.Type == "" {
+			m.Parameters[i].Type = "string"
+		} else if !validParamTypes[p.Type] {
+			return fmt.Errorf("template-meta: parameter %q has unknown type %q", p.Name, p.Type)
+		}
+	}
+	return nil
 }
 
 // RequiredParams returns the names of all required parameters.
@@ -175,12 +195,8 @@ func ParseMeta(src string) (Meta, string, error) {
 	}
 
 	// Validate and normalise parameter types.
-	for i, p := range wrapper.Meta.Parameters {
-		if p.Type == "" {
-			wrapper.Meta.Parameters[i].Type = "string"
-		} else if !validParamTypes[p.Type] {
-			return Meta{}, "", fmt.Errorf("template-meta: parameter %q has unknown type %q", p.Name, p.Type)
-		}
+	if err := NormalizeParams(&wrapper.Meta); err != nil {
+		return Meta{}, "", err
 	}
 
 	if ing := wrapper.Meta.Ingress; ing != nil {
