@@ -19,16 +19,17 @@ type fakeReconciler struct {
 
 type fakeOutcome struct {
 	state    store.JobState
+	message  string
 	resolved bool
 	err      error
 }
 
-func (f *fakeReconciler) Reconcile(_ context.Context, job store.Job, _ *JobContext) (store.JobState, bool, error) {
+func (f *fakeReconciler) Reconcile(_ context.Context, job store.Job, _ *JobContext) (store.JobState, string, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls[job.ID]++
 	o := f.outcomes[job.ID]
-	return o.state, o.resolved, o.err
+	return o.state, o.message, o.resolved, o.err
 }
 
 func (f *fakeReconciler) callCount(id string) int {
@@ -47,7 +48,7 @@ func TestStart_BootTransition(t *testing.T) {
 
 	r := NewRunner(js, Registry{}, 2)
 	r.SetReconcilers(Reconcilers{"migrate": &fakeReconciler{
-		outcomes: map[string]fakeOutcome{mig.ID: {store.JobSucceeded, true, nil}},
+		outcomes: map[string]fakeOutcome{mig.ID: {state: store.JobSucceeded, resolved: true}},
 		calls:    map[string]int{},
 	}})
 	runCtx, cancel := context.WithCancel(ctx)
@@ -69,7 +70,7 @@ func TestReconcileLoop_RetriesInconclusive(t *testing.T) {
 	js.ClaimNext(ctx)
 
 	fr := &fakeReconciler{
-		outcomes: map[string]fakeOutcome{mig.ID: {"", false, nil}}, // inconclusive forever
+		outcomes: map[string]fakeOutcome{mig.ID: {resolved: false}}, // inconclusive forever
 		calls:    map[string]int{},
 	}
 	r := NewRunner(js, Registry{}, 2)
@@ -109,7 +110,7 @@ func TestReconcileLoop_CancelWins(t *testing.T) {
 		t.Fatal("CancelReconciling failed to set up the test")
 	}
 	fr := &fakeReconciler{
-		outcomes: map[string]fakeOutcome{mig.ID: {store.JobFailed, true, nil}},
+		outcomes: map[string]fakeOutcome{mig.ID: {state: store.JobFailed, resolved: true}},
 		calls:    map[string]int{},
 	}
 	r := NewRunner(js, Registry{}, 2)

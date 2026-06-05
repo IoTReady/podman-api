@@ -12,7 +12,7 @@ import (
 
 func TestReconciler_BadArgs_Fails(t *testing.T) {
 	r := &Reconciler{Svc: &instance.Service{}}
-	state, resolved, err := r.Reconcile(context.Background(),
+	state, _, resolved, err := r.Reconcile(context.Background(),
 		store.Job{ID: "j1", Kind: "migrate", Args: json.RawMessage(`not json`)},
 		jobs.NewJobContext(store.NewMemory(), "j1"))
 	if err != nil {

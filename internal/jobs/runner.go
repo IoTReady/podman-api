@@ -46,8 +46,11 @@ type Registry map[string]Handler
 // resolved=false means the attempt was inconclusive (e.g. a host was
 // unreachable) and the job should stay reconciling and be retried on the next
 // sweep. A non-nil err is logged and treated as inconclusive.
+//
+// message is the operator-facing text recorded in the job's error field for a
+// terminal failed outcome; it should be empty for success.
 type Reconciler interface {
-	Reconcile(ctx context.Context, job store.Job, jc *JobContext) (state store.JobState, resolved bool, err error)
+	Reconcile(ctx context.Context, job store.Job, jc *JobContext) (state store.JobState, message string, resolved bool, err error)
 }
 
 // Reconcilers maps a job kind to its reconciler.
@@ -279,7 +282,7 @@ func (r *Runner) reconcileSweep(ctx context.Context) {
 
 // reconcileOne runs a single job's reconciler and records the outcome via CAS.
 func (r *Runner) reconcileOne(ctx context.Context, job store.Job, rec Reconciler) {
-	state, resolved, err := rec.Reconcile(ctx, job, &JobContext{store: r.store, id: job.ID})
+	state, message, resolved, err := rec.Reconcile(ctx, job, &JobContext{store: r.store, id: job.ID})
 	if err != nil {
 		log.Printf("jobs: reconcile %s errored (will retry): %v", job.ID, err)
 		return
@@ -287,16 +290,9 @@ func (r *Runner) reconcileOne(ctx context.Context, job store.Job, rec Reconciler
 	if !resolved {
 		return // inconclusive — retried next sweep
 	}
-	if _, err := r.store.ResolveReconciling(ctx, job.ID, state, reconcileErrMsg(state)); err != nil {
+	if _, err := r.store.ResolveReconciling(ctx, job.ID, state, message); err != nil {
 		log.Printf("jobs: reconcile resolve %s failed: %v", job.ID, err)
 	}
-}
-
-func reconcileErrMsg(state store.JobState) string {
-	if state == store.JobFailed {
-		return "reconciled after daemon restart: rolled back"
-	}
-	return ""
 }
 
 func (r *Runner) worker(ctx context.Context) {

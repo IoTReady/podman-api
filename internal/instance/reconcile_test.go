@@ -3,6 +3,7 @@ package instance
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -51,7 +52,7 @@ func TestReconcileMigrate_RollForward(t *testing.T) {
 	fc.AddPod("h1", healthyPod("web-x")) // source present
 	fc.AddPod("h2", healthyPod("web-x")) // dest healthy
 
-	resolved, ok, err := svc.ReconcileMigrate(context.Background(), req(), nil)
+	resolved, ok, _, err := svc.ReconcileMigrate(context.Background(), req(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,7 +69,7 @@ func TestReconcileMigrate_RollForward_SourceGone(t *testing.T) {
 	svc, fc := reconcileSvc(t)
 	fc.AddPod("h2", healthyPod("web-x")) // dest healthy, no source
 
-	resolved, ok, err := svc.ReconcileMigrate(context.Background(), req(), nil)
+	resolved, ok, _, err := svc.ReconcileMigrate(context.Background(), req(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +83,7 @@ func TestReconcileMigrate_RollBack(t *testing.T) {
 	fc.AddPod("h1", healthyPod("web-x"))   // source present (stopped or running)
 	fc.AddPod("h2", unhealthyPod("web-x")) // dest unhealthy
 
-	resolved, ok, err := svc.ReconcileMigrate(context.Background(), req(), nil)
+	resolved, ok, _, err := svc.ReconcileMigrate(context.Background(), req(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +100,7 @@ func TestReconcileMigrate_DestAbsent_SourcePresent_RollsBack(t *testing.T) {
 	svc, fc := reconcileSvc(t)
 	fc.AddPod("h1", healthyPod("web-x")) // source present, dest absent
 
-	resolved, ok, err := svc.ReconcileMigrate(context.Background(), req(), nil)
+	resolved, ok, _, err := svc.ReconcileMigrate(context.Background(), req(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,12 +113,15 @@ func TestReconcileMigrate_OrphanDest_SourceGone_NeverReaps(t *testing.T) {
 	svc, fc := reconcileSvc(t)
 	fc.AddPod("h2", unhealthyPod("web-x")) // dest unhealthy, source gone
 
-	resolved, ok, err := svc.ReconcileMigrate(context.Background(), req(), nil)
+	resolved, ok, msg, err := svc.ReconcileMigrate(context.Background(), req(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !resolved || ok {
 		t.Fatalf("got resolved=%v ok=%v, want true/false (orphan dest)", resolved, ok)
+	}
+	if !strings.Contains(msg, "manual cleanup") {
+		t.Fatalf("orphan message %q should contain 'manual cleanup'", msg)
 	}
 	// Safety: dest must NOT be reaped — it is the only copy.
 	if _, err := fc.PodInspect(context.Background(), "h2", "web-x"); err != nil {
@@ -129,7 +133,7 @@ func TestReconcileMigrate_Inconclusive_DestUnreachable(t *testing.T) {
 	svc, fc := reconcileSvc(t)
 	fc.PodInspectErr = errors.New("dial tcp: connection refused") // all inspects fail
 
-	resolved, _, err := svc.ReconcileMigrate(context.Background(), req(), nil)
+	resolved, _, _, err := svc.ReconcileMigrate(context.Background(), req(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +153,7 @@ func TestReconcileMigrate_CompensationFailure_Inconclusive(t *testing.T) {
 	fc.AddPod("h2", unhealthyPod("web-x")) // dest unhealthy -> roll back
 	fc.LifecycleErr = errors.New("boom")   // Start(source) will fail
 
-	resolved, _, err := svc.ReconcileMigrate(context.Background(), req(), nil)
+	resolved, _, _, err := svc.ReconcileMigrate(context.Background(), req(), nil)
 	if err != nil {
 		t.Fatal(err)
 	}

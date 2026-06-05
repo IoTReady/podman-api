@@ -25,10 +25,13 @@ const (
 //	resolved=true, succeeded=true   rolled forward (or the commit had finished)
 //	resolved=true, succeeded=false  rolled back, or the dest is an orphan left in place
 //
+// message is an operator-facing summary recorded in the job's error field for
+// terminal failed outcomes; it is empty for success and for inconclusive results.
+//
 // step is a best-effort progress callback (may be nil). It reuses the same
 // primitives as Migrate (waitRunning/Start/Delete) and takes migrateLock so it
 // cannot race a re-issued migrate of the same instance.
-func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step func(step, detail string)) (resolved, succeeded bool, err error) {
+func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step func(step, detail string)) (resolved, succeeded bool, message string, err error) {
 	if step == nil {
 		step = func(string, string) {}
 	}
@@ -42,13 +45,13 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	srcPresent, srcReachable := s.sourcePresent(ctx, req.FromHost, req.Template, req.Slug)
 	if !srcReachable {
 		step("reconcile-inconclusive", req.FromHost+" unreachable")
-		return false, false, nil
+		return false, false, "", nil
 	}
 
 	ds := s.destState(ctx, req.ToHost, req.Template, req.Slug)
 	if ds == destUnreachable {
 		step("reconcile-inconclusive", req.ToHost+" unreachable")
-		return false, false, nil
+		return false, false, "", nil
 	}
 
 	// Mutations run on a detached context so a sweep/shutdown cancellation cannot
@@ -60,11 +63,11 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 		if srcPresent {
 			if derr := s.Delete(mctx, req.FromHost, req.Template, req.Slug, DeleteOptions{PruneVolumes: true, PruneSecrets: true}); derr != nil {
 				step("reconcile-inconclusive", "reap source: "+derr.Error())
-				return false, false, nil
+				return false, false, "", nil
 			}
 		}
 		step("reconcile-roll-forward", req.ToHost)
-		return true, true, nil
+		return true, true, "", nil
 	}
 
 	// dest absent or unhealthy.
@@ -72,20 +75,20 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 		// Roll back: restore source, reap any partial dest.
 		if rerr := s.Start(mctx, req.FromHost, req.Template, req.Slug); rerr != nil {
 			step("reconcile-inconclusive", "restore source: "+rerr.Error())
-			return false, false, nil
+			return false, false, "", nil
 		}
 		if derr := s.Delete(mctx, req.ToHost, req.Template, req.Slug, DeleteOptions{PruneVolumes: true, PruneSecrets: true}); derr != nil {
 			step("reconcile-inconclusive", "reap dest: "+derr.Error())
-			return false, false, nil
+			return false, false, "", nil
 		}
 		step("reconcile-roll-back", req.FromHost)
-		return true, false, nil
+		return true, false, "rolled back: destination unverified, source restored", nil
 	}
 
 	// Source gone and dest not healthy: never destroy the only copy. Leave the
 	// dest in place for the operator and record a needs-attention failure.
 	step("reconcile-orphan-dest", req.ToHost+" left in place; source already removed")
-	return true, false, nil
+	return true, false, "destination left in place; source already removed — manual cleanup required", nil
 }
 
 // destState classifies the destination, distinguishing absent from unreachable
