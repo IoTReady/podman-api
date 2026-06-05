@@ -33,10 +33,17 @@ const (
 //
 // The container seeds its own config on first boot: a small sh wrapper writes
 // caddyfile (passed through the CADDY_SEED env) to the config volume only when
-// the file is absent, then execs caddy. On restart the (persistent) volume
-// already holds the latest config — including anything a live `caddy reload`
-// wrote — so the seed never clobbers it. This avoids the volume-import REST API,
-// which podman only serves at >= 5.6.0; the env+wrapper works on any version.
+// the file is absent, then execs caddy. Writing only-when-absent means a live
+// `caddy reload` (which rewrites the file on the persistent volume) survives a
+// container restart instead of being clobbered by a now-stale seed.
+//
+// Caveat: if the pod is destroyed and recreated while the config volume persists
+// with an OLD Caddyfile, the wrapper keeps that file (it exists) and ignores the
+// fresh seed, so Caddy can boot stale routes until the next change-triggered
+// Reconcile runs the cp+reload path. This self-heals on the next deploy/delete.
+//
+// This avoids the volume-import REST API, which podman only serves at >= 5.6.0;
+// the env+wrapper works on any version (the image must ship /bin/sh).
 func caddyPodYAML(image, caddyfile string) string {
 	cfgPath := caddyConfigDir + "/" + caddyConfigFile
 	boot := fmt.Sprintf(
