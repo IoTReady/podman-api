@@ -1,0 +1,21 @@
+{{define "instance-detail"}}
+<div class="inst-head">
+  <strong>{{.Inst.Template}} / {{.Inst.Slug}}</strong> · {{.Inst.Pod.Status}}
+  <span class="actions">
+    <button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/start"   hx-target="#main">Start</button>
+    <button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/stop"    hx-target="#main">Stop</button>
+    <button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/restart" hx-target="#main">Restart</button>
+    <a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-target="#main" hx-push-url="true">Upgrade</a>
+    <button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/delete" hx-target="#main"
+            hx-confirm="Delete {{.Inst.Template}}/{{.Inst.Slug}}?">Delete</button>
+  </span>
+</div>
+<div class="label">CONTAINERS</div>
+{{range .Inst.Containers}}<div>{{.Name}} — {{.Image}} — {{.Status}} (restarts {{.RestartCount}})</div>{{end}}
+<div class="label">VOLUMES</div>
+{{range .Inst.Volumes}}<div>{{.Name}} {{.SizeBytes}}</div>{{end}}
+<div class="label">ENV</div>
+{{range $k, $v := .Inst.EnvSummary}}<div>{{$k}}={{$v}}</div>{{end}}
+<button hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/logs" hx-target="#logs">View logs</button>
+<pre id="logs"></pre>
+{{end}}
