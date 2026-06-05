@@ -219,6 +219,39 @@ func TestMigrate_HappyPath(t *testing.T) {
 	assert.Equal(t, []string{"load", "preflight", "stop-source", "copy-volume", "verify-volume", "apply-dest", "verify", "commit"}, steps)
 }
 
+// An ingress instance carries public domains in its spec. Migrate must thread
+// those domains into the destination ApplyRequest so the moved spec retains its
+// route — otherwise deriveRoutes emits nothing on the destination and Caddy
+// stops proxying the domain once the source is reaped. (#90)
+func TestMigrate_PreservesDomains(t *testing.T) {
+	ctx := context.Background()
+	hosts := []config.Host{
+		{ID: "h1", Addr: "unix", Socket: "/x"},
+		{ID: "h2", Addr: "unix", Socket: "/y"},
+	}
+	f := fake.New()
+	mem := store.NewMemory()
+	svc := NewService(f, hosts, []config.Template{webTemplate()})
+	svc.SetStore(mem)
+	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
+
+	domains := []string{"app.example.com"}
+	require.NoError(t, mem.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "web", Slug: "demo",
+		Parameters: map[string]any{"slug": "demo", "image": "docker.io/library/nginx:1"},
+		Domains:    domains,
+	}))
+	f.AddPod("h1", podman.Pod{Name: "web-demo", Status: "Running"})
+
+	require.NoError(t, svc.Migrate(ctx, MigrateRequest{
+		FromHost: "h1", ToHost: "h2", Template: "web", Slug: "demo",
+	}, nil))
+
+	dest, err := mem.GetSpec(ctx, "h2", "web", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, domains, dest.Domains, "destination spec must retain the source domains")
+}
+
 func TestMigrate_Rollback(t *testing.T) {
 	ctx := context.Background()
 	params := map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"}
