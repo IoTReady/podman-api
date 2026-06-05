@@ -18,16 +18,22 @@ import (
 )
 
 // pgFixture mirrors the instance package's postgres test template.
-func pgFixture() config.Template {
-	return config.Template{
+func pgFixture() store.Template {
+	return store.Template{
 		Meta: render.Meta{
-			ID:         "postgres",
-			Parameters: render.Parameters{Required: []string{"slug", "image", "port", "db", "user"}},
-			Secrets:    render.Secrets{PerInstance: []string{"password"}},
-			Volumes:    []render.Volume{{Name: "data"}},
+			ID: "postgres",
+			Parameters: []render.ParamDef{
+				{Name: "slug", Type: "string", Required: true},
+				{Name: "image", Type: "string", Required: true},
+				{Name: "port", Type: "string", Required: true},
+				{Name: "db", Type: "string", Required: true},
+				{Name: "user", Type: "string", Required: true},
+			},
+			Secrets: render.Secrets{PerInstance: []string{"password"}},
+			Volumes: []render.Volume{{Name: "data"}},
 		},
 		Body:   "apiVersion: v1\nkind: Pod\nmetadata:\n  name: postgres-{{.slug}}\nspec:\n  containers:\n    - name: db\n      image: {{.image}}\n",
-		Source: "postgres.yaml",
+		Origin: "seed",
 	}
 }
 
@@ -36,8 +42,9 @@ func TestHandler_Run_MigratesAndRecordsSteps(t *testing.T) {
 	f := fake.New()
 	mem := store.NewMemory()
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}, {ID: "h2", Addr: "unix", Socket: "/y"}}
-	svc := instance.NewService(f, hosts, []config.Template{pgFixture()})
+	svc := instance.NewService(f, hosts)
 	svc.SetStore(mem)
+	require.NoError(t, mem.PutTemplate(ctx, pgFixture()))
 
 	params := map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"}
 	require.NoError(t, mem.PutSpec(ctx, store.Spec{

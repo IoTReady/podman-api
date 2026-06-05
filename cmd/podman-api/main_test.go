@@ -14,6 +14,8 @@ import (
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/store"
 	"github.com/iotready/podman-api/internal/ui"
+	"github.com/iotready/podman-api/templates"
+	"github.com/stretchr/testify/require"
 )
 
 func writeKey(t *testing.T) string {
@@ -37,18 +39,34 @@ func storeSpecFixture() store.Spec {
 	}
 }
 
-func TestOpenStore_Disabled(t *testing.T) {
-	st, err := openStore("", "")
-	if err != nil || st != nil {
-		t.Fatalf("disabled store should be (nil,nil), got (%v,%v)", st, err)
+func TestOpenStore_KeyLess(t *testing.T) {
+	// No key file: the store opens key-less. The template catalog and no-secret
+	// specs work; secret ops are refused with store.ErrSecretsNeedKey.
+	db := filepath.Join(t.TempDir(), "state.db")
+	st, err := openStore(db, "")
+	if err != nil {
+		t.Fatalf("key-less openStore: %v", err)
+	}
+	if st == nil {
+		t.Fatal("key-less store should return a non-nil store")
+	}
+	defer st.Close()
+	noSecret := storeSpecFixture()
+	noSecret.Secrets = nil
+	if err := st.PutSpec(context.Background(), noSecret); err != nil {
+		t.Fatalf("PutSpec (no secrets) on key-less store: %v", err)
 	}
 }
 
-func TestOpenStore_MissingKey(t *testing.T) {
-	db := filepath.Join(t.TempDir(), "state.db")
-	if _, err := openStore(db, ""); err == nil {
-		t.Fatal("expected error when -state-db set without -spec-key-file")
+func TestOpenStore_CreatesParentDir(t *testing.T) {
+	// openStore must MkdirAll the parent so a default path like
+	// /var/lib/podman-api/state.db works on a fresh host.
+	db := filepath.Join(t.TempDir(), "nested", "dir", "state.db")
+	st, err := openStore(db, writeKey(t))
+	if err != nil {
+		t.Fatalf("openStore with nested parent: %v", err)
 	}
+	st.Close()
 }
 
 func TestOpenStore_BadKey(t *testing.T) {
@@ -77,8 +95,21 @@ func TestOpenStore_Enabled(t *testing.T) {
 	}
 }
 
+func TestSeedTemplates_OnEmptyOnly(t *testing.T) {
+	ctx := context.Background()
+	db, err := store.OpenSQLite(filepath.Join(t.TempDir(), "s.db"), nil)
+	require.NoError(t, err)
+	defer db.Close()
+	n, err := seedTemplates(ctx, db, templates.Files)
+	require.NoError(t, err)
+	require.Positive(t, n)
+	again, err := seedTemplates(ctx, db, templates.Files)
+	require.NoError(t, err)
+	require.Zero(t, again, "must not re-seed a populated store")
+}
+
 func TestComposeHandlerRootRedirectsToUI(t *testing.T) {
-	svc := instance.NewService(fake.New(), []config.Host{{ID: "edge-1"}}, nil)
+	svc := instance.NewService(fake.New(), []config.Host{{ID: "edge-1"}})
 	hash, _ := config.HashToken("pw")
 	uiApp, err := ui.New(ui.Config{
 		Svc:  svc,

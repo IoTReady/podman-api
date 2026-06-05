@@ -23,6 +23,7 @@ import (
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 const e2eTemplate = `# template-meta:
@@ -68,7 +69,6 @@ func TestE2E_FullLifecycle_LocalOnly(t *testing.T) {
 	hosts := []config.Host{{ID: "local", Addr: "unix", Socket: sock}}
 	meta, body, err := render.ParseMeta(e2eTemplate)
 	require.NoError(t, err)
-	tmpls := []config.Template{{Meta: meta, Body: body, Source: "e2e.yaml"}}
 
 	client, err := podman.NewReal(hosts)
 	require.NoError(t, err)
@@ -76,7 +76,11 @@ func TestE2E_FullLifecycle_LocalOnly(t *testing.T) {
 	tok := "e2etoken"
 	hash, _ := config.HashToken(tok)
 	keys := []config.APIKey{{ID: "e2e", SecretHash: hash, Scopes: []string{"instances:*", "hosts:read"}}}
-	svc := instance.NewService(client, hosts, tmpls)
+	svc := instance.NewService(client, hosts)
+	// The Service resolves templates from its store, so seed the catalog.
+	mem := store.NewMemory()
+	require.NoError(t, mem.PutTemplate(context.Background(), store.Template{Meta: meta, Body: body, Origin: "seed"}))
+	svc.SetStore(mem)
 	r := api.NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil)
 	srv := httptest.NewServer(r)
 	defer srv.Close()
