@@ -60,4 +60,11 @@ type Store interface {
 	GetHostSecret(ctx context.Context, host, name string) ([]byte, error)
 	// DeleteHostSecret removes a per-host secret; absent is not an error.
 	DeleteHostSecret(ctx context.Context, host, name string) error
+
+	// SecretsEnabled reports whether this store can persist secrets — true only
+	// when it was opened with an encryption key. Callers use it to reject a
+	// secret-bearing operation BEFORE mutating any host, so a key-less store does
+	// not leave orphaned host state when the later PutSpec fails with
+	// ErrSecretsNeedKey.
+	SecretsEnabled() bool
 }

@@ -117,6 +117,10 @@ func (m *Memory) DeleteHostSecret(_ context.Context, host, name string) error {
 	return nil
 }
 
+// SecretsEnabled reports whether this store can persist secrets. The in-memory
+// double is keyed-by-default for tests, so it always returns true.
+func (m *Memory) SecretsEnabled() bool { return true }
+
 func (m *Memory) Enqueue(_ context.Context, kind string, args json.RawMessage, parentID string) (Job, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -366,6 +370,7 @@ func cloneJob(j Job) Job {
 }
 
 var _ JobStore = (*Memory)(nil)
+var _ Store = (*Memory)(nil)
 
 // ---------------------------------------------------------------------------
 // TemplateStore implementation

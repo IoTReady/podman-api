@@ -52,8 +52,12 @@ func (b templateBody) toTemplate(id string) store.Template {
 	}
 }
 
-func (h *handlers) listTemplates(w http.ResponseWriter, _ *http.Request) {
-	tmpls := h.svc.Templates()
+func (h *handlers) listTemplates(w http.ResponseWriter, r *http.Request) {
+	tmpls, err := h.svc.Templates(r.Context())
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
 	out := make([]map[string]any, 0, len(tmpls))
 	for _, t := range tmpls {
 		out = append(out, templateJSON(t))

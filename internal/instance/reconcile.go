@@ -55,7 +55,16 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	// phase and be swallowed as inconclusive — the same infinite loop the host
 	// guards above prevent. (Templates load once at startup, so removal coincides
 	// with the restart that produced these reconciling jobs.)
-	if !s.hasTemplate(ctx, req.Template) {
+	present, terr := s.hasTemplate(ctx, req.Template)
+	if terr != nil {
+		// Transient store error (e.g. SQLITE_BUSY, decrypt, cancellation): do NOT
+		// make the terminal "template gone" decision on a recoverable failure, which
+		// would irreversibly fail an otherwise-recoverable migrate. Treat as
+		// inconclusive so the reconcile is retried.
+		step("reconcile-inconclusive", "template lookup failed: "+terr.Error())
+		return false, false, "", nil
+	}
+	if !present {
 		return true, false, "template " + req.Template + " is no longer configured; manual cleanup required", nil
 	}
 

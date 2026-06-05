@@ -458,6 +458,10 @@ func (s *SQLite) DeleteHostSecret(ctx context.Context, host, name string) error 
 	})
 }
 
+// SecretsEnabled reports whether this store can persist secrets — true only when
+// it was opened with an encryption key (-spec-key-file).
+func (s *SQLite) SecretsEnabled() bool { return s.keys != nil }
+
 // ---------------------------------------------------------------------------
 // JobStore implementation
 // ---------------------------------------------------------------------------

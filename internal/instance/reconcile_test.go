@@ -350,6 +350,38 @@ func TestReconcileMigrate_UnknownTemplate_Terminal(t *testing.T) {
 	}
 }
 
+// transientTemplateStore wraps a Store but makes GetTemplate return a fixed
+// non-ErrNotFound error, simulating a transient store failure (SQLITE_BUSY,
+// decrypt, cancellation) during the template lookup.
+type transientTemplateStore struct {
+	Store
+	err error
+}
+
+func (s transientTemplateStore) GetTemplate(context.Context, string) (store.Template, error) {
+	return store.Template{}, s.err
+}
+
+// TestReconcileMigrate_TemplateLookupTransient_Inconclusive verifies the #61
+// review fix: a transient store error during the template-presence check must NOT
+// be mistaken for "template gone" (a terminal, irreversible decision); it must
+// surface as inconclusive so the reconcile is retried.
+func TestReconcileMigrate_TemplateLookupTransient_Inconclusive(t *testing.T) {
+	svc, _, st := reconcileSvc(t)
+	svc.SetStore(transientTemplateStore{Store: st, err: errors.New("db busy")})
+
+	resolved, ok, msg, err := svc.ReconcileMigrate(context.Background(), req(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved || ok {
+		t.Fatalf("got resolved=%v ok=%v, want false/false (transient lookup error must be inconclusive, not terminal)", resolved, ok)
+	}
+	if msg != "" {
+		t.Fatalf("inconclusive result must carry no terminal message, got %q", msg)
+	}
+}
+
 // TestReconcileMigrate_RollForward_CleansOrphanedSourceSpec verifies the round-2
 // #3 fix: roll-forward reaps the source's persisted state even when the source
 // pod is already gone, so a crash inside the original commit's Delete (between

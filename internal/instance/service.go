@@ -169,13 +169,20 @@ func (s *Service) host(id string) (config.Host, bool) {
 	return h, ok
 }
 
-// hasTemplate reports whether a template id is present in the catalog. A store
-// error is treated as "absent" — its only caller (ReconcileMigrate) uses it as a
-// terminal guard, so erring on the side of "not configured" stops an otherwise
-// infinite retry loop rather than masking a real lookup failure.
-func (s *Service) hasTemplate(ctx context.Context, id string) bool {
+// hasTemplate reports whether a template id is present in the catalog. It
+// distinguishes a genuinely-absent template (store.ErrNotFound → (false, nil))
+// from a transient store error ((false, err)): the caller (ReconcileMigrate)
+// makes a terminal "template gone" decision on absence, so a recoverable lookup
+// failure must NOT be mistaken for absence.
+func (s *Service) hasTemplate(ctx context.Context, id string) (bool, error) {
 	_, err := s.store.GetTemplate(ctx, id)
-	return err == nil
+	if errors.Is(err, store.ErrNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *Service) instanceLock(host, tmpl, slug string) *sync.Mutex {
@@ -243,6 +250,13 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	req.Parameters = render.ApplyDefaults(tmpl.Meta, req.Parameters)
 	if err := render.Validate(tmpl.Meta, req.Parameters, req.Secrets); err != nil {
 		return fmt.Errorf("validate: %w", err)
+	}
+	// Reject a secret-bearing deploy on a key-less store BEFORE any host mutation.
+	// PutSpec (far below) would reject the same request with ErrSecretsNeedKey, but
+	// only after secrets were created and the pod played — leaving an orphaned pod
+	// and secrets with no spec row. Fail fast here so nothing is mutated. (#61)
+	if len(req.Secrets) > 0 && !s.store.SecretsEnabled() {
+		return store.ErrSecretsNeedKey
 	}
 	// Domain claims are checked host-wide (validateIngress) but only become
 	// durable at PutSpec far below; the per-instance lock does not serialize two
@@ -639,16 +653,11 @@ func (s *Service) Hosts() []config.Host {
 	return out
 }
 
-// Templates returns the catalog's templates (read-only view). It takes no
-// context — it is called from request handlers that don't thread one — so it
-// uses context.Background(). A store error yields an empty slice rather than an
-// error: callers treat this as a best-effort listing.
-func (s *Service) Templates() []store.Template {
-	tmpls, err := s.store.ListTemplates(context.Background())
-	if err != nil {
-		return nil
-	}
-	return tmpls
+// Templates returns the catalog's templates (read-only view). A store error is
+// propagated so callers can surface it (e.g. an HTTP 500) rather than rendering
+// an empty catalog as if it succeeded.
+func (s *Service) Templates(ctx context.Context) ([]store.Template, error) {
+	return s.store.ListTemplates(ctx)
 }
 
 // HostLoad returns a point-in-time resource snapshot for a host.

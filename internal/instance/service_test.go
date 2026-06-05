@@ -299,6 +299,37 @@ func TestService_Apply_PlayKubeFail_NoSpec(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrNotFound)
 }
 
+// keylessStore wraps a Memory store but reports SecretsEnabled()==false, the way
+// a SQLite store opened without -spec-key-file behaves.
+type keylessStore struct{ *store.Memory }
+
+func (keylessStore) SecretsEnabled() bool { return false }
+
+// On a key-less store, a secret-bearing Apply must be rejected with
+// ErrSecretsNeedKey BEFORE any host mutation — no pod played, no secret created —
+// so the host is never left with an orphaned pod/secrets the missing spec can't
+// account for. (#61)
+func TestService_Apply_SecretBearing_KeylessStore_NoMutation(t *testing.T) {
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	f := fake.New()
+	mem := seedStore(t, pgTemplate())
+	svc := NewService(f, hosts)
+	svc.SetStore(keylessStore{mem})
+	ctx := context.Background()
+
+	err := svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true})
+	require.ErrorIs(t, err, store.ErrSecretsNeedKey)
+
+	// No host mutation happened: no pod played, no secret created.
+	assert.Empty(t, f.PlayCalls, "PlayKube must not be called")
+	secs, lerr := f.SecretList(ctx, "h1")
+	require.NoError(t, lerr)
+	assert.Empty(t, secs, "no secrets must be created")
+	// And of course no spec row.
+	_, gerr := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	assert.ErrorIs(t, gerr, store.ErrNotFound)
+}
+
 func TestService_Apply_StorePutError_Fatal(t *testing.T) {
 	svc, _, mem := newSvcMem(t)
 	mem.PutErr = errors.New("db down")
