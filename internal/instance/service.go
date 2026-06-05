@@ -65,8 +65,9 @@ type Service struct {
 
 	verifyVolumes bool // verify each migrated volume's content before reaping the source
 
-	mu    sync.Mutex
-	locks map[string]*sync.Mutex // key = host|template|slug
+	mu        sync.Mutex
+	locks     map[string]*sync.Mutex // key = host|template|slug
+	hostLocks map[string]*sync.Mutex // key = host; serializes host-wide domain claims (#82)
 }
 
 func NewService(client podman.Client, hosts []config.Host, tmpls []config.Template) *Service {
@@ -75,6 +76,7 @@ func NewService(client podman.Client, hosts []config.Host, tmpls []config.Templa
 		templates:     map[string]config.Template{},
 		secretEnvs:    map[string]map[string]bool{},
 		locks:         map[string]*sync.Mutex{},
+		hostLocks:     map[string]*sync.Mutex{},
 		verifyVolumes: true,
 	}
 	s.ingress = ingress.Disabled{}
@@ -182,6 +184,23 @@ func (s *Service) instanceLock(host, tmpl, slug string) *sync.Mutex {
 	return m
 }
 
+// hostLock serializes the host-wide domain-uniqueness check and the spec
+// persist that claims those domains. Without it, two Applies for *different*
+// instances on one host hold *different* instanceLocks, so both can pass
+// validateIngress before either persists and both claim the same domain. Apply
+// takes it (before the instanceLock — a consistent order so the two never
+// deadlock) only for domain-carrying requests. (#82)
+func (s *Service) hostLock(host string) *sync.Mutex {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	m, ok := s.hostLocks[host]
+	if !ok {
+		m = &sync.Mutex{}
+		s.hostLocks[host] = m
+	}
+	return m
+}
+
 func (s *Service) lookup(host, tmpl string) (config.Template, error) {
 	if _, ok := s.host(host); !ok {
 		return config.Template{}, ErrUnknownHost
@@ -211,6 +230,23 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	}
 	if err := render.Validate(tmpl.Meta, req.Parameters, req.Secrets); err != nil {
 		return fmt.Errorf("validate: %w", err)
+	}
+	// Domain claims are checked host-wide (validateIngress) but only become
+	// durable at PutSpec far below; the per-instance lock does not serialize two
+	// different instances racing for the same domain on one host. Hold a per-host
+	// lock for domain-carrying requests so the check→persist claim is atomic.
+	// Because the spec is persisted AFTER PlayKube (to avoid leaving a poison
+	// spec when the play fails), this lock necessarily spans the image pull and
+	// pod play too: two *ingress* deploys to the same host serialize end-to-end,
+	// not just over the store access. That's acceptable for a single-operator
+	// system — non-ingress and different-host deploys take no host lock and stay
+	// fully concurrent. Taken before the instanceLock (consistent order → no
+	// deadlock) and only when domains are present; a request with no domains can
+	// never create a claim, so it needs no host-wide serialization. (#82)
+	if len(req.Domains) > 0 {
+		hl := s.hostLock(host)
+		hl.Lock()
+		defer hl.Unlock()
 	}
 	lock := s.instanceLock(host, req.Template, req.Slug)
 	lock.Lock()
