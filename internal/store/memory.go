@@ -15,9 +15,10 @@ import (
 // corresponding call fail, to exercise callers' fatal-failure paths.
 // It also implements JobStore with an in-memory []Job slice.
 type Memory struct {
-	mu    sync.Mutex
-	specs map[string]Spec
-	jobs  []Job // insertion order; newest last
+	mu          sync.Mutex
+	specs       map[string]Spec
+	jobs        []Job             // insertion order; newest last
+	hostSecrets map[string][]byte // "host\x00name" -> value
 
 	PutErr    error
 	DeleteErr error
@@ -25,7 +26,10 @@ type Memory struct {
 
 // NewMemory returns an empty in-memory store.
 func NewMemory() *Memory {
-	return &Memory{specs: map[string]Spec{}}
+	return &Memory{
+		specs:       map[string]Spec{},
+		hostSecrets: map[string][]byte{},
+	}
 }
 
 func memKey(host, template, slug string) string {
@@ -77,6 +81,31 @@ func (m *Memory) ListSpecKeys(_ context.Context, host string) ([]SpecKey, error)
 		}
 	}
 	return out, nil
+}
+
+func (m *Memory) PutHostSecret(_ context.Context, host, name string, value []byte) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cp := append([]byte(nil), value...)
+	m.hostSecrets[host+"\x00"+name] = cp
+	return nil
+}
+
+func (m *Memory) GetHostSecret(_ context.Context, host, name string) ([]byte, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	v, ok := m.hostSecrets[host+"\x00"+name]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return append([]byte(nil), v...), nil
+}
+
+func (m *Memory) DeleteHostSecret(_ context.Context, host, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.hostSecrets, host+"\x00"+name)
+	return nil
 }
 
 func (m *Memory) Enqueue(_ context.Context, kind string, args json.RawMessage, parentID string) (Job, error) {
