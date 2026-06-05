@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"errors"
 	"path/filepath"
 	"testing"
 
@@ -103,5 +102,4 @@ func TestHostSecret_SQLiteSealsAtRest(t *testing.T) {
 	require.NoError(t, sq.db.QueryRowContext(ctx,
 		`SELECT value FROM host_secrets WHERE host='h1' AND name='k'`).Scan(&blob))
 	assert.NotContains(t, string(blob), "SUPERSECRET")
-	assert.False(t, errors.Is(nil, ErrNotFound)) // keep errors import used
 }
