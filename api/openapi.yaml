@@ -299,7 +299,7 @@ components:
 
     PlannedMove:
       type: object
-      required: [slug, template, to_host, ok, issues]
+      required: [slug, template, to_host, ok, issues, provisions]
       properties:
         slug: {type: string}
         template: {type: string}
