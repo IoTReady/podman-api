@@ -51,6 +51,12 @@ func classify(err error) (code string, status int, msg string) {
 		return "instance_not_found", http.StatusNotFound, err.Error()
 	case errors.Is(err, instance.ErrInstanceExists):
 		return "instance_already_exists", http.StatusConflict, err.Error()
+	case errors.Is(err, instance.ErrTemplateExists):
+		return "template_already_exists", http.StatusConflict, err.Error()
+	case errors.Is(err, instance.ErrTemplateInUse):
+		return "template_in_use", http.StatusConflict, err.Error()
+	case errors.Is(err, instance.ErrInvalidTemplate):
+		return "invalid_template", http.StatusBadRequest, err.Error()
 	case errors.Is(err, instance.ErrHostSecretMissing):
 		return "host_secret_missing", http.StatusUnprocessableEntity, err.Error()
 	case errors.Is(err, instance.ErrImagePull):

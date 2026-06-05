@@ -16,6 +16,9 @@ import (
 var (
 	ErrTemplateInUse  = errors.New("template is in use by one or more instances")
 	ErrTemplateExists = errors.New("template already exists")
+	// ErrInvalidTemplate wraps validation failures (bad id, unparsable body,
+	// unknown parameter type, ingress mismatch) so the API can map them to 400.
+	ErrInvalidTemplate = errors.New("invalid template")
 )
 
 // GetTemplate returns a stored template by id (ErrUnknownTemplate if absent).
@@ -34,7 +37,7 @@ func (s *Service) GetTemplate(ctx context.Context, id string) (store.Template, e
 // already exists. Origin defaults to "user" when the caller leaves it blank.
 func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
 	if err := render.NormalizeParams(&t.Meta); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
 	if err := validateTemplate(t); err != nil {
 		return err
@@ -55,7 +58,7 @@ func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
 // cannot silently flip a "seed" template to "user".
 func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 	if err := render.NormalizeParams(&t.Meta); err != nil {
-		return err
+		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
 	if err := validateTemplate(t); err != nil {
 		return err
@@ -81,7 +84,7 @@ func (s *Service) CloneTemplate(ctx context.Context, srcID, newID string) (store
 	cl.Created = time.Time{}
 	cl.Updated = time.Time{}
 	if err := render.NormalizeParams(&cl.Meta); err != nil {
-		return store.Template{}, err
+		return store.Template{}, fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
 	if err := validateTemplate(cl); err != nil {
 		return store.Template{}, err
@@ -128,17 +131,17 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string, force bool) err
 //     container whose name matches Ingress.Container.
 func validateTemplate(t store.Template) error {
 	if !render.ValidName(t.Meta.ID) {
-		return fmt.Errorf("invalid template id %q: must match %s", t.Meta.ID, render.NameRe.String())
+		return fmt.Errorf("%w: id %q must match %s", ErrInvalidTemplate, t.Meta.ID, render.NameRe.String())
 	}
 
 	rendered, err := render.RenderBody(t.Body, dummyParams(t.Meta))
 	if err != nil {
-		return fmt.Errorf("invalid template body: %w", err)
+		return fmt.Errorf("%w: body: %v", ErrInvalidTemplate, err)
 	}
 
 	if t.Meta.Ingress != nil {
 		if err := checkIngressContainer(rendered, t.Meta.Ingress.Container); err != nil {
-			return err
+			return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 		}
 	}
 	return nil
