@@ -141,22 +141,11 @@ func main() {
 	var ingressCtl *ingress.CaddyController
 
 	if *ingressEnabled {
-		// Derive the ingress container/port per template from the stored catalog
-		// (seeded above, so this is non-empty on a fresh boot).
-		stored, err := db.ListTemplates(seedCtx)
-		if err != nil {
-			log.Fatalf("ingress: list templates: %v", err)
-		}
-		tmplIngress := map[string]ingress.TemplateIngress{}
-		for _, t := range stored {
-			if t.Meta.Ingress != nil {
-				tmplIngress[t.Meta.ID] = ingress.TemplateIngress{
-					Container: t.Meta.Ingress.Container,
-					Port:      t.Meta.Ingress.Port,
-				}
-			}
-		}
-		ctl := ingress.NewCaddyController(client, db, tmplIngress, ingress.Config{
+		// The controller resolves each instance's ingress declaration from the
+		// store at reconcile time (db serves both specs and template lookups),
+		// so templates created or edited after boot take effect without a
+		// restart.
+		ctl := ingress.NewCaddyController(client, db, ingress.Config{
 			Network:    *ingressNetwork,
 			CaddyImage: *ingressImage,
 			ACMEEmail:  *ingressACME,

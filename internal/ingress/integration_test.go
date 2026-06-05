@@ -15,6 +15,7 @@ import (
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/ingress"
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
 )
 
@@ -24,8 +25,8 @@ import (
 const ingressITNetwork = "podman-api-ingress-it"
 
 // webPod is a minimal backend the Caddy proxy routes to. It is deployed onto
-// the ingress network under the container name "web" so it matches the
-// TemplateIngress{Container: "web"} the controller derives the upstream from.
+// the ingress network under the container name "web" so it matches the stored
+// "web" template's ingress: declaration the controller derives the upstream from.
 const webPod = `apiVersion: v1
 kind: Pod
 metadata:
@@ -89,6 +90,16 @@ func TestIngressEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
+	// The controller resolves the backend port from the stored "web" template's
+	// ingress: declaration, so seed that template alongside the spec.
+	require.NoError(t, st.PutTemplate(ctx, store.Template{
+		Meta: render.Meta{
+			ID:      "web",
+			Ingress: &render.Ingress{Container: "web", Port: 80},
+		},
+		Body:   webPod,
+		Origin: "user",
+	}))
 	require.NoError(t, st.PutSpec(ctx, store.Spec{
 		Host:     host,
 		Template: "web",
@@ -99,7 +110,6 @@ func TestIngressEndToEnd(t *testing.T) {
 	ctl := ingress.NewCaddyController(
 		client,
 		st,
-		map[string]ingress.TemplateIngress{"web": {Container: "web", Port: 80}},
 		ingress.Config{
 			Network:    ingressITNetwork,
 			CaddyImage: "docker.io/library/caddy:2",

@@ -2,9 +2,12 @@ package ingress
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
+
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // podName mirrors instance.podName: an instance's pod is "<template>-<slug>",
@@ -36,11 +39,26 @@ func (c *CaddyController) deriveRoutes(ctx context.Context, host string) ([]Rout
 		if len(sp.Domains) == 0 {
 			continue
 		}
-		ti, ok := c.templates[k.Template]
-		if !ok {
-			return nil, fmt.Errorf("ingress: instance %s/%s has domains but template %q declares no ingress", k.Template, k.Slug, k.Template)
+		// Resolve the template's ingress declaration from the store at reconcile
+		// time: templates are mutable, so a cached boot-time map would drop
+		// routes for templates created/edited after startup.
+		tmpl, err := c.store.GetTemplate(ctx, k.Template)
+		if err != nil {
+			if errors.Is(err, store.ErrNotFound) {
+				// Template was deleted while a spec still references it. Skip its
+				// routes rather than failing the whole host reconcile; the spec
+				// is the operator's to clean up.
+				continue
+			}
+			// A transient store failure must fail this reconcile cycle so it
+			// retries, not silently drop routes.
+			return nil, fmt.Errorf("ingress: get template for %s/%s: %w", k.Template, k.Slug, err)
 		}
-		backend := podName(k.Template, k.Slug) + ":" + strconv.Itoa(ti.Port)
+		if tmpl.Meta.Ingress == nil {
+			// Not an ingress template; it declares no backend, so skip its routes.
+			continue
+		}
+		backend := podName(k.Template, k.Slug) + ":" + strconv.Itoa(tmpl.Meta.Ingress.Port)
 		for _, d := range sp.Domains {
 			if prev, dup := owner[d]; dup {
 				return nil, fmt.Errorf("ingress: domain %q claimed by both %s and %s/%s", d, prev, k.Template, k.Slug)

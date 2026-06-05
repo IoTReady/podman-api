@@ -8,11 +8,12 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/iotready/podman-api/internal/podman/fake"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 func TestEnsureProxyCreatesWhenAbsent(t *testing.T) {
 	f := fake.New()
-	c := NewCaddyController(f, &memStore{}, nil, Config{
+	c := NewCaddyController(f, store.NewMemory(), Config{
 		Network: "podman-api-ingress", CaddyImage: "docker.io/library/caddy:2", ACMEEmail: "ops@example.com",
 	})
 	created, err := c.ensureProxy(context.Background(), "h1", "{\n\temail ops@example.com\n}\n\n")
@@ -29,7 +30,7 @@ func TestEnsureProxyCreatesWhenAbsent(t *testing.T) {
 
 func TestEnsureProxyNoopWhenPresent(t *testing.T) {
 	f := fake.New()
-	c := NewCaddyController(f, &memStore{}, nil, Config{Network: "n", CaddyImage: "img"})
+	c := NewCaddyController(f, store.NewMemory(), Config{Network: "n", CaddyImage: "img"})
 	_, err := c.ensureProxy(context.Background(), "h1", "{\n}\n\n")
 	require.NoError(t, err)
 	plays := len(f.PlayCalls)
