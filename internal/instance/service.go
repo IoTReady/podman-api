@@ -75,7 +75,12 @@ type Service struct {
 	mu        sync.Mutex
 	locks     map[string]*sync.Mutex // key = host|template|slug
 	hostLocks map[string]*sync.Mutex // key = host; serializes host-wide domain claims (#82)
-	tmplMu    sync.Mutex             // serializes all template mutations (create/update/clone/delete) so check-then-act is atomic (#61)
+	// tmplMu serializes template mutations (create/update/clone/delete) so each
+	// check-then-act is atomic (#61). Apply takes it as a *read* lock only around
+	// its final template-existence recheck + PutSpec, so a concurrent
+	// DeleteTemplate (write lock) cannot delete a template between Apply's recheck
+	// and its spec persist — closing the delete-vs-Apply orphan race (#61 review-2).
+	tmplMu sync.RWMutex
 }
 
 func NewService(client podman.Client, hosts []config.Host) *Service {
@@ -378,7 +383,33 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 		Secrets:    secretsCopy,
 		Domains:    domainsCopy,
 	}
-	if err := s.store.PutSpec(ctx, sp); err != nil {
+	// Recheck the template still exists, then persist the spec — both under the
+	// template read lock so a concurrent DeleteTemplate (write lock) cannot slip
+	// its in-use scan + delete between our recheck and our PutSpec. Ordering
+	// guarantee w.r.t. DeleteTemplate: either we PutSpec first (then Delete's
+	// in-use scan sees this spec and blocks with ErrTemplateInUse), or Delete
+	// completes first (then this recheck finds the template gone and we fail
+	// before persisting). Either way no spec ever references a deleted template.
+	//
+	// Lock order: tmplMu.RLock is taken AFTER the hostLock/instanceLock this Apply
+	// already holds; DeleteTemplate takes only tmplMu.Lock (no host/instance
+	// locks), so the lock sets are disjoint and there is no deadlock cycle.
+	//
+	// Residual window (accepted): if the template is deleted DURING the play above
+	// (before this recheck), we will have played the pod yet fail here — a narrow
+	// orphan-pod window of the same class as a mid-deploy crash. We deliberately
+	// do not hold a lock across the slow image-pull/play to close it.
+	s.tmplMu.RLock()
+	if _, err := s.store.GetTemplate(ctx, req.Template); err != nil {
+		s.tmplMu.RUnlock()
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrUnknownTemplate // template deleted mid-deploy
+		}
+		return fmt.Errorf("recheck template: %w", err)
+	}
+	err = s.store.PutSpec(ctx, sp)
+	s.tmplMu.RUnlock()
+	if err != nil {
 		return fmt.Errorf("persist spec: %w", err)
 	}
 	if s.ingressEnabled() {

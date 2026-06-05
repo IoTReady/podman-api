@@ -311,6 +311,77 @@ func TestCreateTemplate_Concurrent(t *testing.T) {
 	assert.Equal(t, int32(n-1), dupCount, "all other creates should get ErrTemplateExists")
 }
 
+// TestDeleteTemplate_BlockedAfterApply proves the delete-vs-Apply ordering
+// invariant (#61 review-2): once Apply has persisted a spec, the template's
+// in-use scan sees it, so a subsequent DeleteTemplate(without force) is blocked
+// with ErrTemplateInUse. (The full delete-mid-deploy interleaving can't be
+// driven deterministically; this asserts the win condition we can test — Delete
+// after Apply observes the spec.)
+func TestDeleteTemplate_BlockedAfterApply(t *testing.T) {
+	ctx := context.Background()
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	svc, mem := newSvcWith(t, fake.New(), hosts, noIngressTemplate())
+
+	req := ApplyRequest{
+		Template:   "db",
+		Slug:       "demo",
+		Parameters: map[string]any{"slug": "demo", "image": "docker.io/library/postgres:16"},
+	}
+	require.NoError(t, svc.Apply(ctx, "h1", req, ApplyOptions{Replace: true}))
+
+	// Apply persisted a spec referencing "db" → the in-use scan must see it.
+	_, err := mem.GetSpec(ctx, "h1", "db", "demo")
+	require.NoError(t, err, "Apply should have persisted the spec")
+
+	err = svc.DeleteTemplate(ctx, "db", false)
+	require.ErrorIs(t, err, ErrTemplateInUse)
+}
+
+func TestIngressChanged(t *testing.T) {
+	web := &render.Ingress{Container: "web", Port: 8080}
+	cases := []struct {
+		name     string
+		old, new *render.Ingress
+		want     bool
+	}{
+		{"no-ingress-to-no-ingress", nil, nil, false},
+		{"added-ingress", nil, web, false},
+		{"removed-ingress", web, nil, true},
+		{"port-changed", web, &render.Ingress{Container: "web", Port: 9090}, true},
+		{"container-changed", web, &render.Ingress{Container: "api", Port: 8080}, true},
+		{"unchanged", web, &render.Ingress{Container: "web", Port: 8080}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := ingressChanged(c.old, c.new); got != c.want {
+				t.Errorf("ingressChanged = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// TestUpdateTemplate_IngressRemovalIsNonBlocking confirms that editing a live,
+// referenced template to drop its ingress is warned about but NOT blocked
+// (#61 review-2): the edit succeeds and the new (ingress-less) body is stored.
+func TestUpdateTemplate_IngressRemovalIsNonBlocking(t *testing.T) {
+	ctx := context.Background()
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	svc, mem := newSvcWith(t, fake.New(), hosts, webTemplate())
+	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
+
+	// Deploy a referencing instance with a domain.
+	require.NoError(t, svc.Apply(ctx, "h1", webApply("demo"), ApplyOptions{Replace: true}))
+
+	// Edit the template to remove ingress entirely. Must not block.
+	edited := webTemplate()
+	edited.Meta.Ingress = nil
+	require.NoError(t, svc.UpdateTemplate(ctx, edited))
+
+	got, err := mem.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	require.Nil(t, got.Meta.Ingress, "ingress removal must be persisted despite live reference")
+}
+
 // TestCreateTemplate_IngressPortZero / High / EmptyContainer verify that the
 // ingress declaration is validated (port range, non-empty container) on
 // API-created templates that bypass render.ParseMeta (#61).

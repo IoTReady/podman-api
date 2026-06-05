@@ -113,13 +113,32 @@ func TestSeedTemplates_RejectsMalformed(t *testing.T) {
 	// A seed whose ingress names a container the body never declares passes
 	// ParseMeta but must fail ValidateTemplate, so seedTemplates returns an
 	// error and persists nothing (boot fails fast rather than storing garbage).
+	//
+	// The fixture pairs a VALID seed (alphabetically first) with the broken one
+	// so a single validate+put loop would persist the good one before hitting the
+	// bad one. seedTemplates is two-pass / all-or-nothing, so the store must stay
+	// empty — otherwise the next boot (CountTemplates > 0) would never re-seed and
+	// the catalog would be permanently partial (#61).
 	ctx := context.Background()
 	db, err := store.OpenSQLite(filepath.Join(t.TempDir(), "s.db"), nil)
 	require.NoError(t, err)
 	defer db.Close()
 
-	bad := fstest.MapFS{
-		"broken.yaml": &fstest.MapFile{Data: []byte(
+	seeds := fstest.MapFS{
+		"a-good.yaml": &fstest.MapFile{Data: []byte(
+			"# template-meta:\n" +
+				"#   id: good\n" +
+				"---\n" +
+				"apiVersion: v1\n" +
+				"kind: Pod\n" +
+				"metadata:\n" +
+				"  name: good\n" +
+				"spec:\n" +
+				"  containers:\n" +
+				"    - name: app\n" +
+				"      image: nginx:1\n",
+		)},
+		"b-broken.yaml": &fstest.MapFile{Data: []byte(
 			"# template-meta:\n" +
 				"#   id: broken\n" +
 				"#   ingress:\n" +
@@ -137,14 +156,14 @@ func TestSeedTemplates_RejectsMalformed(t *testing.T) {
 		)},
 	}
 
-	n, err := seedTemplates(ctx, db, bad)
+	n, err := seedTemplates(ctx, db, seeds)
 	require.Error(t, err)
 	require.Zero(t, n)
 	require.Contains(t, err.Error(), "broken")
 
 	count, err := db.CountTemplates(ctx)
 	require.NoError(t, err)
-	require.Zero(t, count, "malformed seed must not be persisted")
+	require.Zero(t, count, "all-or-nothing: a single bad seed must persist nothing")
 }
 
 func TestComposeHandlerRootRedirectsToUI(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -72,7 +73,58 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 		return err
 	}
 	t.Origin = existing.Origin
+
+	// Edit-time signal: if this edit removes or changes the ingress declaration
+	// while instances still reference the template, those instances' routes will
+	// silently drop (or move) at the next reconcile — deriveRoutes skips+warns,
+	// but the operator making the EDIT otherwise gets no signal. Warn (non-
+	// blocking) so the edit is informed (#61 review-2).
+	//
+	// SpecKey carries no domains, and decrypting every spec via GetSpec just to
+	// see if Domains is set would be wasteful; we keep it cheap and warn on ANY
+	// referencing instance. Worst case the warning over-counts non-ingress
+	// instances, which is acceptable for an informational message.
+	if ingressChanged(existing.Meta.Ingress, t.Meta.Ingress) {
+		if n := s.countTemplateRefs(ctx, t.Meta.ID); n > 0 {
+			log.Printf("template %q ingress changed/removed but %d instance(s) reference it; their routes may drop on next reconcile", t.Meta.ID, n)
+		}
+	}
+
 	return s.store.PutTemplate(ctx, t)
+}
+
+// ingressChanged reports whether an ingress declaration was removed or altered
+// in a way that affects derived routes (a different container or port, or no
+// ingress at all). Adding ingress where there was none does not drop routes.
+func ingressChanged(old, new *render.Ingress) bool {
+	if old == nil {
+		return false // had no routes to drop
+	}
+	if new == nil {
+		return true // ingress removed
+	}
+	return old.Container != new.Container || old.Port != new.Port
+}
+
+// countTemplateRefs counts instances on any host whose spec references template
+// id, reusing the in-use scan pattern from DeleteTemplate. On a per-host list
+// error it logs and skips that host rather than failing the caller — this only
+// feeds an informational warning. Caller already holds tmplMu.
+func (s *Service) countTemplateRefs(ctx context.Context, id string) int {
+	n := 0
+	for _, h := range s.hostsSnap() {
+		keys, err := s.store.ListSpecKeys(ctx, h.ID)
+		if err != nil {
+			log.Printf("template %q ref count: list specs on %s: %v", id, h.ID, err)
+			continue
+		}
+		for _, k := range keys {
+			if k.Template == id {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // CloneTemplate copies srcID to a new template with id newID and Origin "user".

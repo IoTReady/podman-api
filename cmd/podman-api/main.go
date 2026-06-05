@@ -471,14 +471,18 @@ func seedTemplates(ctx context.Context, db store.TemplateStore, fsys fs.FS) (int
 	if err != nil {
 		return 0, err
 	}
+	// Two-pass, all-or-nothing: validate EVERY seed before persisting ANY. A
+	// single-loop validate+put would leave a partial catalog in the store if a
+	// later seed is invalid — and because the next boot sees CountTemplates() > 0
+	// it would never re-seed, permanently stranding the catalog half-populated.
+	// Seeds are already param-normalized by ParseSeeds/ParseMeta, so
+	// ValidateTemplate alone is the same gate authored templates pass (#61).
 	for _, t := range seeds {
-		// Seeds are already param-normalized by ParseSeeds/ParseMeta, so
-		// ValidateTemplate alone is the same gate authored templates pass. Fail
-		// fast on a malformed seed rather than persisting garbage that would
-		// only surface at first deploy (#61).
 		if err := instance.ValidateTemplate(t); err != nil {
 			return 0, fmt.Errorf("seed template %q invalid: %w", t.Meta.ID, err)
 		}
+	}
+	for _, t := range seeds {
 		if err := db.PutTemplate(ctx, t); err != nil {
 			return 0, err
 		}
