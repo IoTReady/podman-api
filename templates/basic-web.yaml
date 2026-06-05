@@ -1,0 +1,39 @@
+# template-meta:
+#   id: basic-web
+#   display:
+#     name: Basic web app
+#     description: Run any container image and expose one HTTP port. Clone and edit for your app.
+#     category: Generic
+#   parameters:
+#     - name: slug
+#       type: string
+#       required: true
+#       label: Instance name
+#     - name: image
+#       type: string
+#       required: true
+#       label: Image
+#       description: Container image (e.g. docker.io/library/nginx:1)
+#     - name: port
+#       type: int
+#       required: true
+#       label: HTTP port
+#       description: Port your app serves HTTP on
+#       default: 8080
+#   ingress:
+#     container: app
+#     port: 8080
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: basic-web-{{.slug}}
+  labels:
+    podman-api/template: basic-web
+    podman-api/slug: {{.slug}}
+spec:
+  containers:
+    - name: app
+      image: {{.image}}
+      ports:
+        - containerPort: {{.port}}
