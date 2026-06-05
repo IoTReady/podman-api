@@ -137,3 +137,23 @@ func TestReconcileMigrate_Inconclusive_DestUnreachable(t *testing.T) {
 		t.Fatal("got resolved=true, want false (host unreachable -> inconclusive)")
 	}
 }
+
+// TestReconcileMigrate_CompensationFailure_Inconclusive verifies that when the
+// roll-back Start (restoring the source) fails, the result is inconclusive
+// (resolved=false) so the reconcile loop retries rather than producing a false
+// terminal. fake.LifecycleErr makes PodStart return an error without removing
+// the pod, which is the path s.Start takes.
+func TestReconcileMigrate_CompensationFailure_Inconclusive(t *testing.T) {
+	svc, fc := reconcileSvc(t)
+	fc.AddPod("h1", healthyPod("web-x"))   // source present
+	fc.AddPod("h2", unhealthyPod("web-x")) // dest unhealthy -> roll back
+	fc.LifecycleErr = errors.New("boom")   // Start(source) will fail
+
+	resolved, _, err := svc.ReconcileMigrate(context.Background(), req(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved {
+		t.Fatal("got resolved=true, want false (failed compensation must retry, not falsely terminate)")
+	}
+}

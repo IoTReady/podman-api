@@ -36,15 +36,18 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	lk.Lock()
 	defer lk.Unlock()
 
-	ds := s.destState(ctx, req.ToHost, req.Template, req.Slug)
-	if ds == destUnreachable {
-		step("reconcile-inconclusive", req.ToHost+" unreachable")
-		return false, false, nil
-	}
-
+	// Check source reachability first: it is a single cheap inspect, whereas
+	// destState may poll for up to verifyTimeout. This avoids burning the verify
+	// window when the source host is unreachable.
 	srcPresent, srcReachable := s.sourcePresent(ctx, req.FromHost, req.Template, req.Slug)
 	if !srcReachable {
 		step("reconcile-inconclusive", req.FromHost+" unreachable")
+		return false, false, nil
+	}
+
+	ds := s.destState(ctx, req.ToHost, req.Template, req.Slug)
+	if ds == destUnreachable {
+		step("reconcile-inconclusive", req.ToHost+" unreachable")
 		return false, false, nil
 	}
 
@@ -88,6 +91,9 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 // destState classifies the destination, distinguishing absent from unreachable
 // and giving a present-but-not-yet-ready dest the verify window to become healthy.
 func (s *Service) destState(ctx context.Context, host, tmpl, slug string) destStatus {
+	// A pre-waitRunning inspect distinguishes destAbsent (ErrNotFound) from
+	// destUnreachable (any other error) before paying the verifyTimeout cost.
+	// If the pod exists, fall through to let it race the verify window.
 	if _, err := s.client.PodInspect(ctx, host, podName(tmpl, slug)); err != nil {
 		if errors.Is(err, podman.ErrNotFound) {
 			return destAbsent
@@ -97,8 +103,12 @@ func (s *Service) destState(ctx context.Context, host, tmpl, slug string) destSt
 	if err := s.waitRunning(ctx, host, tmpl, slug); err == nil {
 		return destHealthy
 	}
-	// Not healthy within the window. Distinguish a genuine unhealthy dest from a
-	// host that dropped mid-wait (which must be inconclusive, not a false roll-back).
+	// Not healthy within the window. Re-inspect to distinguish a pod that is
+	// genuinely unhealthy from a host that dropped mid-wait:
+	//   - ErrNotFound: pod vanished during the wait — the host is still reachable
+	//     but the pod is gone; treat as destUnhealthy (reachable, destabilised).
+	//   - any other error: host became unreachable mid-wait → destUnreachable
+	//     (must be inconclusive, not a false roll-back).
 	if _, err := s.client.PodInspect(ctx, host, podName(tmpl, slug)); err != nil && !errors.Is(err, podman.ErrNotFound) {
 		return destUnreachable
 	}
