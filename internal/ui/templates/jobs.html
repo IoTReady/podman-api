@@ -1,7 +1,9 @@
 {{define "jobs"}}
 <h2>Jobs</h2>
-{{if .Disabled}}<p>The job store is not enabled.</p>{{else}}
+{{if .Disabled}}<p>The job store is not enabled.</p>
+{{else if .Jobs}}
 <table class="pure-table">
+  <thead><tr><th>ID</th><th>Kind</th><th>State</th></tr></thead>
   <tbody>
   {{range .Jobs}}
     <tr class="clickable" hx-get="/ui/jobs/{{.ID}}" hx-target="#main" hx-push-url="true">
@@ -10,5 +12,5 @@
   {{end}}
   </tbody>
 </table>
-{{end}}
+{{else}}<p>No jobs yet.</p>{{end}}
 {{end}}
