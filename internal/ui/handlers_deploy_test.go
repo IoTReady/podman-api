@@ -73,6 +73,31 @@ func TestDeployCreateMissingRequiredParamRerendersForm(t *testing.T) {
 	}
 }
 
+func TestDeployFormUnknownHostIs404(t *testing.T) {
+	u := uiWithTemplate(t)
+	w := authedGet(t, u, "/ui/hosts/nope/deploy")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for unknown host", w.Code)
+	}
+}
+
+func TestUpgradeApplyMissingImageRerendersForm(t *testing.T) {
+	u := uiWithTemplate(t)
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{csrfField: {csrfToken(tok)}} // no image
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/instances/demo/main/upgrade", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code == http.StatusOK || w.Code == http.StatusSeeOther {
+		t.Fatalf("expected a non-success status for upgrade with no image, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `name="image"`) {
+		t.Error("upgrade form should re-render with the image field on error")
+	}
+}
+
 func TestUpgradeFormRenders(t *testing.T) {
 	u := uiWithTemplate(t)
 	w := authedGet(t, u, "/ui/hosts/edge-1/instances/demo/main/upgrade")

@@ -2,6 +2,7 @@ package ui
 
 import (
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/iotready/podman-api/internal/config"
@@ -13,6 +14,26 @@ import (
 type hostSecretRef struct {
 	Name    string
 	Present bool
+}
+
+// hostExists reports whether host is a configured host.
+func (u *UI) hostExists(host string) bool {
+	for _, h := range u.cfg.Svc.Hosts() {
+		if h.ID == host {
+			return true
+		}
+	}
+	return false
+}
+
+// sortedTemplates returns the templates ordered by id, so the deploy form's
+// <select> is stable across renders (Service.Templates() iterates a map).
+func (u *UI) sortedTemplates() []config.Template {
+	tmpls := u.cfg.Svc.Templates()
+	slices.SortFunc(tmpls, func(a, b config.Template) int {
+		return strings.Compare(a.Meta.ID, b.Meta.ID)
+	})
+	return tmpls
 }
 
 // fieldData resolves the template by id and computes the present/absent status
@@ -62,7 +83,11 @@ func formValues(form map[string][]string) (params map[string]any, secrets map[st
 
 func (u *UI) deployForm(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
-	tmpls := u.cfg.Svc.Templates()
+	if !u.hostExists(host) {
+		u.renderError(w, r, instance.ErrUnknownHost)
+		return
+	}
+	tmpls := u.sortedTemplates()
 	sel := r.URL.Query().Get("template")
 	if sel == "" && len(tmpls) > 0 {
 		sel = tmpls[0].Meta.ID
@@ -84,7 +109,7 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
-	params, secrets := formValues(r.Form)
+	params, secrets := formValues(r.PostForm)
 	req := instance.ApplyRequest{
 		Template:   r.FormValue("template"),
 		Slug:       r.FormValue("slug"),
@@ -95,7 +120,7 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 		tmpl, refs := u.fieldData(r, host, req.Template)
 		u.render(w, r, errorStatus(err), "deploy-form", u.pageData(map[string]any{
 			"Host":      host,
-			"Templates": u.cfg.Svc.Templates(),
+			"Templates": u.sortedTemplates(),
 			"Selected":  req.Template,
 			"Tmpl":      tmpl,
 			"HostRefs":  refs,
@@ -134,7 +159,7 @@ func (u *UI) upgradeApply(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
-	params, secrets := formValues(r.Form)
+	params, secrets := formValues(r.PostForm)
 	req := instance.ApplyRequest{Template: tmplID, Slug: slug, Parameters: params, Secrets: secrets}
 	if err := u.cfg.Svc.Upgrade(r.Context(), host, req, r.FormValue("image")); err != nil {
 		tmpl, refs := u.fieldData(r, host, tmplID)
