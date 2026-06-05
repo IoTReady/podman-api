@@ -249,6 +249,9 @@ func main() {
 			log.Fatalf("ui: %v", err)
 		}
 		log.Printf("admin UI enabled at /ui (operator=%s, fp=%s)", op.Username, fp)
+		if !*uiSecureCookie {
+			log.Printf("admin UI: -ui-secure-cookie=false; the session cookie will be sent over plain HTTP — enable it when serving over HTTPS/behind TLS")
+		}
 	}
 
 	srv := &http.Server{
@@ -392,10 +395,11 @@ func composeHandler(apiRouter http.Handler, uiApp *ui.UI) http.Handler {
 	if uiApp == nil {
 		return apiRouter
 	}
+	uiHandler := uiApp.Handler()
 	top := http.NewServeMux()
 	top.Handle("/", apiRouter)
-	top.Handle("/ui", uiApp.Handler())
-	top.Handle("/ui/", uiApp.Handler())
+	top.Handle("/ui", uiHandler)
+	top.Handle("/ui/", uiHandler)
 	top.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/ui", http.StatusSeeOther)
 	})
