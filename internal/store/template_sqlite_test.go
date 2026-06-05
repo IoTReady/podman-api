@@ -128,20 +128,45 @@ func TestMigrateAddsTemplatesTable(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "web", got.Meta.ID)
 
-	// user_version must be 5.
+	// user_version must be 6 (v6 made specs.secrets nullable).
 	var v int
 	require.NoError(t, s.db.QueryRow(`PRAGMA user_version`).Scan(&v))
-	require.Equal(t, 5, v)
+	require.Equal(t, 6, v)
 }
 
-// TestFreshDB_UserVersion5 asserts that a brand-new DB opened via OpenSQLite
-// has user_version == 5.
-func TestFreshDB_UserVersion5(t *testing.T) {
+// TestFreshDB_UserVersion6 asserts that a brand-new DB opened via OpenSQLite
+// has user_version == 6.
+func TestFreshDB_UserVersion6(t *testing.T) {
 	s, err := OpenSQLite(filepath.Join(t.TempDir(), "s.db"), NewKeyStore(testKey(0x11)))
 	require.NoError(t, err)
 	defer s.Close()
 
 	var v int
 	require.NoError(t, s.db.QueryRow(`PRAGMA user_version`).Scan(&v))
-	require.Equal(t, 5, v)
+	require.Equal(t, 6, v)
+}
+
+func TestSQLite_KeylessRejectsSecretsButAllowsTemplates(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenSQLite(filepath.Join(t.TempDir(), "s.db"), nil) // no keys
+	require.NoError(t, err)
+	defer db.Close()
+
+	// templates work key-less
+	require.NoError(t, db.PutTemplate(ctx, Template{Meta: render.Meta{ID: "x"}, Body: "k", Origin: "user"}))
+	// secret op is rejected
+	err = db.PutHostSecret(ctx, "h1", "DB_PASS", []byte("p"))
+	require.ErrorIs(t, err, ErrSecretsNeedKey)
+}
+
+func TestSQLite_KeylessSpecWithoutSecrets(t *testing.T) {
+	ctx := context.Background()
+	db, err := OpenSQLite(filepath.Join(t.TempDir(), "s.db"), nil)
+	require.NoError(t, err)
+	defer db.Close()
+	require.NoError(t, db.PutSpec(ctx, Spec{Host: "h1", Template: "web", Slug: "demo",
+		Parameters: map[string]any{"slug": "demo"}}))
+	got, err := db.GetSpec(ctx, "h1", "web", "demo")
+	require.NoError(t, err)
+	require.Equal(t, "demo", got.Slug)
 }

@@ -12,6 +12,10 @@ import (
 // ErrNotFound is returned when no row matches a lookup (specs, jobs, or host secrets).
 var ErrNotFound = errors.New("store: not found")
 
+// ErrSecretsNeedKey is returned when a secret operation is attempted on a store
+// that was opened without an encryption key (-spec-key-file).
+var ErrSecretsNeedKey = errors.New("secrets require an encryption key (-spec-key-file)")
+
 // Spec is the desired state of one instance.
 type Spec struct {
 	Host     string

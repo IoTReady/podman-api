@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS specs (
   template   TEXT NOT NULL,
   slug       TEXT NOT NULL,
   parameters TEXT NOT NULL,
-  secrets    BLOB NOT NULL,
+  secrets    BLOB,
   domains    TEXT NOT NULL DEFAULT '[]',
   created    INTEGER NOT NULL,
   updated    INTEGER NOT NULL,
@@ -193,6 +193,7 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 
 // migrateSchema brings an existing DB up to the current schema version.
 // v4 added specs.domains. v5 added the templates table.
+// v6 made specs.secrets nullable (NULL = no secrets; key-less open allowed).
 // Each step is guarded by user_version so OpenSQLite is idempotent.
 func migrateSchema(db *sql.DB) error {
 	var v int
@@ -233,6 +234,34 @@ func migrateSchema(db *sql.DB) error {
 		if _, err := db.Exec(`PRAGMA user_version = 5`); err != nil {
 			return fmt.Errorf("migrateSchema: set user_version: %w", err)
 		}
+		v = 5
+	}
+	if v < 6 {
+		// specs.secrets changes from BLOB NOT NULL to BLOB (nullable).
+		// SQLite does not support DROP NOT NULL via ALTER COLUMN; recreate the
+		// table using the standard rename-copy-drop-rename sequence.
+		steps := []string{
+			`ALTER TABLE specs RENAME TO specs_v5`,
+			`CREATE TABLE specs (
+  host       TEXT NOT NULL,
+  template   TEXT NOT NULL,
+  slug       TEXT NOT NULL,
+  parameters TEXT NOT NULL,
+  secrets    BLOB,
+  domains    TEXT NOT NULL DEFAULT '[]',
+  created    INTEGER NOT NULL,
+  updated    INTEGER NOT NULL,
+  PRIMARY KEY (host, template, slug)
+)`,
+			`INSERT INTO specs SELECT host,template,slug,parameters,secrets,domains,created,updated FROM specs_v5`,
+			`DROP TABLE specs_v5`,
+			`PRAGMA user_version = 6`,
+		}
+		for _, sql := range steps {
+			if _, err := db.Exec(sql); err != nil {
+				return fmt.Errorf("migrateSchema v6: %w", err)
+			}
+		}
 	}
 	return nil
 }
@@ -255,14 +284,19 @@ func (s *SQLite) PutSpec(ctx context.Context, sp Spec) error {
 	if err != nil {
 		return err
 	}
-	secJSON, err := json.Marshal(sp.Secrets)
-	if err != nil {
-		return err
-	}
-	key := s.keys.Load()
-	blob, err := seal(key, secJSON)
-	if err != nil {
-		return err
+	var blob []byte
+	if len(sp.Secrets) > 0 {
+		if s.keys == nil {
+			return ErrSecretsNeedKey
+		}
+		secJSON, err := json.Marshal(sp.Secrets)
+		if err != nil {
+			return err
+		}
+		blob, err = seal(s.keys.Load(), secJSON)
+		if err != nil {
+			return err
+		}
 	}
 	if sp.Domains == nil {
 		sp.Domains = []string{}
@@ -306,13 +340,18 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 	if err := json.Unmarshal([]byte(paramsJSON), &params); err != nil {
 		return Spec{}, err
 	}
-	secJSON, err := open(s.keys.Load(), blob)
-	if err != nil {
-		return Spec{}, err
-	}
 	var secrets map[string]string
-	if err := json.Unmarshal(secJSON, &secrets); err != nil {
-		return Spec{}, err
+	if len(blob) > 0 {
+		if s.keys == nil {
+			return Spec{}, ErrSecretsNeedKey
+		}
+		secJSON, err := open(s.keys.Load(), blob)
+		if err != nil {
+			return Spec{}, err
+		}
+		if err := json.Unmarshal(secJSON, &secrets); err != nil {
+			return Spec{}, err
+		}
 	}
 	var domains []string
 	if err := json.Unmarshal([]byte(domainsJSON), &domains); err != nil {
@@ -362,6 +401,9 @@ func (s *SQLite) ListSpecKeys(ctx context.Context, host string) ([]SpecKey, erro
 }
 
 func (s *SQLite) PutHostSecret(ctx context.Context, host, name string, value []byte) error {
+	if s.keys == nil {
+		return ErrSecretsNeedKey
+	}
 	blob, err := seal(s.keys.Load(), value)
 	if err != nil {
 		return err
@@ -380,6 +422,9 @@ ON CONFLICT(host, name) DO UPDATE SET
 }
 
 func (s *SQLite) GetHostSecret(ctx context.Context, host, name string) ([]byte, error) {
+	if s.keys == nil {
+		return nil, ErrSecretsNeedKey
+	}
 	var blob []byte
 	err := s.db.QueryRowContext(ctx,
 		`SELECT value FROM host_secrets WHERE host=? AND name=?`, host, name).Scan(&blob)
