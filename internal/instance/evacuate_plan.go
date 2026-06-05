@@ -83,7 +83,8 @@ func (s *Service) planMove(ctx context.Context, m MigrateRequest) PlannedMove {
 	if err := render.Validate(tmpl.Meta, eff, spec.Secrets); err != nil {
 		pm.Issues = append(pm.Issues, PlanIssue{Code: codeInvalidParameters, Message: err.Error()})
 	}
-	for _, e := range s.preflightIssues(ctx, m, tmpl, eff) {
+	errs, _ := s.preflightIssues(ctx, m, tmpl, eff)
+	for _, e := range errs {
 		pm.Issues = append(pm.Issues, classifyPlanIssue(e))
 	}
 	pm.OK = len(pm.Issues) == 0

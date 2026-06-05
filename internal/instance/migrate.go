@@ -133,47 +133,55 @@ func (s *Service) hostSecretProvisionable(ctx context.Context, fromHost, name st
 	}
 }
 
-// preflightIssues runs every destination preflight check and returns all
-// problems found, in check order. A nil/empty result means the destination
-// would currently accept the instance. Each error is either a sentinel-wrapped
-// blocking condition (ErrHostDraining / ErrInstanceExists / ErrHostSecretMissing
-// / ErrPortConflict) or an infrastructure error that made a check inconclusive.
-// preflightDest (fail-fast executor path) and PlanEvacuation (collect-all preview
-// path) both build on it, so the preview and the executor never disagree.
-func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl config.Template, eff map[string]any) []error {
+// preflightIssues runs every destination preflight check and returns (issues,
+// provisionable): all problems found in check order, plus the per-host secrets
+// that are absent on the destination but can be auto-provisioned from the source
+// host's persisted value. A nil/empty issues slice means the destination would
+// accept the instance (after provisioning any returned secrets). Each issue is a
+// sentinel-wrapped blocking condition or an infrastructure error that made a
+// check inconclusive. preflightDest (executor), migratePostStop (executor), and
+// PlanEvacuation (preview) all build on this, so they never disagree.
+func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl config.Template, eff map[string]any) ([]error, []string) {
 	var issues []error
+	var provisionable []string
 	hostCfg, _ := s.host(req.ToHost)
 	if hostCfg.Drain {
 		issues = append(issues, ErrHostDraining)
 	}
-	// An infra error here (host unreachable) makes the remaining checks
-	// inconclusive; report it and stop rather than accumulating spurious
-	// failures.
 	if _, err := s.client.PodInspect(ctx, req.ToHost, podName(req.Template, req.Slug)); err == nil {
 		issues = append(issues, ErrInstanceExists)
 	} else if !errors.Is(err, podman.ErrNotFound) {
-		return append(issues, fmt.Errorf("inspect dest pod: %w", err))
+		return append(issues, fmt.Errorf("inspect dest pod: %w", err)), provisionable
 	}
 	for _, name := range tmpl.Meta.Secrets.PerHostReferenced {
-		if _, err := s.client.SecretInspect(ctx, req.ToHost, name); err != nil {
-			if errors.Is(err, podman.ErrNotFound) {
-				issues = append(issues, fmt.Errorf("%w: %s", ErrHostSecretMissing, name))
-			} else {
-				// Infra error (host unreachable): the remaining secret/port checks
-				// would just block on the same dead host. Report it and stop —
-				// avoids piling up timeout-length RPCs on the executor's failure path.
-				return append(issues, fmt.Errorf("inspect host secret %q: %w", name, err))
-			}
+		_, err := s.client.SecretInspect(ctx, req.ToHost, name)
+		if err == nil {
+			continue // present on dest
 		}
+		if !errors.Is(err, podman.ErrNotFound) {
+			// Infra error (host unreachable): report and stop — avoids piling up
+			// timeout-length RPCs on the executor's failure path.
+			return append(issues, fmt.Errorf("inspect host secret %q: %w", name, err)), provisionable
+		}
+		// Absent on dest: provisionable from the source host's persisted value?
+		ok, perr := s.hostSecretProvisionable(ctx, req.FromHost, name)
+		if perr != nil {
+			return append(issues, fmt.Errorf("lookup persisted host secret %q: %w", name, perr)), provisionable
+		}
+		if ok {
+			provisionable = append(provisionable, name)
+			continue
+		}
+		issues = append(issues, fmt.Errorf("%w: %s", ErrHostSecretMissing, name))
 	}
 	want, err := s.requiredHostPorts(tmpl, eff)
 	if err != nil {
-		return append(issues, err)
+		return append(issues, err), provisionable
 	}
 	if len(want) > 0 {
 		used, err := s.PortsInUse(ctx, req.ToHost)
 		if err != nil {
-			return append(issues, fmt.Errorf("ports in use: %w", err))
+			return append(issues, fmt.Errorf("ports in use: %w", err)), provisionable
 		}
 		busy := map[int]bool{}
 		for _, p := range used {
@@ -185,7 +193,7 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 			}
 		}
 	}
-	return issues
+	return issues, provisionable
 }
 
 // preflightDest runs all fail-fast destination checks (no mutation), returning
@@ -193,7 +201,7 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 // order. It is the executor's guard; PlanEvacuation uses preflightIssues to
 // collect every problem instead.
 func (s *Service) preflightDest(ctx context.Context, req MigrateRequest, tmpl config.Template, eff map[string]any) error {
-	if errs := s.preflightIssues(ctx, req, tmpl, eff); len(errs) > 0 {
+	if errs, _ := s.preflightIssues(ctx, req, tmpl, eff); len(errs) > 0 {
 		return errs[0]
 	}
 	return nil

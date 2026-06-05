@@ -54,7 +54,7 @@ func TestPreflightIssues_CollectsAll(t *testing.T) {
 
 	tmpl := secretAndPortTemplate()
 	eff := map[string]any{"slug": "x", "image": "img"}
-	errs := svc.preflightIssues(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "needs-both", Slug: "x"}, tmpl, eff)
+	errs, _ := svc.preflightIssues(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "needs-both", Slug: "x"}, tmpl, eff)
 
 	require.Len(t, errs, 2, "expected both the missing-secret and port-conflict issues")
 	var sawSecret, sawPort bool

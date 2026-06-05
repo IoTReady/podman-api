@@ -108,3 +108,47 @@ func TestPutHostSecret_PersistError_HostStillUpdated(t *testing.T) {
 	_, ierr := f.SecretInspect(ctx, "h1", "shared-pull-token")
 	assert.NoError(t, ierr)
 }
+
+func TestPreflightIssues_ProvisionableNotBlocking(t *testing.T) {
+	svc, _, mem := newHostSecretSvc(t)
+	ctx := context.Background()
+	// shared-pull-token absent on dest h2 BUT persisted for source h1.
+	require.NoError(t, mem.PutHostSecret(ctx, "h1", "shared-pull-token", []byte("v")))
+
+	tmpl := templateWithHostSecret()
+	eff := map[string]any{"slug": "s1", "image": "img"}
+	req := MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "needs-host-secret", Slug: "s1"}
+	issues, provisionable := svc.preflightIssues(ctx, req, tmpl, eff)
+
+	assert.Empty(t, issues, "provisionable secret must not be a blocking issue")
+	assert.Equal(t, []string{"shared-pull-token"}, provisionable)
+}
+
+func TestPreflightIssues_NotPersistedStillBlocks(t *testing.T) {
+	svc, _, _ := newHostSecretSvc(t)
+	ctx := context.Background()
+	tmpl := templateWithHostSecret()
+	eff := map[string]any{"slug": "s1", "image": "img"}
+	req := MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "needs-host-secret", Slug: "s1"}
+	issues, provisionable := svc.preflightIssues(ctx, req, tmpl, eff)
+
+	require.Len(t, issues, 1)
+	assert.ErrorIs(t, issues[0], ErrHostSecretMissing)
+	assert.Empty(t, provisionable)
+}
+
+func TestPreflightIssues_PresentOnDestNotProvisioned(t *testing.T) {
+	svc, f, mem := newHostSecretSvc(t)
+	ctx := context.Background()
+	// Already present on the destination AND persisted: present wins, no provision.
+	require.NoError(t, f.SecretCreate(ctx, "h2", "shared-pull-token", []byte("x")))
+	require.NoError(t, mem.PutHostSecret(ctx, "h1", "shared-pull-token", []byte("v")))
+
+	tmpl := templateWithHostSecret()
+	eff := map[string]any{"slug": "s1", "image": "img"}
+	req := MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "needs-host-secret", Slug: "s1"}
+	issues, provisionable := svc.preflightIssues(ctx, req, tmpl, eff)
+
+	assert.Empty(t, issues)
+	assert.Empty(t, provisionable, "present-on-dest secret is not in the provision list")
+}
