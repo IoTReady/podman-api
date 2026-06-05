@@ -29,6 +29,7 @@ import (
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/prune"
 	"github.com/iotready/podman-api/internal/store"
+	"github.com/iotready/podman-api/internal/ui"
 	"github.com/iotready/podman-api/templates"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -61,6 +62,9 @@ func main() {
 		ingressImage    = flag.String("ingress-caddy-image", "docker.io/library/caddy:2", "Caddy image for the per-host ingress pod; must include /bin/sh (the pod seeds its config via a small shell wrapper), so a shell-less distroless/scratch variant won't work")
 		ingressACME     = flag.String("ingress-acme-email", "", "ACME account email for Let's Encrypt (required when -ingress-enabled)")
 		ingressInterval = flag.Duration("ingress-reconcile-interval", 5*time.Minute, "periodic ingress drift-correction interval per host; 0 disables the periodic loop")
+
+		operatorFile   = flag.String("operator-file", "", "if set, enable the admin UI and authenticate the single operator against this YAML file (username, password_hash)")
+		uiSecureCookie = flag.Bool("ui-secure-cookie", false, "set the Secure flag on the UI session cookie (enable when serving the UI over HTTPS / behind TLS)")
 	)
 	flag.Parse()
 
@@ -227,9 +231,32 @@ func main() {
 	// with -metrics-addr to bind it on a separate (typically internal) socket.
 	router := api.NewRouter(svc, jobStore, keyStore, combined, nil, canceller)
 
+	// opHolder carries the live operator credential; visible to both the UI auth
+	// closure below and the SIGHUP goroutine that follows.
+	var opHolder atomic.Pointer[config.Operator]
+	var uiApp *ui.UI
+	if *operatorFile != "" {
+		op, fp, err := loadOperator(*operatorFile)
+		if err != nil {
+			log.Fatalf("operator: %v", err)
+		}
+		opHolder.Store(&op)
+		authr := ui.AuthenticatorFunc(func(user, pass string) (ui.Identity, error) {
+			return ui.NewOperatorAuthenticator(*opHolder.Load()).Authenticate(user, pass)
+		})
+		uiApp, err = ui.New(ui.Config{Svc: svc, Jobs: jobStore, Auth: authr, Secure: *uiSecureCookie})
+		if err != nil {
+			log.Fatalf("ui: %v", err)
+		}
+		log.Printf("admin UI enabled at /ui (operator=%s, fp=%s)", op.Username, fp)
+		if !*uiSecureCookie {
+			log.Printf("admin UI: -ui-secure-cookie=false; the session cookie will be sent over plain HTTP — enable it when serving over HTTPS/behind TLS")
+		}
+	}
+
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           router,
+		Handler:           composeHandler(router, uiApp),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -276,6 +303,15 @@ func main() {
 					}
 				}
 				log.Printf("hosts reloaded: %d entries (%d draining)", len(newHosts), draining)
+			}
+
+			if *operatorFile != "" {
+				if newOp, fp, err := loadOperator(*operatorFile); err != nil {
+					log.Printf("operator reload FAILED, keeping previous: %v", err)
+				} else {
+					opHolder.Store(&newOp)
+					log.Printf("operator reloaded: username=%s, fp=%s", newOp.Username, fp)
+				}
 			}
 
 		}
@@ -350,6 +386,39 @@ func main() {
 		log.Fatal(err)
 	}
 	<-idleClosed
+}
+
+// composeHandler mounts the admin UI under /ui on top of the API router when
+// uiApp is non-nil (operator file configured). A bare GET / redirects to /ui.
+// When uiApp is nil the API router is returned unchanged.
+func composeHandler(apiRouter http.Handler, uiApp *ui.UI) http.Handler {
+	if uiApp == nil {
+		return apiRouter
+	}
+	uiHandler := uiApp.Handler()
+	top := http.NewServeMux()
+	top.Handle("/", apiRouter)
+	top.Handle("/ui", uiHandler)
+	top.Handle("/ui/", uiHandler)
+	top.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/ui", http.StatusSeeOther)
+	})
+	return top
+}
+
+// loadOperator reads and parses the operator credential file, returning the
+// parsed Operator and a short SHA-256 fingerprint of the file contents.
+func loadOperator(path string) (config.Operator, string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return config.Operator{}, "", err
+	}
+	op, err := config.ParseOperatorYAML(raw)
+	if err != nil {
+		return config.Operator{}, "", err
+	}
+	sum := sha256.Sum256(raw)
+	return op, hex.EncodeToString(sum[:8]), nil
 }
 
 // loadKeys reads and parses the keys file, returning the parsed list and a

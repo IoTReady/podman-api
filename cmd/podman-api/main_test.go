@@ -3,11 +3,17 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/iotready/podman-api/internal/config"
+	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/store"
+	"github.com/iotready/podman-api/internal/ui"
 )
 
 func writeKey(t *testing.T) string {
@@ -68,5 +74,46 @@ func TestOpenStore_Enabled(t *testing.T) {
 	}
 	if _, err := st.Enqueue(context.Background(), "migrate", nil, ""); err != nil {
 		t.Fatalf("Enqueue via returned DB: %v", err)
+	}
+}
+
+func TestComposeHandlerRootRedirectsToUI(t *testing.T) {
+	svc := instance.NewService(fake.New(), []config.Host{{ID: "edge-1"}}, nil)
+	hash, _ := config.HashToken("pw")
+	uiApp, err := ui.New(ui.Config{
+		Svc:  svc,
+		Auth: ui.NewOperatorAuthenticator(config.Operator{Username: "op", PasswordHash: hash}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := composeHandler(http.NewServeMux(), uiApp)
+
+	// Bare GET / → 303 to /ui.
+	r := httptest.NewRequest("GET", "/", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/ui" {
+		t.Fatalf("GET / → %d %q; want 303 /ui", w.Code, w.Header().Get("Location"))
+	}
+
+	// GET /ui without a session → 303 to /ui/login.
+	r = httptest.NewRequest("GET", "/ui", nil)
+	w = httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != http.StatusSeeOther || w.Header().Get("Location") != "/ui/login" {
+		t.Fatalf("GET /ui → %d %q; want 303 /ui/login", w.Code, w.Header().Get("Location"))
+	}
+}
+
+func TestComposeHandlerNilUIReturnsAPIRouter(t *testing.T) {
+	api := http.NewServeMux()
+	api.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
+	h := composeHandler(api, nil)
+	r := httptest.NewRequest("GET", "/healthz", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("nil UI should pass through to API router, got %d", w.Code)
 	}
 }

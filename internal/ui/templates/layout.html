@@ -1,0 +1,44 @@
+{{define "layout"}}<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>podman-api</title>
+  <!-- Swap 4xx/5xx responses too (htmx ignores them by default), so inline
+       validation errors and renderError fragments land in their target. -->
+  <meta name="htmx-config" content='{"responseHandling":[{"code":"204","swap":false},{"code":"[1-5]..","swap":true}]}'>
+  <link rel="stylesheet" href="/ui/static/pure-min.css">
+  <link rel="stylesheet" href="/ui/static/app.css">
+  <script src="/ui/static/htmx.min.js" defer></script>
+</head>
+<!-- The header name is the well-known csrfHeader constant (internal/ui/session.go); hardcoded here so a missing data field can't silently produce an empty header and break every htmx mutation. -->
+<body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
+  {{/* Authenticated pages set .Shell and render inside the persistent shell
+       (sidebar + #main); the login page does not and renders bare. Gating on
+       .Shell (not .Hosts) keeps the chrome even when zero hosts are configured. */}}
+  {{if .Shell}}
+  <div class="shell">
+    {{template "nav" .}}
+    <main id="main">{{template "body" .}}</main>
+  </div>
+  {{else}}
+  {{template "body" .}}
+  {{end}}
+</body>
+</html>{{end}}
+
+{{define "nav"}}
+<nav class="sidebar">
+  <div class="label">HOSTS</div>
+  <ul>
+    {{range .Hosts}}
+    <li><a href="/ui/hosts/{{.ID}}" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true">{{.ID}}</a></li>
+    {{end}}
+  </ul>
+  <a href="/ui/jobs" hx-get="/ui/jobs" hx-target="#main" hx-push-url="true">Jobs</a>
+  <form method="post" action="/ui/logout">
+    <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+    <button type="submit">Sign out</button>
+  </form>
+</nav>
+{{end}}

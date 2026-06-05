@@ -1,0 +1,7 @@
+# Single-operator admin UI credential.
+# Enable the UI by pointing the daemon at a real copy of this file:
+#   podman-api -operator-file auth/operator.yaml
+# Generate the password_hash with the built-in subcommand:
+#   ./bin/podman-api hash-token <your-password>
+username: operator
+password_hash: "$argon2id$v=19$m=65536,t=3,p=4$REPLACE_WITH_SALT$REPLACE_WITH_HASH"

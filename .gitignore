@@ -1,10 +1,12 @@
 /bin/
 /.worktrees/
+/.superpowers/
 *.test
 *.out
 coverage.txt
 .idea/
 .vscode/
 /auth/keys.yaml
+/auth/operator.yaml
 /podman-api
 /hosts/ec2.yaml
