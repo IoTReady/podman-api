@@ -205,7 +205,7 @@ An optional, embedded, server-rendered admin UI (HTMX + PureCSS) is served at `/
    ```
 3. Start the daemon with `-operator-file auth/operator.yaml`.
 
-The UI provides a single-operator login, a host list, template-based deployment, and full instance lifecycle from the browser: start, stop, restart, upgrade, delete, and a live log tail — all without touching the API directly.
+The UI provides a single-operator login, a host list, template-based deployment, and full instance lifecycle from the browser: start, stop, restart, upgrade, delete, and a static log tail (last 200 lines on request; live streaming is a later slice) — all without touching the API directly.
 
 **Flags:**
 
