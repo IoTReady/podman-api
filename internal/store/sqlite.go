@@ -39,7 +39,15 @@ CREATE TABLE IF NOT EXISTS jobs (
   started   INTEGER,
   finished  INTEGER
 );
-CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);`
+CREATE INDEX IF NOT EXISTS jobs_state ON jobs(state);
+CREATE TABLE IF NOT EXISTS host_secrets (
+  host    TEXT NOT NULL,
+  name    TEXT NOT NULL,
+  value   BLOB NOT NULL,
+  created INTEGER NOT NULL,
+  updated INTEGER NOT NULL,
+  PRIMARY KEY (host, name)
+);`
 
 // maxOpenConns bounds the SQLite connection pool. WAL allows many concurrent
 // readers + one writer; setting the pool above the job worker count
@@ -324,6 +332,45 @@ func (s *SQLite) ListSpecKeys(ctx context.Context, host string) ([]SpecKey, erro
 		out = append(out, k)
 	}
 	return out, rows.Err()
+}
+
+func (s *SQLite) PutHostSecret(ctx context.Context, host, name string, value []byte) error {
+	blob, err := seal(s.keys.Load(), value)
+	if err != nil {
+		return err
+	}
+	now := time.Now().Unix()
+	return s.write(ctx, func() error {
+		_, err := s.db.ExecContext(ctx, `
+INSERT INTO host_secrets (host, name, value, created, updated)
+VALUES (?, ?, ?, ?, ?)
+ON CONFLICT(host, name) DO UPDATE SET
+  value   = excluded.value,
+  updated = excluded.updated`,
+			host, name, blob, now, now)
+		return err
+	})
+}
+
+func (s *SQLite) GetHostSecret(ctx context.Context, host, name string) ([]byte, error) {
+	var blob []byte
+	err := s.db.QueryRowContext(ctx,
+		`SELECT value FROM host_secrets WHERE host=? AND name=?`, host, name).Scan(&blob)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return open(s.keys.Load(), blob)
+}
+
+func (s *SQLite) DeleteHostSecret(ctx context.Context, host, name string) error {
+	return s.write(ctx, func() error {
+		_, err := s.db.ExecContext(ctx,
+			`DELETE FROM host_secrets WHERE host=? AND name=?`, host, name)
+		return err
+	})
 }
 
 // ---------------------------------------------------------------------------

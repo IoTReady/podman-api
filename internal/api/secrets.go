@@ -30,7 +30,8 @@ func (h *handlers) putSecret(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Value string `json:"value"`
+		Value   string `json:"value"`
+		Persist *bool  `json:"persist"` // optional; defaults to true
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
@@ -40,7 +41,11 @@ func (h *handlers) putSecret(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "value is required"})
 		return
 	}
-	if err := h.svc.PutHostSecret(r.Context(), host, name, []byte(body.Value)); err != nil {
+	persist := true
+	if body.Persist != nil {
+		persist = *body.Persist
+	}
+	if err := h.svc.PutHostSecret(r.Context(), host, name, []byte(body.Value), persist); err != nil {
 		WriteError(w, err)
 		return
 	}

@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// ErrNotFound is returned when no row matches a lookup (specs or jobs).
+// ErrNotFound is returned when no row matches a lookup (specs, jobs, or host secrets).
 var ErrNotFound = errors.New("store: not found")
 
 // Spec is the desired state of one instance.
@@ -48,4 +48,12 @@ type Store interface {
 	// ListSpecKeys returns the (template, slug) of every spec on host, without
 	// decrypting secrets. Empty slice (no error) when the host has none.
 	ListSpecKeys(ctx context.Context, host string) ([]SpecKey, error)
+
+	// PutHostSecret inserts or replaces the sealed value of a per-host secret,
+	// keyed by (host, name). Implementations seal Value at rest.
+	PutHostSecret(ctx context.Context, host, name string, value []byte) error
+	// GetHostSecret returns the decrypted per-host secret value, or ErrNotFound.
+	GetHostSecret(ctx context.Context, host, name string) ([]byte, error)
+	// DeleteHostSecret removes a per-host secret; absent is not an error.
+	DeleteHostSecret(ctx context.Context, host, name string) error
 }

@@ -299,7 +299,7 @@ components:
 
     PlannedMove:
       type: object
-      required: [slug, template, to_host, ok, issues]
+      required: [slug, template, to_host, ok, issues, provisions]
       properties:
         slug: {type: string}
         template: {type: string}
@@ -310,6 +310,14 @@ components:
         issues:
           type: array
           items: {$ref: '#/components/schemas/PlanIssue'}
+        provisions:
+          type: array
+          items:
+            type: string
+          description: >
+            Per-host secrets absent on the destination that the evacuate will
+            auto-provision from the source host's persisted value. Non-blocking:
+            a move with provisions and no issues is still ok.
 
     PlanIssue:
       type: object
@@ -331,6 +339,16 @@ components:
       required: [value]
       properties:
         value: {type: string}
+        persist:
+          type: boolean
+          default: true
+          description: >
+            When the state store is enabled, also persist this value so a later
+            migrate/evacuate can auto-provision the secret on a destination host.
+            Set false to push to the host only. No effect when the store is disabled.
+            Note: rotating with persist:false updates the host but not the store,
+            so a later migrate/evacuate would provision the previously-stored
+            (now stale) value onto a destination.
 
     BulkRequest:
       type: object

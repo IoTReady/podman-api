@@ -32,6 +32,11 @@ func (m *memStore) ListSpecKeys(_ context.Context, host string) ([]store.SpecKey
 	}
 	return out, nil
 }
+func (m *memStore) PutHostSecret(context.Context, string, string, []byte) error { return nil }
+func (m *memStore) GetHostSecret(context.Context, string, string) ([]byte, error) {
+	return nil, store.ErrNotFound
+}
+func (m *memStore) DeleteHostSecret(context.Context, string, string) error { return nil }
 
 func newCtl(specs []store.Spec, tmpls map[string]TemplateIngress) *CaddyController {
 	return NewCaddyController(nil, &memStore{specs: specs}, tmpls, Config{})

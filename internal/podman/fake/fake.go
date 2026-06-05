@@ -83,6 +83,9 @@ type Fake struct {
 	// VolumeInspectErr, if non-nil, makes VolumeInspect return this error (use a
 	// non-ErrNotFound error to exercise the transient-failure path).
 	VolumeInspectErr error
+	// SecretCreateErr, if non-nil, makes SecretCreate return this error
+	// instead of recording the secret.
+	SecretCreateErr error
 	// HostInfoVal is returned by HostInfo when HostInfoErr is nil.
 	HostInfoVal podman.HostInfo
 	// HostInfoErr, if non-nil, makes HostInfo return this error.
@@ -332,6 +335,9 @@ func (f *Fake) PodRemove(_ context.Context, h, name string, _ bool) error {
 func (f *Fake) SecretCreate(_ context.Context, h, name string, _ []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.SecretCreateErr != nil {
+		return f.SecretCreateErr
+	}
 	f.hostSecrets(h)[name] = podman.Secret{Name: name, CreatedAt: time.Now()}
 	return nil
 }

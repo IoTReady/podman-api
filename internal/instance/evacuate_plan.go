@@ -27,11 +27,12 @@ type EvacuationPlan struct {
 
 // PlannedMove is one instance's planned move and its preflight verdict.
 type PlannedMove struct {
-	Slug     string      `json:"slug"`
-	Template string      `json:"template"`
-	ToHost   string      `json:"to_host"`
-	OK       bool        `json:"ok"` // true iff Issues is empty
-	Issues   []PlanIssue `json:"issues"`
+	Slug       string      `json:"slug"`
+	Template   string      `json:"template"`
+	ToHost     string      `json:"to_host"`
+	OK         bool        `json:"ok"` // true iff Issues is empty
+	Issues     []PlanIssue `json:"issues"`
+	Provisions []string    `json:"provisions"` // per-host secrets auto-provisioned on dest; informational, does not affect ok; [] not null
 }
 
 // PlanIssue is a single reason a move is not clean: a blocking destination
@@ -62,7 +63,7 @@ func (s *Service) PlanEvacuation(ctx context.Context, req EvacuateRequest) (Evac
 // result. Spec-load / template-lookup failures are reported as check_error so
 // the move is still surfaced rather than blanking the whole plan.
 func (s *Service) planMove(ctx context.Context, m MigrateRequest) PlannedMove {
-	pm := PlannedMove{Slug: m.Slug, Template: m.Template, ToHost: m.ToHost, Issues: []PlanIssue{}}
+	pm := PlannedMove{Slug: m.Slug, Template: m.Template, ToHost: m.ToHost, Issues: []PlanIssue{}, Provisions: []string{}}
 	tmpl, err := s.lookup(m.ToHost, m.Template)
 	if err != nil {
 		pm.Issues = append(pm.Issues, PlanIssue{Code: codeCheckError, Message: err.Error()})
@@ -83,9 +84,11 @@ func (s *Service) planMove(ctx context.Context, m MigrateRequest) PlannedMove {
 	if err := render.Validate(tmpl.Meta, eff, spec.Secrets); err != nil {
 		pm.Issues = append(pm.Issues, PlanIssue{Code: codeInvalidParameters, Message: err.Error()})
 	}
-	for _, e := range s.preflightIssues(ctx, m, tmpl, eff) {
+	errs, provisionable := s.preflightIssues(ctx, m, tmpl, eff)
+	for _, e := range errs {
 		pm.Issues = append(pm.Issues, classifyPlanIssue(e))
 	}
+	pm.Provisions = append(pm.Provisions, provisionable...)
 	pm.OK = len(pm.Issues) == 0
 	return pm
 }

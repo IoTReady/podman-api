@@ -140,9 +140,9 @@ func TestService_PutHostSecret_Rotates(t *testing.T) {
 	svc, f := newSvc(t)
 	ctx := context.Background()
 
-	require.NoError(t, svc.PutHostSecret(ctx, "h1", "shared", []byte("v1")))
+	require.NoError(t, svc.PutHostSecret(ctx, "h1", "shared", []byte("v1"), true))
 	// Second put must find the existing secret and rotate it (remove + create).
-	require.NoError(t, svc.PutHostSecret(ctx, "h1", "shared", []byte("v2")))
+	require.NoError(t, svc.PutHostSecret(ctx, "h1", "shared", []byte("v2"), true))
 
 	_, err := f.SecretInspect(ctx, "h1", "shared")
 	require.NoError(t, err)

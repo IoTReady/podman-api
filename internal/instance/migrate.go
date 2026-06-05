@@ -14,6 +14,7 @@ import (
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // verify-poll knobs; vars (not consts) so same-package tests can shorten them.
@@ -113,47 +114,79 @@ func (s *Service) requiredHostPorts(tmpl config.Template, params map[string]any)
 	return ports, nil
 }
 
-// preflightIssues runs every destination preflight check and returns all
-// problems found, in check order. A nil/empty result means the destination
-// would currently accept the instance. Each error is either a sentinel-wrapped
-// blocking condition (ErrHostDraining / ErrInstanceExists / ErrHostSecretMissing
-// / ErrPortConflict) or an infrastructure error that made a check inconclusive.
-// preflightDest (fail-fast executor path) and PlanEvacuation (collect-all preview
-// path) both build on it, so the preview and the executor never disagree.
-func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl config.Template, eff map[string]any) []error {
+// hostSecretProvisionable reports whether per-host secret `name` — already known
+// absent on the destination — can be auto-provisioned from the source host's
+// persisted value. A non-nil error is an infra/store failure the caller should
+// treat as inconclusive. Returns (false, nil) when the store is disabled or holds
+// no value (i.e. genuinely missing, not an error).
+func (s *Service) hostSecretProvisionable(ctx context.Context, fromHost, name string) (bool, error) {
+	if s.store == nil {
+		return false, nil
+	}
+	switch _, err := s.store.GetHostSecret(ctx, fromHost, name); {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, store.ErrNotFound):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
+// preflightIssues runs every destination preflight check and returns (issues,
+// provisionable): all problems found in check order, plus the per-host secrets
+// that are absent on the destination but can be auto-provisioned from the source
+// host's persisted value. A nil/empty issues slice means the destination would
+// accept the instance (after provisioning any returned secrets). Each issue is a
+// sentinel-wrapped blocking condition or an infrastructure error that made a
+// check inconclusive. preflightDest (the executor's fail-fast gate) and
+// PlanEvacuation (the collect-all preview) both build on this, so they never disagree.
+func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl config.Template, eff map[string]any) ([]error, []string) {
 	var issues []error
+	var provisionable []string
 	hostCfg, _ := s.host(req.ToHost)
 	if hostCfg.Drain {
 		issues = append(issues, ErrHostDraining)
 	}
-	// An infra error here (host unreachable) makes the remaining checks
-	// inconclusive; report it and stop rather than accumulating spurious
-	// failures.
 	if _, err := s.client.PodInspect(ctx, req.ToHost, podName(req.Template, req.Slug)); err == nil {
 		issues = append(issues, ErrInstanceExists)
 	} else if !errors.Is(err, podman.ErrNotFound) {
-		return append(issues, fmt.Errorf("inspect dest pod: %w", err))
+		return append(issues, fmt.Errorf("inspect dest pod: %w", err)), provisionable
 	}
 	for _, name := range tmpl.Meta.Secrets.PerHostReferenced {
-		if _, err := s.client.SecretInspect(ctx, req.ToHost, name); err != nil {
-			if errors.Is(err, podman.ErrNotFound) {
-				issues = append(issues, fmt.Errorf("%w: %s", ErrHostSecretMissing, name))
-			} else {
-				// Infra error (host unreachable): the remaining secret/port checks
-				// would just block on the same dead host. Report it and stop —
-				// avoids piling up timeout-length RPCs on the executor's failure path.
-				return append(issues, fmt.Errorf("inspect host secret %q: %w", name, err))
-			}
+		_, err := s.client.SecretInspect(ctx, req.ToHost, name)
+		if err == nil {
+			continue // present on dest
 		}
+		if !errors.Is(err, podman.ErrNotFound) {
+			// Infra error (host unreachable): report and stop — avoids piling up
+			// timeout-length RPCs on the executor's failure path.
+			return append(issues, fmt.Errorf("inspect host secret %q: %w", name, err)), provisionable
+		}
+		// Absent on dest: provisionable from the source host's persisted value?
+		ok, perr := s.hostSecretProvisionable(ctx, req.FromHost, name)
+		if perr != nil {
+			// A store-lookup failure is a fast local error, not a timeout-prone
+			// RPC: record it as this secret's issue and keep scanning so the
+			// collect-all preview still reports the remaining checks. The executor
+			// (preflightDest) takes the first issue, so it still aborts.
+			issues = append(issues, fmt.Errorf("lookup persisted host secret %q: %w", name, perr))
+			continue
+		}
+		if ok {
+			provisionable = append(provisionable, name)
+			continue
+		}
+		issues = append(issues, fmt.Errorf("%w: %s", ErrHostSecretMissing, name))
 	}
 	want, err := s.requiredHostPorts(tmpl, eff)
 	if err != nil {
-		return append(issues, err)
+		return append(issues, err), provisionable
 	}
 	if len(want) > 0 {
 		used, err := s.PortsInUse(ctx, req.ToHost)
 		if err != nil {
-			return append(issues, fmt.Errorf("ports in use: %w", err))
+			return append(issues, fmt.Errorf("ports in use: %w", err)), provisionable
 		}
 		busy := map[int]bool{}
 		for _, p := range used {
@@ -165,7 +198,7 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 			}
 		}
 	}
-	return issues
+	return issues, provisionable
 }
 
 // preflightDest runs all fail-fast destination checks (no mutation), returning
@@ -173,7 +206,7 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 // order. It is the executor's guard; PlanEvacuation uses preflightIssues to
 // collect every problem instead.
 func (s *Service) preflightDest(ctx context.Context, req MigrateRequest, tmpl config.Template, eff map[string]any) error {
-	if errs := s.preflightIssues(ctx, req, tmpl, eff); len(errs) > 0 {
+	if errs, _ := s.preflightIssues(ctx, req, tmpl, eff); len(errs) > 0 {
 		return errs[0]
 	}
 	return nil
@@ -224,7 +257,7 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 	}
 	step("stop-source", req.FromHost)
 
-	if err := s.migratePostStop(ctx, req, eff, spec.Secrets, step); err != nil {
+	if err := s.migratePostStop(ctx, req, eff, tmpl, spec.Secrets, step); err != nil {
 		step("rollback", err.Error())
 		// Compensate on a detached context: migratePostStop may have failed
 		// *because* ctx was cancelled/timed out (the verify poll returns
@@ -252,7 +285,46 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 
 // migratePostStop runs the destination-mutating steps: copy volumes, apply the
 // spec, verify health. Any error here is rolled back by the caller.
-func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, secrets map[string]string, step func(step, detail string)) error {
+func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, tmpl config.Template, secrets map[string]string, step func(step, detail string)) error {
+	// Provision any persisted per-host secrets the destination is missing, from
+	// the source host's stored value. Idempotent: only creates what is absent.
+	// Provisioned secrets are intentionally left in place on rollback — they are
+	// shared, host-scoped, and additive, and other instances on the destination
+	// may rely on them (Delete's PruneSecrets only reaps per-instance secrets).
+	for _, name := range tmpl.Meta.Secrets.PerHostReferenced {
+		if _, err := s.client.SecretInspect(ctx, req.ToHost, name); err == nil {
+			continue // already present on dest
+		} else if !errors.Is(err, podman.ErrNotFound) {
+			return fmt.Errorf("inspect dest host secret %q: %w", name, err)
+		}
+		val, err := s.store.GetHostSecret(ctx, req.FromHost, name)
+		if errors.Is(err, store.ErrNotFound) {
+			// Defensive: preflight (same store lookup, before Stop) already gated
+			// this, so it is unreachable in the executor path. Apply's pre-check is
+			// the backstop if it ever is reached.
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("load host secret %q: %w", name, err)
+		}
+		if err := s.client.SecretCreate(ctx, req.ToHost, name, wrapAsKubeSecret(name, val)); err != nil {
+			// A concurrent move may have created it between inspect and create;
+			// tolerate that, fail on anything else.
+			if _, ie := s.client.SecretInspect(ctx, req.ToHost, name); ie == nil {
+				continue
+			}
+			return fmt.Errorf("provision host secret %q: %w", name, err)
+		}
+		step("provision-secret", name)
+		// Record the dest as a valid future provisioning source so multi-hop
+		// evacuations chain (h1->h2->h3). Best-effort: the secret is already on the
+		// dest and the move is sound, so a failed record must not roll back a
+		// healthy migration — a later hop would simply re-provision.
+		if rerr := s.store.PutHostSecret(ctx, req.ToHost, name, val); rerr != nil {
+			step("record-host-secret-failed", name)
+		}
+	}
+
 	vols, err := s.InstanceVolumes(ctx, req.FromHost, req.Template, req.Slug)
 	if err != nil {
 		return fmt.Errorf("list source volumes: %w", err)
