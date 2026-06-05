@@ -51,9 +51,12 @@ func TestErrorStatus(t *testing.T) {
 		instance.ErrUnknownTemplate:   http.StatusNotFound,
 		instance.ErrInstanceNotFound:  http.StatusNotFound,
 		instance.ErrInstanceExists:    http.StatusConflict,
-		instance.ErrHostDraining:      http.StatusConflict,
 		instance.ErrPortConflict:      http.StatusConflict,
-		instance.ErrHostSecretMissing: http.StatusBadRequest,
+		instance.ErrHostDraining:      http.StatusLocked,
+		instance.ErrHostSecretMissing: http.StatusUnprocessableEntity,
+		instance.ErrImagePull:         http.StatusBadGateway,
+		instance.ErrStoreDisabled:     http.StatusNotImplemented,
+		instance.ErrSameHost:          http.StatusBadRequest,
 		errors.New("boom"):            http.StatusInternalServerError,
 	}
 	for err, want := range cases {

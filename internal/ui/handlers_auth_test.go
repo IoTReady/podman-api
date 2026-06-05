@@ -85,6 +85,21 @@ func TestCSRFGuardedPostAcceptedWithToken(t *testing.T) {
 	}
 }
 
+func TestUnauthenticatedHtmxRequestGetsHXRedirect(t *testing.T) {
+	u := testUI(t)
+	r := httptest.NewRequest("GET", "/ui", nil)
+	r.Header.Set("HX-Request", "true")
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	// htmx must do a top-level redirect, not swap the login page into #main.
+	if w.Header().Get("HX-Redirect") != "/ui/login" {
+		t.Errorf("HX-Redirect = %q, want /ui/login", w.Header().Get("HX-Redirect"))
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 (htmx performs the redirect client-side)", w.Code)
+	}
+}
+
 func TestProtectedRouteRedirectsWhenUnauthenticated(t *testing.T) {
 	u := testUI(t)
 	r := httptest.NewRequest("GET", "/ui", nil)

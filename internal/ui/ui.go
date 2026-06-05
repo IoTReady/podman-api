@@ -59,6 +59,10 @@ func (u *UI) pageData(data map[string]any) map[string]any {
 	if data == nil {
 		data = map[string]any{}
 	}
+	// Shell tells the layout to render the persistent chrome (sidebar + #main).
+	// Set for every authenticated page regardless of host count, so an operator
+	// with zero configured hosts still gets nav + sign-out.
+	data["Shell"] = true
 	// Svc is nil only in template-only construction (tests that never reach an
 	// authenticated handler); guard so pageData can't panic there.
 	if u.cfg.Svc != nil {

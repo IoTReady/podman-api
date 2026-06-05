@@ -51,6 +51,25 @@ func TestDashboardListsHosts(t *testing.T) {
 	}
 }
 
+func TestZeroHostsStillRendersShell(t *testing.T) {
+	svc := instance.NewService(fake.New(), nil, nil) // zero configured hosts
+	hash, _ := config.HashToken("pw")
+	u, err := New(Config{
+		Svc:  svc,
+		Auth: NewOperatorAuthenticator(config.Operator{Username: "op", PasswordHash: hash}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := authedGet(t, u, "/ui")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "Sign out") {
+		t.Error("an authenticated page with zero hosts should still render the shell chrome")
+	}
+}
+
 func TestHostInstancesUnknownHostIs404(t *testing.T) {
 	u := uiWithService(t)
 	w := authedGet(t, u, "/ui/hosts/does-not-exist")

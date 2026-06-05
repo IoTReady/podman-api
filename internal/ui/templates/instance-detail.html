@@ -5,7 +5,7 @@
     <button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/start"   hx-target="#main">Start</button>
     <button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/stop"    hx-target="#main">Stop</button>
     <button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/restart" hx-target="#main">Restart</button>
-    <a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-target="#main" hx-push-url="true">Upgrade</a>
+    {{if .CanUpgrade}}<a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-target="#main" hx-push-url="true">Upgrade</a>{{end}}
     <button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/delete" hx-target="#main"
             hx-confirm="Delete {{.Inst.Template}}/{{.Inst.Slug}}?">Delete</button>
   </span>

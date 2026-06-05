@@ -468,6 +468,45 @@ func (s *Service) Upgrade(ctx context.Context, host string, req ApplyRequest, im
 	return s.Apply(ctx, host, req, ApplyOptions{Replace: true})
 }
 
+// UpgradeImage performs an image-only upgrade: it loads the instance's stored
+// spec (parameters + secrets), overrides the "image" parameter, and re-applies
+// with Replace. Existing secrets and parameters are reused as-is — the operator
+// supplies only the new image; rotating a secret is a separate operation.
+// Requires the desired-state store (that is where the reused secrets live):
+// returns ErrStoreDisabled when it is not configured, and ErrInstanceNotFound
+// when no spec is stored for the instance.
+func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image string) error {
+	if image == "" {
+		return errors.New("upgrade requires an image")
+	}
+	if s.store == nil {
+		return ErrStoreDisabled
+	}
+	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrInstanceNotFound
+		}
+		return fmt.Errorf("load spec: %w", err)
+	}
+	params := maps.Clone(spec.Parameters)
+	if params == nil {
+		params = map[string]any{}
+	}
+	params["image"] = image
+	return s.Apply(ctx, host, ApplyRequest{
+		Template:   tmpl,
+		Slug:       slug,
+		Parameters: params,
+		Secrets:    spec.Secrets,
+		Domains:    spec.Domains,
+	}, ApplyOptions{Replace: true})
+}
+
+// HasStore reports whether the desired-state store is configured (so image-only
+// upgrades, which reuse stored secrets, are available).
+func (s *Service) HasStore() bool { return s.store != nil }
+
 // Delete removes the pod and optionally its volumes and per-instance secrets.
 func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts DeleteOptions) error {
 	if _, err := s.lookup(host, tmpl); err != nil {

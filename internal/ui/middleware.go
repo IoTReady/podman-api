@@ -19,12 +19,12 @@ func (u *UI) requireSession(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c, err := r.Cookie(sessionCookie)
 		if err != nil {
-			http.Redirect(w, r, "/ui/login", http.StatusSeeOther)
+			redirectToLogin(w, r)
 			return
 		}
 		id, ok := u.cfg.Sessions.Lookup(c.Value)
 		if !ok {
-			http.Redirect(w, r, "/ui/login", http.StatusSeeOther)
+			redirectToLogin(w, r)
 			return
 		}
 		ctx := context.WithValue(r.Context(), identityKey, id)
@@ -60,6 +60,19 @@ func (u *UI) requireCSRF(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// redirectToLogin sends the browser to /ui/login. For an htmx request a plain
+// 303 would be followed by XHR and the login page swapped into the target
+// panel; instead we send an HX-Redirect header so htmx navigates the whole
+// window. Non-htmx requests get an ordinary 303.
+func redirectToLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("HX-Request") == "true" {
+		w.Header().Set("HX-Redirect", "/ui/login")
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	http.Redirect(w, r, "/ui/login", http.StatusSeeOther)
 }
 
 func identityFrom(r *http.Request) (Identity, bool) {

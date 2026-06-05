@@ -309,3 +309,44 @@ func TestService_Delete_StoreDeleteError_Fatal(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "delete spec")
 }
+
+func TestService_UpgradeImage_ReusesStoredSecrets(t *testing.T) {
+	svc, _ := newSvc(t)
+	mem := store.NewMemory()
+	svc.SetStore(mem)
+	ctx := context.Background()
+
+	// Initial deploy persists params + the per-instance secret.
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	// Image-only upgrade: the operator supplies just the new image.
+	require.NoError(t, svc.UpgradeImage(ctx, "h1", "postgres", "demo", "docker.io/library/postgres:17"))
+
+	// Stored spec now carries the new image; the secret is reused unchanged.
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, "docker.io/library/postgres:17", sp.Parameters["image"])
+	assert.Equal(t, "p", sp.Secrets["password"], "secret should be reused, not wiped")
+	// Non-image params are preserved too.
+	assert.Equal(t, "app", sp.Parameters["db"])
+}
+
+func TestService_UpgradeImage_RequiresStore(t *testing.T) {
+	svc, _ := newSvc(t)
+	err := svc.UpgradeImage(context.Background(), "h1", "postgres", "demo", "x:1")
+	assert.ErrorIs(t, err, ErrStoreDisabled)
+}
+
+func TestService_UpgradeImage_MissingSpecIsNotFound(t *testing.T) {
+	svc, _ := newSvc(t)
+	svc.SetStore(store.NewMemory())
+	err := svc.UpgradeImage(context.Background(), "h1", "postgres", "ghost", "x:1")
+	assert.ErrorIs(t, err, ErrInstanceNotFound)
+}
+
+func TestService_UpgradeImage_EmptyImageRejected(t *testing.T) {
+	svc, _ := newSvc(t)
+	svc.SetStore(store.NewMemory())
+	err := svc.UpgradeImage(context.Background(), "h1", "postgres", "demo", "")
+	require.Error(t, err)
+}

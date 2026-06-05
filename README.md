@@ -205,7 +205,7 @@ An optional, embedded, server-rendered admin UI (HTMX + PureCSS) is served at `/
    ```
 3. Start the daemon with `-operator-file auth/operator.yaml`.
 
-The UI provides a single-operator login, a host list, template-based deployment, and full instance lifecycle from the browser: start, stop, restart, upgrade, delete, and a static log tail (last 200 lines on request; live streaming is a later slice) — all without touching the API directly.
+The UI provides a single-operator login, a host list, template-based deployment, and instance lifecycle from the browser: start, stop, restart, delete, and a static log tail (last 200 lines on request; live streaming is a later slice) — all without touching the API directly. **Upgrade** is image-only: it reuses the instance's stored parameters and secrets and asks only for a new image, so it requires the desired-state store (`-state-db`) and is hidden when the store is off; rotating a secret is a separate operation (a per-instance secret-management UI is future work).
 
 **Flags:**
 

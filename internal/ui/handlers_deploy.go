@@ -134,42 +134,50 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 		u.renderError(w, r, err)
 		return
 	}
-	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(map[string]any{"Host": host, "Inst": obs}))
+	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(host, obs)))
 }
 
+// upgradeForm renders the image-only upgrade form. The upgrade reuses the
+// instance's stored parameters and secrets (the operator supplies only a new
+// image), so it requires the desired-state store; without it, there are no
+// stored secrets to reuse.
 func (u *UI) upgradeForm(w http.ResponseWriter, r *http.Request) {
 	host, tmplID, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
-	tmpl, refs := u.fieldData(r, host, tmplID)
-	if tmpl.Meta.ID == "" {
-		u.renderError(w, r, instance.ErrUnknownTemplate)
+	if !u.cfg.Svc.HasStore() {
+		u.renderError(w, r, instance.ErrStoreDisabled)
+		return
+	}
+	obs, err := u.cfg.Svc.Get(r.Context(), host, tmplID, slug)
+	if err != nil {
+		u.renderError(w, r, err)
 		return
 	}
 	u.render(w, r, http.StatusOK, "upgrade-form", u.pageData(map[string]any{
-		"Host":     host,
-		"Template": tmplID,
-		"Slug":     slug,
-		"Tmpl":     tmpl,
-		"HostRefs": refs,
+		"Host":         host,
+		"Template":     tmplID,
+		"Slug":         slug,
+		"CurrentImage": firstContainerImage(obs),
 	}))
 }
 
 func (u *UI) upgradeApply(w http.ResponseWriter, r *http.Request) {
 	host, tmplID, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "bad form", http.StatusBadRequest)
+	image := strings.TrimSpace(r.FormValue("image"))
+	if image == "" {
+		obs, _ := u.cfg.Svc.Get(r.Context(), host, tmplID, slug)
+		u.render(w, r, http.StatusBadRequest, "upgrade-form", u.pageData(map[string]any{
+			"Host": host, "Template": tmplID, "Slug": slug,
+			"CurrentImage": firstContainerImage(obs),
+			"Error":        "image is required",
+		}))
 		return
 	}
-	params, secrets := formValues(r.PostForm)
-	req := instance.ApplyRequest{Template: tmplID, Slug: slug, Parameters: params, Secrets: secrets}
-	if err := u.cfg.Svc.Upgrade(r.Context(), host, req, r.FormValue("image")); err != nil {
-		tmpl, refs := u.fieldData(r, host, tmplID)
+	if err := u.cfg.Svc.UpgradeImage(r.Context(), host, tmplID, slug, image); err != nil {
+		obs, _ := u.cfg.Svc.Get(r.Context(), host, tmplID, slug)
 		u.render(w, r, errorStatus(err), "upgrade-form", u.pageData(map[string]any{
-			"Host":     host,
-			"Template": tmplID,
-			"Slug":     slug,
-			"Tmpl":     tmpl,
-			"HostRefs": refs,
-			"Error":    err.Error(),
+			"Host": host, "Template": tmplID, "Slug": slug,
+			"CurrentImage": firstContainerImage(obs),
+			"Error":        err.Error(),
 		}))
 		return
 	}
@@ -178,5 +186,14 @@ func (u *UI) upgradeApply(w http.ResponseWriter, r *http.Request) {
 		u.renderError(w, r, err)
 		return
 	}
-	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(map[string]any{"Host": host, "Inst": obs}))
+	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(host, obs)))
+}
+
+// firstContainerImage returns the first container's image, for prefilling the
+// upgrade form; "" when the instance has no observed containers.
+func firstContainerImage(obs instance.Observed) string {
+	if len(obs.Containers) > 0 {
+		return obs.Containers[0].Image
+	}
+	return ""
 }

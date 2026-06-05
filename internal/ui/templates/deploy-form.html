@@ -1,10 +1,10 @@
 {{define "deploy-form"}}
 <h2>Deploy on {{.Host}}</h2>
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-<form hx-post="/ui/hosts/{{.Host}}/deploy" hx-target="#main" hx-push-url="true" class="pure-form pure-form-stacked">
+<form hx-post="/ui/hosts/{{.Host}}/deploy" hx-target="#main" class="pure-form pure-form-stacked">
   <input type="hidden" name="csrf_token" value="{{.CSRF}}">
   <label>Template
-    <select name="template" hx-get="/ui/hosts/{{.Host}}/deploy" hx-target="#main" hx-trigger="change" hx-include="closest form">
+    <select name="template" hx-get="/ui/hosts/{{.Host}}/deploy" hx-target="#main" hx-trigger="change" hx-include="closest form" hx-params="not csrf_token">
       {{range .Templates}}<option value="{{.Meta.ID}}"{{if eq .Meta.ID $.Selected}} selected{{end}}>{{.Meta.ID}}</option>{{end}}
     </select>
   </label>

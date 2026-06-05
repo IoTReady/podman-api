@@ -81,8 +81,8 @@ func (u *UI) renderError(w http.ResponseWriter, r *http.Request, err error) {
 	u.render(w, r, errorStatus(err), "error", u.pageData(map[string]any{"Error": err.Error()}))
 }
 
-// errorStatus maps instance sentinel errors to HTTP status codes, mirroring the
-// JSON API's taxonomy.
+// errorStatus maps instance/store/render sentinel errors to HTTP status codes,
+// mirroring the JSON API's classify() taxonomy (internal/api/errors.go).
 func errorStatus(err error) int {
 	switch {
 	case errors.Is(err, instance.ErrUnknownHost),
@@ -91,11 +91,18 @@ func errorStatus(err error) int {
 		errors.Is(err, store.ErrNotFound):
 		return http.StatusNotFound
 	case errors.Is(err, instance.ErrInstanceExists),
-		errors.Is(err, instance.ErrHostDraining),
 		errors.Is(err, instance.ErrPortConflict):
 		return http.StatusConflict
-	case errors.Is(err, instance.ErrHostSecretMissing),
-		errors.Is(err, render.ErrInvalidParameters):
+	case errors.Is(err, instance.ErrHostDraining):
+		return http.StatusLocked
+	case errors.Is(err, instance.ErrHostSecretMissing):
+		return http.StatusUnprocessableEntity
+	case errors.Is(err, instance.ErrImagePull):
+		return http.StatusBadGateway
+	case errors.Is(err, instance.ErrStoreDisabled):
+		return http.StatusNotImplemented
+	case errors.Is(err, render.ErrInvalidParameters),
+		errors.Is(err, instance.ErrSameHost):
 		return http.StatusBadRequest
 	default:
 		return http.StatusInternalServerError
