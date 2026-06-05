@@ -187,6 +187,35 @@ podman-api \
 
 A systemd unit and an opinionated installer live in `contrib/`. See [`contrib/install.sh`](contrib/install.sh) — it creates a dedicated `podman-api` user, installs the binary, and enables the service.
 
+## Admin UI
+
+An optional, embedded, server-rendered admin UI (HTMX + PureCSS) is served at `/ui` on the main `-addr` listener. It is **disabled** unless `-operator-file <path>` is set — no flag, no UI, no auth surface.
+
+**Setup:**
+
+1. Copy `auth/operator.example.yaml` to `auth/operator.yaml` (gitignored).
+2. Generate a password hash and paste it in:
+   ```sh
+   ./bin/podman-api hash-token <your-password>
+   ```
+   The file shape is:
+   ```yaml
+   username: operator
+   password_hash: "$argon2id$v=19$m=65536,t=3,p=4$..."
+   ```
+3. Start the daemon with `-operator-file auth/operator.yaml`.
+
+The UI provides a single-operator login, a host list, template-based deployment, and full instance lifecycle from the browser: start, stop, restart, upgrade, delete, and a live log tail — all without touching the API directly.
+
+**Flags:**
+
+- **`-operator-file <path>`** — path to the operator credential YAML; enables the UI.
+- **`-ui-secure-cookie`** — marks the session cookie `Secure`; set this when serving over HTTPS or behind a TLS-terminating proxy.
+
+Like `auth/keys.yaml`, the operator file is reloaded on SIGHUP — edit the file, send `kill -HUP $(pidof podman-api)`, and the new credential takes effect on the next login attempt.
+
+Design spec: [`docs/superpowers/specs/2026-06-04-admin-ui-shell-design.md`](docs/superpowers/specs/2026-06-04-admin-ui-shell-design.md).
+
 ## Security model
 
 - **TLS** is the responsibility of a reverse proxy. The recommended setup is Caddy in front (see `contrib/Caddyfile.example`), terminating Let's Encrypt. The binary itself binds to `127.0.0.1` and never exposes plaintext on a public port.
