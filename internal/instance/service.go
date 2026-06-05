@@ -172,6 +172,14 @@ func (s *Service) host(id string) (config.Host, bool) {
 	return h, ok
 }
 
+// hasTemplate reports whether a template id is configured. A helper (rather than
+// a direct map reach-in) keeps the templates map encapsulated — load-bearing the
+// day templates move to a live-reloadable store.
+func (s *Service) hasTemplate(id string) bool {
+	_, ok := s.templates[id]
+	return ok
+}
+
 func (s *Service) instanceLock(host, tmpl, slug string) *sync.Mutex {
 	key := host + "|" + tmpl + "|" + slug
 	s.mu.Lock()

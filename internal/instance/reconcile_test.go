@@ -227,6 +227,42 @@ func TestReconcileMigrate_BothAbsent_NotFound(t *testing.T) {
 	}
 }
 
+// hostErrIngress is a fake ingress.Controller whose Reconcile fails only for a
+// chosen host, used to prove roll-forward does not couple to source-proxy health.
+type hostErrIngress struct{ failHost string }
+
+func (h hostErrIngress) Reconcile(_ context.Context, host string) error {
+	if host == h.failHost {
+		return errors.New("caddy wedged")
+	}
+	return nil
+}
+
+// TestReconcileMigrate_RollForward_SourceIngressWedged_StillSucceeds verifies the
+// round-3 fix: when the source pod is already gone, roll-forward clears the
+// orphaned source spec row and refreshes source ingress best-effort — a wedged
+// source caddy must NOT strand a committed, healthy migrate in reconciling.
+func TestReconcileMigrate_RollForward_SourceIngressWedged_StillSucceeds(t *testing.T) {
+	svc, fc, st := reconcileSvc(t)
+	svc.SetIngress(hostErrIngress{failHost: "h1"}, "ingressnet") // source (h1) caddy wedged
+	ctx := context.Background()
+	fc.AddPod("h2", healthyPod("web-x"))                                // dest healthy, source pod gone
+	st.PutSpec(ctx, store.Spec{Host: "h2", Template: "web", Slug: "x"}) // dest committed
+	st.PutSpec(ctx, store.Spec{Host: "h1", Template: "web", Slug: "x"}) // orphaned source spec
+
+	resolved, ok, _, err := svc.ReconcileMigrate(ctx, req(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resolved || !ok {
+		t.Fatalf("got resolved=%v ok=%v, want true/true (source caddy health must not block roll-forward)", resolved, ok)
+	}
+	// The orphaned source spec row is still cleaned despite the wedged source caddy.
+	if _, err := st.GetSpec(ctx, "h1", "web", "x"); !errors.Is(err, store.ErrNotFound) {
+		t.Fatalf("orphaned source spec not cleaned: %v", err)
+	}
+}
+
 // getSpecErrStore wraps a memory store but fails GetSpec with a transient
 // (non-ErrNotFound) error, to exercise the inconclusive path of destSpecState.
 type getSpecErrStore struct {

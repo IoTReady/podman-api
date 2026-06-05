@@ -55,7 +55,7 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	// phase and be swallowed as inconclusive — the same infinite loop the host
 	// guards above prevent. (Templates load once at startup, so removal coincides
 	// with the restart that produced these reconciling jobs.)
-	if _, ok := s.templates[req.Template]; !ok {
+	if !s.hasTemplate(req.Template) {
 		return true, false, "template " + req.Template + " is no longer configured; manual cleanup required", nil
 	}
 
@@ -106,14 +106,36 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 					return false, false, "", nil
 				}
 			}
-			// Reap the source unconditionally — pod AND persisted state — even when
-			// the pod is already gone: a crash inside the original commit's Delete
-			// (between PodRemove and DeleteSpec) can leave an orphaned source spec
-			// row that the periodic ingress loop would re-derive into a dead route.
-			// Delete is idempotent toward "gone" (tolerates a missing pod/spec).
-			if derr := s.Delete(mctx, req.FromHost, req.Template, req.Slug, DeleteOptions{PruneVolumes: true, PruneSecrets: true}); derr != nil {
-				step("reconcile-inconclusive", "reap source: "+derr.Error())
-				return false, false, "", nil
+			// Reap the source. If its pod is present, fully delete it (pod +
+			// volumes + secrets + spec + ingress); a failure there is genuinely
+			// inconclusive — we must not leave a duplicate of the committed dest.
+			//
+			// If the pod is already gone (fully committed, or a commit interrupted
+			// between PodRemove and DeleteSpec), only persisted state may linger:
+			// clear the spec row directly with a best-effort ingress refresh. Using
+			// the full Delete here would couple adoption of the healthy dest to the
+			// *source* host's proxy health — Delete's final ingress.Reconcile
+			// propagates errors — stranding a committed migrate in `reconciling`
+			// whenever the source caddy is wedged while still serving other apps.
+			if srcPresent {
+				if derr := s.Delete(mctx, req.FromHost, req.Template, req.Slug, DeleteOptions{PruneVolumes: true, PruneSecrets: true}); derr != nil {
+					step("reconcile-inconclusive", "reap source: "+derr.Error())
+					return false, false, "", nil
+				}
+			} else if s.store != nil {
+				// A store write is local and reliable; a failure is worth retrying so
+				// the orphan row is cleaned. The source ingress refresh is best-effort
+				// — if it fails, the periodic ingress loop reconciles from the now
+				// row-less state.
+				if derr := s.store.DeleteSpec(mctx, req.FromHost, req.Template, req.Slug); derr != nil && !errors.Is(derr, store.ErrNotFound) {
+					step("reconcile-inconclusive", "clean source spec: "+derr.Error())
+					return false, false, "", nil
+				}
+				if s.ingressEnabled() {
+					if rerr := s.ingress.Reconcile(mctx, req.FromHost); rerr != nil {
+						step("reconcile-source-ingress-cleanup-failed", rerr.Error())
+					}
+				}
 			}
 			step("reconcile-roll-forward", req.ToHost)
 			return true, true, "", nil
