@@ -2,6 +2,7 @@ package ui
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman"
@@ -60,10 +61,31 @@ func (u *UI) lifecycle(w http.ResponseWriter, r *http.Request) {
 	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(map[string]any{"Host": host, "Inst": obs}))
 }
 
-// logsTail renders the last N log lines as static text.
+// logsTail renders the last N log lines of one container as static text. The
+// container is taken from the ?container= query (a name suffix), defaulting to
+// the instance's first container. Service.Logs caps output server-side via
+// LogOptions.Tail; the drain is bounded by that and is safe for a static render.
 func (u *UI) logsTail(w http.ResponseWriter, r *http.Request) {
 	host, tmpl, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
-	ch, err := u.cfg.Svc.Logs(r.Context(), host, tmpl, slug, "", podman.LogOptions{Tail: 200})
+
+	container := r.URL.Query().Get("container")
+	if container == "" {
+		obs, err := u.cfg.Svc.Get(r.Context(), host, tmpl, slug)
+		if err != nil {
+			u.renderError(w, r, err)
+			return
+		}
+		if len(obs.Containers) == 0 {
+			u.render(w, r, http.StatusOK, "logs", u.pageData(map[string]any{"Host": host, "Template": tmpl, "Slug": slug, "Lines": nil}))
+			return
+		}
+		// Service.Logs reconstructs the container name as "<tmpl>-<slug>-<arg>";
+		// Observed carries the full container name, so strip that prefix to
+		// recover the suffix it expects.
+		container = strings.TrimPrefix(obs.Containers[0].Name, tmpl+"-"+slug+"-")
+	}
+
+	ch, err := u.cfg.Svc.Logs(r.Context(), host, tmpl, slug, container, podman.LogOptions{Tail: 200})
 	if err != nil {
 		u.renderError(w, r, err)
 		return

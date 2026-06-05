@@ -35,6 +35,7 @@ func uiWithSeededInstance(t *testing.T) *UI {
 			{Name: "postgres-main-db", Image: "docker.io/library/postgres", Status: "Running"},
 		},
 	})
+	fc.LogLines = []podman.LogLine{{Container: "postgres-main-db", Line: "database system is ready"}}
 	svc := instance.NewService(fc, hosts, tmpls)
 	hash, _ := config.HashToken("pw")
 	u, err := New(Config{
@@ -85,6 +86,17 @@ func TestInstanceDetailNotFoundIs404(t *testing.T) {
 	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/ghost")
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 for missing instance", w.Code)
+	}
+}
+
+func TestLogsTailRendersLines(t *testing.T) {
+	u := uiWithSeededInstance(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/main/logs")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "database system is ready") {
+		t.Error("logs view should show the seeded log line")
 	}
 }
 
