@@ -2,7 +2,10 @@ package instance
 
 import (
 	"context"
+	"fmt"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -126,6 +129,57 @@ func TestApplyRejectsDomainsOnNonIngressTemplate(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "has no ingress")
 	assert.Empty(t, f.PlayCalls, "no pod should be played for a rejected request")
+}
+
+// slowReadStore widens the validateIngress check window: every host-wide
+// uniqueness read (ListSpecKeys) sleeps before returning. This makes the #82
+// TOCTOU race deterministic — concurrent Applies for different instances all
+// observe the pre-claim state unless the service serializes domain claims per
+// host. The embedded store carries the remaining methods unchanged.
+type slowReadStore struct {
+	store.Store
+	delay time.Duration
+}
+
+func (s slowReadStore) ListSpecKeys(ctx context.Context, host string) ([]store.SpecKey, error) {
+	time.Sleep(s.delay)
+	return s.Store.ListSpecKeys(ctx, host)
+}
+
+// Two different instances racing to claim the SAME host-wide-unique domain must
+// not both succeed: the host-wide uniqueness check and the spec persist have to
+// be atomic across instances. The per-instance lock alone does not serialize
+// distinct instances, so without a per-host guard both observe an unclaimed
+// domain and both persist it. (#82)
+func TestApplyDomainUniquenessIsHostSerialized(t *testing.T) {
+	svc, _ := newWebSvc(t)
+	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
+	svc.SetStore(slowReadStore{Store: store.NewMemory(), delay: 50 * time.Millisecond})
+
+	const n = 8
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Distinct slugs -> distinct instance locks (all run concurrently),
+			// but every request claims the same domain app.example.com.
+			req := webApply(fmt.Sprintf("inst%d", i))
+			errs[i] = svc.Apply(context.Background(), "h1", req, ApplyOptions{Replace: true})
+		}(i)
+	}
+	wg.Wait()
+
+	success := 0
+	for _, e := range errs {
+		if e == nil {
+			success++
+			continue
+		}
+		assert.Contains(t, e.Error(), "already claimed")
+	}
+	assert.Equal(t, 1, success, "exactly one instance may claim a host-wide-unique domain")
 }
 
 // A domain already claimed by another instance on the host must be rejected
