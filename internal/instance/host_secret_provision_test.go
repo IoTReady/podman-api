@@ -2,6 +2,7 @@ package instance
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,6 +12,17 @@ import (
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/store"
 )
+
+// failingStore satisfies store.Store but fails every PutHostSecret. Embedding
+// the interface means we only override the one method we care about (the rest
+// panic with nil-pointer if called, which is fine — this test never calls them).
+type failingStore struct {
+	store.Store
+}
+
+func (failingStore) PutHostSecret(_ context.Context, _, _ string, _ []byte) error {
+	return errors.New("boom")
+}
 
 func newHostSecretSvc(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
 	t.Helper()
@@ -79,4 +91,20 @@ func TestHostSecretProvisionable(t *testing.T) {
 	ok, err = svc.hostSecretProvisionable(ctx, "h1", "absent")
 	require.NoError(t, err)
 	assert.False(t, ok)
+}
+
+func TestPutHostSecret_PersistError_HostStillUpdated(t *testing.T) {
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/a"}}
+	f := fake.New()
+	svc := NewService(f, hosts, []config.Template{templateWithHostSecret()})
+	svc.SetStore(failingStore{})
+	ctx := context.Background()
+
+	err := svc.PutHostSecret(ctx, "h1", "shared-pull-token", []byte("v"), true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "persist host secret")
+
+	// Push-before-persist: the host already holds the secret even though persist failed.
+	_, ierr := f.SecretInspect(ctx, "h1", "shared-pull-token")
+	assert.NoError(t, ierr)
 }
