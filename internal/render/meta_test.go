@@ -154,4 +154,20 @@ kind: Pod
 	require.Equal(t, "port", m.Parameters[1].Name)
 	require.False(t, m.Parameters[1].Required)
 	require.Contains(t, body, "kind: Pod")
+	require.Equal(t, "nginx:1", m.Parameters[0].Default)
+	require.EqualValues(t, 8080, m.Parameters[1].Default)
+}
+
+func TestParseMeta_RejectsUnknownType(t *testing.T) {
+	src := `# template-meta:
+#   id: x
+#   parameters:
+#     - name: foo
+#       type: float
+---
+kind: Pod
+`
+	_, _, err := ParseMeta(src)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "float")
 }

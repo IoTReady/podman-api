@@ -13,7 +13,7 @@ import (
 // It is parsed from the leading "# template-meta:" comment block.
 type Meta struct {
 	ID         string     `yaml:"id"`
-	Display    Display    `yaml:"display"`
+	Display    Display    `yaml:"display,omitempty" json:"display,omitempty"`
 	Parameters []ParamDef `yaml:"parameters"`
 	Secrets    Secrets    `yaml:"secrets"`
 	Volumes    []Volume   `yaml:"volumes"`
