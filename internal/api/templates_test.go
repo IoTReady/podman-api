@@ -109,6 +109,41 @@ func TestRenderTemplate(t *testing.T) {
 	assert.Contains(t, string(body[:n]), "name: app-hello")
 }
 
+func TestRenderTemplate_AppliesDefaults(t *testing.T) {
+	// A render preview that omits a defaulted parameter must succeed with the
+	// default filled in, matching what an actual deploy would render (#61).
+	srv, tok, mem, _ := newSrvWithTmpl(t)
+	require.NoError(t, mem.PutTemplate(context.Background(), store.Template{
+		Meta: render.Meta{
+			ID: "defaulted",
+			Parameters: []render.ParamDef{
+				{Name: "slug", Type: "string", Required: true},
+				{Name: "tag", Type: "string", Default: "latest"},
+			},
+		},
+		Body:   "kind: Pod\nname: d-{{.slug}}\nimage: nginx:{{.tag}}\n",
+		Origin: "seed",
+	}))
+
+	resp := authedReq(t, srv, tok, "GET", "/templates/defaulted/render?slug=hi")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	body := make([]byte, 1024)
+	n, _ := resp.Body.Read(body)
+	out := string(body[:n])
+	assert.Contains(t, out, "name: d-hi")
+	assert.Contains(t, out, "image: nginx:latest")
+}
+
+func TestDeleteTemplate_UnknownIs404(t *testing.T) {
+	// OpenAPI documents 404 for an unknown id even though store deletes are
+	// absent-OK (#61).
+	srv, tok, _, _ := newSrvWithTmpl(t)
+	resp := doReq(t, srv, tok, "DELETE", "/templates/nope", "")
+	resp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
 func TestCreateTemplate_AndConflict(t *testing.T) {
 	srv, tok, _, _ := newSrvWithTmpl(t)
 	body := `{"id":"redis","body":"kind: Pod\nname: redis-{{.slug}}\n","parameters":[{"name":"slug","type":"string","required":true}]}`

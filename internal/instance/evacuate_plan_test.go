@@ -197,7 +197,7 @@ func TestPlanEvacuation_InvalidParameters(t *testing.T) {
 	svc, _, mem := newPlanSvc(t)
 	ctx := context.Background()
 	// Contract drift: the stored postgres spec predates a required param/secret
-	// (here it omits the "password" secret). render.Render tolerates this, so the
+	// (here it omits the "password" secret). Body rendering tolerates this, so the
 	// live port check passes — but the executor's Apply-time render.Validate would
 	// reject it. The preview must predict that with an invalid_parameters issue.
 	require.NoError(t, mem.PutSpec(ctx, store.Spec{

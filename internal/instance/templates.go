@@ -41,7 +41,7 @@ func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
 	if err := render.NormalizeParams(&t.Meta); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
-	if err := validateTemplate(t); err != nil {
+	if err := ValidateTemplate(t); err != nil {
 		return err
 	}
 	if _, err := s.GetTemplate(ctx, t.Meta.ID); err == nil {
@@ -64,7 +64,7 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 	if err := render.NormalizeParams(&t.Meta); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
-	if err := validateTemplate(t); err != nil {
+	if err := ValidateTemplate(t); err != nil {
 		return err
 	}
 	existing, err := s.GetTemplate(ctx, t.Meta.ID)
@@ -92,7 +92,7 @@ func (s *Service) CloneTemplate(ctx context.Context, srcID, newID string) (store
 	if err := render.NormalizeParams(&cl.Meta); err != nil {
 		return store.Template{}, fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
-	if err := validateTemplate(cl); err != nil {
+	if err := ValidateTemplate(cl); err != nil {
 		return store.Template{}, err
 	}
 	if _, err := s.GetTemplate(ctx, newID); err == nil {
@@ -113,6 +113,11 @@ func (s *Service) CloneTemplate(ctx context.Context, srcID, newID string) (store
 func (s *Service) DeleteTemplate(ctx context.Context, id string, force bool) error {
 	s.tmplMu.Lock()
 	defer s.tmplMu.Unlock()
+	// store.DeleteTemplate is absent-OK, but the API documents 404 for an
+	// unknown id — so confirm existence first (#61).
+	if _, err := s.GetTemplate(ctx, id); err != nil {
+		return err
+	}
 	if !force {
 		for _, h := range s.hostsSnap() {
 			keys, err := s.store.ListSpecKeys(ctx, h.ID)
@@ -129,7 +134,7 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string, force bool) err
 	return s.store.DeleteTemplate(ctx, id)
 }
 
-// validateTemplate checks an authored template before it is persisted:
+// ValidateTemplate checks an authored or seed template before it is persisted:
 //
 //  1. The template id must be a valid DNS-label-style name.
 //  2. A dry-run render of the body (with a dummy value for every declared
@@ -138,7 +143,7 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string, force bool) err
 //  3. If the template declares ingress, its container must be non-empty and its
 //     port in 1..65535 (render.ValidateIngress), AND the rendered pod must
 //     contain a container whose name matches Ingress.Container.
-func validateTemplate(t store.Template) error {
+func ValidateTemplate(t store.Template) error {
 	if !render.ValidName(t.Meta.ID) {
 		return fmt.Errorf("%w: id %q must match %s", ErrInvalidTemplate, t.Meta.ID, render.NameRe.String())
 	}

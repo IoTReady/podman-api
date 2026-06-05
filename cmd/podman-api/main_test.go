@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"testing/fstest"
 
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
@@ -106,6 +107,44 @@ func TestSeedTemplates_OnEmptyOnly(t *testing.T) {
 	again, err := seedTemplates(ctx, db, templates.Files)
 	require.NoError(t, err)
 	require.Zero(t, again, "must not re-seed a populated store")
+}
+
+func TestSeedTemplates_RejectsMalformed(t *testing.T) {
+	// A seed whose ingress names a container the body never declares passes
+	// ParseMeta but must fail ValidateTemplate, so seedTemplates returns an
+	// error and persists nothing (boot fails fast rather than storing garbage).
+	ctx := context.Background()
+	db, err := store.OpenSQLite(filepath.Join(t.TempDir(), "s.db"), nil)
+	require.NoError(t, err)
+	defer db.Close()
+
+	bad := fstest.MapFS{
+		"broken.yaml": &fstest.MapFile{Data: []byte(
+			"# template-meta:\n" +
+				"#   id: broken\n" +
+				"#   ingress:\n" +
+				"#     container: missing\n" +
+				"#     port: 8080\n" +
+				"---\n" +
+				"apiVersion: v1\n" +
+				"kind: Pod\n" +
+				"metadata:\n" +
+				"  name: broken\n" +
+				"spec:\n" +
+				"  containers:\n" +
+				"    - name: app\n" +
+				"      image: nginx:1\n",
+		)},
+	}
+
+	n, err := seedTemplates(ctx, db, bad)
+	require.Error(t, err)
+	require.Zero(t, n)
+	require.Contains(t, err.Error(), "broken")
+
+	count, err := db.CountTemplates(ctx)
+	require.NoError(t, err)
+	require.Zero(t, count, "malformed seed must not be persisted")
 }
 
 func TestComposeHandlerRootRedirectsToUI(t *testing.T) {

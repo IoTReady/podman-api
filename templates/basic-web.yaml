@@ -14,12 +14,6 @@
 #       required: true
 #       label: Image
 #       description: Container image (e.g. docker.io/library/nginx:1)
-#     - name: port
-#       type: int
-#       required: true
-#       label: HTTP port
-#       description: Port your app serves HTTP on
-#       default: 8080
 #   ingress:
 #     container: app
 #     port: 8080
@@ -36,4 +30,4 @@ spec:
     - name: app
       image: {{.image}}
       ports:
-        - containerPort: {{.port}}
+        - containerPort: 8080

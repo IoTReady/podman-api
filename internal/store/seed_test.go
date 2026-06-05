@@ -35,13 +35,15 @@ func TestParseSeeds_IncludesBasicWeb(t *testing.T) {
 }
 
 func TestBasicWeb_Renders(t *testing.T) {
-	// Read the full source (meta + body) directly from the embed.FS so that
-	// render.Render can strip the meta block before template execution.
-	// render.RenderBody does not exist yet; render.Render requires the full source.
+	// Read the full source (meta + body) directly from the embed.FS and split
+	// the meta block off with ParseMeta before rendering the body.
 	raw, err := templates.Files.ReadFile("basic-web.yaml")
 	require.NoError(t, err)
-	out, err := render.Render(string(raw), map[string]any{"slug": "demo", "image": "nginx:1", "port": 8080})
+	_, body, err := render.ParseMeta(string(raw))
+	require.NoError(t, err)
+	out, err := render.RenderBody(body, map[string]any{"slug": "demo", "image": "nginx:1"})
 	require.NoError(t, err)
 	require.Contains(t, out, "basic-web-demo")
 	require.Contains(t, out, "nginx:1")
+	require.Contains(t, out, "containerPort: 8080")
 }

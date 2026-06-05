@@ -179,6 +179,10 @@ func (h *handlers) renderTemplate(w http.ResponseWriter, r *http.Request) {
 			params[k] = v[0]
 		}
 	}
+	// Fill omitted-but-defaulted parameters so a preview matches what an actual
+	// deploy (which applies defaults) would render; otherwise missingkey=error
+	// fails the preview for a param the deploy would have supplied (#61).
+	params = render.ApplyDefaults(tmpl.Meta, params)
 	out, err := render.RenderBody(tmpl.Body, params)
 	if err != nil {
 		WriteError(w, err)

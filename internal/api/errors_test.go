@@ -10,6 +10,7 @@ import (
 
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 func TestWriteError_KnownSentinels(t *testing.T) {
@@ -24,6 +25,7 @@ func TestWriteError_KnownSentinels(t *testing.T) {
 		{instance.ErrInstanceExists, "instance_already_exists", http.StatusConflict},
 		{instance.ErrHostSecretMissing, "host_secret_missing", http.StatusUnprocessableEntity},
 		{render.ErrInvalidParameters, "invalid_parameters", http.StatusBadRequest},
+		{store.ErrSecretsNeedKey, "secrets_need_key", http.StatusBadRequest},
 		{errors.New("anything else"), "internal", http.StatusInternalServerError},
 	}
 	for _, c := range cases {

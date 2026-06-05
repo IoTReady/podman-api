@@ -171,6 +171,15 @@ func TestDeleteTemplate_NotInUse(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrNotFound)
 }
 
+func TestDeleteTemplate_UnknownIsNotFound(t *testing.T) {
+	// store.DeleteTemplate is absent-OK, but the API documents 404 for an
+	// unknown id, so DeleteTemplate must surface ErrUnknownTemplate (#61).
+	ctx := context.Background()
+	svc, _ := tmplSvc(t, webTemplate())
+	err := svc.DeleteTemplate(ctx, "nope", false)
+	require.ErrorIs(t, err, ErrUnknownTemplate)
+}
+
 // TestCreateTemplate_IntParamNormalization verifies that a template whose
 // parameter has Type=="" (as received from JSON before normalization) is
 // treated as "string" and does not cause a false rejection.

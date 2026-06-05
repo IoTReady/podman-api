@@ -20,7 +20,9 @@ kind: Pod
 metadata:
   name: x-{{.slug}}
 `
-	out, err := Render(src, map[string]any{"slug": "iotready"})
+	_, body, err := ParseMeta(src)
+	require.NoError(t, err)
+	out, err := RenderBody(body, map[string]any{"slug": "iotready"})
 	require.NoError(t, err)
 	assert.Contains(t, out, "name: x-iotready")
 	assert.NotContains(t, out, "template-meta")
@@ -38,7 +40,9 @@ metadata:
   name: x-{{.slug}}
 `
 	// Use Go template's missingkey=error mode.
-	_, err := Render(src, map[string]any{})
+	_, body, err := ParseMeta(src)
+	require.NoError(t, err)
+	_, err = RenderBody(body, map[string]any{})
 	require.Error(t, err)
 }
 
@@ -66,7 +70,9 @@ kind: Pod
 metadata:
   name: p-{{.slug}}
 `
-	out, err := Render(src, map[string]any{"slug": "a"})
+	_, body, err := ParseMeta(src)
+	require.NoError(t, err)
+	out, err := RenderBody(body, map[string]any{"slug": "a"})
 	require.NoError(t, err)
 	assert.Contains(t, out, "name: cm-a")
 	assert.Contains(t, out, "name: p-a")
