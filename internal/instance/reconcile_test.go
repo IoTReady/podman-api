@@ -28,14 +28,12 @@ func reconcileSvc(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
 		{ID: "h1", Addr: "unix", Socket: "/a"},
 		{ID: "h2", Addr: "unix", Socket: "/b"},
 	}
-	tmpls := []config.Template{{Meta: render.Meta{
+	webTmpl := store.Template{Meta: render.Meta{
 		ID:      "web",
 		Volumes: []render.Volume{{Name: "data"}},
 		Secrets: render.Secrets{PerInstance: []string{"password"}},
-	}}}
-	svc := NewService(fc, hosts, tmpls)
-	st := store.NewMemory()
-	svc.SetStore(st)
+	}}
+	svc, st := newSvcWith(t, fc, hosts, webTmpl)
 	return svc, fc, st
 }
 

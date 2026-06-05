@@ -42,6 +42,12 @@ metadata:
 	require.Error(t, err)
 }
 
+func TestRenderBody_SubstitutesParams(t *testing.T) {
+	out, err := RenderBody("value: {{.x}}", map[string]any{"x": "hello"})
+	require.NoError(t, err)
+	assert.Equal(t, "value: hello", out)
+}
+
 func TestRender_PreservesMultipleDocs(t *testing.T) {
 	src := `# template-meta:
 #   id: x

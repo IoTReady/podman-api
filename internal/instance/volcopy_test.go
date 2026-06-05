@@ -16,7 +16,7 @@ import (
 
 func newVolSvc(f *fake.Fake) *Service {
 	hosts := []config.Host{{ID: "a", Addr: "unix", Socket: "/x"}, {ID: "b", Addr: "unix", Socket: "/y"}}
-	return NewService(f, hosts, nil)
+	return NewService(f, hosts)
 }
 
 func TestCopyVolume_HappyPath(t *testing.T) {

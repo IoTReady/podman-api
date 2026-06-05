@@ -17,11 +17,11 @@ import (
 )
 
 // noIngressTemplate is a fixture that declares NO ingress.
-func noIngressTemplate() config.Template {
-	return config.Template{
+func noIngressTemplate() store.Template {
+	return store.Template{
 		Meta: render.Meta{
 			ID:         "db",
-			Parameters: render.Parameters{Required: []string{"slug", "image"}},
+			Parameters: requiredParams("slug", "image"),
 		},
 		Body: `apiVersion: v1
 kind: Pod
@@ -32,7 +32,7 @@ spec:
     - name: db
       image: {{.image}}
 `,
-		Source: "db.yaml",
+		Origin: "seed",
 	}
 }
 
@@ -45,14 +45,12 @@ func (r *recordingCtl) Reconcile(_ context.Context, host string) error {
 }
 
 // webTemplate is a web-shaped fixture that declares ingress.
-func webTemplate() config.Template {
-	return config.Template{
+func webTemplate() store.Template {
+	return store.Template{
 		Meta: render.Meta{
-			ID: "web",
-			Parameters: render.Parameters{
-				Required: []string{"slug", "image"},
-			},
-			Ingress: &render.Ingress{Container: "web", Port: 8080},
+			ID:         "web",
+			Parameters: requiredParams("slug", "image"),
+			Ingress:    &render.Ingress{Container: "web", Port: 8080},
 		},
 		Body: `apiVersion: v1
 kind: Pod
@@ -66,7 +64,7 @@ spec:
     - name: web
       image: {{.image}}
 `,
-		Source: "web.yaml",
+		Origin: "seed",
 	}
 }
 
@@ -74,7 +72,7 @@ func newWebSvc(t *testing.T) (*Service, *fake.Fake) {
 	t.Helper()
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	f := fake.New()
-	svc := NewService(f, hosts, []config.Template{webTemplate()})
+	svc, _ := newSvcWith(t, f, hosts, webTemplate())
 	return svc, f
 }
 
@@ -116,7 +114,7 @@ func TestApplyAttachesNetworkAndReconcilesWhenEnabled(t *testing.T) {
 func TestApplyRejectsDomainsOnNonIngressTemplate(t *testing.T) {
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	f := fake.New()
-	svc := NewService(f, hosts, []config.Template{noIngressTemplate()})
+	svc, _ := newSvcWith(t, f, hosts, noIngressTemplate())
 	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
 
 	req := ApplyRequest{
@@ -135,15 +133,16 @@ func TestApplyRejectsDomainsOnNonIngressTemplate(t *testing.T) {
 // uniqueness read (ListSpecKeys) sleeps before returning. This makes the #82
 // TOCTOU race deterministic — concurrent Applies for different instances all
 // observe the pre-claim state unless the service serializes domain claims per
-// host. The embedded store carries the remaining methods unchanged.
+// host. It embeds *store.Memory so the template catalog and remaining store
+// methods carry through unchanged.
 type slowReadStore struct {
-	store.Store
+	*store.Memory
 	delay time.Duration
 }
 
 func (s slowReadStore) ListSpecKeys(ctx context.Context, host string) ([]store.SpecKey, error) {
 	time.Sleep(s.delay)
-	return s.Store.ListSpecKeys(ctx, host)
+	return s.Memory.ListSpecKeys(ctx, host)
 }
 
 // Two different instances racing to claim the SAME host-wide-unique domain must
@@ -154,7 +153,7 @@ func (s slowReadStore) ListSpecKeys(ctx context.Context, host string) ([]store.S
 func TestApplyDomainUniquenessIsHostSerialized(t *testing.T) {
 	svc, _ := newWebSvc(t)
 	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
-	svc.SetStore(slowReadStore{Store: store.NewMemory(), delay: 50 * time.Millisecond})
+	svc.SetStore(slowReadStore{Memory: seedStore(t, webTemplate()), delay: 50 * time.Millisecond})
 
 	const n = 8
 	errs := make([]error, n)
@@ -187,7 +186,7 @@ func TestApplyDomainUniquenessIsHostSerialized(t *testing.T) {
 func TestApplyRejectsDuplicateDomainAcrossInstances(t *testing.T) {
 	svc, f := newWebSvc(t)
 	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
-	st := store.NewMemory()
+	st := seedStore(t, webTemplate())
 	svc.SetStore(st)
 	require.NoError(t, st.PutSpec(context.Background(), store.Spec{
 		Host: "h1", Template: "web", Slug: "other", Domains: []string{"app.example.com"},

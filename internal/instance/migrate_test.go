@@ -28,11 +28,11 @@ func setVerifyKnobs(timeout, interval time.Duration) func() {
 
 // portTemplate is a fixture whose rendered Pod declares a fixed hostPort, used
 // to exercise the dest port-conflict preflight.
-func portTemplate() config.Template {
-	return config.Template{
+func portTemplate() store.Template {
+	return store.Template{
 		Meta: render.Meta{
 			ID:         "web",
-			Parameters: render.Parameters{Required: []string{"slug", "image"}},
+			Parameters: requiredParams("slug", "image"),
 		},
 		Body: `apiVersion: v1
 kind: Pod
@@ -46,7 +46,7 @@ spec:
         - hostPort: 8080
           containerPort: 80
 `,
-		Source: "web.yaml",
+		Origin: "seed",
 	}
 }
 
@@ -58,9 +58,7 @@ func newMigrateSvc(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
 		{ID: "draining", Addr: "unix", Socket: "/z", Drain: true},
 	}
 	f := fake.New()
-	mem := store.NewMemory()
-	svc := NewService(f, hosts, []config.Template{pgTemplate(), portTemplate()})
-	svc.SetStore(mem)
+	svc, mem := newSvcWith(t, f, hosts, pgTemplate(), portTemplate())
 	return svc, f, mem
 }
 
@@ -171,9 +169,7 @@ func TestMigrate_PreflightFailFast_SourceUntouched(t *testing.T) {
 	t.Run("missing per-host secret on dest", func(t *testing.T) {
 		hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}, {ID: "h2", Addr: "unix", Socket: "/y"}}
 		f := fake.New()
-		mem := store.NewMemory()
-		svc := NewService(f, hosts, []config.Template{templateWithHostSecret()})
-		svc.SetStore(mem)
+		svc, mem := newSvcWith(t, f, hosts, templateWithHostSecret())
 		seedSpec(t, mem, "h1", "needs-host-secret", "s1", map[string]any{"slug": "s1", "image": "x"})
 		f.AddPod("h1", podman.Pod{Name: "needs-host-secret-s1", Status: "Running"})
 		err := svc.Migrate(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "needs-host-secret", Slug: "s1"}, nil)
@@ -230,9 +226,7 @@ func TestMigrate_PreservesDomains(t *testing.T) {
 		{ID: "h2", Addr: "unix", Socket: "/y"},
 	}
 	f := fake.New()
-	mem := store.NewMemory()
-	svc := NewService(f, hosts, []config.Template{webTemplate()})
-	svc.SetStore(mem)
+	svc, mem := newSvcWith(t, f, hosts, webTemplate())
 	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
 
 	domains := []string{"app.example.com"}

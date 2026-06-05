@@ -64,7 +64,7 @@ func (s *Service) PlanEvacuation(ctx context.Context, req EvacuateRequest) (Evac
 // the move is still surfaced rather than blanking the whole plan.
 func (s *Service) planMove(ctx context.Context, m MigrateRequest) PlannedMove {
 	pm := PlannedMove{Slug: m.Slug, Template: m.Template, ToHost: m.ToHost, Issues: []PlanIssue{}, Provisions: []string{}}
-	tmpl, err := s.lookup(m.ToHost, m.Template)
+	tmpl, err := s.lookup(ctx, m.ToHost, m.Template)
 	if err != nil {
 		pm.Issues = append(pm.Issues, PlanIssue{Code: codeCheckError, Message: err.Error()})
 		return pm

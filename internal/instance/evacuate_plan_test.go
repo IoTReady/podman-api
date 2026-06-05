@@ -17,11 +17,11 @@ import (
 
 // secretAndPortTemplate declares both a per-host secret and a fixed hostPort, so
 // a single destination can surface two distinct preflight issues at once.
-func secretAndPortTemplate() config.Template {
-	return config.Template{
+func secretAndPortTemplate() store.Template {
+	return store.Template{
 		Meta: render.Meta{
 			ID:         "needs-both",
-			Parameters: render.Parameters{Required: []string{"slug", "image"}},
+			Parameters: requiredParams("slug", "image"),
 			Secrets:    render.Secrets{PerHostReferenced: []string{"shared-token"}},
 		},
 		Body: `apiVersion: v1
@@ -36,7 +36,7 @@ spec:
         - hostPort: 9090
           containerPort: 80
 `,
-		Source: "needs-both.yaml",
+		Origin: "seed",
 	}
 }
 
@@ -44,9 +44,7 @@ func TestPreflightIssues_CollectsAll(t *testing.T) {
 	ctx := context.Background()
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}, {ID: "h2", Addr: "unix", Socket: "/y"}}
 	f := fake.New()
-	mem := store.NewMemory()
-	svc := NewService(f, hosts, []config.Template{secretAndPortTemplate()})
-	svc.SetStore(mem)
+	svc, _ := newSvcWith(t, f, hosts, secretAndPortTemplate())
 	// Occupy port 9090 on the destination so the port check fails; leave the
 	// per-host secret "shared-token" absent so the secret check also fails.
 	f.AddPod("h2", podman.Pod{Name: "occupier", Status: "Running",
@@ -81,9 +79,7 @@ func newPlanSvc(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
 		{ID: "draining", Addr: "unix", Socket: "/d", Drain: true},
 	}
 	f := fake.New()
-	mem := store.NewMemory()
-	svc := NewService(f, hosts, []config.Template{pgTemplate(), portTemplate(), templateWithHostSecret()})
-	svc.SetStore(mem)
+	svc, mem := newSvcWith(t, f, hosts, pgTemplate(), portTemplate(), templateWithHostSecret())
 	return svc, f, mem
 }
 
