@@ -1,6 +1,7 @@
 package podman
 
 import (
+	"archive/tar"
 	"bytes"
 	"context"
 	"fmt"
@@ -14,9 +15,11 @@ import (
 	"time"
 
 	"github.com/containers/podman/v5/libpod/define"
+	handlers "github.com/containers/podman/v5/pkg/api/handlers"
 	"github.com/containers/podman/v5/pkg/bindings"
 	"github.com/containers/podman/v5/pkg/bindings/containers"
 	"github.com/containers/podman/v5/pkg/bindings/images"
+	network "github.com/containers/podman/v5/pkg/bindings/network"
 	"github.com/containers/podman/v5/pkg/bindings/play"
 	"github.com/containers/podman/v5/pkg/bindings/pods"
 	"github.com/containers/podman/v5/pkg/bindings/secrets"
@@ -24,6 +27,8 @@ import (
 	"github.com/containers/podman/v5/pkg/bindings/volumes"
 	"github.com/containers/podman/v5/pkg/domain/entities"
 	"github.com/containers/podman/v5/pkg/domain/entities/reports"
+	dockerContainer "github.com/docker/docker/api/types/container"
+	nettypes "go.podman.io/common/libnetwork/types"
 
 	"github.com/iotready/podman-api/internal/config"
 )
@@ -138,7 +143,7 @@ func (r *Real) Version(ctx context.Context, id string) (string, error) {
 	return info.Version.Version, nil
 }
 
-func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool) error {
+func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool, networks ...string) error {
 	c, err := r.ctxFor(ctx, id)
 	if err != nil {
 		return err
@@ -157,6 +162,9 @@ func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool) error
 	if replace {
 		t := true
 		opts.Replace = &t
+	}
+	if len(networks) > 0 {
+		opts.Network = &networks
 	}
 	_, err = play.Kube(c, tmp.Name(), opts)
 	return err
@@ -424,6 +432,80 @@ func (r *Real) VolumeCreate(ctx context.Context, id, name string) error {
 		return err
 	}
 	return nil
+}
+
+// NetworkEnsure creates the named network if absent. An already-existing
+// network is treated as success so callers can call this idempotently.
+func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	ignore := true
+	_, err = network.CreateWithOptions(c, &nettypes.Network{Name: name},
+		&network.ExtraCreateOptions{IgnoreIfExists: &ignore})
+	return err
+}
+
+func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []string) (ExecResult, error) {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return ExecResult{}, err
+	}
+	sessionID, err := containers.ExecCreate(c, container, &handlers.ExecCreateConfig{
+		ExecOptions: dockerContainer.ExecOptions{
+			Cmd:          cmd,
+			AttachStdout: true,
+			AttachStderr: true,
+		},
+	})
+	if err != nil {
+		return ExecResult{}, mapNotFound(err)
+	}
+	var buf bytes.Buffer
+	var w io.Writer = &buf
+	attach := true
+	if err := containers.ExecStartAndAttach(c, sessionID, &containers.ExecStartAndAttachOptions{
+		OutputStream: &w,
+		ErrorStream:  &w,
+		AttachOutput: &attach,
+		AttachError:  &attach,
+	}); err != nil {
+		return ExecResult{}, err
+	}
+	ins, err := containers.ExecInspect(c, sessionID, &containers.ExecInspectOptions{})
+	if err != nil {
+		return ExecResult{}, err
+	}
+	return ExecResult{ExitCode: ins.ExitCode, Output: buf.String()}, nil
+}
+
+func (r *Real) CopyToContainer(ctx context.Context, id, container, destDir, name string, content []byte) error {
+	c, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return err
+	}
+	var tarBuf bytes.Buffer
+	tw := tar.NewWriter(&tarBuf)
+	if err := tw.WriteHeader(&tar.Header{
+		Name: name,
+		Mode: 0o644,
+		Size: int64(len(content)),
+	}); err != nil {
+		return err
+	}
+	if _, err := tw.Write(content); err != nil {
+		return err
+	}
+	if err := tw.Close(); err != nil {
+		return err
+	}
+	// CopyFromArchive copies INTO the container (PUT /containers/{id}/archive).
+	copyFn, err := containers.CopyFromArchive(c, container, destDir, &tarBuf)
+	if err != nil {
+		return mapNotFound(err)
+	}
+	return copyFn()
 }
 
 // --- helpers ---

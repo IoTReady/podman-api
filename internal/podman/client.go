@@ -11,7 +11,7 @@ import (
 // tests use the in-memory fake under ./fake.
 type Client interface {
 	// Pods
-	PlayKube(ctx context.Context, hostID, yaml string, replace bool) error
+	PlayKube(ctx context.Context, hostID, yaml string, replace bool, networks ...string) error
 	PodInspect(ctx context.Context, hostID, name string) (Pod, error)
 	PodList(ctx context.Context, hostID string, labelFilters map[string]string) ([]Pod, error)
 	PodStart(ctx context.Context, hostID, name string) error
@@ -37,6 +37,21 @@ type Client interface {
 	// VolumeCreate creates an empty named volume on host. Creating a volume that
 	// already exists is a no-op (no error).
 	VolumeCreate(ctx context.Context, hostID, name string) error
+
+	// Networks
+	// NetworkEnsure creates the named network if absent; creating one that
+	// already exists is a no-op (no error).
+	NetworkEnsure(ctx context.Context, hostID, name string) error
+
+	// Exec
+	// ContainerExec runs cmd in the named running container and returns its
+	// exit code and combined stdout+stderr. A non-zero exit code is NOT an
+	// error; only a transport/podman failure returns a non-nil error.
+	ContainerExec(ctx context.Context, hostID, container string, cmd []string) (ExecResult, error)
+	// CopyToContainer writes content as a single file `name` into directory
+	// `destDir` inside the running container (e.g. destDir="/etc/caddy",
+	// name="Caddyfile"). destDir must already exist in the container.
+	CopyToContainer(ctx context.Context, hostID, container, destDir, name string, content []byte) error
 
 	// Logs
 	ContainerLogs(ctx context.Context, hostID, container string, opts LogOptions) (<-chan LogLine, error)
@@ -68,6 +83,12 @@ type Client interface {
 	// The host set is fixed at construction, so a host added via config reload is
 	// not Knows() until the daemon (and client) restarts.
 	Knows(hostID string) bool
+}
+
+// ExecResult is the outcome of ContainerExec.
+type ExecResult struct {
+	ExitCode int
+	Output   string // combined stdout+stderr
 }
 
 // PruneReport summarizes one prune operation: the ids/names removed and the

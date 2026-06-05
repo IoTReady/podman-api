@@ -282,6 +282,18 @@ Runs appear in the jobs API as kind `prune`
 (`GET /jobs?kind=prune&state=succeeded`), and are exported as the Prometheus
 counters `podman_api_prune_runs_total` and `podman_api_prune_reclaimed_bytes_total`.
 
+### Ingress + auto-TLS (optional)
+
+`-ingress-enabled` runs a per-host Caddy pod that terminates TLS (HTTP-01 ACME)
+and reverse-proxies each instance's `domains` to its pod over the shared
+`-ingress-network`. Requires `-state-db` and `-ingress-acme-email`. Apps join the
+ingress network and publish no host ports; only Caddy publishes :80/:443.
+
+**Rootless prerequisite:** the host must allow rootless binding of privileged
+ports — set `net.ipv4.ip_unprivileged_port_start=80` persistently (e.g. a
+`/etc/sysctl.d/` drop-in), or Caddy cannot publish :80/:443. See the wiki
+"Provisioning a Podman Host" page.
+
 ## Observability
 
 - **Audit log:** every state-changing request (POST/PUT/DELETE) emits one JSON line to stdout — or, if `-audit-log-file=/var/log/podman-api/audit.log` is set, to that file. Each line includes method, path, host, template, slug, status, duration, key_id, and any error.

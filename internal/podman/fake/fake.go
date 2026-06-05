@@ -65,6 +65,8 @@ type Fake struct {
 	PullErr map[string]error
 	// PullCalls records every (host, image) pair passed to ImagePull.
 	PullCalls []struct{ Host, Image string }
+	// PlayCalls records every PlayKube invocation (host, replace, networks).
+	PlayCalls []PlayCall
 	// PodListErr, if non-nil, makes PodList return this error.
 	PodListErr error
 	// LogLines, if set, are emitted in order by ContainerLogs before the
@@ -87,6 +89,45 @@ type Fake struct {
 	HostInfoErr error
 	// HostInfoCalls counts HostInfo invocations (lets a test assert probe throttling).
 	HostInfoCalls int
+
+	// NetworkEnsureCalls records, per host, the network names ensured.
+	NetworkEnsureCalls map[string][]string
+	// NetworkEnsureErr, if non-nil, makes NetworkEnsure fail.
+	NetworkEnsureErr error
+
+	// ExecFunc, if set, produces the ContainerExec result for tests. Default
+	// (nil) returns ExitCode 0, empty output.
+	ExecFunc func(host, container string, cmd []string) (podman.ExecResult, error)
+	// ExecCalls records every ContainerExec invocation.
+	ExecCalls []ExecCall
+
+	// CopyCalls records every CopyToContainer invocation.
+	CopyCalls []CopyCall
+	// CopyErr, if non-nil, makes CopyToContainer fail.
+	CopyErr error
+}
+
+// PlayCall records one PlayKube invocation for assertions.
+type PlayCall struct {
+	Host     string
+	Replace  bool
+	Networks []string
+}
+
+// ExecCall records one ContainerExec invocation for assertions.
+type ExecCall struct {
+	Host      string
+	Container string
+	Cmd       []string
+}
+
+// CopyCall records one CopyToContainer invocation for assertions.
+type CopyCall struct {
+	Host      string
+	Container string
+	DestDir   string
+	Name      string
+	Content   []byte
 }
 
 // AddVolume seeds a volume on a host so VolumeInspect resolves it. Test-only.
@@ -122,12 +163,13 @@ func (f *Fake) VolumeData(host, name string) []byte {
 // New returns a fresh fake.
 func New() *Fake {
 	return &Fake{
-		pods:         map[string]map[string]podman.Pod{},
-		secrets:      map[string]map[string]podman.Secret{},
-		volumes:      map[string]map[string]podman.Volume{},
-		volData:      map[string]map[string][]byte{},
-		PruneReports: map[string]podman.PruneReport{},
-		PruneErr:     map[string]error{},
+		pods:               map[string]map[string]podman.Pod{},
+		secrets:            map[string]map[string]podman.Secret{},
+		volumes:            map[string]map[string]podman.Volume{},
+		volData:            map[string]map[string][]byte{},
+		PruneReports:       map[string]podman.PruneReport{},
+		PruneErr:           map[string]error{},
+		NetworkEnsureCalls: map[string][]string{},
 	}
 }
 
@@ -156,9 +198,10 @@ func (f *Fake) hostVolData(h string) map[string][]byte {
 	return f.volData[h]
 }
 
-func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool) error {
+func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool, networks ...string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.PlayCalls = append(f.PlayCalls, PlayCall{Host: hostID, Replace: replace, Networks: networks})
 	if f.PlayKubeErr != nil {
 		return f.PlayKubeErr
 	}
@@ -382,6 +425,16 @@ func (f *Fake) VolumeCreate(_ context.Context, h, name string) error {
 	return nil
 }
 
+func (f *Fake) NetworkEnsure(_ context.Context, host, name string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.NetworkEnsureErr != nil {
+		return f.NetworkEnsureErr
+	}
+	f.NetworkEnsureCalls[host] = append(f.NetworkEnsureCalls[host], name)
+	return nil
+}
+
 func (f *Fake) ContainerLogs(_ context.Context, _, _ string, _ podman.LogOptions) (<-chan podman.LogLine, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -477,6 +530,29 @@ func (f *Fake) BuildCachePrune(_ context.Context, host string) (podman.PruneRepo
 
 func (f *Fake) VolumePrune(_ context.Context, host string, filters map[string][]string) (podman.PruneReport, error) {
 	return f.pruneScope(host, "volumes", false, filters)
+}
+
+func (f *Fake) ContainerExec(_ context.Context, host, container string, cmd []string) (podman.ExecResult, error) {
+	f.mu.Lock()
+	f.ExecCalls = append(f.ExecCalls, ExecCall{Host: host, Container: container, Cmd: cmd})
+	fn := f.ExecFunc
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(host, container, cmd)
+	}
+	return podman.ExecResult{}, nil
+}
+
+func (f *Fake) CopyToContainer(_ context.Context, host, container, destDir, name string, content []byte) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.CopyErr != nil {
+		return f.CopyErr
+	}
+	cp := make([]byte, len(content))
+	copy(cp, content)
+	f.CopyCalls = append(f.CopyCalls, CopyCall{Host: host, Container: container, DestDir: destDir, Name: name, Content: cp})
+	return nil
 }
 
 // Compile-time guarantee that Fake implements the interface.
