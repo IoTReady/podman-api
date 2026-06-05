@@ -16,7 +16,8 @@ import (
 // authenticated operator.
 func uiWithJobs(t *testing.T, js store.JobStore) *UI {
 	t.Helper()
-	svc := instance.NewService(fake.New(), []config.Host{{ID: "edge-1"}}, nil)
+	svc := instance.NewService(fake.New(), []config.Host{{ID: "edge-1"}})
+	svc.SetStore(store.NewMemory())
 	hash, _ := config.HashToken("pw")
 	u, err := New(Config{
 		Svc:  svc,

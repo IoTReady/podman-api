@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // uiWithSeededInstance builds a UI with a "postgres" template registered and a
@@ -22,9 +24,6 @@ func uiWithSeededInstance(t *testing.T) *UI {
 	t.Helper()
 	fc := fake.New()
 	hosts := []config.Host{{ID: "edge-1"}}
-	tmpls := []config.Template{
-		{Meta: render.Meta{ID: "postgres"}},
-	}
 	fc.AddPod("edge-1", podman.Pod{
 		Name:   "postgres-main",
 		Status: "Running",
@@ -37,7 +36,10 @@ func uiWithSeededInstance(t *testing.T) *UI {
 		},
 	})
 	fc.LogLines = []podman.LogLine{{Container: "postgres-main-db", Line: "database system is ready"}}
-	svc := instance.NewService(fc, hosts, tmpls)
+	mem := store.NewMemory()
+	_ = mem.PutTemplate(context.Background(), store.Template{Meta: render.Meta{ID: "postgres"}})
+	svc := instance.NewService(fc, hosts)
+	svc.SetStore(mem)
 	hash, _ := config.HashToken("pw")
 	u, err := New(Config{
 		Svc:  svc,
@@ -72,7 +74,10 @@ func TestLifecycleFailureKeepsDetailWithBanner(t *testing.T) {
 		},
 	})
 	fc.LifecycleErr = errors.New("daemon refused")
-	svc := instance.NewService(fc, []config.Host{{ID: "edge-1"}}, []config.Template{{Meta: render.Meta{ID: "postgres"}}})
+	mem := store.NewMemory()
+	_ = mem.PutTemplate(context.Background(), store.Template{Meta: render.Meta{ID: "postgres"}})
+	svc := instance.NewService(fc, []config.Host{{ID: "edge-1"}})
+	svc.SetStore(mem)
 	hash, _ := config.HashToken("pw")
 	u, err := New(Config{
 		Svc:  svc,

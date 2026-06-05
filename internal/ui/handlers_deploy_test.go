@@ -23,10 +23,6 @@ func uiWithStoredInstance(t *testing.T) *UI {
 	t.Helper()
 	fc := fake.New()
 	hosts := []config.Host{{ID: "edge-1"}}
-	tmpls := []config.Template{{Meta: render.Meta{
-		ID:         "demo",
-		Parameters: render.Parameters{Required: []string{"image"}},
-	}}}
 	fc.AddPod("edge-1", podman.Pod{
 		Name:   "demo-main",
 		Status: "Running",
@@ -35,11 +31,19 @@ func uiWithStoredInstance(t *testing.T) *UI {
 		},
 	})
 	mem := store.NewMemory()
+	_ = mem.PutTemplate(context.Background(), store.Template{
+		Meta: render.Meta{
+			ID: "demo",
+			Parameters: []render.ParamDef{
+				{Name: "image", Required: true},
+			},
+		},
+	})
 	_ = mem.PutSpec(context.Background(), store.Spec{
 		Host: "edge-1", Template: "demo", Slug: "main",
 		Parameters: map[string]any{"image": "demo:1"},
 	})
-	svc := instance.NewService(fc, hosts, tmpls)
+	svc := instance.NewService(fc, hosts)
 	svc.SetStore(mem)
 	hash, _ := config.HashToken("pw")
 	u, err := New(Config{
@@ -59,12 +63,18 @@ func uiWithTemplate(t *testing.T) *UI {
 	t.Helper()
 	fc := fake.New()
 	hosts := []config.Host{{ID: "edge-1"}}
-	tmpls := []config.Template{{Meta: render.Meta{
-		ID:         "demo",
-		Parameters: render.Parameters{Required: []string{"version"}},
-		Secrets:    render.Secrets{PerInstance: []string{"password"}},
-	}}}
-	svc := instance.NewService(fc, hosts, tmpls)
+	mem := store.NewMemory()
+	_ = mem.PutTemplate(context.Background(), store.Template{
+		Meta: render.Meta{
+			ID: "demo",
+			Parameters: []render.ParamDef{
+				{Name: "version", Required: true},
+			},
+			Secrets: render.Secrets{PerInstance: []string{"password"}},
+		},
+	})
+	svc := instance.NewService(fc, hosts)
+	svc.SetStore(mem)
 	hash, _ := config.HashToken("pw")
 	u, err := New(Config{
 		Svc:  svc,
@@ -121,11 +131,13 @@ func TestDeployFormUnknownHostIs404(t *testing.T) {
 	}
 }
 
-func TestUpgradeFormRequiresStore(t *testing.T) {
-	u := uiWithTemplate(t) // no state store
+// TestUpgradeFormAlwaysAvailable verifies that the upgrade form is always
+// accessible now that the store is always present (HasStore gating is removed).
+func TestUpgradeFormAlwaysAvailable(t *testing.T) {
+	u := uiWithStoredInstance(t)
 	w := authedGet(t, u, "/ui/hosts/edge-1/instances/demo/main/upgrade")
-	if w.Code != http.StatusNotImplemented {
-		t.Fatalf("status = %d, want 501 (image-only upgrade needs the store)", w.Code)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (upgrade always available)", w.Code)
 	}
 }
 
