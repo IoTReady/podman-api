@@ -13,11 +13,12 @@ import (
 type JobState string
 
 const (
-	JobQueued    JobState = "queued"
-	JobRunning   JobState = "running"
-	JobSucceeded JobState = "succeeded"
-	JobFailed    JobState = "failed"
-	JobCanceled  JobState = "canceled"
+	JobQueued      JobState = "queued"
+	JobRunning     JobState = "running"
+	JobReconciling JobState = "reconciling"
+	JobSucceeded   JobState = "succeeded"
+	JobFailed      JobState = "failed"
+	JobCanceled    JobState = "canceled"
 )
 
 // JobStep is one progress entry recorded by a handler.
@@ -91,6 +92,11 @@ type JobStore interface {
 	// FailRunning marks every job still in running as failed with reason; returns
 	// the count. Called once at startup to reap crash-interrupted jobs.
 	FailRunning(ctx context.Context, reason string) (int, error)
+	// MarkReconciling moves every running job whose kind is in kinds to the
+	// reconciling state (non-terminal); returns the count moved. Called once at
+	// startup, before FailRunning, so reconcilable kinds are recovered rather than
+	// failed. An empty kinds slice is a no-op returning 0.
+	MarkReconciling(ctx context.Context, kinds []string) (int, error)
 	// CancelQueued atomically transitions a still-queued job to canceled (setting
 	// finished). Returns true if it transitioned; false if the job was not in the
 	// queued state (already claimed, terminal, or absent).

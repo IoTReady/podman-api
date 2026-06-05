@@ -242,6 +242,26 @@ func (m *Memory) FailRunning(_ context.Context, reason string) (int, error) {
 	return n, nil
 }
 
+func (m *Memory) MarkReconciling(_ context.Context, kinds []string) (int, error) {
+	if len(kinds) == 0 {
+		return 0, nil
+	}
+	want := make(map[string]bool, len(kinds))
+	for _, k := range kinds {
+		want[k] = true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for i := range m.jobs {
+		if m.jobs[i].State == JobRunning && want[m.jobs[i].Kind] {
+			m.jobs[i].State = JobReconciling
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (m *Memory) CancelQueued(_ context.Context, id string) (bool, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
