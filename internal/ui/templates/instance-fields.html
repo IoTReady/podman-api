@@ -2,11 +2,13 @@
 <div class="label">PARAMETERS</div>
 {{range .Tmpl.Meta.Parameters}}
   {{- $label := .Label}}{{if eq $label ""}}{{$label = .Name}}{{end}}
-  {{- /* A defaulted param advertises its default as the placeholder, so an empty
-        (e.g. cleared) field shows that deploying it empty applies the default —
-        the apply path back-fills absent params via render.ApplyDefaults. An
-        explicit Placeholder wins. */ -}}
-  {{- $ph := .Placeholder}}{{if and (eq $ph "") .Default}}{{$ph = printf "default: %v" .Default}}{{end}}
+  {{- /* Placeholder is computed server-side (paramPlaceholders): an explicit
+        ParamDef.Placeholder, else "default: <value>" for a defaulted param —
+        communicating that deploying the field empty applies that default (the
+        apply path back-fills via render.ApplyDefaults). Computing it server-side
+        keeps a falsy default (false/0) from vanishing under template truthiness
+        (#100), matching mergeParamDefaults' nil-check. */ -}}
+  {{- $ph := index $.Placeholders .Name}}
   <label>{{$label}}{{if .Required}} (required){{end}}
     <input name="param.{{.Name}}"{{if .Required}} required{{end}}{{if $ph}} placeholder="{{$ph}}"{{end}} value="{{index $.Values (printf "param.%s" .Name)}}">
   </label>

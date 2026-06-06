@@ -250,6 +250,37 @@ func TestDeployFormDefaultedFieldShowsDefaultPlaceholder(t *testing.T) {
 	}
 }
 
+// TestDeployFormFalsyDefaultShowsPlaceholder guards #100: a non-nil but falsy
+// default (false, 0) must still advertise its default. mergeParamDefaults gates
+// on Default != nil and fills the value, so the placeholder hint must use the
+// same nil-check rather than template truthiness (under which false/0 vanish).
+func TestDeployFormFalsyDefaultShowsPlaceholder(t *testing.T) {
+	u := uiWithTemplateMeta(t, render.Meta{
+		ID:         "demo",
+		Parameters: []render.ParamDef{{Name: "debug", Type: "bool", Default: false}},
+	})
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo").Body.String()
+	if !strings.Contains(body, `placeholder="default: false"`) {
+		t.Error("a falsy non-nil default should still advertise its default via the placeholder")
+	}
+}
+
+// TestDeployFormExplicitPlaceholderWins verifies an author-supplied Placeholder
+// is not overridden by the derived "default: …" hint.
+func TestDeployFormExplicitPlaceholderWins(t *testing.T) {
+	u := uiWithTemplateMeta(t, render.Meta{
+		ID:         "demo",
+		Parameters: []render.ParamDef{{Name: "version", Default: "9.9", Placeholder: "e.g. 1.2.3"}},
+	})
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo").Body.String()
+	if !strings.Contains(body, `placeholder="e.g. 1.2.3"`) {
+		t.Error("an explicit placeholder should be used as-is")
+	}
+	if strings.Contains(body, `placeholder="default: 9.9"`) {
+		t.Error("an explicit placeholder must not be overridden by the derived default hint")
+	}
+}
+
 // TestDeployFormSetsNoStore verifies rendered pages are non-cacheable, since they
 // now re-populate typed per-instance secrets into the HTML.
 func TestDeployFormSetsNoStore(t *testing.T) {
