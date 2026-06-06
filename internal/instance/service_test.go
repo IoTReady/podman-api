@@ -515,20 +515,20 @@ func TestRotateInstanceSecrets_ConcurrentRotationsDoNotLoseUpdates(t *testing.T)
 		errA <- svc.RotateInstanceSecrets(ctx, "h1", "twosec", "demo", map[string]string{"password": "A"})
 	}()
 	<-g.reached
-	// B rotates token. Fixed code: B blocks on the instance lock (no GetSpec yet).
-	// Old code: B reads the pre-commit spec and reaches its own gated PlayKube.
+	// B rotates token. In BOTH worlds B blocks on Apply's instance lock (held by
+	// A, parked in PlayKube) and never reaches its own gate — the difference is
+	// only WHERE B's GetSpec sits relative to that lock:
+	//   pre-fix:  B reads the spec OUTSIDE the lock first (the stale pre-commit
+	//             read is what bakes in the lost update), then blocks on the lock;
+	//   post-fix: B blocks on the lock BEFORE any read, so it can't read stale.
 	go func() {
 		errB <- svc.RotateInstanceSecrets(ctx, "h1", "twosec", "demo", map[string]string{"token": "B"})
 	}()
-	select {
-	case <-g.reached:
-		// pre-fix only: B already read the stale spec and reached its own
-		// PlayKube — fast-path the release.
-	case <-time.After(300 * time.Millisecond):
-		// fixed code: B is structurally unable to reach the gate while A holds
-		// the instance lock, so this timeout branch is forced regardless of its
-		// duration — longer only slows the test, shorter risks nothing.
-	}
+	// Give B time to reach that blocking point before releasing A. A fixed wait
+	// (not a gate signal) is correct here precisely because B cannot reach the
+	// PlayKube gate while A holds the lock — so there is no signal to wait on;
+	// longer only slows the test, shorter risks nothing.
+	time.Sleep(300 * time.Millisecond)
 	close(g.release)
 	require.NoError(t, <-errA)
 	require.NoError(t, <-errB)
