@@ -43,34 +43,26 @@ func (u *UI) sortedTemplates(ctx context.Context) ([]store.Template, error) {
 	return tmpls, nil
 }
 
-// fieldData resolves the template by id and computes the present/absent status
-// of each per-host-referenced secret on the host. A store error from the
-// template lookup is propagated so the handler can surface it.
-func (u *UI) fieldData(r *http.Request, host, tmplID string) (store.Template, []hostSecretRef, error) {
-	var tmpl store.Template
-	tmpls, err := u.cfg.Svc.Templates(r.Context())
-	if err != nil {
-		return store.Template{}, nil, err
+// hostSecretRefs computes the present/absent status of each per-host-referenced
+// secret the template declares, checked against the secrets actually on the
+// host. A HostSecrets error is treated as "none present" (every ref absent),
+// matching the form's display-only intent. The caller supplies the already
+// resolved template, so this issues no template query of its own.
+func (u *UI) hostSecretRefs(r *http.Request, host string, tmpl store.Template) []hostSecretRef {
+	if len(tmpl.Meta.Secrets.PerHostReferenced) == 0 {
+		return nil
 	}
-	for _, t := range tmpls {
-		if t.Meta.ID == tmplID {
-			tmpl = t
-			break
+	present := map[string]bool{}
+	if secs, err := u.cfg.Svc.HostSecrets(r.Context(), host); err == nil {
+		for _, s := range secs {
+			present[s.Name] = true
 		}
 	}
 	var refs []hostSecretRef
-	if len(tmpl.Meta.Secrets.PerHostReferenced) > 0 {
-		present := map[string]bool{}
-		if secs, err := u.cfg.Svc.HostSecrets(r.Context(), host); err == nil {
-			for _, s := range secs {
-				present[s.Name] = true
-			}
-		}
-		for _, name := range tmpl.Meta.Secrets.PerHostReferenced {
-			refs = append(refs, hostSecretRef{Name: name, Present: present[name]})
-		}
+	for _, name := range tmpl.Meta.Secrets.PerHostReferenced {
+		refs = append(refs, hostSecretRef{Name: name, Present: present[name]})
 	}
-	return tmpl, refs, nil
+	return refs
 }
 
 // formValues collects param.* and secret.* fields, skipping empties so a blank
@@ -157,25 +149,34 @@ func paramPlaceholders(tmpl store.Template) map[string]string {
 	return ph
 }
 
-// deployFormData resolves the selected template (defaulting to the first
-// template when none is given) and assembles the data map the "deploy-form"
-// template needs. vals are the raw typed param.*/secret.* values to
-// re-populate; mergeParamDefaults is applied here so every caller shares one
-// defaults policy. A store error from the template lookup is returned for the
-// caller to surface via renderError. The caller adds an "Error" key when
-// re-rendering after a failed deploy.
-func (u *UI) deployFormData(r *http.Request, host, selected, slug string, vals map[string]string) (map[string]any, error) {
+// deployFormData assembles the data map the "deploy-form" template needs. vals
+// are the raw typed param.*/secret.* values to re-populate; mergeParamDefaults
+// is applied here so every caller shares one defaults policy. A store error
+// from the template list is returned for the caller to surface via renderError.
+// The caller adds an "Error" key when re-rendering after a failed deploy.
+//
+// defaultFirst selects the first template when selected is empty — wanted on
+// the initial GET load (so a fresh form shows a real template) but NOT on the
+// POST switch or the failed-deploy re-render, where an empty selection is the
+// operator's actual input and must not be silently replaced with the first
+// template (and its merged defaults). The template is resolved from the list
+// already fetched here, so no second template query is issued.
+func (u *UI) deployFormData(r *http.Request, host, selected, slug string, vals map[string]string, defaultFirst bool) (map[string]any, error) {
 	tmpls, err := u.sortedTemplates(r.Context())
 	if err != nil {
 		return nil, err
 	}
-	if selected == "" && len(tmpls) > 0 {
+	if defaultFirst && selected == "" && len(tmpls) > 0 {
 		selected = tmpls[0].Meta.ID
 	}
-	tmpl, refs, err := u.fieldData(r, host, selected)
-	if err != nil {
-		return nil, err
+	var tmpl store.Template
+	for _, t := range tmpls {
+		if t.Meta.ID == selected {
+			tmpl = t
+			break
+		}
 	}
+	refs := u.hostSecretRefs(r, host, tmpl)
 	mergeParamDefaults(vals, tmpl)
 	return map[string]any{
 		"Host":         host,
@@ -196,7 +197,7 @@ func (u *UI) deployForm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	data, err := u.deployFormData(r, host, q.Get("template"), q.Get("slug"), typedValues(q))
+	data, err := u.deployFormData(r, host, q.Get("template"), q.Get("slug"), typedValues(q), true)
 	if err != nil {
 		u.renderError(w, r, err)
 		return
@@ -219,7 +220,7 @@ func (u *UI) deployFormPost(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad form", http.StatusBadRequest)
 		return
 	}
-	data, err := u.deployFormData(r, host, r.FormValue("template"), r.FormValue("slug"), typedValues(r.PostForm))
+	data, err := u.deployFormData(r, host, r.PostFormValue("template"), r.PostFormValue("slug"), typedValues(r.PostForm), false)
 	if err != nil {
 		u.renderError(w, r, err)
 		return
@@ -241,7 +242,7 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 		Secrets:    secrets,
 	}
 	if applyErr := u.cfg.Svc.Apply(r.Context(), host, req, instance.ApplyOptions{Replace: false}); applyErr != nil {
-		data, derr := u.deployFormData(r, host, req.Template, req.Slug, typedValues(r.PostForm))
+		data, derr := u.deployFormData(r, host, req.Template, req.Slug, typedValues(r.PostForm), false)
 		if derr != nil {
 			u.renderError(w, r, derr)
 			return

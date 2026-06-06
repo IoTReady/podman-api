@@ -233,6 +233,34 @@ func TestDeployFormDropsValuesForFieldsNotInTemplate(t *testing.T) {
 	}
 }
 
+// TestDeployFormPostEmptyTemplateDoesNotDefaultToFirst guards against the
+// re-render auto-selecting the first template (and merging its defaults) when
+// the operator's submitted template is empty — e.g. a failed deploy with a
+// missing/deleted template field. Only the initial GET load defaults to first;
+// the POST re-render must reflect the empty selection honestly.
+func TestDeployFormPostEmptyTemplateDoesNotDefaultToFirst(t *testing.T) {
+	u := defaultedParamUI(t) // "demo" with param "version" default "9.9"
+	w := authedPost(t, u, "/ui/hosts/edge-1/deploy/form", url.Values{"template": {""}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, `name="param.version"`) || strings.Contains(body, `value="9.9"`) {
+		t.Error("an empty template on the POST switch must not auto-select the first template or merge its defaults")
+	}
+}
+
+// TestDeployFormGetEmptyTemplateDefaultsToFirst is the GET counterpart: the
+// initial load with no template DOES select the first template, so a fresh form
+// shows a real template's fields.
+func TestDeployFormGetEmptyTemplateDefaultsToFirst(t *testing.T) {
+	u := defaultedParamUI(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy").Body.String()
+	if !strings.Contains(body, `name="param.version"`) {
+		t.Error("the initial GET load should default to the first template and render its fields")
+	}
+}
+
 // TestDeployFormPostRequiresCSRF verifies the POST re-render endpoint is behind
 // the write guard: a POST with a valid session but no CSRF token is rejected.
 func TestDeployFormPostRequiresCSRF(t *testing.T) {
