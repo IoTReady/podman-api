@@ -135,6 +135,16 @@ func TestDeployFormUnknownHostIs404(t *testing.T) {
 	}
 }
 
+// TestDeployFormPostUnknownHostIs404 covers the POST re-render endpoint's
+// host-existence guard (the GET path is covered by TestDeployFormUnknownHostIs404).
+func TestDeployFormPostUnknownHostIs404(t *testing.T) {
+	u := uiWithTemplate(t)
+	w := authedPost(t, u, "/ui/hosts/nope/deploy/form", url.Values{"template": {"demo"}})
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for unknown host", w.Code)
+	}
+}
+
 // TestUpgradeFormAlwaysAvailable verifies that the upgrade form is always
 // accessible now that the store is always present (HasStore gating is removed).
 func TestUpgradeFormAlwaysAvailable(t *testing.T) {
@@ -166,11 +176,16 @@ func TestUpgradeFormRendersImageField(t *testing.T) {
 
 // authedPost drives a POST through a real session as x-www-form-urlencoded,
 // injecting a valid CSRF token field. The caller supplies the other fields.
+// The caller's url.Values is not mutated.
 func authedPost(t *testing.T, u *UI, path string, form url.Values) *httptest.ResponseRecorder {
 	t.Helper()
 	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
-	form.Set(csrfField, csrfToken(tok))
-	r := httptest.NewRequest("POST", path, strings.NewReader(form.Encode()))
+	merged := make(url.Values, len(form)+1)
+	for k, vs := range form {
+		merged[k] = vs
+	}
+	merged.Set(csrfField, csrfToken(tok))
+	r := httptest.NewRequest("POST", path, strings.NewReader(merged.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
 	w := httptest.NewRecorder()
