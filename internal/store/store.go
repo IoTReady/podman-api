@@ -16,6 +16,13 @@ var ErrNotFound = errors.New("store: not found")
 // that was opened without an encryption key (-spec-key-file).
 var ErrSecretsNeedKey = errors.New("secrets require an encryption key (-spec-key-file)")
 
+// ErrSpecCorrupt marks a permanently unreadable spec row: the secrets blob no
+// longer decrypts (key loss/rotation) or a JSON column is malformed. It is
+// distinct from transient store errors (context cancellation, SQLITE_BUSY) and
+// from the definitive ErrNotFound, so callers (e.g. boot reconciliation) can
+// stop retrying a row that will never become readable.
+var ErrSpecCorrupt = errors.New("store: spec row corrupt or undecryptable")
+
 // Spec is the desired state of one instance.
 type Spec struct {
 	Host     string

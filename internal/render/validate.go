@@ -18,6 +18,19 @@ var ErrInvalidParameters = errors.New("invalid parameters")
 //
 // Returns a single error listing every problem found.
 func Validate(m Meta, params map[string]any, secrets map[string]string) error {
+	return validate(m, params, secrets, false)
+}
+
+// ValidateAllowMissingSecrets is Validate without the "every PerInstance secret
+// must be present" rule. It still rejects unknown secrets and enforces required
+// parameters. The secret-rotation path uses this to re-apply a stored spec that
+// legitimately lacks a PerInstance secret (one never set, or added to the
+// template after deploy) without forcing the operator to re-supply it.
+func ValidateAllowMissingSecrets(m Meta, params map[string]any, secrets map[string]string) error {
+	return validate(m, params, secrets, true)
+}
+
+func validate(m Meta, params map[string]any, secrets map[string]string, allowMissingSecrets bool) error {
 	var problems []string
 
 	allowed := map[string]bool{}
@@ -36,9 +49,11 @@ func Validate(m Meta, params map[string]any, secrets map[string]string) error {
 	}
 
 	allowedSecrets := stringSet(m.Secrets.PerInstance)
-	for _, k := range m.Secrets.PerInstance {
-		if _, ok := secrets[k]; !ok {
-			problems = append(problems, fmt.Sprintf("missing required secret %q", k))
+	if !allowMissingSecrets {
+		for _, k := range m.Secrets.PerInstance {
+			if _, ok := secrets[k]; !ok {
+				problems = append(problems, fmt.Sprintf("missing required secret %q", k))
+			}
 		}
 	}
 	for k := range secrets {

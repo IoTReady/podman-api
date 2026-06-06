@@ -307,7 +307,7 @@ func (g *getSpecErrStore) GetSpec(context.Context, string, string, string) (stor
 }
 
 // TestReconcileMigrate_DestSpecLookupError_Inconclusive verifies the round-2 #1
-// fix: a transient GetSpec error (BUSY / decrypt / cancellation) must be treated
+// fix: a transient GetSpec error (BUSY / cancellation) must be treated
 // as inconclusive, NOT as "spec not persisted" — otherwise a committed, healthy
 // dest would be wrongly rolled back and deleted.
 func TestReconcileMigrate_DestSpecLookupError_Inconclusive(t *testing.T) {
@@ -329,6 +329,35 @@ func TestReconcileMigrate_DestSpecLookupError_Inconclusive(t *testing.T) {
 	}
 	if _, err := fc.PodInspect(context.Background(), "h1", "web-x"); err != nil {
 		t.Fatalf("source was mutated on a transient lookup error: %v", err)
+	}
+}
+
+// TestReconcileMigrate_DestSpecCorrupt_Terminal verifies a permanently
+// undecryptable dest spec (ErrSpecCorrupt) ends the reconcile as terminal
+// `failed` — not an inconclusive retry — while mutating neither host. An
+// undecryptable row never becomes readable, so retrying forever is wrong.
+func TestReconcileMigrate_DestSpecCorrupt_Terminal(t *testing.T) {
+	svc, fc, st := reconcileSvc(t)
+	svc.SetStore(&getSpecErrStore{Memory: st, err: store.ErrSpecCorrupt})
+	fc.AddPod("h1", healthyPod("web-x")) // source present
+	fc.AddPod("h2", healthyPod("web-x")) // dest healthy
+
+	resolved, ok, msg, err := svc.ReconcileMigrate(context.Background(), req(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resolved || ok {
+		t.Fatalf("got resolved=%v ok=%v, want true/false (terminal failed)", resolved, ok)
+	}
+	if !strings.Contains(msg, "unreadable") {
+		t.Fatalf("message = %q, want it to mention the spec is unreadable", msg)
+	}
+	// Neither host may be mutated on a terminal corrupt-spec result.
+	if _, err := fc.PodInspect(context.Background(), "h2", "web-x"); err != nil {
+		t.Fatalf("dest was deleted on a corrupt-spec result (data loss): %v", err)
+	}
+	if _, err := fc.PodInspect(context.Background(), "h1", "web-x"); err != nil {
+		t.Fatalf("source was mutated on a corrupt-spec result: %v", err)
 	}
 }
 

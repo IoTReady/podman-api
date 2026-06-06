@@ -36,6 +36,13 @@ var (
 type ApplyOptions struct {
 	Replace  bool // if false and the pod exists, return ErrInstanceExists
 	SkipPull bool // if true, do not pre-pull container images (CI / local-only refs)
+	// AllowMissingSecrets relaxes the "every PerInstance secret must be present"
+	// validation rule for this Apply. It is used by the secret-rotation path:
+	// rotation overlays new values onto a stored spec and re-applies it, and must
+	// not be blocked just because a PerInstance secret was already unset in that
+	// spec (e.g. a template that gained a secret after the instance was deployed).
+	// The "unknown secret" check still applies. Deploys never set this.
+	AllowMissingSecrets bool
 }
 
 // ApplyRequest is the body of POST /instances and PUT /instances/{...}.
@@ -254,7 +261,11 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	// and render, so callers can omit optional params for a one-click deploy.
 	// Caller-supplied values always win; only absent keys are filled.
 	req.Parameters = render.ApplyDefaults(tmpl.Meta, req.Parameters)
-	if err := render.Validate(tmpl.Meta, req.Parameters, req.Secrets); err != nil {
+	validate := render.Validate
+	if opts.AllowMissingSecrets {
+		validate = render.ValidateAllowMissingSecrets
+	}
+	if err := validate(tmpl.Meta, req.Parameters, req.Secrets); err != nil {
 		return fmt.Errorf("validate: %w", err)
 	}
 	// Reject a secret-bearing deploy on a key-less store BEFORE any host mutation.
@@ -560,7 +571,11 @@ func (s *Service) Upgrade(ctx context.Context, host string, req ApplyRequest, im
 // UpgradeImage performs an image-only upgrade: it loads the instance's stored
 // spec (parameters + secrets), overrides the "image" parameter, and re-applies
 // with Replace. Existing secrets and parameters are reused as-is — the operator
-// supplies only the new image; rotating a secret is a separate operation.
+// supplies only the new image; rotating a secret is a separate operation. Like
+// RotateInstanceSecrets it sets AllowMissingSecrets, so a template that gained a
+// required per-instance secret after the instance was deployed does not block an
+// image upgrade of that already-running instance (the missing secret was already
+// missing; the upgrade never worsens the pod).
 // Returns ErrInstanceNotFound when no spec is stored for the instance.
 func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image string) error {
 	if image == "" {
@@ -584,7 +599,61 @@ func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image stri
 		Parameters: params,
 		Secrets:    spec.Secrets,
 		Domains:    spec.Domains,
-	}, ApplyOptions{Replace: true})
+	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
+}
+
+// RotateInstanceSecrets overlays newSecrets onto the instance's stored
+// per-instance secrets and re-applies (Replace=true), restarting the pod. Names
+// absent from newSecrets keep their existing value — callers are write-only and
+// never see current values. An empty newSecrets is rejected so a blank submit
+// does not pointlessly restart the instance. Returns ErrInstanceNotFound when no
+// spec is stored, or the store's error (incl. store.ErrSpecCorrupt) when the
+// spec cannot be read.
+func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug string, newSecrets map[string]string) error {
+	if len(newSecrets) == 0 {
+		return errors.New("no secrets to rotate")
+	}
+	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrInstanceNotFound
+		}
+		return fmt.Errorf("load spec: %w", err)
+	}
+	merged := maps.Clone(spec.Secrets)
+	if merged == nil {
+		merged = map[string]string{}
+	}
+	for k, v := range newSecrets {
+		merged[k] = v
+	}
+	return s.Apply(ctx, host, ApplyRequest{
+		Template:   tmpl,
+		Slug:       slug,
+		Parameters: spec.Parameters,
+		Secrets:    merged,
+		Domains:    spec.Domains,
+	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
+}
+
+// InstanceSecretState reports, per stored per-instance secret name, that a value
+// is present — presence only, never the value (the secret model is write-only).
+// Names a template declares but the instance never set are simply absent from the
+// map. Returns ErrInstanceNotFound when no spec is stored, or the store's error
+// (incl. store.ErrSpecCorrupt) when the spec cannot be read.
+func (s *Service) InstanceSecretState(ctx context.Context, host, tmpl, slug string) (map[string]bool, error) {
+	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, ErrInstanceNotFound
+		}
+		return nil, fmt.Errorf("load spec: %w", err)
+	}
+	set := make(map[string]bool, len(spec.Secrets))
+	for name := range spec.Secrets {
+		set[name] = true
+	}
+	return set, nil
 }
 
 // pruneInstanceResources best-effort removes an instance's per-instance secrets
@@ -690,6 +759,13 @@ func (s *Service) Hosts() []config.Host {
 // an empty catalog as if it succeeded.
 func (s *Service) Templates(ctx context.Context) ([]store.Template, error) {
 	return s.store.ListTemplates(ctx)
+}
+
+// Template returns one catalog template by ID (read-only view), or
+// store.ErrNotFound. A point lookup for callers that need a single template,
+// avoiding Templates()' full-catalog list + scan.
+func (s *Service) Template(ctx context.Context, id string) (store.Template, error) {
+	return s.store.GetTemplate(ctx, id)
 }
 
 // HostLoad returns a point-in-time resource snapshot for a host.

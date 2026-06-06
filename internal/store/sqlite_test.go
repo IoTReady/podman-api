@@ -190,3 +190,60 @@ func TestMigrateAddsDomainsColumn(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []string{"x.example.com"}, got.Domains)
 }
+
+func TestSQLite_GetSpec_WrongKey_IsErrSpecCorrupt(t *testing.T) {
+	ctx := context.Background()
+	ks := NewKeyStore(testKey(0x11))
+	s := openTestStore(t, ks)
+	require.NoError(t, s.PutSpec(ctx, sampleSpec()))
+	ks.Store(testKey(0x22)) // rotate to the wrong key → decrypt fails
+	_, err := s.GetSpec(ctx, "h1", "postgres", "demo")
+	require.ErrorIs(t, err, ErrSpecCorrupt)
+}
+
+func TestSQLite_GetSpec_CorruptParamsJSON_IsErrSpecCorrupt(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	require.NoError(t, s.PutSpec(ctx, sampleSpec()))
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE specs SET parameters='{not json' WHERE host='h1' AND template='postgres' AND slug='demo'`)
+	require.NoError(t, err)
+	_, err = s.GetSpec(ctx, "h1", "postgres", "demo")
+	require.ErrorIs(t, err, ErrSpecCorrupt)
+}
+
+func TestSQLite_GetSpec_CorruptDomainsJSON_IsErrSpecCorrupt(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	require.NoError(t, s.PutSpec(ctx, sampleSpec()))
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE specs SET domains='{not json' WHERE host='h1' AND template='postgres' AND slug='demo'`)
+	require.NoError(t, err)
+	_, err = s.GetSpec(ctx, "h1", "postgres", "demo")
+	require.ErrorIs(t, err, ErrSpecCorrupt)
+}
+
+func TestSQLite_GetSpec_NotFound_IsNotErrSpecCorrupt(t *testing.T) {
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	_, err := s.GetSpec(context.Background(), "h1", "x", "y")
+	require.ErrorIs(t, err, ErrNotFound)
+	require.NotErrorIs(t, err, ErrSpecCorrupt)
+}
+
+// TestSQLite_GetSpec_CorruptSecretsJSON_IsErrSpecCorrupt covers the one wrapped
+// path that touches decrypted plaintext: a blob that decrypts cleanly under the
+// live key but yields non-JSON. Sealing "{bad" under the keystore's key exercises
+// the post-decrypt json.Unmarshal failure that the other corruption tests can't.
+func TestSQLite_GetSpec_CorruptSecretsJSON_IsErrSpecCorrupt(t *testing.T) {
+	ctx := context.Background()
+	ks := NewKeyStore(testKey(0x11))
+	s := openTestStore(t, ks)
+	require.NoError(t, s.PutSpec(ctx, sampleSpec()))
+	blob, err := seal(ks.Load(), []byte("{bad"))
+	require.NoError(t, err)
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE specs SET secrets=? WHERE host='h1' AND template='postgres' AND slug='demo'`, blob)
+	require.NoError(t, err)
+	_, err = s.GetSpec(ctx, "h1", "postgres", "demo")
+	require.ErrorIs(t, err, ErrSpecCorrupt)
+}
