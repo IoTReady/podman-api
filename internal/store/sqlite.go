@@ -351,7 +351,7 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 	}
 	var params map[string]any
 	if err := json.Unmarshal([]byte(paramsJSON), &params); err != nil {
-		return Spec{}, err
+		return Spec{}, fmt.Errorf("%w: parameters: %v", ErrSpecCorrupt, err)
 	}
 	var secrets map[string]string
 	if len(blob) > 0 {
@@ -360,15 +360,15 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 		}
 		secJSON, err := open(s.keys.Load(), blob)
 		if err != nil {
-			return Spec{}, err
+			return Spec{}, fmt.Errorf("%w: decrypt secrets: %v", ErrSpecCorrupt, err)
 		}
 		if err := json.Unmarshal(secJSON, &secrets); err != nil {
-			return Spec{}, err
+			return Spec{}, fmt.Errorf("%w: secrets: %v", ErrSpecCorrupt, err)
 		}
 	}
 	var domains []string
 	if err := json.Unmarshal([]byte(domainsJSON), &domains); err != nil {
-		return Spec{}, err
+		return Spec{}, fmt.Errorf("%w: domains: %v", ErrSpecCorrupt, err)
 	}
 	return Spec{
 		Host: host, Template: template, Slug: slug,
