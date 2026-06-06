@@ -1,0 +1,158 @@
+# Deploy-form value preservation on template switch — Design
+
+**Issue:** #93 (follow-up from #62 / PR #89 review finding #6)
+**Date:** 2026-06-05
+**Status:** Approved
+
+## Problem
+
+In the Admin UI deploy form (`internal/ui/templates/deploy-form.html`), changing
+the template `<select>` fires an htmx `GET /ui/hosts/{host}/deploy` that re-renders
+the form for the newly-selected template. Any values the operator already typed —
+params and per-instance secrets — are discarded, because the inputs re-render
+empty. Only `template` (and, since #62, `slug`) survive the switch.
+
+The values are **not lost in transit**: the `<select>` already carries
+`hx-include="closest form"`, so every `param.*` and `secret.*` field is sent on
+the re-fetch. The gap is entirely server-side — `deployForm` ignores the incoming
+field values, and `instance-fields.html` renders inputs with no `value=`.
+
+## Goal
+
+On a template switch, re-populate every input whose name exists in the
+newly-selected template with the value the operator already typed — params **and**
+secrets (single-operator local session; echoing the just-typed secret back into
+the form HTML is acceptable here). Fields that only existed under the previous
+template naturally drop, because the new template does not render them.
+
+Apply the same re-population to the **failed-deploy** (POST error) re-render, which
+today also loses typed param/secret values. Same mechanism, strictly better.
+
+## Approach
+
+Server-side re-population, extending the existing `slug` round-trip pattern. No
+JavaScript is added — consistent with the rest of the server-rendered UI.
+
+### Data flow
+
+1. `deployForm` (GET) and the error path of `deployCreate` (POST) build a single
+   `Values map[string]string` keyed by **full field name** (`param.db`,
+   `secret.password`, `slug`), collected from the request:
+   - GET: from `r.URL.Query()`
+   - POST error: from `r.PostForm`
+2. The map is passed into the template data under key `Values`.
+3. `instance-fields.html` renders each input's `value=` by looking the field up in
+   `$.Values`:
+   ```
+   <input name="param.{{.}}" value="{{index $.Values (printf "param.%s" .)}}" required>
+   ```
+   `html/template` auto-escapes attribute values, so a typed value containing
+   quotes or `<` cannot break out of the attribute or inject markup.
+4. A missing key returns the zero value (`""`), so `index` is safe when no value
+   was typed for a field.
+
+Because `instance-fields.html` only ranges over the **selected** template's
+declared params/secrets, a value carried in `Values` for a field absent from the
+new template is simply never read — old-template-only fields drop with no special
+handling.
+
+### Slug
+
+`slug` already round-trips via its own `.Slug` data key and works today. It is left
+as-is (not folded into `Values`) to keep the change minimal; the two mechanisms
+coexist without conflict.
+
+## Components
+
+- `internal/ui/handlers_deploy.go`
+  - New helper `typedValues(form map[string][]string) map[string]string` that
+    copies `param.*` and `secret.*` entries verbatim (no empty-skipping — an empty
+    value re-renders an empty input, which is correct).
+  - `deployForm`: build `Values` from `r.URL.Query()`, add to template data.
+  - `deployCreate` error path: build `Values` from `r.PostForm`, add to template
+    data.
+- `internal/ui/templates/instance-fields.html`
+  - Emit `value="{{index $.Values (printf "param.%s" .)}}"` on each param input
+    and `value="{{index $.Values (printf "secret.%s" .)}}"` on each secret input.
+- `internal/ui/templates/deploy-form.html`
+  - No change: `{{template "instance-fields" .}}` already passes the root `.`,
+    which now carries `Values`.
+
+### Interaction note: `formValues` vs `typedValues`
+
+`formValues` (existing) deliberately **skips empty** fields so a blank required
+field surfaces as a validation error rather than an empty submitted value — that
+behavior is for the *apply* path and is unchanged. `typedValues` is a separate
+concern (what to render back into the form) and does **not** skip empties.
+
+## Testing
+
+New tests in `internal/ui/handlers_deploy_test.go`, using the existing
+`uiWithTemplate` fixture (template `demo`, required param `version`, per-instance
+secret `password`) and `authedGet` helper:
+
+1. **`TestDeployFormPreservesTypedValuesOnTemplateSwitch`** — GET
+   `/ui/hosts/edge-1/deploy?template=demo&slug=web&param.version=1.2.3&secret.password=hunter2`;
+   assert the body contains `value="1.2.3"` (param) and `value="hunter2"` (secret),
+   and `value="web"` (slug still works).
+2. **`TestDeployFormDropsValuesForFieldsNotInTemplate`** — GET with
+   `param.bogus=keepme` (a field the `demo` template does not declare); assert the
+   body does **not** contain `keepme` (no stray input rendered for it).
+3. **`TestDeployCreateErrorPreservesTypedValues`** — POST a deploy that fails
+   validation (missing required `version`) while supplying
+   `secret.password=hunter2`; assert the re-rendered form contains
+   `value="hunter2"` so the operator does not have to re-type it.
+
+## Out of scope
+
+- Client-side field preservation (rejected: adds JS to a deliberately JS-light UI).
+- Persisting draft form state across navigation/sessions.
+- Any change to the apply/validation semantics of `formValues`.
+
+## Rebase addendum (2026-06-06) — onto the #98 typed-template model
+
+After this design was written, #98 (DB-backed template catalog, #61) landed and
+reshaped the deploy form's substrate. The fix above was rebased onto it; the
+`typedValues`/`Values` mechanism is unchanged, but two details adapted:
+
+1. **Typed parameters.** `Meta.Parameters` is now `[]render.ParamDef` (not the old
+   `Required`/`Optional` name lists). `instance-fields.html` iterates
+   `{{range .Tmpl.Meta.Parameters}}` over `.Name`/`.Required`/`.Placeholder`/`.Default`.
+   `Meta.Secrets.PerInstance` (`[]string`) is unchanged, so secret inputs are
+   re-populated exactly as designed.
+2. **Default precedence (resolved server-side).** Each param now carries a
+   one-click `Default` from #61. Precedence is *typed value wins, else the
+   parameter default* — but the template can't distinguish a missing key from a
+   typed-empty one (`index` returns `""` for both), so resolving it in the
+   template would make a **cleared** field silently revert to its default (and a
+   resubmit would re-apply it). Instead, `mergeParamDefaults` fills a default into
+   the `Values` map only for keys the request did not submit **at all**; the input
+   collapses to `value="{{index $.Values (printf "param.%s" .Name)}}"`, symmetric
+   with the secret line. Tests: `TestDeployFormTypedValueBeatsParamDefault`
+   (default on a fresh form, typed wins on switch) and
+   `TestDeployFormClearedDefaultedFieldStaysEmpty` (a cleared field stays empty).
+
+   *Apply-path coupling (display-only fix).* `mergeParamDefaults` only governs
+   what the form shows. The apply path treats empty and absent identically — a
+   cleared field is dropped by `formValues`, then back-filled by
+   `render.ApplyDefaults` in `Service.Apply` — so deploying a cleared defaulted
+   field still applies the default. The parameter model has no "explicitly empty",
+   so rather than pretend otherwise, a defaulted param advertises its default as
+   the input **placeholder** (`default: <value>`, unless the template sets an
+   explicit one); an empty/cleared field then visibly communicates that deploying
+   it applies the default. `TestDeployFormDefaultedFieldShowsDefaultPlaceholder`
+   covers it. (`mergeParamDefaults` is the UI's copy of the same
+   fill-absent-from-defaults rule in `render.ApplyDefaults` and `api/templates.go`;
+   the comment cross-references them.)
+
+3. **No-store on rendered pages.** Because the form now re-populates typed
+   per-instance secrets into the HTML, the central `render` helper sets
+   `Cache-Control: no-store` so responses aren't cached by a browser or
+   intermediary. Static assets are served separately and stay cacheable.
+   (Follow-up: secrets still transit GET query strings on a template switch via
+   the pre-existing `hx-include` — tracked separately to move the switch to POST.)
+
+Handler signatures also gained `error` returns (`Templates(ctx)`,
+`sortedTemplates(ctx)`, `fieldData`) and `config.Template`/`HasStore` were removed
+(store is always present) — all threaded through `renderError`, no behavior change
+to this fix.

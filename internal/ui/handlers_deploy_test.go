@@ -57,22 +57,15 @@ func uiWithStoredInstance(t *testing.T) *UI {
 	return u
 }
 
-// uiWithTemplate registers a "demo" template (one required param "version", one
-// per-instance secret "password") so the meta-driven form has fields to render.
-func uiWithTemplate(t *testing.T) *UI {
+// uiWithTemplateMeta registers a single "demo" template described by meta and
+// returns a UI wired to a memory store, so meta-driven form tests can vary the
+// parameter contract without re-deriving the fixture each time.
+func uiWithTemplateMeta(t *testing.T, meta render.Meta) *UI {
 	t.Helper()
 	fc := fake.New()
 	hosts := []config.Host{{ID: "edge-1"}}
 	mem := store.NewMemory()
-	_ = mem.PutTemplate(context.Background(), store.Template{
-		Meta: render.Meta{
-			ID: "demo",
-			Parameters: []render.ParamDef{
-				{Name: "version", Required: true},
-			},
-			Secrets: render.Secrets{PerInstance: []string{"password"}},
-		},
-	})
+	_ = mem.PutTemplate(context.Background(), store.Template{Meta: meta})
 	svc := instance.NewService(fc, hosts)
 	svc.SetStore(mem)
 	hash, _ := config.HashToken("pw")
@@ -84,6 +77,17 @@ func uiWithTemplate(t *testing.T) *UI {
 		t.Fatal(err)
 	}
 	return u
+}
+
+// uiWithTemplate registers a "demo" template (one required param "version", one
+// per-instance secret "password") so the meta-driven form has fields to render.
+func uiWithTemplate(t *testing.T) *UI {
+	t.Helper()
+	return uiWithTemplateMeta(t, render.Meta{
+		ID:         "demo",
+		Parameters: []render.ParamDef{{Name: "version", Required: true}},
+		Secrets:    render.Secrets{PerInstance: []string{"password"}},
+	})
 }
 
 func TestDeployFormRendersMetaFields(t *testing.T) {
@@ -157,6 +161,125 @@ func TestUpgradeFormRendersImageField(t *testing.T) {
 	// Image-only: no param/secret inputs.
 	if strings.Contains(body, `name="param.`) || strings.Contains(body, `name="secret.`) {
 		t.Error("image-only upgrade form must not render param/secret inputs")
+	}
+}
+
+func TestDeployFormPreservesTypedValuesOnTemplateSwitch(t *testing.T) {
+	u := uiWithTemplate(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&slug=web&param.version=1.2.3&secret.password=hunter2")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `value="1.2.3"`) {
+		t.Error("typed param 'version' should be preserved across template switch")
+	}
+	if !strings.Contains(body, `value="hunter2"`) {
+		t.Error("typed secret 'password' should be preserved across template switch")
+	}
+	if !strings.Contains(body, `value="web"`) {
+		t.Error("typed slug should still round-trip")
+	}
+}
+
+func TestDeployFormDropsValuesForFieldsNotInTemplate(t *testing.T) {
+	u := uiWithTemplate(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&param.bogus=keepme")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "keepme") {
+		t.Error("a value for a field not declared by the selected template must not render")
+	}
+}
+
+// defaultedParamUI is a UI whose "demo" template has a single param carrying a
+// one-click default, for exercising the default-vs-typed precedence.
+func defaultedParamUI(t *testing.T) *UI {
+	return uiWithTemplateMeta(t, render.Meta{
+		ID:         "demo",
+		Parameters: []render.ParamDef{{Name: "version", Default: "9.9"}},
+	})
+}
+
+// TestDeployFormTypedValueBeatsParamDefault locks in the precedence introduced by
+// the #98 typed-parameter model: a one-click default shows on a fresh form, but a
+// value the operator already typed wins over it across a template switch.
+func TestDeployFormTypedValueBeatsParamDefault(t *testing.T) {
+	u := defaultedParamUI(t)
+
+	// Fresh form: the parameter default is shown.
+	if body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo").Body.String(); !strings.Contains(body, `value="9.9"`) {
+		t.Error("fresh form should show the parameter default")
+	}
+
+	// Typed value present: it wins over the default.
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&param.version=1.2.3").Body.String()
+	if !strings.Contains(body, `value="1.2.3"`) {
+		t.Error("typed value should be rendered")
+	}
+	if strings.Contains(body, `value="9.9"`) {
+		t.Error("typed value must win over the parameter default")
+	}
+}
+
+// TestDeployFormClearedDefaultedFieldStaysEmpty guards the missing-vs-empty
+// distinction: a field the operator deliberately cleared is submitted present
+// but empty (hx-include sends param.version=), and must NOT silently revert to
+// the default — otherwise a resubmit would re-apply a value the operator removed.
+func TestDeployFormClearedDefaultedFieldStaysEmpty(t *testing.T) {
+	u := defaultedParamUI(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&param.version=").Body.String()
+	if !strings.Contains(body, `name="param.version"`) {
+		t.Fatal("version field should still render")
+	}
+	if strings.Contains(body, `value="9.9"`) {
+		t.Error("a cleared defaulted field must not revert to the default")
+	}
+}
+
+// TestDeployFormDefaultedFieldShowsDefaultPlaceholder documents that a defaulted
+// param advertises its default via the placeholder, so an empty (e.g. cleared)
+// field communicates that deploying it empty applies the default — matching the
+// apply path's render.ApplyDefaults behavior.
+func TestDeployFormDefaultedFieldShowsDefaultPlaceholder(t *testing.T) {
+	u := defaultedParamUI(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo").Body.String()
+	if !strings.Contains(body, `placeholder="default: 9.9"`) {
+		t.Error("a defaulted param should advertise its default via the placeholder")
+	}
+}
+
+// TestDeployFormSetsNoStore verifies rendered pages are non-cacheable, since they
+// now re-populate typed per-instance secrets into the HTML.
+func TestDeployFormSetsNoStore(t *testing.T) {
+	u := uiWithTemplate(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1/deploy")
+	if got := w.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+}
+
+func TestDeployCreateErrorPreservesTypedValues(t *testing.T) {
+	u := uiWithTemplate(t)
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{
+		csrfField:         {csrfToken(tok)},
+		"template":        {"demo"},
+		"slug":            {"web"},
+		"secret.password": {"hunter2"},
+		// no param.version → validation fails, form re-renders
+	}
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/deploy", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code == http.StatusOK || w.Code == http.StatusSeeOther {
+		t.Fatalf("expected a non-success status for invalid deploy, got %d", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `value="hunter2"`) {
+		t.Error("typed secret should be preserved on a failed-deploy re-render")
 	}
 }
 

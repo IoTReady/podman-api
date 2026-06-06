@@ -58,6 +58,10 @@ func (u *UI) render(w http.ResponseWriter, r *http.Request, status int, block st
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	// Rendered pages can carry secret values (the deploy form re-populates typed
+	// per-instance secrets), so never let a browser or intermediary cache them.
+	// Static assets are served separately and stay cacheable.
+	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_, _ = w.Write(buf.Bytes())
 }
