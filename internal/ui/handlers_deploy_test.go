@@ -57,22 +57,15 @@ func uiWithStoredInstance(t *testing.T) *UI {
 	return u
 }
 
-// uiWithTemplate registers a "demo" template (one required param "version", one
-// per-instance secret "password") so the meta-driven form has fields to render.
-func uiWithTemplate(t *testing.T) *UI {
+// uiWithTemplateMeta registers a single "demo" template described by meta and
+// returns a UI wired to a memory store, so meta-driven form tests can vary the
+// parameter contract without re-deriving the fixture each time.
+func uiWithTemplateMeta(t *testing.T, meta render.Meta) *UI {
 	t.Helper()
 	fc := fake.New()
 	hosts := []config.Host{{ID: "edge-1"}}
 	mem := store.NewMemory()
-	_ = mem.PutTemplate(context.Background(), store.Template{
-		Meta: render.Meta{
-			ID: "demo",
-			Parameters: []render.ParamDef{
-				{Name: "version", Required: true},
-			},
-			Secrets: render.Secrets{PerInstance: []string{"password"}},
-		},
-	})
+	_ = mem.PutTemplate(context.Background(), store.Template{Meta: meta})
 	svc := instance.NewService(fc, hosts)
 	svc.SetStore(mem)
 	hash, _ := config.HashToken("pw")
@@ -84,6 +77,17 @@ func uiWithTemplate(t *testing.T) *UI {
 		t.Fatal(err)
 	}
 	return u
+}
+
+// uiWithTemplate registers a "demo" template (one required param "version", one
+// per-instance secret "password") so the meta-driven form has fields to render.
+func uiWithTemplate(t *testing.T) *UI {
+	t.Helper()
+	return uiWithTemplateMeta(t, render.Meta{
+		ID:         "demo",
+		Parameters: []render.ParamDef{{Name: "version", Required: true}},
+		Secrets:    render.Secrets{PerInstance: []string{"password"}},
+	})
 }
 
 func TestDeployFormRendersMetaFields(t *testing.T) {
@@ -189,29 +193,20 @@ func TestDeployFormDropsValuesForFieldsNotInTemplate(t *testing.T) {
 	}
 }
 
+// defaultedParamUI is a UI whose "demo" template has a single param carrying a
+// one-click default, for exercising the default-vs-typed precedence.
+func defaultedParamUI(t *testing.T) *UI {
+	return uiWithTemplateMeta(t, render.Meta{
+		ID:         "demo",
+		Parameters: []render.ParamDef{{Name: "version", Default: "9.9"}},
+	})
+}
+
 // TestDeployFormTypedValueBeatsParamDefault locks in the precedence introduced by
 // the #98 typed-parameter model: a one-click default shows on a fresh form, but a
 // value the operator already typed wins over it across a template switch.
 func TestDeployFormTypedValueBeatsParamDefault(t *testing.T) {
-	fc := fake.New()
-	hosts := []config.Host{{ID: "edge-1"}}
-	mem := store.NewMemory()
-	_ = mem.PutTemplate(context.Background(), store.Template{
-		Meta: render.Meta{
-			ID:         "demo",
-			Parameters: []render.ParamDef{{Name: "version", Default: "9.9"}},
-		},
-	})
-	svc := instance.NewService(fc, hosts)
-	svc.SetStore(mem)
-	hash, _ := config.HashToken("pw")
-	u, err := New(Config{
-		Svc:  svc,
-		Auth: NewOperatorAuthenticator(config.Operator{Username: "op", PasswordHash: hash}),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	u := defaultedParamUI(t)
 
 	// Fresh form: the parameter default is shown.
 	if body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo").Body.String(); !strings.Contains(body, `value="9.9"`) {
@@ -225,6 +220,31 @@ func TestDeployFormTypedValueBeatsParamDefault(t *testing.T) {
 	}
 	if strings.Contains(body, `value="9.9"`) {
 		t.Error("typed value must win over the parameter default")
+	}
+}
+
+// TestDeployFormClearedDefaultedFieldStaysEmpty guards the missing-vs-empty
+// distinction: a field the operator deliberately cleared is submitted present
+// but empty (hx-include sends param.version=), and must NOT silently revert to
+// the default — otherwise a resubmit would re-apply a value the operator removed.
+func TestDeployFormClearedDefaultedFieldStaysEmpty(t *testing.T) {
+	u := defaultedParamUI(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&param.version=").Body.String()
+	if !strings.Contains(body, `name="param.version"`) {
+		t.Fatal("version field should still render")
+	}
+	if strings.Contains(body, `value="9.9"`) {
+		t.Error("a cleared defaulted field must not revert to the default")
+	}
+}
+
+// TestDeployFormSetsNoStore verifies rendered pages are non-cacheable, since they
+// now re-populate typed per-instance secrets into the HTML.
+func TestDeployFormSetsNoStore(t *testing.T) {
+	u := uiWithTemplate(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1/deploy")
+	if got := w.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
 	}
 }
 

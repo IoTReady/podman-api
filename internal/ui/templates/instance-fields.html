@@ -2,9 +2,8 @@
 <div class="label">PARAMETERS</div>
 {{range .Tmpl.Meta.Parameters}}
   {{- $label := .Label}}{{if eq $label ""}}{{$label = .Name}}{{end}}
-  {{- $typed := index $.Values (printf "param.%s" .Name)}}
   <label>{{$label}}{{if .Required}} (required){{end}}
-    <input name="param.{{.Name}}"{{if .Required}} required{{end}}{{if .Placeholder}} placeholder="{{.Placeholder}}"{{end}} value="{{if $typed}}{{$typed}}{{else if .Default}}{{.Default}}{{end}}">
+    <input name="param.{{.Name}}"{{if .Required}} required{{end}}{{if .Placeholder}} placeholder="{{.Placeholder}}"{{end}} value="{{index $.Values (printf "param.%s" .Name)}}">
   </label>
 {{end}}
 {{if .Tmpl.Meta.Secrets.PerInstance}}

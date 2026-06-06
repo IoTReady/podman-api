@@ -120,12 +120,24 @@ reshaped the deploy form's substrate. The fix above was rebased onto it; the
    `{{range .Tmpl.Meta.Parameters}}` over `.Name`/`.Required`/`.Placeholder`/`.Default`.
    `Meta.Secrets.PerInstance` (`[]string`) is unchanged, so secret inputs are
    re-populated exactly as designed.
-2. **Default precedence.** Each param input now carries a one-click `Default` from
-   #61. The value rule became *typed value wins, else the parameter default*:
-   `value="{{if $typed}}{{$typed}}{{else if .Default}}{{.Default}}{{end}}"` (the
-   `else if .Default` guard avoids rendering a nil `any` default into the
-   attribute). A new test, `TestDeployFormTypedValueBeatsParamDefault`, locks this
-   ordering in.
+2. **Default precedence (resolved server-side).** Each param now carries a
+   one-click `Default` from #61. Precedence is *typed value wins, else the
+   parameter default* — but the template can't distinguish a missing key from a
+   typed-empty one (`index` returns `""` for both), so resolving it in the
+   template would make a **cleared** field silently revert to its default (and a
+   resubmit would re-apply it). Instead, `mergeParamDefaults` fills a default into
+   the `Values` map only for keys the request did not submit **at all**; the input
+   collapses to `value="{{index $.Values (printf "param.%s" .Name)}}"`, symmetric
+   with the secret line. Tests: `TestDeployFormTypedValueBeatsParamDefault`
+   (default on a fresh form, typed wins on switch) and
+   `TestDeployFormClearedDefaultedFieldStaysEmpty` (a cleared field stays empty).
+
+3. **No-store on rendered pages.** Because the form now re-populates typed
+   per-instance secrets into the HTML, the central `render` helper sets
+   `Cache-Control: no-store` so responses aren't cached by a browser or
+   intermediary. Static assets are served separately and stay cacheable.
+   (Follow-up: secrets still transit GET query strings on a template switch via
+   the pre-existing `hx-include` — tracked separately to move the switch to POST.)
 
 Handler signatures also gained `error` returns (`Templates(ctx)`,
 `sortedTemplates(ctx)`, `fieldData`) and `config.Template`/`HasStore` were removed
