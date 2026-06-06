@@ -106,6 +106,12 @@ func main() {
 		log.Fatalf("podman: %v", err)
 	}
 
+	// Refuse to boot against a reachable host below the podman version floor;
+	// unreachable hosts are warned and re-checked on first use (#85).
+	if err := client.Preflight(context.Background()); err != nil {
+		log.Fatalf("podman: %v", err)
+	}
+
 	svc := instance.NewService(client, hosts)
 	instance.SetVerifyTimeout(*migrateVerifyTimeout)
 	svc.SetVerifyVolumes(*migrateVerifyVolumes)
