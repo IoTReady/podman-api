@@ -140,6 +140,7 @@ func TestPreflight_ToleratesUnreachable(t *testing.T) {
 }
 
 func TestPreflight_TimeoutDefers(t *testing.T) {
+	// Mutates a package-level var; safe only while this package's tests stay serial (no t.Parallel).
 	old := preflightTimeout
 	preflightTimeout = 50 * time.Millisecond
 	defer func() { preflightTimeout = old }()

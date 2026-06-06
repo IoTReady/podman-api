@@ -206,7 +206,8 @@ func (r *Real) preflightHost(ctx context.Context, id string) error {
 	// connections at context.Background() (per-request cancellation must not
 	// kill them), so the attempt is bounded externally. On timeout the
 	// goroutine is abandoned; if it completes later it merely caches a usable
-	// connection for first use.
+	// connection for first use — caching grants no unverified access, it only
+	// avoids a second dial (opCtxFor still runs the version gate).
 	go func() {
 		c, err := r.ctxFor(ctx, id)
 		if err != nil {
