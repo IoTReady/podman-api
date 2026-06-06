@@ -163,6 +163,21 @@ func (corruptSpecStore) GetSpec(context.Context, string, string, string) (store.
 	return store.Spec{}, store.ErrSpecCorrupt
 }
 
+// TestSecretsFormHidesRotateWhenNoDeclaredSecrets: reaching the form for an
+// instance whose template declares no per-instance secrets (e.g. a direct URL —
+// the gated control wouldn't link here) shows an explanation and no Rotate button
+// that could only ever 400.
+func TestSecretsFormHidesRotateWhenNoDeclaredSecrets(t *testing.T) {
+	u := uiWithStoredInstance(t) // "demo" template declares no per-instance secrets
+	body := authedGet(t, u, "/ui/hosts/edge-1/instances/demo/main/secrets").Body.String()
+	if strings.Contains(body, ">Rotate<") {
+		t.Error("Rotate button should be hidden when the template declares no per-instance secrets")
+	}
+	if !strings.Contains(body, "declares no per-instance secrets") {
+		t.Error("the form should explain there are no per-instance secrets to manage")
+	}
+}
+
 // TestSecretsRotateIgnoresQueryStringSecret locks the body-only invariant (#99):
 // a secret smuggled into the query string must be ignored (the handler reads
 // r.PostForm), so the body — carrying only the CSRF token — is an empty rotation.

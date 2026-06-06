@@ -22,19 +22,16 @@ func (u *UI) instanceView(ctx context.Context, host string, obs instance.Observe
 }
 
 // templatePerInstanceSecrets returns the per-instance secret names the template
-// declares, or nil when the template is unknown or the catalog can't be read
-// (best-effort: a lookup failure degrades to "no secrets", never an error here).
+// declares, or nil when the template is unknown or can't be read (best-effort: a
+// lookup failure degrades to "no secrets", never an error here). Uses a point
+// lookup rather than listing the whole catalog, since this runs on every
+// instance-detail render.
 func (u *UI) templatePerInstanceSecrets(ctx context.Context, tmplID string) []string {
-	tmpls, err := u.cfg.Svc.Templates(ctx)
+	tmpl, err := u.cfg.Svc.Template(ctx, tmplID)
 	if err != nil {
 		return nil
 	}
-	for _, t := range tmpls {
-		if t.Meta.ID == tmplID {
-			return t.Meta.Secrets.PerInstance
-		}
-	}
-	return nil
+	return tmpl.Meta.Secrets.PerInstance
 }
 
 func (u *UI) instanceDetail(w http.ResponseWriter, r *http.Request) {

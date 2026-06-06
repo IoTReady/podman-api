@@ -761,6 +761,13 @@ func (s *Service) Templates(ctx context.Context) ([]store.Template, error) {
 	return s.store.ListTemplates(ctx)
 }
 
+// Template returns one catalog template by ID (read-only view), or
+// store.ErrNotFound. A point lookup for callers that need a single template,
+// avoiding Templates()' full-catalog list + scan.
+func (s *Service) Template(ctx context.Context, id string) (store.Template, error) {
+	return s.store.GetTemplate(ctx, id)
+}
+
 // HostLoad returns a point-in-time resource snapshot for a host.
 func (s *Service) HostLoad(ctx context.Context, host string) (podman.HostInfo, error) {
 	if _, ok := s.host(host); !ok {
