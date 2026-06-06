@@ -97,15 +97,21 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	mctx := context.WithoutCancel(ctx)
 
 	if ds == destHealthy {
-		persisted, ok := s.destSpecState(ctx, req.ToHost, req.Template, req.Slug)
-		if !ok {
-			// The store could not be consulted (transient: cancellation, BUSY,
-			// decrypt). Treat as inconclusive — NOT as "not persisted", which would
-			// wrongly roll back and delete a committed destination.
+		spec := s.destSpecState(ctx, req.ToHost, req.Template, req.Slug)
+		if spec == specInconclusive {
+			// The store could not be consulted (transient: cancellation, BUSY).
+			// Treat as inconclusive — NOT as "not persisted", which would wrongly
+			// roll back and delete a committed destination.
 			step("reconcile-inconclusive", "destination spec lookup failed")
 			return false, false, "", nil
 		}
-		if persisted {
+		if spec == specCorrupt {
+			// The dest spec row exists but will never decode (decrypt failure or a
+			// malformed column). Retrying is futile — fail terminally.
+			step("reconcile-spec-corrupt", "destination spec unreadable")
+			return true, false, "destination spec unreadable (corrupt/undecryptable); manual cleanup required", nil
+		}
+		if spec == specPersisted {
 			// Dest is a complete, committed replacement. Repair its ingress routes
 			// (idempotent; covers a crash between PutSpec and ingress.Reconcile),
 			// then reap the source.
@@ -184,31 +190,48 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	return true, false, "destination left in place; source already removed — manual cleanup required", nil
 }
 
+// specState classifies a dest desired-state spec lookup.
+type specState int
+
+const (
+	specInconclusive specState = iota // store could not be consulted (transient): retry
+	specPersisted                     // spec row present and readable: roll forward
+	specAbsent                        // definitively not persisted (ErrNotFound): fall through
+	specCorrupt                       // permanently unreadable (ErrSpecCorrupt): terminal fail
+)
+
 // destSpecState reports whether the destination's desired-state spec was stored
 // — the last durable step of a migrate's Apply (PlayKube → PutSpec → ingress). A
 // healthy dest pod whose spec is missing means Apply was interrupted before it
 // committed; that dest must NOT be treated as the source of truth.
 //
-// ok=false means the store could not be consulted (a transient error: context
-// cancellation, SQLITE_BUSY, a decrypt failure). The caller must treat that as
-// inconclusive and retry — never as "not persisted", which would wrongly roll
-// back (and delete) a committed destination. Only store.ErrNotFound is a
-// definitive "not persisted".
+//   - specInconclusive: the store could not be consulted (a transient error —
+//     context cancellation or SQLITE_BUSY). The caller treats it as inconclusive
+//     and retries; it must NEVER be read as "not persisted", which would wrongly
+//     roll back (and delete) a committed destination.
+//   - specPersisted: a readable spec row exists.
+//   - specAbsent (store.ErrNotFound): definitively not persisted.
+//   - specCorrupt (store.ErrSpecCorrupt): the row exists but will never decode
+//     (decrypt failure after key loss/rotation, or a malformed JSON column). The
+//     caller fails the job terminally — retrying is futile.
 //
 // TODO(#54): this re-derives Apply's commit point from "a spec row exists", and
 // the ingress repair in the roll-forward branch is evidence the equivalence
 // leaks (a durable step runs after PutSpec). A cleaner design records one
 // explicit commit marker as Apply's final durable action and gates roll-forward
 // on that fact.
-func (s *Service) destSpecState(ctx context.Context, host, tmpl, slug string) (persisted, ok bool) {
+func (s *Service) destSpecState(ctx context.Context, host, tmpl, slug string) specState {
 	_, err := s.store.GetSpec(ctx, host, tmpl, slug)
-	if err == nil {
-		return true, true
+	switch {
+	case err == nil:
+		return specPersisted
+	case errors.Is(err, store.ErrNotFound):
+		return specAbsent
+	case errors.Is(err, store.ErrSpecCorrupt):
+		return specCorrupt
+	default:
+		return specInconclusive
 	}
-	if errors.Is(err, store.ErrNotFound) {
-		return false, true
-	}
-	return false, false // transient/unknown — caller retries
 }
 
 // destState classifies the destination, distinguishing absent from unreachable
