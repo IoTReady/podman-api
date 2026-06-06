@@ -447,7 +447,14 @@ func (s *SQLite) GetHostSecret(ctx context.Context, host, name string) ([]byte, 
 		}
 		return nil, err
 	}
-	return open(s.keys.Load(), blob)
+	val, err := open(s.keys.Load(), blob)
+	if err != nil {
+		// A wrong/missing key is recoverable by a restart with the correct
+		// -spec-key-file; surface the typed sentinel so the API/UI classify it
+		// 422 (coherent with GetSpec), not a raw 500. (#117)
+		return nil, fmt.Errorf("%w: decrypt host secret: %v", ErrSecretsUndecryptable, err)
+	}
+	return val, nil
 }
 
 func (s *SQLite) DeleteHostSecret(ctx context.Context, host, name string) error {
