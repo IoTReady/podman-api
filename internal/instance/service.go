@@ -254,6 +254,18 @@ func instanceSecretName(tmpl, slug, name string) string {
 // before the instance lock — a consistent order so the two never deadlock) and the
 // per-instance lock, then runs applyLocked.
 func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts ApplyOptions) error {
+	// Domain claims are checked host-wide (validateIngress) but only become
+	// durable at PutSpec far below; the per-instance lock does not serialize two
+	// different instances racing for the same domain on one host. Hold a per-host
+	// lock for domain-carrying requests so the check→persist claim is atomic.
+	// Because the spec is persisted AFTER PlayKube (to avoid leaving a poison
+	// spec when the play fails), this lock necessarily spans the image pull and
+	// pod play too: two *ingress* deploys to the same host serialize end-to-end,
+	// not just over the store access. That's acceptable for a single-operator
+	// system — non-ingress and different-host deploys take no host lock and stay
+	// fully concurrent. Taken before the instanceLock (consistent order → no
+	// deadlock) and only when domains are present; a request with no domains can
+	// never create a claim, so it needs no host-wide serialization. (#82)
 	if len(req.Domains) > 0 {
 		hl := s.hostLock(host)
 		hl.Lock()
@@ -267,10 +279,10 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 
 // applyLocked is the lock-free core of Apply: it performs the full create/replace
 // (validate → play → persist → ingress) assuming the caller already holds the
-// per-instance lock (and, for domain-carrying requests, the per-host lock). It
-// exists so the read-modify-write callers (RotateInstanceSecrets, UpgradeImage)
-// can hold one lock across GetSpec + re-apply without re-entering Apply's lock
-// (which is non-reentrant). Apply is the public, lock-acquiring entry point.
+// per-instance lock (and, for domain-carrying requests, the per-host lock).
+// Splitting it out lets the read-modify-write callers (RotateInstanceSecrets,
+// UpgradeImage) hold a single lock across GetSpec + re-apply without re-entering
+// Apply's non-reentrant lock. Apply is the public, lock-acquiring entry point.
 func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest, opts ApplyOptions) error {
 	tmpl, err := s.lookup(ctx, host, req.Template)
 	if err != nil {
@@ -294,19 +306,6 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 	if len(req.Secrets) > 0 && !s.store.SecretsEnabled() {
 		return store.ErrSecretsNeedKey
 	}
-	// Domain claims are checked host-wide (validateIngress) but only become
-	// durable at PutSpec far below; the per-instance lock does not serialize two
-	// different instances racing for the same domain on one host. Hold a per-host
-	// lock for domain-carrying requests so the check→persist claim is atomic.
-	// Because the spec is persisted AFTER PlayKube (to avoid leaving a poison
-	// spec when the play fails), this lock necessarily spans the image pull and
-	// pod play too: two *ingress* deploys to the same host serialize end-to-end,
-	// not just over the store access. That's acceptable for a single-operator
-	// system — non-ingress and different-host deploys take no host lock and stay
-	// fully concurrent. Taken before the instanceLock (consistent order → no
-	// deadlock) and only when domains are present; a request with no domains can
-	// never create a claim, so it needs no host-wide serialization. (#82)
-
 	// Validate ingress rules BEFORE playing the pod or persisting the spec, so a
 	// rejected request never leaves a poison spec in the store — a persisted spec
 	// that violates these rules would fail every later reconcile on the host.
