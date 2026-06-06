@@ -134,13 +134,14 @@ type JobStore interface {
 	PruneJobs(ctx context.Context, olderThan time.Time) (int, error)
 }
 
-// DB is the full backend: spec store + job store + template store + closer.
+// DB is the full backend: spec store + job store + template store + backup store + closer.
 // main holds one of these; instance.Service takes the Store view, the runner
 // takes the JobStore view.
 type DB interface {
 	Store
 	JobStore
 	TemplateStore
+	BackupStore
 	io.Closer
 }
 

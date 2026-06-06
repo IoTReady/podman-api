@@ -57,7 +57,19 @@ CREATE TABLE IF NOT EXISTS templates (
   origin  TEXT NOT NULL,
   created INTEGER NOT NULL,
   updated INTEGER NOT NULL
-);`
+);
+CREATE TABLE IF NOT EXISTS backups (
+  id       TEXT PRIMARY KEY,
+  host     TEXT NOT NULL,
+  template TEXT NOT NULL,
+  slug     TEXT NOT NULL,
+  state    TEXT NOT NULL,
+  volumes  TEXT NOT NULL DEFAULT '[]',
+  image    TEXT NOT NULL DEFAULT '',
+  created  INTEGER NOT NULL,
+  finished INTEGER
+);
+CREATE INDEX IF NOT EXISTS backups_instance ON backups(host, template, slug);`
 
 // maxOpenConns bounds the SQLite connection pool. WAL allows many concurrent
 // readers + one writer; setting the pool above the job worker count

@@ -9,18 +9,35 @@ import (
 	"time"
 )
 
+// cloneBackupVolumes returns a deep copy of vols so callers cannot mutate
+// stored state (matching SQLite, which deserializes fresh on every read).
+func cloneBackupVolumes(vols []BackupVolume) []BackupVolume {
+	if vols == nil {
+		return nil
+	}
+	out := make([]BackupVolume, len(vols))
+	for i, v := range vols {
+		out[i] = v
+		if v.Manifest != nil {
+			out[i].Manifest = append(json.RawMessage(nil), v.Manifest...)
+		}
+	}
+	return out
+}
+
 // Memory is an in-memory Store for tests. Secrets are kept in plaintext and
 // timestamps are NOT stamped (unlike the SQLite store) — it is a test double,
 // not a production backend. PutErr/DeleteErr, when non-nil, make the
 // corresponding call fail, to exercise callers' fatal-failure paths.
-// It also implements JobStore with an in-memory []Job slice and TemplateStore
-// with an in-memory map.
+// It also implements JobStore with an in-memory []Job slice, TemplateStore
+// with an in-memory map, and BackupStore with an in-memory map.
 type Memory struct {
 	mu          sync.Mutex
 	specs       map[string]Spec
 	jobs        []Job             // insertion order; newest last
 	hostSecrets map[string][]byte // "host\x00name" -> value
 	templates   map[string]Template
+	backups     map[string]Backup // id -> Backup
 
 	PutErr    error
 	DeleteErr error
@@ -32,6 +49,7 @@ func NewMemory() *Memory {
 		specs:       map[string]Spec{},
 		hostSecrets: map[string][]byte{},
 		templates:   map[string]Template{},
+		backups:     map[string]Backup{},
 	}
 }
 
@@ -371,6 +389,97 @@ func cloneJob(j Job) Job {
 
 var _ JobStore = (*Memory)(nil)
 var _ Store = (*Memory)(nil)
+
+// ---------------------------------------------------------------------------
+// BackupStore implementation
+// ---------------------------------------------------------------------------
+
+func (m *Memory) CreateBackup(_ context.Context, b Backup) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b.State = BackupCreating
+	b.Created = time.Now()
+	b.Finished = time.Time{}
+	b.Volumes = cloneBackupVolumes(b.Volumes)
+	m.backups[b.ID] = b
+	return nil
+}
+
+func (m *Memory) CompleteBackup(_ context.Context, id string, vols []BackupVolume) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.backups[id]
+	if !ok || b.State != BackupCreating {
+		return false, nil
+	}
+	b.State = BackupComplete
+	b.Volumes = cloneBackupVolumes(vols)
+	b.Finished = time.Now()
+	m.backups[id] = b
+	return true, nil
+}
+
+func (m *Memory) FailBackup(_ context.Context, id string) (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.backups[id]
+	if !ok || b.State != BackupCreating {
+		return false, nil
+	}
+	b.State = BackupFailed
+	b.Finished = time.Now()
+	m.backups[id] = b
+	return true, nil
+}
+
+func (m *Memory) GetBackup(_ context.Context, id string) (Backup, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	b, ok := m.backups[id]
+	if !ok {
+		return Backup{}, ErrNotFound
+	}
+	b.Volumes = cloneBackupVolumes(b.Volumes)
+	return b, nil
+}
+
+func (m *Memory) ListBackups(_ context.Context, host, template, slug string, limit int) ([]Backup, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var matched []Backup
+	for _, b := range m.backups {
+		if b.Host == host && b.Template == template && b.Slug == slug {
+			cp := b
+			cp.Volumes = cloneBackupVolumes(b.Volumes)
+			matched = append(matched, cp)
+		}
+	}
+	// Sort newest-first; tiebreak by id descending (same order as SQLite).
+	sort.Slice(matched, func(i, j int) bool {
+		ci, cj := matched[i].Created, matched[j].Created
+		if !ci.Equal(cj) {
+			return ci.After(cj)
+		}
+		return matched[i].ID > matched[j].ID
+	})
+	n := clampJobLimit(limit)
+	if len(matched) > n {
+		matched = matched[:n]
+	}
+	return matched, nil
+}
+
+func (m *Memory) DeleteBackup(_ context.Context, id string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.backups[id]; !ok {
+		return ErrNotFound
+	}
+	delete(m.backups, id)
+	return nil
+}
+
+var _ BackupStore = (*Memory)(nil)
 
 // ---------------------------------------------------------------------------
 // TemplateStore implementation
