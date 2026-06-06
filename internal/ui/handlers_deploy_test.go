@@ -370,6 +370,20 @@ func TestDeployCreateErrorPreservesTypedValues(t *testing.T) {
 	}
 }
 
+// TestDeployFormSwitchUsesPost locks the template <select> to a POST switch
+// (#99): a GET switch would put typed secrets in the URL/logs. The structural
+// assertion guards against a silent regression back to hx-get.
+func TestDeployFormSwitchUsesPost(t *testing.T) {
+	u := uiWithTemplate(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy").Body.String()
+	if !strings.Contains(body, `hx-post="/ui/hosts/edge-1/deploy/form"`) {
+		t.Error("the template <select> should POST the switch to /deploy/form")
+	}
+	if strings.Contains(body, `hx-get="/ui/hosts/edge-1/deploy"`) {
+		t.Error("the template <select> must not switch via hx-get (secret-in-URL leak)")
+	}
+}
+
 func TestUpgradeApplyMissingImageRerendersForm(t *testing.T) {
 	u := uiWithStoredInstance(t)
 	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
