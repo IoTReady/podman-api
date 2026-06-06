@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"context"
 	"net/http"
 	"strings"
 
@@ -9,9 +10,31 @@ import (
 )
 
 // instanceView builds the instance-detail render data. Upgrade is always
-// available since the desired-state store is always present.
-func (u *UI) instanceView(host string, obs instance.Observed) map[string]any {
-	return map[string]any{"Host": host, "Inst": obs, "CanUpgrade": true}
+// available since the desired-state store is always present. HasSecrets gates
+// the manage-secrets control on the template declaring any per-instance secrets.
+func (u *UI) instanceView(ctx context.Context, host string, obs instance.Observed) map[string]any {
+	return map[string]any{
+		"Host":       host,
+		"Inst":       obs,
+		"CanUpgrade": true,
+		"HasSecrets": len(u.templatePerInstanceSecrets(ctx, obs.Template)) > 0,
+	}
+}
+
+// templatePerInstanceSecrets returns the per-instance secret names the template
+// declares, or nil when the template is unknown or the catalog can't be read
+// (best-effort: a lookup failure degrades to "no secrets", never an error here).
+func (u *UI) templatePerInstanceSecrets(ctx context.Context, tmplID string) []string {
+	tmpls, err := u.cfg.Svc.Templates(ctx)
+	if err != nil {
+		return nil
+	}
+	for _, t := range tmpls {
+		if t.Meta.ID == tmplID {
+			return t.Meta.Secrets.PerInstance
+		}
+	}
+	return nil
 }
 
 func (u *UI) instanceDetail(w http.ResponseWriter, r *http.Request) {
@@ -21,7 +44,7 @@ func (u *UI) instanceDetail(w http.ResponseWriter, r *http.Request) {
 		u.renderError(w, r, err)
 		return
 	}
-	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(host, obs)))
+	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(r.Context(), host, obs)))
 }
 
 // lifecycle dispatches start/stop/restart/delete, then re-renders the instance
@@ -56,7 +79,7 @@ func (u *UI) lifecycle(w http.ResponseWriter, r *http.Request) {
 			u.renderError(w, r, err)
 			return
 		}
-		data := u.instanceView(host, obs)
+		data := u.instanceView(ctx, host, obs)
 		data["ActionError"] = err.Error()
 		u.render(w, r, errorStatus(err), "instance-detail", u.pageData(data))
 		return
@@ -75,7 +98,7 @@ func (u *UI) lifecycle(w http.ResponseWriter, r *http.Request) {
 		u.renderError(w, r, gerr)
 		return
 	}
-	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(host, obs)))
+	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(ctx, host, obs)))
 }
 
 // logsTail renders the last N log lines of one container as static text. The

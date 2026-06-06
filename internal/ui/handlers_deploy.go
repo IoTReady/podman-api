@@ -272,7 +272,7 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 		u.renderError(w, r, err)
 		return
 	}
-	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(host, obs)))
+	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(r.Context(), host, obs)))
 }
 
 // upgradeForm renders the image-only upgrade form. The upgrade reuses the
@@ -320,7 +320,7 @@ func (u *UI) upgradeApply(w http.ResponseWriter, r *http.Request) {
 		u.renderError(w, r, err)
 		return
 	}
-	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(host, obs)))
+	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(r.Context(), host, obs)))
 }
 
 // firstContainerImage returns the first container's image, for prefilling the
