@@ -391,3 +391,88 @@ func TestService_UpgradeImage_EmptyImageRejected(t *testing.T) {
 	err := svc.UpgradeImage(context.Background(), "h1", "postgres", "demo", "")
 	require.Error(t, err)
 }
+
+// twoSecretTemplate declares two per-instance secrets so a rotation of one can
+// prove the other (a field left blank) is preserved. render.Validate treats the
+// PerInstance list as the complete allow-list AND requires every declared name,
+// so an undeclared secret can't be seeded — both must be declared and supplied.
+func twoSecretTemplate() store.Template {
+	return store.Template{
+		Meta: render.Meta{
+			ID:         "twosec",
+			Parameters: requiredParams("slug", "image"),
+			Secrets:    render.Secrets{PerInstance: []string{"password", "token"}},
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: twosec-{{.slug}}
+spec:
+  containers:
+    - name: app
+      image: {{.image}}
+`,
+		Origin: "seed",
+	}
+}
+
+func TestRotateInstanceSecrets_OverlaysAndReapplies(t *testing.T) {
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	svc, mem := newSvcWith(t, fake.New(), hosts, twoSecretTemplate())
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", ApplyRequest{
+		Template:   "twosec",
+		Slug:       "demo",
+		Parameters: map[string]any{"slug": "demo", "image": "img:1"},
+		Secrets:    map[string]string{"password": "p", "token": "keep"},
+	}, ApplyOptions{Replace: true}))
+
+	// Rotate only "password"; "token" is left out (the write-only "blank keeps
+	// existing value" path).
+	require.NoError(t, svc.RotateInstanceSecrets(ctx, "h1", "twosec", "demo",
+		map[string]string{"password": "rotated"}))
+
+	got, err := mem.GetSpec(ctx, "h1", "twosec", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, "rotated", got.Secrets["password"]) // overlaid
+	assert.Equal(t, "keep", got.Secrets["token"])       // absent name preserved
+	assert.Equal(t, "img:1", got.Parameters["image"])   // params preserved
+}
+
+func TestRotateInstanceSecrets_EmptyIsRejected(t *testing.T) {
+	svc, _, _ := newSvcMem(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	require.Error(t, svc.RotateInstanceSecrets(ctx, "h1", "postgres", "demo", map[string]string{}))
+}
+
+func TestRotateInstanceSecrets_NoSpecIsNotFound(t *testing.T) {
+	svc, _, _ := newSvcMem(t)
+	err := svc.RotateInstanceSecrets(context.Background(), "h1", "postgres", "ghost",
+		map[string]string{"password": "x"})
+	require.ErrorIs(t, err, ErrInstanceNotFound)
+}
+
+func TestRotateInstanceSecrets_CorruptSpecPropagates(t *testing.T) {
+	svc, _, mem := newSvcMem(t)
+	svc.SetStore(&getSpecErrStore{Memory: mem, err: store.ErrSpecCorrupt})
+	err := svc.RotateInstanceSecrets(context.Background(), "h1", "postgres", "demo",
+		map[string]string{"password": "x"})
+	require.ErrorIs(t, err, store.ErrSpecCorrupt)
+}
+
+func TestInstanceSecretState_ReportsPresenceNotValues(t *testing.T) {
+	svc, _, _ := newSvcMem(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	set, err := svc.InstanceSecretState(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.True(t, set["password"]) // stored
+	assert.False(t, set["token"])   // never set → absent → false
+}
+
+func TestInstanceSecretState_NoSpecIsNotFound(t *testing.T) {
+	svc, _, _ := newSvcMem(t)
+	_, err := svc.InstanceSecretState(context.Background(), "h1", "postgres", "ghost")
+	require.ErrorIs(t, err, ErrInstanceNotFound)
+}

@@ -587,6 +587,60 @@ func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image stri
 	}, ApplyOptions{Replace: true})
 }
 
+// RotateInstanceSecrets overlays newSecrets onto the instance's stored
+// per-instance secrets and re-applies (Replace=true), restarting the pod. Names
+// absent from newSecrets keep their existing value — callers are write-only and
+// never see current values. An empty newSecrets is rejected so a blank submit
+// does not pointlessly restart the instance. Returns ErrInstanceNotFound when no
+// spec is stored, or the store's error (incl. store.ErrSpecCorrupt) when the
+// spec cannot be read.
+func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug string, newSecrets map[string]string) error {
+	if len(newSecrets) == 0 {
+		return errors.New("no secrets to rotate")
+	}
+	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrInstanceNotFound
+		}
+		return fmt.Errorf("load spec: %w", err)
+	}
+	merged := maps.Clone(spec.Secrets)
+	if merged == nil {
+		merged = map[string]string{}
+	}
+	for k, v := range newSecrets {
+		merged[k] = v
+	}
+	return s.Apply(ctx, host, ApplyRequest{
+		Template:   tmpl,
+		Slug:       slug,
+		Parameters: spec.Parameters,
+		Secrets:    merged,
+		Domains:    spec.Domains,
+	}, ApplyOptions{Replace: true})
+}
+
+// InstanceSecretState reports, per stored per-instance secret name, that a value
+// is present — presence only, never the value (the secret model is write-only).
+// Names a template declares but the instance never set are simply absent from the
+// map. Returns ErrInstanceNotFound when no spec is stored, or the store's error
+// (incl. store.ErrSpecCorrupt) when the spec cannot be read.
+func (s *Service) InstanceSecretState(ctx context.Context, host, tmpl, slug string) (map[string]bool, error) {
+	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return nil, ErrInstanceNotFound
+		}
+		return nil, fmt.Errorf("load spec: %w", err)
+	}
+	set := make(map[string]bool, len(spec.Secrets))
+	for name := range spec.Secrets {
+		set[name] = true
+	}
+	return set, nil
+}
+
 // pruneInstanceResources best-effort removes an instance's per-instance secrets
 // and/or named volumes on a host. Both names are deterministic from
 // template+slug, so leaving them behind risks a future deploy of the same slug
