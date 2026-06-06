@@ -195,7 +195,7 @@ func (r *Real) Version(ctx context.Context, id string) (string, error) {
 }
 
 func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool, networks ...string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -222,7 +222,7 @@ func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool, netwo
 }
 
 func (r *Real) PodInspect(ctx context.Context, id, name string) (Pod, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return Pod{}, err
 	}
@@ -287,7 +287,7 @@ func enrichContainer(c *Container, ins *define.InspectContainerData) {
 }
 
 func (r *Real) PodList(ctx context.Context, id string, filters map[string]string) ([]Pod, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -321,7 +321,7 @@ func (r *Real) PodList(ctx context.Context, id string, filters map[string]string
 }
 
 func (r *Real) PodStart(ctx context.Context, id, name string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -330,7 +330,7 @@ func (r *Real) PodStart(ctx context.Context, id, name string) error {
 }
 
 func (r *Real) PodStop(ctx context.Context, id, name string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -339,7 +339,7 @@ func (r *Real) PodStop(ctx context.Context, id, name string) error {
 }
 
 func (r *Real) PodRestart(ctx context.Context, id, name string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -348,7 +348,7 @@ func (r *Real) PodRestart(ctx context.Context, id, name string) error {
 }
 
 func (r *Real) PodRemove(ctx context.Context, id, name string, force bool) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -362,7 +362,7 @@ func (r *Real) PodRemove(ctx context.Context, id, name string, force bool) error
 }
 
 func (r *Real) SecretCreate(ctx context.Context, id, name string, value []byte) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -372,7 +372,7 @@ func (r *Real) SecretCreate(ctx context.Context, id, name string, value []byte) 
 }
 
 func (r *Real) SecretList(ctx context.Context, id string) ([]Secret, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -388,7 +388,7 @@ func (r *Real) SecretList(ctx context.Context, id string) ([]Secret, error) {
 }
 
 func (r *Real) SecretInspect(ctx context.Context, id, name string) (Secret, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return Secret{}, err
 	}
@@ -400,7 +400,7 @@ func (r *Real) SecretInspect(ctx context.Context, id, name string) (Secret, erro
 }
 
 func (r *Real) SecretRemove(ctx context.Context, id, name string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -408,7 +408,7 @@ func (r *Real) SecretRemove(ctx context.Context, id, name string) error {
 }
 
 func (r *Real) VolumeInspect(ctx context.Context, id, name string) (Volume, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return Volume{}, err
 	}
@@ -422,7 +422,7 @@ func (r *Real) VolumeInspect(ctx context.Context, id, name string) (Volume, erro
 }
 
 func (r *Real) VolumeRemove(ctx context.Context, id, name string, force bool) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -440,7 +440,7 @@ func (r *Real) VolumeRemove(ctx context.Context, id, name string, force bool) er
 // because that binding copies into an io.Writer, whereas our contract must hand
 // back a live io.ReadCloser for pipe streaming.
 func (r *Real) VolumeExport(ctx context.Context, id, name string) (io.ReadCloser, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -462,7 +462,7 @@ func (r *Real) VolumeExport(ctx context.Context, id, name string) (io.ReadCloser
 
 // VolumeImport unpacks an uncompressed tar into an existing volume on the host.
 func (r *Real) VolumeImport(ctx context.Context, id, name string, src io.Reader) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -472,7 +472,7 @@ func (r *Real) VolumeImport(ctx context.Context, id, name string, src io.Reader)
 // VolumeCreate creates an empty named volume. An already-existing name is
 // treated as success so migrate's create-then-copy step is idempotent on retry.
 func (r *Real) VolumeCreate(ctx context.Context, id, name string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -496,7 +496,7 @@ func (r *Real) VolumeCreate(ctx context.Context, id, name string) error {
 // via the API, so we fail with the one-time fix instead of silently keeping it
 // disabled (which IgnoreIfExists would do).
 func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -521,7 +521,7 @@ func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
 }
 
 func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []string) (ExecResult, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return ExecResult{}, err
 	}
@@ -554,7 +554,7 @@ func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []st
 }
 
 func (r *Real) CopyToContainer(ctx context.Context, id, container, destDir, name string, content []byte) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -651,7 +651,7 @@ func podFromList(p *entities.ListPodsReport) Pod {
 // request; mergedCtx derives from c but can be independently cancelled so
 // the streaming call is torn down without killing the cached connection.
 func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts LogOptions) (<-chan LogLine, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -732,7 +732,7 @@ func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts Log
 }
 
 func (r *Real) ImagePull(ctx context.Context, id, ref string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -741,7 +741,7 @@ func (r *Real) ImagePull(ctx context.Context, id, ref string) error {
 }
 
 func (r *Real) UsedHostPorts(ctx context.Context, id string) ([]PortMapping, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -899,7 +899,7 @@ func sumPrune(reps []*reports.PruneReport) PruneReport {
 }
 
 func (r *Real) ImagePrune(ctx context.Context, id string, all bool) (PruneReport, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return PruneReport{}, err
 	}
@@ -911,7 +911,7 @@ func (r *Real) ImagePrune(ctx context.Context, id string, all bool) (PruneReport
 }
 
 func (r *Real) ContainerPrune(ctx context.Context, id string) (PruneReport, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return PruneReport{}, err
 	}
@@ -923,7 +923,7 @@ func (r *Real) ContainerPrune(ctx context.Context, id string) (PruneReport, erro
 }
 
 func (r *Real) BuildCachePrune(ctx context.Context, id string) (PruneReport, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return PruneReport{}, err
 	}
@@ -937,7 +937,7 @@ func (r *Real) BuildCachePrune(ctx context.Context, id string) (PruneReport, err
 }
 
 func (r *Real) VolumePrune(ctx context.Context, id string, filters map[string][]string) (PruneReport, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return PruneReport{}, err
 	}
