@@ -587,10 +587,22 @@ func (s *Service) Upgrade(ctx context.Context, host string, req ApplyRequest, im
 // image upgrade of that already-running instance (the missing secret was already
 // missing; the upgrade never worsens the pod).
 // Returns ErrInstanceNotFound when no spec is stored for the instance.
+//
+// The load (GetSpec) and re-apply (applyLocked) happen atomically under the
+// per-instance lock: the image override is a read-modify-write of the stored
+// parameters, so holding the lock across both halves keeps a concurrent
+// rotation/upgrade of the same instance from reading the pre-commit spec and
+// dropping this update. It takes only the instance lock (no host lock): the
+// upgrade re-applies the instance's own domains, which validateIngress excludes
+// from its uniqueness check, so it can never create a new cross-instance domain
+// claim. (#114)
 func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image string) error {
 	if image == "" {
 		return errors.New("upgrade requires an image")
 	}
+	lock := s.instanceLock(host, tmpl, slug)
+	lock.Lock()
+	defer lock.Unlock()
 	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -603,7 +615,7 @@ func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image stri
 		params = map[string]any{}
 	}
 	params["image"] = image
-	return s.Apply(ctx, host, ApplyRequest{
+	return s.applyLocked(ctx, host, ApplyRequest{
 		Template:   tmpl,
 		Slug:       slug,
 		Parameters: params,
@@ -619,10 +631,21 @@ func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image stri
 // does not pointlessly restart the instance. Returns ErrInstanceNotFound when no
 // spec is stored, or the store's error (incl. store.ErrSpecCorrupt or
 // store.ErrSecretsUndecryptable) when the spec cannot be read.
+//
+// The load (GetSpec) and re-apply (applyLocked) happen atomically under the
+// per-instance lock: rotation is a read-modify-write of the stored secrets, so
+// holding the lock across both halves keeps a concurrent rotation/upgrade of the
+// same instance from reading the pre-commit spec and dropping this update. It
+// takes only the instance lock (no host lock): rotation re-applies the
+// instance's own domains, which validateIngress excludes from its uniqueness
+// check, so it can never create a new cross-instance domain claim. (#114)
 func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug string, newSecrets map[string]string) error {
 	if len(newSecrets) == 0 {
 		return errors.New("no secrets to rotate")
 	}
+	lock := s.instanceLock(host, tmpl, slug)
+	lock.Lock()
+	defer lock.Unlock()
 	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -637,7 +660,7 @@ func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug st
 	for k, v := range newSecrets {
 		merged[k] = v
 	}
-	return s.Apply(ctx, host, ApplyRequest{
+	return s.applyLocked(ctx, host, ApplyRequest{
 		Template:   tmpl,
 		Slug:       slug,
 		Parameters: spec.Parameters,

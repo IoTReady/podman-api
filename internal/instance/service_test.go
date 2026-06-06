@@ -3,7 +3,9 @@ package instance
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -464,6 +466,72 @@ func TestUpgradeImage_AllowsMissingRequiredSecret(t *testing.T) {
 	got, err := mem.GetSpec(ctx, "h1", "twosec", "demo")
 	require.NoError(t, err)
 	assert.Equal(t, "img:2", got.Parameters["image"])
+}
+
+// gatedClient wraps a podman.Client and, once armed, blocks every PlayKube until
+// the test closes release — signalling each entry on reached (buffered so a second
+// concurrent entry never blocks). It lets the test interleave two rotations of one
+// instance deterministically.
+type gatedClient struct {
+	podman.Client
+	armed   atomic.Bool
+	reached chan struct{}
+	release chan struct{}
+}
+
+func (g *gatedClient) PlayKube(ctx context.Context, host, yaml string, replace bool, networks ...string) error {
+	if g.armed.Load() {
+		g.reached <- struct{}{}
+		<-g.release
+	}
+	return g.Client.PlayKube(ctx, host, yaml, replace, networks...)
+}
+
+// TestRotateInstanceSecrets_ConcurrentRotationsDoNotLoseUpdates proves load+apply
+// is atomic under one lock: two concurrent rotations of *different* secrets on the
+// same instance must both survive. On the pre-fix code (GetSpec outside Apply's
+// lock) the second rotation reads the spec before the first commits and re-applies
+// a stale value, dropping one update.
+func TestRotateInstanceSecrets_ConcurrentRotationsDoNotLoseUpdates(t *testing.T) {
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	g := &gatedClient{Client: fake.New(), reached: make(chan struct{}, 2), release: make(chan struct{})}
+	svc, mem := newSvcWith(t, g, hosts, twoSecretTemplate())
+	ctx := context.Background()
+
+	// Deploy with the gate disarmed.
+	require.NoError(t, svc.Apply(ctx, "h1", ApplyRequest{
+		Template:   "twosec",
+		Slug:       "demo",
+		Parameters: map[string]any{"slug": "demo", "image": "img:1"},
+		Secrets:    map[string]string{"password": "p", "token": "t"},
+	}, ApplyOptions{Replace: true}))
+
+	g.armed.Store(true)
+
+	errA := make(chan error, 1)
+	errB := make(chan error, 1)
+	// A rotates password, parks in PlayKube holding the instance lock.
+	go func() {
+		errA <- svc.RotateInstanceSecrets(ctx, "h1", "twosec", "demo", map[string]string{"password": "A"})
+	}()
+	<-g.reached
+	// B rotates token. Fixed code: B blocks on the instance lock (no GetSpec yet).
+	// Old code: B reads the pre-commit spec and reaches its own gated PlayKube.
+	go func() {
+		errB <- svc.RotateInstanceSecrets(ctx, "h1", "twosec", "demo", map[string]string{"token": "B"})
+	}()
+	select {
+	case <-g.reached: // old code: B already read the stale spec
+	case <-time.After(300 * time.Millisecond): // fixed code: B is blocked on the lock
+	}
+	close(g.release)
+	require.NoError(t, <-errA)
+	require.NoError(t, <-errB)
+
+	got, err := mem.GetSpec(ctx, "h1", "twosec", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, "A", got.Secrets["password"], "password rotation lost (RMW race)")
+	assert.Equal(t, "B", got.Secrets["token"], "token rotation lost (RMW race)")
 }
 
 func TestRotateInstanceSecrets_EmptyIsRejected(t *testing.T) {
