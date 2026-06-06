@@ -43,6 +43,21 @@ Both wants are done in lockstep because rotation exercises the same decrypt path
   per-instance only; host secrets already have their own surface).
 - No secret value is ever read back to a client. The view shows presence only.
 
+## Design decision: rotation relaxes the "all required secrets present" rule
+
+Rotation re-applies the stored spec via `Apply(Replace=true)`, which runs
+`render.Validate`. `Validate` treats a template's `PerInstance` list as *required*
+— every declared secret must be present. A stored spec can legitimately lack one
+(a template that gained a per-instance secret after the instance was deployed),
+which would block rotating an unrelated secret. Rather than force the operator to
+re-supply every declared secret on each rotation, rotation opts into
+`render.ValidateAllowMissingSecrets` (a new `ApplyOptions.AllowMissingSecrets`
+flag) which skips *only* the "missing required secret" rule; the unknown-secret
+check and all parameter validation still run, and the deploy path is unchanged.
+This never worsens a pod (a missing required secret was already missing) but does
+permit re-applying a pod that lacks a required secret — an accepted trade for not
+blocking single-secret rotation. (Decision confirmed during implementation.)
+
 ## Architecture
 
 Two layers, one PR.
