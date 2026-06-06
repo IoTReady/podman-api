@@ -45,14 +45,19 @@ import (
 type Real struct {
 	hosts map[string]config.Host
 
-	mu  sync.Mutex
-	ctx map[string]context.Context // hostID -> connection-bearing ctx
+	mu       sync.Mutex
+	ctx      map[string]context.Context // hostID -> connection-bearing ctx
+	verified map[string]bool            // hostID -> passed the MinPodmanVersion check
+
+	// versionProbe overrides the version lookup in tests; nil means
+	// system.Info over the supplied connection ctx.
+	versionProbe func(context.Context) (string, error)
 }
 
 // NewReal validates host configs and registers them. Connections are not
 // opened here; first use opens them.
 func NewReal(hosts []config.Host) (*Real, error) {
-	r := &Real{hosts: map[string]config.Host{}, ctx: map[string]context.Context{}}
+	r := &Real{hosts: map[string]config.Host{}, ctx: map[string]context.Context{}, verified: map[string]bool{}}
 	for _, h := range hosts {
 		if h.ID == "" {
 			return nil, fmt.Errorf("host with empty id")
@@ -122,6 +127,56 @@ func (r *Real) ctxFor(parent context.Context, id string) (context.Context, error
 	return c, nil
 }
 
+// probeVersion fetches the podman version over an established connection ctx.
+func (r *Real) probeVersion(c context.Context) (string, error) {
+	if r.versionProbe != nil {
+		return r.versionProbe(c)
+	}
+	info, err := system.Info(c, &system.InfoOptions{})
+	if err != nil {
+		return "", err
+	}
+	return info.Version.Version, nil
+}
+
+// ensureVerified enforces MinPodmanVersion once per host per process. On
+// failure the host stays unverified (and the connection stays cached), so a
+// host whose podman is upgraded in place starts passing without a restart.
+// The probe runs outside the mutex; a concurrent duplicate probe is harmless.
+func (r *Real) ensureVerified(c context.Context, id string) error {
+	r.mu.Lock()
+	ok := r.verified[id]
+	r.mu.Unlock()
+	if ok {
+		return nil
+	}
+	v, err := r.probeVersion(c)
+	if err != nil {
+		return fmt.Errorf("verify host %q podman version: %w", id, err)
+	}
+	if err := checkVersion(id, v); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.verified[id] = true
+	r.mu.Unlock()
+	return nil
+}
+
+// opCtxFor is ctxFor plus the MinPodmanVersion gate. Every operation method
+// uses it; diagnostics (Ping, Version, HostInfo) use raw ctxFor so GET /hosts
+// can still display an unsupported host's version (#85).
+func (r *Real) opCtxFor(parent context.Context, id string) (context.Context, error) {
+	c, err := r.ctxFor(parent, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.ensureVerified(c, id); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
 func (r *Real) Ping(ctx context.Context, id string) error {
 	c, err := r.ctxFor(ctx, id)
 	if err != nil {
@@ -136,11 +191,7 @@ func (r *Real) Version(ctx context.Context, id string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	info, err := system.Info(c, &system.InfoOptions{})
-	if err != nil {
-		return "", err
-	}
-	return info.Version.Version, nil
+	return r.probeVersion(c)
 }
 
 func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool, networks ...string) error {

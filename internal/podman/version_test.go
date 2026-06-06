@@ -1,11 +1,14 @@
 package podman
 
 import (
+	"context"
 	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/iotready/podman-api/internal/config"
 )
 
 func TestCheckVersion(t *testing.T) {
@@ -20,6 +23,7 @@ func TestCheckVersion(t *testing.T) {
 		{"dev suffix above floor", "5.8.2-dev", false},
 		{"v prefix tolerated", "v5.7.0", false},
 		{"pre-release of floor is below floor", "5.6.0-rc1", true},
+		{"pre-release of floor is below floor (dev)", "5.6.0-dev", true},
 		{"empty", "", true},
 		{"garbage", "abc", true},
 	}
@@ -36,4 +40,71 @@ func TestCheckVersion(t *testing.T) {
 			}
 		})
 	}
+}
+
+// stubReal returns a Real with one host "h1" whose connection is pre-cached
+// (no dial) and whose version probe is stubbed.
+func stubReal(t *testing.T, probe func(context.Context) (string, error)) *Real {
+	t.Helper()
+	r, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}})
+	require.NoError(t, err)
+	r.ctx["h1"] = context.Background()
+	r.versionProbe = probe
+	return r
+}
+
+func TestOpCtxFor_RefusesOldVersion(t *testing.T) {
+	r := stubReal(t, func(context.Context) (string, error) { return "5.4.2", nil })
+	_, err := r.opCtxFor(context.Background(), "h1")
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrHostVersionUnsupported))
+}
+
+func TestOpCtxFor_VerifiesOncePerHost(t *testing.T) {
+	calls := 0
+	r := stubReal(t, func(context.Context) (string, error) { calls++; return "5.8.2", nil })
+	for i := 0; i < 3; i++ {
+		_, err := r.opCtxFor(context.Background(), "h1")
+		require.NoError(t, err)
+	}
+	assert.Equal(t, 1, calls, "version probed once, then cached")
+}
+
+func TestOpCtxFor_InPlaceUpgradeRecovers(t *testing.T) {
+	calls := 0
+	r := stubReal(t, func(context.Context) (string, error) {
+		calls++
+		if calls == 1 {
+			return "5.4.2", nil // old at first
+		}
+		return "5.8.2", nil // host upgraded in place
+	})
+	_, err := r.opCtxFor(context.Background(), "h1")
+	require.Error(t, err)
+	_, err = r.opCtxFor(context.Background(), "h1")
+	require.NoError(t, err, "no daemon restart needed after host upgrade")
+}
+
+func TestOpCtxFor_ProbeErrorIsNotVerified(t *testing.T) {
+	calls := 0
+	r := stubReal(t, func(context.Context) (string, error) {
+		calls++
+		if calls == 1 {
+			return "", errors.New("transient")
+		}
+		return "5.8.2", nil
+	})
+	_, err := r.opCtxFor(context.Background(), "h1")
+	require.Error(t, err)
+	assert.False(t, errors.Is(err, ErrHostVersionUnsupported),
+		"transient probe failure is not a version verdict")
+	_, err = r.opCtxFor(context.Background(), "h1")
+	require.NoError(t, err)
+}
+
+func TestVersion_BypassesEnforcement(t *testing.T) {
+	r := stubReal(t, func(context.Context) (string, error) { return "5.4.2", nil })
+	v, err := r.Version(context.Background(), "h1")
+	require.NoError(t, err, "diagnostics stay readable on unsupported hosts")
+	assert.Equal(t, "5.4.2", v)
 }

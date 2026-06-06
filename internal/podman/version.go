@@ -30,8 +30,8 @@ func checkVersion(hostID, version string) error {
 			hostID, version, MinPodmanVersion, ErrHostVersionUnsupported)
 	}
 	if v.LT(minPodmanVersion) {
-		return fmt.Errorf("host %q: podman %s < minimum %s (volume export/import requires >= %s): %w",
-			hostID, version, MinPodmanVersion, MinPodmanVersion, ErrHostVersionUnsupported)
+		return fmt.Errorf("host %q: podman %s < minimum %s (floor for the volume export/import API): %w",
+			hostID, version, MinPodmanVersion, ErrHostVersionUnsupported)
 	}
 	return nil
 }
