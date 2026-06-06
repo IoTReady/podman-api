@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -182,18 +183,21 @@ func (r *Real) opCtxFor(parent context.Context, id string) (context.Context, err
 // var (not const) so tests can shrink it.
 var preflightTimeout = 10 * time.Second
 
-// Preflight enforces MinPodmanVersion at boot. A reachable host below the
-// floor returns an error (main treats it as fatal — the daemon refuses to
-// start). An unreachable or slow host is logged and left unverified; the
-// check re-runs on its first successful connect (opCtxFor), so a down-at-boot
-// old host still cannot sneak in. See #85.
+// Preflight enforces MinPodmanVersion at boot. ALL reachable hosts are checked
+// and any below the floor are collected; the returned error aggregates every
+// offender via errors.Join so operators see every problem in a single boot
+// attempt (main treats it as fatal — the daemon refuses to start). An
+// unreachable or slow host is logged and left unverified; the check re-runs on
+// its first successful connect (opCtxFor), so a down-at-boot old host still
+// cannot sneak in. See #85.
 func (r *Real) Preflight(ctx context.Context) error {
+	var errs []error
 	for id := range r.hosts {
 		if err := r.preflightHost(ctx, id); err != nil {
-			return err
+			errs = append(errs, err)
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func (r *Real) preflightHost(ctx context.Context, id string) error {
@@ -233,6 +237,9 @@ func (r *Real) preflightHost(ctx context.Context, id string) error {
 		return nil
 	case <-time.After(preflightTimeout):
 		log.Printf("preflight: host %q did not answer within %s, podman version check deferred to first use", id, preflightTimeout)
+		return nil
+	case <-ctx.Done():
+		log.Printf("preflight: host %q check cancelled, podman version check deferred to first use: %v", id, ctx.Err())
 		return nil
 	}
 }

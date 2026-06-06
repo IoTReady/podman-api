@@ -139,6 +139,38 @@ func TestPreflight_ToleratesUnreachable(t *testing.T) {
 	assert.False(t, r.verified["h1"], "unreachable host stays unverified")
 }
 
+func TestPreflight_AggregatesAllOldHosts(t *testing.T) {
+	// Build a Real with TWO hosts, both below the floor.
+	r, err := NewReal([]config.Host{
+		{ID: "h1", Addr: "unix", Socket: "/x"},
+		{ID: "h2", Addr: "unix", Socket: "/x"},
+	})
+	require.NoError(t, err)
+	// Pre-seed both connection contexts so ctxFor does not dial.
+	r.ctx["h1"] = context.Background()
+	r.ctx["h2"] = context.Background()
+	r.versionProbe = func(context.Context) (string, error) { return "5.4.2", nil }
+
+	err = r.Preflight(context.Background())
+	require.Error(t, err, "both below-floor hosts must cause an error")
+	assert.True(t, errors.Is(err, ErrHostVersionUnsupported))
+	assert.Contains(t, err.Error(), `host "h1"`)
+	assert.Contains(t, err.Error(), `host "h2"`)
+}
+
+func TestPreflight_CtxCancelDefers(t *testing.T) {
+	r := stubReal(t, func(context.Context) (string, error) {
+		time.Sleep(500 * time.Millisecond)
+		return "5.4.2", nil
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // cancel immediately before calling Preflight
+	require.NoError(t, r.Preflight(ctx), "ctx cancellation must defer like a timeout, not fail boot")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	assert.False(t, r.verified["h1"], "host stays unverified on cancel")
+}
+
 func TestPreflight_TimeoutDefers(t *testing.T) {
 	// Mutates a package-level var; safe only while this package's tests stay serial (no t.Parallel).
 	old := preflightTimeout

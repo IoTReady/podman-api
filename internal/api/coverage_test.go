@@ -48,6 +48,19 @@ func TestGetHost_FoundAndUnknown(t *testing.T) {
 	assert.Contains(t, bodyString(t, resp), `"code":"unknown_host"`)
 }
 
+func TestGetHost_PodmanVersionUsesOverride(t *testing.T) {
+	srv, tok, f := newSrvFull(t)
+	f.VersionStr = "5.4.2"
+
+	resp := authedReq(t, srv, tok, "GET", "/hosts/h1")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, "5.4.2", got["podman_version"],
+		"diagnostics display whatever version the host reports, regardless of floor")
+}
+
 // --- GET /hosts/{host}/ports-in-use -----------------------------------------
 
 func TestPortsInUse_OKAndUnknownHost(t *testing.T) {
