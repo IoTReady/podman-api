@@ -157,38 +157,51 @@ func paramPlaceholders(tmpl store.Template) map[string]string {
 	return ph
 }
 
+// deployFormData resolves the selected template (defaulting to the first
+// template when none is given) and assembles the data map the "deploy-form"
+// template needs. vals are the raw typed param.*/secret.* values to
+// re-populate; mergeParamDefaults is applied here so every caller shares one
+// defaults policy. A store error from the template lookup is returned for the
+// caller to surface via renderError. The caller adds an "Error" key when
+// re-rendering after a failed deploy.
+func (u *UI) deployFormData(r *http.Request, host, selected, slug string, vals map[string]string) (map[string]any, error) {
+	tmpls, err := u.sortedTemplates(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	if selected == "" && len(tmpls) > 0 {
+		selected = tmpls[0].Meta.ID
+	}
+	tmpl, refs, err := u.fieldData(r, host, selected)
+	if err != nil {
+		return nil, err
+	}
+	mergeParamDefaults(vals, tmpl)
+	return map[string]any{
+		"Host":         host,
+		"Templates":    tmpls,
+		"Selected":     selected,
+		"Tmpl":         tmpl,
+		"HostRefs":     refs,
+		"Slug":         slug,
+		"Values":       vals,
+		"Placeholders": paramPlaceholders(tmpl),
+	}, nil
+}
+
 func (u *UI) deployForm(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	if !u.hostExists(host) {
 		u.renderError(w, r, instance.ErrUnknownHost)
 		return
 	}
-	tmpls, err := u.sortedTemplates(r.Context())
+	q := r.URL.Query()
+	data, err := u.deployFormData(r, host, q.Get("template"), q.Get("slug"), typedValues(q))
 	if err != nil {
 		u.renderError(w, r, err)
 		return
 	}
-	sel := r.URL.Query().Get("template")
-	if sel == "" && len(tmpls) > 0 {
-		sel = tmpls[0].Meta.ID
-	}
-	tmpl, refs, err := u.fieldData(r, host, sel)
-	if err != nil {
-		u.renderError(w, r, err)
-		return
-	}
-	vals := typedValues(r.URL.Query())
-	mergeParamDefaults(vals, tmpl)
-	u.render(w, r, http.StatusOK, "deploy-form", u.pageData(map[string]any{
-		"Host":         host,
-		"Templates":    tmpls,
-		"Selected":     sel,
-		"Tmpl":         tmpl,
-		"HostRefs":     refs,
-		"Slug":         r.URL.Query().Get("slug"),
-		"Values":       vals,
-		"Placeholders": paramPlaceholders(tmpl),
-	}))
+	u.render(w, r, http.StatusOK, "deploy-form", u.pageData(data))
 }
 
 func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
@@ -205,29 +218,13 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 		Secrets:    secrets,
 	}
 	if applyErr := u.cfg.Svc.Apply(r.Context(), host, req, instance.ApplyOptions{Replace: false}); applyErr != nil {
-		tmpl, refs, ferr := u.fieldData(r, host, req.Template)
-		if ferr != nil {
-			u.renderError(w, r, ferr)
+		data, derr := u.deployFormData(r, host, req.Template, req.Slug, typedValues(r.PostForm))
+		if derr != nil {
+			u.renderError(w, r, derr)
 			return
 		}
-		tmpls, terr := u.sortedTemplates(r.Context())
-		if terr != nil {
-			u.renderError(w, r, terr)
-			return
-		}
-		vals := typedValues(r.PostForm)
-		mergeParamDefaults(vals, tmpl)
-		u.render(w, r, errorStatus(applyErr), "deploy-form", u.pageData(map[string]any{
-			"Host":         host,
-			"Templates":    tmpls,
-			"Selected":     req.Template,
-			"Tmpl":         tmpl,
-			"HostRefs":     refs,
-			"Slug":         req.Slug,
-			"Values":       vals,
-			"Placeholders": paramPlaceholders(tmpl),
-			"Error":        applyErr.Error(),
-		}))
+		data["Error"] = applyErr.Error()
+		u.render(w, r, errorStatus(applyErr), "deploy-form", u.pageData(data))
 		return
 	}
 	obs, err := u.cfg.Svc.Get(r.Context(), host, req.Template, req.Slug)
