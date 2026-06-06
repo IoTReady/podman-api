@@ -105,6 +105,16 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 			step("reconcile-inconclusive", "destination spec lookup failed")
 			return false, false, "", nil
 		}
+		if spec == specNeedsKey {
+			// The dest spec's secrets can't be read because the daemon's key file
+			// is missing or wrong — a static config fault recoverable by restarting
+			// with the correct -spec-key-file. Stay inconclusive (retry) and mutate
+			// nothing: a future reconcile reads the spec once the key is fixed,
+			// without re-issuing the migrate. Distinct, visible step so the operator
+			// sees the configuration is the problem.
+			step("reconcile-needs-key", "destination spec secrets unreadable (key missing or wrong); restart with -spec-key-file")
+			return false, false, "", nil
+		}
 		if spec == specCorrupt {
 			// The dest spec row exists but will never decode (decrypt failure or a
 			// malformed column). Retrying is futile — fail terminally.
@@ -198,6 +208,7 @@ const (
 	specPersisted                     // spec row present and readable: roll forward
 	specAbsent                        // definitively not persisted (ErrNotFound): fall through
 	specCorrupt                       // permanently unreadable (ErrSpecCorrupt): terminal fail
+	specNeedsKey                      // key missing/wrong (ErrSecretsNeedKey / ErrSecretsUndecryptable): recoverable, retry visibly
 )
 
 // destSpecState reports whether the destination's desired-state spec was stored
@@ -211,9 +222,15 @@ const (
 //     roll back (and delete) a committed destination.
 //   - specPersisted: a readable spec row exists.
 //   - specAbsent (store.ErrNotFound): definitively not persisted.
-//   - specCorrupt (store.ErrSpecCorrupt): the row exists but will never decode
-//     (decrypt failure after key loss/rotation, or a malformed JSON column). The
-//     caller fails the job terminally — retrying is futile.
+//   - specCorrupt (store.ErrSpecCorrupt): the row exists but will never decode —
+//     genuine malformed JSON. The caller fails the job terminally; retrying is
+//     futile.
+//   - specNeedsKey (store.ErrSecretsNeedKey / store.ErrSecretsUndecryptable): the
+//     sealed secrets blob can't be decrypted because the daemon's key file is
+//     missing or wrong — a static configuration fault, NOT data corruption. The
+//     caller treats it as a distinct recoverable state that retries visibly: a
+//     restart with the correct -spec-key-file lets a future reconcile read the
+//     spec and resume the migrate.
 //
 // TODO(#54): this re-derives Apply's commit point from "a spec row exists", and
 // the ingress repair in the roll-forward branch is evidence the equivalence
@@ -227,6 +244,8 @@ func (s *Service) destSpecState(ctx context.Context, host, tmpl, slug string) sp
 		return specPersisted
 	case errors.Is(err, store.ErrNotFound):
 		return specAbsent
+	case errors.Is(err, store.ErrSecretsNeedKey), errors.Is(err, store.ErrSecretsUndecryptable):
+		return specNeedsKey
 	case errors.Is(err, store.ErrSpecCorrupt):
 		return specCorrupt
 	default:

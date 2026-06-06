@@ -3,6 +3,7 @@ package instance
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -358,6 +359,45 @@ func TestReconcileMigrate_DestSpecCorrupt_Terminal(t *testing.T) {
 	}
 	if _, err := fc.PodInspect(context.Background(), "h1", "web-x"); err != nil {
 		t.Fatalf("source was mutated on a corrupt-spec result: %v", err)
+	}
+}
+
+// TestReconcileMigrate_DestSpecNeedsKey_Inconclusive verifies a key-file
+// misconfiguration on the dest spec (no key OR wrong key) is recoverable: the
+// reconcile stays inconclusive (retries) and mutates neither host, so a restart
+// with the correct -spec-key-file resumes the in-flight migrate. Contrast with
+// _DestSpecCorrupt_Terminal: genuine JSON corruption is terminal.
+func TestReconcileMigrate_DestSpecNeedsKey_Inconclusive(t *testing.T) {
+	for name, keyErr := range map[string]error{
+		"no key":    store.ErrSecretsNeedKey,
+		"wrong key": store.ErrSecretsUndecryptable,
+	} {
+		t.Run(name, func(t *testing.T) {
+			svc, fc, st := reconcileSvc(t)
+			svc.SetStore(&getSpecErrStore{Memory: st, err: keyErr})
+			fc.AddPod("h1", healthyPod("web-x")) // source present
+			fc.AddPod("h2", healthyPod("web-x")) // dest healthy
+
+			var steps []string
+			resolved, ok, _, err := svc.ReconcileMigrate(context.Background(), req(),
+				func(s, _ string) { steps = append(steps, s) })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if resolved || ok {
+				t.Fatalf("got resolved=%v ok=%v, want false/false (recoverable: inconclusive retry)", resolved, ok)
+			}
+			if !slices.Contains(steps, "reconcile-needs-key") {
+				t.Fatalf("steps = %v, want a visible reconcile-needs-key step", steps)
+			}
+			// Neither host may be mutated on a recoverable inconclusive result.
+			if _, err := fc.PodInspect(context.Background(), "h2", "web-x"); err != nil {
+				t.Fatalf("dest deleted on a recoverable key fault (data loss): %v", err)
+			}
+			if _, err := fc.PodInspect(context.Background(), "h1", "web-x"); err != nil {
+				t.Fatalf("source mutated on a recoverable key fault: %v", err)
+			}
+		})
 	}
 }
 
