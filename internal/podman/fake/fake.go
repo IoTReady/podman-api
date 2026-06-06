@@ -59,6 +59,8 @@ type Fake struct {
 	// Unknown lists hosts that Knows should report as not registered; nil means
 	// every host is known. Lets a test exercise the scheduler's unknown-host skip.
 	Unknown map[string]bool
+	// VersionStr overrides the version Version reports; empty means "fake-1.0".
+	VersionStr string
 
 	// PullErr, if non-nil, makes ImagePull return this error for matching refs.
 	// Key is image ref; the empty key matches any ref.
@@ -494,8 +496,13 @@ func (f *Fake) ImagePull(_ context.Context, host, ref string) error {
 	return nil
 }
 
-func (f *Fake) Ping(_ context.Context, _ string) error              { return nil }
-func (f *Fake) Version(_ context.Context, _ string) (string, error) { return "fake-1.0", nil }
+func (f *Fake) Ping(_ context.Context, _ string) error { return nil }
+func (f *Fake) Version(_ context.Context, _ string) (string, error) {
+	if f.VersionStr != "" {
+		return f.VersionStr, nil
+	}
+	return "fake-1.0", nil
+}
 
 // Knows reports a host as registered unless it's listed in Unknown.
 func (f *Fake) Knows(id string) bool {

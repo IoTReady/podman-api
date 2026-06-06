@@ -205,6 +205,7 @@ func TestClassify_RemainingSentinels(t *testing.T) {
 		{instance.ErrHostDraining, "host_draining", http.StatusLocked},
 		{podman.ErrNotFound, "instance_not_found", http.StatusNotFound},
 		{store.ErrSecretsUndecryptable, "secrets_undecryptable", http.StatusUnprocessableEntity},
+		{podman.ErrHostVersionUnsupported, "host_version_unsupported", http.StatusUnprocessableEntity},
 	}
 	for _, c := range cases {
 		rr := httptest.NewRecorder()

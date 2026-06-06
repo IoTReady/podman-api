@@ -65,6 +65,8 @@ func classify(err error) (code string, status int, msg string) {
 		return "host_draining", http.StatusLocked, err.Error()
 	case errors.Is(err, podman.ErrNotFound):
 		return "instance_not_found", http.StatusNotFound, err.Error()
+	case errors.Is(err, podman.ErrHostVersionUnsupported):
+		return "host_version_unsupported", http.StatusUnprocessableEntity, err.Error()
 	case errors.Is(err, render.ErrInvalidParameters):
 		return "invalid_parameters", http.StatusBadRequest, err.Error()
 	case errors.Is(err, errJobsDisabled):
