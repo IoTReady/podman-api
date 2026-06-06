@@ -247,12 +247,43 @@ func instanceSecretName(tmpl, slug, name string) string {
 	return tmpl + "-" + slug + "-" + name
 }
 
-// Apply creates or replaces an instance. If opts.Replace is false and the
-// pod exists, returns ErrInstanceExists. Unless opts.SkipPull is set, every
-// container image referenced in the rendered Pod spec is pulled before the
-// manifest is played — this surfaces registry errors fast and avoids the
-// opaque timeout from play kube's implicit pull.
+// Apply creates or replaces an instance. If opts.Replace is false and the pod
+// exists, returns ErrInstanceExists. Unless opts.SkipPull is set, every container
+// image referenced in the rendered Pod spec is pulled before the manifest is
+// played. Apply acquires the per-host lock (domain-carrying requests only, taken
+// before the instance lock — a consistent order so the two never deadlock) and the
+// per-instance lock, then runs applyLocked.
 func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts ApplyOptions) error {
+	// Domain claims are checked host-wide (validateIngress) but only become
+	// durable at PutSpec far below; the per-instance lock does not serialize two
+	// different instances racing for the same domain on one host. Hold a per-host
+	// lock for domain-carrying requests so the check→persist claim is atomic.
+	// Because the spec is persisted AFTER PlayKube (to avoid leaving a poison
+	// spec when the play fails), this lock necessarily spans the image pull and
+	// pod play too: two *ingress* deploys to the same host serialize end-to-end,
+	// not just over the store access. That's acceptable for a single-operator
+	// system — non-ingress and different-host deploys take no host lock and stay
+	// fully concurrent. Taken before the instanceLock (consistent order → no
+	// deadlock) and only when domains are present; a request with no domains can
+	// never create a claim, so it needs no host-wide serialization. (#82)
+	if len(req.Domains) > 0 {
+		hl := s.hostLock(host)
+		hl.Lock()
+		defer hl.Unlock()
+	}
+	lock := s.instanceLock(host, req.Template, req.Slug)
+	lock.Lock()
+	defer lock.Unlock()
+	return s.applyLocked(ctx, host, req, opts)
+}
+
+// applyLocked is the lock-free core of Apply: it performs the full create/replace
+// (validate → play → persist → ingress) assuming the caller already holds the
+// per-instance lock (and, for domain-carrying requests, the per-host lock).
+// Splitting it out lets the read-modify-write callers (RotateInstanceSecrets,
+// UpgradeImage) hold a single lock across GetSpec + re-apply without re-entering
+// Apply's non-reentrant lock. Apply is the public, lock-acquiring entry point.
+func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest, opts ApplyOptions) error {
 	tmpl, err := s.lookup(ctx, host, req.Template)
 	if err != nil {
 		return err
@@ -275,27 +306,6 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	if len(req.Secrets) > 0 && !s.store.SecretsEnabled() {
 		return store.ErrSecretsNeedKey
 	}
-	// Domain claims are checked host-wide (validateIngress) but only become
-	// durable at PutSpec far below; the per-instance lock does not serialize two
-	// different instances racing for the same domain on one host. Hold a per-host
-	// lock for domain-carrying requests so the check→persist claim is atomic.
-	// Because the spec is persisted AFTER PlayKube (to avoid leaving a poison
-	// spec when the play fails), this lock necessarily spans the image pull and
-	// pod play too: two *ingress* deploys to the same host serialize end-to-end,
-	// not just over the store access. That's acceptable for a single-operator
-	// system — non-ingress and different-host deploys take no host lock and stay
-	// fully concurrent. Taken before the instanceLock (consistent order → no
-	// deadlock) and only when domains are present; a request with no domains can
-	// never create a claim, so it needs no host-wide serialization. (#82)
-	if len(req.Domains) > 0 {
-		hl := s.hostLock(host)
-		hl.Lock()
-		defer hl.Unlock()
-	}
-	lock := s.instanceLock(host, req.Template, req.Slug)
-	lock.Lock()
-	defer lock.Unlock()
-
 	// Validate ingress rules BEFORE playing the pod or persisting the spec, so a
 	// rejected request never leaves a poison spec in the store — a persisted spec
 	// that violates these rules would fail every later reconcile on the host.
@@ -577,10 +587,25 @@ func (s *Service) Upgrade(ctx context.Context, host string, req ApplyRequest, im
 // image upgrade of that already-running instance (the missing secret was already
 // missing; the upgrade never worsens the pod).
 // Returns ErrInstanceNotFound when no spec is stored for the instance.
+//
+// The load (GetSpec) and re-apply (applyLocked) happen atomically under the
+// per-instance lock: the image override is a read-modify-write of the stored
+// parameters, so holding the lock across both halves keeps a concurrent
+// rotation/upgrade of the same instance from reading the pre-commit spec and
+// dropping this update. It takes only the instance lock (no host lock): the
+// upgrade re-applies the instance's own already-persisted domains unchanged,
+// which validateIngress excludes from its uniqueness check, so it can never
+// create a new cross-instance domain claim and needs no per-host lock. (If a
+// future edit let this method *change* domains, the missing host lock would
+// become a real bug — the no-hostLock safety rests on domains being unchanged.)
+// (#114)
 func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image string) error {
 	if image == "" {
 		return errors.New("upgrade requires an image")
 	}
+	lock := s.instanceLock(host, tmpl, slug)
+	lock.Lock()
+	defer lock.Unlock()
 	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -593,7 +618,7 @@ func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image stri
 		params = map[string]any{}
 	}
 	params["image"] = image
-	return s.Apply(ctx, host, ApplyRequest{
+	return s.applyLocked(ctx, host, ApplyRequest{
 		Template:   tmpl,
 		Slug:       slug,
 		Parameters: params,
@@ -609,10 +634,24 @@ func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image stri
 // does not pointlessly restart the instance. Returns ErrInstanceNotFound when no
 // spec is stored, or the store's error (incl. store.ErrSpecCorrupt or
 // store.ErrSecretsUndecryptable) when the spec cannot be read.
+//
+// The load (GetSpec) and re-apply (applyLocked) happen atomically under the
+// per-instance lock: rotation is a read-modify-write of the stored secrets, so
+// holding the lock across both halves keeps a concurrent rotation/upgrade of the
+// same instance from reading the pre-commit spec and dropping this update. It
+// takes only the instance lock (no host lock): rotation re-applies the
+// instance's own already-persisted domains unchanged, which validateIngress
+// excludes from its uniqueness check, so it can never create a new
+// cross-instance domain claim and needs no per-host lock. (If a future edit let
+// this method *change* domains, the missing host lock would become a real bug —
+// the no-hostLock safety rests on domains being unchanged.) (#114)
 func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug string, newSecrets map[string]string) error {
 	if len(newSecrets) == 0 {
 		return errors.New("no secrets to rotate")
 	}
+	lock := s.instanceLock(host, tmpl, slug)
+	lock.Lock()
+	defer lock.Unlock()
 	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -627,7 +666,7 @@ func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug st
 	for k, v := range newSecrets {
 		merged[k] = v
 	}
-	return s.Apply(ctx, host, ApplyRequest{
+	return s.applyLocked(ctx, host, ApplyRequest{
 		Template:   tmpl,
 		Slug:       slug,
 		Parameters: spec.Parameters,
