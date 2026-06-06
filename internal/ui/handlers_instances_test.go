@@ -5,7 +5,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 
@@ -51,17 +50,12 @@ func uiWithSeededInstance(t *testing.T) *UI {
 	return u
 }
 
-// authedAction drives an authenticated POST with a valid CSRF token.
+// authedAction drives an authenticated POST (no extra fields) with a valid CSRF
+// token. It is authedPost with an empty body — see authedPost in
+// handlers_deploy_test.go.
 func authedAction(t *testing.T, u *UI, path string) *httptest.ResponseRecorder {
 	t.Helper()
-	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
-	form := url.Values{csrfField: {csrfToken(tok)}}
-	r := httptest.NewRequest("POST", path, strings.NewReader(form.Encode()))
-	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
-	w := httptest.NewRecorder()
-	u.Handler().ServeHTTP(w, r)
-	return w
+	return authedPost(t, u, path, nil)
 }
 
 func TestLifecycleFailureKeepsDetailWithBanner(t *testing.T) {

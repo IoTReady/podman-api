@@ -4,7 +4,7 @@
 <form hx-post="/ui/hosts/{{.Host}}/deploy" hx-target="#main" class="pure-form pure-form-stacked">
   <input type="hidden" name="csrf_token" value="{{.CSRF}}">
   <label>Template
-    <select name="template" hx-get="/ui/hosts/{{.Host}}/deploy" hx-target="#main" hx-trigger="change" hx-include="closest form" hx-params="not csrf_token">
+    <select name="template" hx-post="/ui/hosts/{{.Host}}/deploy/form" hx-target="#main" hx-trigger="change" hx-include="closest form">
       {{range .Templates}}<option value="{{.Meta.ID}}"{{if eq .Meta.ID $.Selected}} selected{{end}}>{{.Meta.ID}}</option>{{end}}
     </select>
   </label>

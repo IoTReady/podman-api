@@ -135,6 +135,16 @@ func TestDeployFormUnknownHostIs404(t *testing.T) {
 	}
 }
 
+// TestDeployFormPostUnknownHostIs404 covers the POST re-render endpoint's
+// host-existence guard (the GET path is covered by TestDeployFormUnknownHostIs404).
+func TestDeployFormPostUnknownHostIs404(t *testing.T) {
+	u := uiWithTemplate(t)
+	w := authedPost(t, u, "/ui/hosts/nope/deploy/form", url.Values{"template": {"demo"}})
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for unknown host", w.Code)
+	}
+}
+
 // TestUpgradeFormAlwaysAvailable verifies that the upgrade form is always
 // accessible now that the store is always present (HasStore gating is removed).
 func TestUpgradeFormAlwaysAvailable(t *testing.T) {
@@ -164,9 +174,36 @@ func TestUpgradeFormRendersImageField(t *testing.T) {
 	}
 }
 
+// authedPost drives a POST through a real session as x-www-form-urlencoded,
+// injecting a valid CSRF token field. The caller supplies the other fields.
+// The caller's url.Values is not mutated.
+func authedPost(t *testing.T, u *UI, path string, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	merged := make(url.Values, len(form)+1)
+	for k, vs := range form {
+		merged[k] = vs
+	}
+	merged.Set(csrfField, csrfToken(tok))
+	r := httptest.NewRequest("POST", path, strings.NewReader(merged.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	return w
+}
+
+// TestDeployFormPreservesTypedValuesOnTemplateSwitch drives the POST re-render
+// endpoint (#99): typed params, the typed secret, and the slug all travel in
+// the request body and are re-populated into the fragment — no secret in the URL.
 func TestDeployFormPreservesTypedValuesOnTemplateSwitch(t *testing.T) {
 	u := uiWithTemplate(t)
-	w := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&slug=web&param.version=1.2.3&secret.password=hunter2")
+	w := authedPost(t, u, "/ui/hosts/edge-1/deploy/form", url.Values{
+		"template":        {"demo"},
+		"slug":            {"web"},
+		"param.version":   {"1.2.3"},
+		"secret.password": {"hunter2"},
+	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
@@ -184,12 +221,82 @@ func TestDeployFormPreservesTypedValuesOnTemplateSwitch(t *testing.T) {
 
 func TestDeployFormDropsValuesForFieldsNotInTemplate(t *testing.T) {
 	u := uiWithTemplate(t)
-	w := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&param.bogus=keepme")
+	w := authedPost(t, u, "/ui/hosts/edge-1/deploy/form", url.Values{
+		"template":    {"demo"},
+		"param.bogus": {"keepme"},
+	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
 	if strings.Contains(w.Body.String(), "keepme") {
 		t.Error("a value for a field not declared by the selected template must not render")
+	}
+}
+
+// TestDeployFormPostEmptyTemplateDoesNotDefaultToFirst guards against the
+// re-render auto-selecting the first template (and merging its defaults) when
+// the operator's submitted template is empty — e.g. a failed deploy with a
+// missing/deleted template field. Only the initial GET load defaults to first;
+// the POST re-render must reflect the empty selection honestly.
+func TestDeployFormPostEmptyTemplateDoesNotDefaultToFirst(t *testing.T) {
+	u := defaultedParamUI(t) // "demo" with param "version" default "9.9"
+	w := authedPost(t, u, "/ui/hosts/edge-1/deploy/form", url.Values{"template": {""}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, `name="param.version"`) || strings.Contains(body, `value="9.9"`) {
+		t.Error("an empty template on the POST switch must not auto-select the first template or merge its defaults")
+	}
+}
+
+// TestDeployFormGetEmptyTemplateDefaultsToFirst is the GET counterpart: the
+// initial load with no template DOES select the first template, so a fresh form
+// shows a real template's fields.
+func TestDeployFormGetEmptyTemplateDefaultsToFirst(t *testing.T) {
+	u := defaultedParamUI(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy").Body.String()
+	if !strings.Contains(body, `name="param.version"`) {
+		t.Error("the initial GET load should default to the first template and render its fields")
+	}
+}
+
+// TestDeployFormGetDropsSecretFromQuery guards the GET-path residual (#111,
+// folded into #99): a hand-crafted GET carrying a secret.* query param must not
+// reflect it back into the form, which would round-trip the secret through the
+// request line/logs and the response HTML. Secrets only travel via the POST
+// switch body.
+func TestDeployFormGetDropsSecretFromQuery(t *testing.T) {
+	u := uiWithTemplate(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&secret.password=hunter2").Body.String()
+	if strings.Contains(body, "hunter2") {
+		t.Error("a secret.* value from the GET query string must not be reflected into the form")
+	}
+}
+
+// TestDeployFormGetPreservesParamFromQuery confirms the GET filter is secret-only:
+// a param.* deep-link value still round-trips.
+func TestDeployFormGetPreservesParamFromQuery(t *testing.T) {
+	u := uiWithTemplate(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&param.version=1.2.3").Body.String()
+	if !strings.Contains(body, `value="1.2.3"`) {
+		t.Error("a param.* value from the GET query string should still be preserved")
+	}
+}
+
+// TestDeployFormPostRequiresCSRF verifies the POST re-render endpoint is behind
+// the write guard: a POST with a valid session but no CSRF token is rejected.
+func TestDeployFormPostRequiresCSRF(t *testing.T) {
+	u := uiWithTemplate(t)
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{"template": {"demo"}} // no csrf_token field, no header
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/deploy/form", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 for a POST switch without CSRF", w.Code)
 	}
 }
 
@@ -311,6 +418,20 @@ func TestDeployCreateErrorPreservesTypedValues(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), `value="hunter2"`) {
 		t.Error("typed secret should be preserved on a failed-deploy re-render")
+	}
+}
+
+// TestDeployFormSwitchUsesPost locks the template <select> to a POST switch
+// (#99): a GET switch would put typed secrets in the URL/logs. The structural
+// assertion guards against a silent regression back to hx-get.
+func TestDeployFormSwitchUsesPost(t *testing.T) {
+	u := uiWithTemplate(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy").Body.String()
+	if !strings.Contains(body, `hx-post="/ui/hosts/edge-1/deploy/form"`) {
+		t.Error("the template <select> should POST the switch to /deploy/form")
+	}
+	if strings.Contains(body, `hx-get="/ui/hosts/edge-1/deploy"`) {
+		t.Error("the template <select> must not switch via hx-get (secret-in-URL leak)")
 	}
 }
 
