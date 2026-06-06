@@ -38,6 +38,11 @@ type JobStep struct {
 	TS     time.Time `json:"ts"`
 	Step   string    `json:"step"`
 	Detail string    `json:"detail,omitempty"`
+	// Count is the total number of consecutive identical occurrences of this
+	// step, materialized only when coalesced (>1). 0/omitted ⇒ a single
+	// occurrence. AppendStep collapses consecutive identical (Step, Detail)
+	// rows so a long-looping reconcile can't grow the array unboundedly. (#117)
+	Count int `json:"count,omitempty"`
 }
 
 // Job is one row of the jobs table.

@@ -25,6 +25,7 @@ type stepView struct {
 	TS     string `json:"ts"`
 	Step   string `json:"step"`
 	Detail string `json:"detail,omitempty"`
+	Count  int    `json:"count,omitempty"`
 }
 
 type jobView struct {
@@ -51,7 +52,7 @@ func toJobView(j store.Job) jobView {
 	}
 	for _, s := range j.Steps {
 		v.Steps = append(v.Steps, stepView{
-			TS: s.TS.UTC().Format(time.RFC3339), Step: s.Step, Detail: s.Detail,
+			TS: s.TS.UTC().Format(time.RFC3339), Step: s.Step, Detail: s.Detail, Count: s.Count,
 		})
 	}
 	if !j.Started.IsZero() {

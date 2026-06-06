@@ -653,7 +653,18 @@ func (s *SQLite) AppendStep(ctx context.Context, id string, step JobStep) error 
 	if err := json.Unmarshal([]byte(steps), &arr); err != nil {
 		return err
 	}
-	arr = append(arr, step)
+	if n := len(arr); n > 0 && arr[n-1].Step == step.Step && arr[n-1].Detail == step.Detail {
+		// Collapse a consecutive identical step (e.g. a reconcile loop stuck on
+		// the same condition): bump the occurrence count and refresh the
+		// timestamp to the latest attempt rather than growing the array. (#117)
+		if arr[n-1].Count == 0 {
+			arr[n-1].Count = 1
+		}
+		arr[n-1].Count++
+		arr[n-1].TS = step.TS
+	} else {
+		arr = append(arr, step)
+	}
 	b, err := json.Marshal(arr)
 	if err != nil {
 		return err
