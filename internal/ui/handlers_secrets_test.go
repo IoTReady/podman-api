@@ -162,3 +162,25 @@ type corruptSpecStore struct{ *store.Memory }
 func (corruptSpecStore) GetSpec(context.Context, string, string, string) (store.Spec, error) {
 	return store.Spec{}, store.ErrSpecCorrupt
 }
+
+// TestSecretsRotateFailureNeverEchoesSubmittedValue locks down the most
+// security-sensitive branch: when a rotation fails and the form is re-rendered
+// with the error, the submitted secret value must never appear in the response.
+// A secret name the template doesn't declare makes RotateInstanceSecrets re-apply
+// and render.Validate reject it ("unknown secret"), so secretsFormData still
+// succeeds and the rotate-error re-render path runs.
+func TestSecretsRotateFailureNeverEchoesSubmittedValue(t *testing.T) {
+	u, _ := uiWithSecretInstance(t)
+	w := authedPost(t, u, "/ui/hosts/edge-1/instances/demo/main/secrets",
+		url.Values{"secret.bogus": {"leakcanary"}})
+	if w.Code == http.StatusOK {
+		t.Fatalf("status = %d, want a non-OK status for an invalid rotation", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `name="secret.password"`) {
+		t.Error("a rotate failure should re-render the form")
+	}
+	if strings.Contains(body, "leakcanary") {
+		t.Error("a submitted secret value must never be echoed into the re-rendered form")
+	}
+}
