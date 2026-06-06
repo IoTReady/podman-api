@@ -155,8 +155,8 @@ func TestSecretsFormCorruptSpecDegrades(t *testing.T) {
 	}
 }
 
-// corruptSpecStore makes GetSpec report a permanently-undecryptable row, the way
-// a key-loss/rotation leaves a sealed secrets blob.
+// corruptSpecStore makes GetSpec report a permanently-corrupt (malformed) row —
+// distinct from the recoverable, wrong-key undecryptableSpecStore below.
 type corruptSpecStore struct{ *store.Memory }
 
 func (corruptSpecStore) GetSpec(context.Context, string, string, string) (store.Spec, error) {
