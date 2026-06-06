@@ -593,9 +593,12 @@ func (s *Service) Upgrade(ctx context.Context, host string, req ApplyRequest, im
 // parameters, so holding the lock across both halves keeps a concurrent
 // rotation/upgrade of the same instance from reading the pre-commit spec and
 // dropping this update. It takes only the instance lock (no host lock): the
-// upgrade re-applies the instance's own domains, which validateIngress excludes
-// from its uniqueness check, so it can never create a new cross-instance domain
-// claim. (#114)
+// upgrade re-applies the instance's own already-persisted domains unchanged,
+// which validateIngress excludes from its uniqueness check, so it can never
+// create a new cross-instance domain claim and needs no per-host lock. (If a
+// future edit let this method *change* domains, the missing host lock would
+// become a real bug — the no-hostLock safety rests on domains being unchanged.)
+// (#114)
 func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image string) error {
 	if image == "" {
 		return errors.New("upgrade requires an image")
@@ -637,8 +640,11 @@ func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image stri
 // holding the lock across both halves keeps a concurrent rotation/upgrade of the
 // same instance from reading the pre-commit spec and dropping this update. It
 // takes only the instance lock (no host lock): rotation re-applies the
-// instance's own domains, which validateIngress excludes from its uniqueness
-// check, so it can never create a new cross-instance domain claim. (#114)
+// instance's own already-persisted domains unchanged, which validateIngress
+// excludes from its uniqueness check, so it can never create a new
+// cross-instance domain claim and needs no per-host lock. (If a future edit let
+// this method *change* domains, the missing host lock would become a real bug —
+// the no-hostLock safety rests on domains being unchanged.) (#114)
 func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug string, newSecrets map[string]string) error {
 	if len(newSecrets) == 0 {
 		return errors.New("no secrets to rotate")

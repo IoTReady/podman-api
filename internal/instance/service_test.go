@@ -521,8 +521,13 @@ func TestRotateInstanceSecrets_ConcurrentRotationsDoNotLoseUpdates(t *testing.T)
 		errB <- svc.RotateInstanceSecrets(ctx, "h1", "twosec", "demo", map[string]string{"token": "B"})
 	}()
 	select {
-	case <-g.reached: // old code: B already read the stale spec
-	case <-time.After(300 * time.Millisecond): // fixed code: B is blocked on the lock
+	case <-g.reached:
+		// pre-fix only: B already read the stale spec and reached its own
+		// PlayKube — fast-path the release.
+	case <-time.After(300 * time.Millisecond):
+		// fixed code: B is structurally unable to reach the gate while A holds
+		// the instance lock, so this timeout branch is forced regardless of its
+		// duration — longer only slows the test, shorter risks nothing.
 	}
 	close(g.release)
 	require.NoError(t, <-errA)
