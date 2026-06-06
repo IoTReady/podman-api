@@ -89,6 +89,21 @@ func TestHostSecret_Delete(t *testing.T) {
 	}
 }
 
+// A wrong/missing key surfaces the typed undecryptable sentinel (→ 422), not a
+// raw GCM error (→ 500), coherent with GetSpec's secrets path. (#117)
+func TestHostSecret_WrongKey_IsErrSecretsUndecryptable(t *testing.T) {
+	ctx := context.Background()
+	keys := &KeyStore{}
+	keys.Store([32]byte{1, 2, 3})
+	sq, err := OpenSQLite(filepath.Join(t.TempDir(), "s.db"), keys)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = sq.Close() })
+	require.NoError(t, sq.PutHostSecret(ctx, "h1", "shared-token", []byte("v")))
+	keys.Store([32]byte{9, 9, 9}) // rotate to the wrong key → decrypt fails
+	_, err = sq.GetHostSecret(ctx, "h1", "shared-token")
+	require.ErrorIs(t, err, ErrSecretsUndecryptable)
+}
+
 // SQLite seals at rest: the encrypted blob must not contain the plaintext.
 func TestHostSecret_SQLiteSealsAtRest(t *testing.T) {
 	keys := &KeyStore{}

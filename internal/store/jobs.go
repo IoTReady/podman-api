@@ -38,6 +38,11 @@ type JobStep struct {
 	TS     time.Time `json:"ts"`
 	Step   string    `json:"step"`
 	Detail string    `json:"detail,omitempty"`
+	// Count is the total number of consecutive identical occurrences of this
+	// step, materialized only when coalesced (>1). 0/omitted ⇒ a single
+	// occurrence. AppendStep collapses consecutive identical (Step, Detail)
+	// rows so a long-looping reconcile can't grow the array unboundedly. (#117)
+	Count int `json:"count,omitempty"`
 }
 
 // Job is one row of the jobs table.
@@ -145,4 +150,20 @@ func newJobID() string {
 	var b [6]byte
 	_, _ = io.ReadFull(rand.Reader, b[:])
 	return fmt.Sprintf("%016x-%x", uint64(time.Now().UnixNano()), b)
+}
+
+// coalesceStep appends step to steps, collapsing a consecutive identical
+// (Step, Detail) into an occurrence-count bump + timestamp refresh on the
+// last element instead of growing the slice. Count holds total occurrences,
+// materialized only when >1. (#117)
+func coalesceStep(steps []JobStep, step JobStep) []JobStep {
+	if n := len(steps); n > 0 && steps[n-1].Step == step.Step && steps[n-1].Detail == step.Detail {
+		if steps[n-1].Count == 0 {
+			steps[n-1].Count = 1
+		}
+		steps[n-1].Count++
+		steps[n-1].TS = step.TS
+		return steps
+	}
+	return append(steps, step)
 }

@@ -31,7 +31,7 @@ var ErrSpecCorrupt = errors.New("store: spec row corrupt (malformed)")
 // GCM layer). Unlike ErrSpecCorrupt (permanently malformed plaintext) this is
 // recoverable: a restart with the correct key file makes the row readable again,
 // so callers (boot reconciliation) keep retrying rather than failing terminally.
-var ErrSecretsUndecryptable = errors.New("store: spec secrets undecryptable (wrong or missing -spec-key-file)")
+var ErrSecretsUndecryptable = errors.New("store: secrets undecryptable (wrong or missing -spec-key-file)")
 
 // Spec is the desired state of one instance.
 type Spec struct {

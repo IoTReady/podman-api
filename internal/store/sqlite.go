@@ -447,7 +447,17 @@ func (s *SQLite) GetHostSecret(ctx context.Context, host, name string) ([]byte, 
 		}
 		return nil, err
 	}
-	return open(s.keys.Load(), blob)
+	val, err := open(s.keys.Load(), blob)
+	if err != nil {
+		// A wrong/missing key is recoverable by a restart with the correct
+		// -spec-key-file. Surface the typed sentinel (not a raw GCM error) so this
+		// key fault classifies consistently with GetSpec: any HTTP path that routes
+		// a store read through api/errors.go gets 422 rather than 500. Today
+		// GetHostSecret is reached only via the migrate/evacuate job path, so this
+		// is forward-looking consistency, not an observable status change yet. (#117)
+		return nil, fmt.Errorf("%w: decrypt host secret: %v", ErrSecretsUndecryptable, err)
+	}
+	return val, nil
 }
 
 func (s *SQLite) DeleteHostSecret(ctx context.Context, host, name string) error {
@@ -646,7 +656,7 @@ func (s *SQLite) AppendStep(ctx context.Context, id string, step JobStep) error 
 	if err := json.Unmarshal([]byte(steps), &arr); err != nil {
 		return err
 	}
-	arr = append(arr, step)
+	arr = coalesceStep(arr, step)
 	b, err := json.Marshal(arr)
 	if err != nil {
 		return err

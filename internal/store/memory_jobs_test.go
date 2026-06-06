@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestMemory_Jobs_EnqueueClaimFinish(t *testing.T) {
@@ -131,5 +132,43 @@ func TestMemory_CancelQueued(t *testing.T) {
 	// absent -> false
 	if ok, _ := m.CancelQueued(ctx, "nope"); ok {
 		t.Fatal("absent job should not CancelQueued")
+	}
+}
+
+func TestMemory_AppendStep_CoalescesConsecutiveIdentical(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+	j, _ := m.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	step := JobStep{TS: time.Unix(100, 0), Step: "reconcile-needs-key", Detail: "d"}
+	if err := m.AppendStep(ctx, j.ID, step); err != nil {
+		t.Fatalf("AppendStep: %v", err)
+	}
+	step.TS = time.Unix(160, 0)
+	if err := m.AppendStep(ctx, j.ID, step); err != nil {
+		t.Fatalf("AppendStep: %v", err)
+	}
+	got, _ := m.GetJob(ctx, j.ID)
+	if len(got.Steps) != 1 || got.Steps[0].Count != 2 || !got.Steps[0].TS.Equal(time.Unix(160, 0)) {
+		t.Fatalf("want 1 step Count=2 TS=160, got %+v", got.Steps)
+	}
+}
+
+func TestMemory_AppendStep_DistinctStepsDoNotCoalesce(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+	j, _ := m.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	for _, s := range []JobStep{
+		{Step: "a", Detail: "x"}, {Step: "b", Detail: "y"}, {Step: "a", Detail: "x"},
+	} {
+		if err := m.AppendStep(ctx, j.ID, s); err != nil {
+			t.Fatalf("AppendStep: %v", err)
+		}
+	}
+	got, _ := m.GetJob(ctx, j.ID)
+	if len(got.Steps) != 3 {
+		t.Fatalf("want 3, got %d: %+v", len(got.Steps), got.Steps)
+	}
+	if got.Steps[0].Count != 0 {
+		t.Fatalf("single occurrence must leave Count=0, got %d", got.Steps[0].Count)
 	}
 }

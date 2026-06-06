@@ -186,6 +186,52 @@ func TestSQLite_AppendStep_Finish_FailRunning(t *testing.T) {
 	}
 }
 
+func TestSQLite_AppendStep_CoalescesConsecutiveIdentical(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+	j, _ := s.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	_, _, _ = s.ClaimNext(ctx)
+	mustStep := func(ts int64, step, detail string) {
+		if err := s.AppendStep(ctx, j.ID, JobStep{TS: time.Unix(ts, 0), Step: step, Detail: detail}); err != nil {
+			t.Fatalf("AppendStep: %v", err)
+		}
+	}
+	mustStep(100, "reconcile-needs-key", "restart with -spec-key-file")
+	mustStep(160, "reconcile-needs-key", "restart with -spec-key-file") // identical → coalesce
+	got, _ := s.GetJob(ctx, j.ID)
+	if len(got.Steps) != 1 {
+		t.Fatalf("want 1 coalesced step, got %d: %+v", len(got.Steps), got.Steps)
+	}
+	if got.Steps[0].Count != 2 {
+		t.Fatalf("want Count=2, got %d", got.Steps[0].Count)
+	}
+	if !got.Steps[0].TS.Equal(time.Unix(160, 0)) {
+		t.Fatalf("want latest TS refreshed to 160, got %v", got.Steps[0].TS)
+	}
+}
+
+func TestSQLite_AppendStep_DistinctStepsDoNotCoalesce(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+	j, _ := s.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	_, _, _ = s.ClaimNext(ctx)
+	must := func(step, detail string) {
+		if err := s.AppendStep(ctx, j.ID, JobStep{TS: time.Unix(1, 0), Step: step, Detail: detail}); err != nil {
+			t.Fatalf("AppendStep: %v", err)
+		}
+	}
+	must("reconcile-needs-key", "x")     // 1
+	must("reconcile-inconclusive", "h1") // 2 — different step
+	must("reconcile-needs-key", "x")     // 3 — identical to #1 but NOT consecutive
+	got, _ := s.GetJob(ctx, j.ID)
+	if len(got.Steps) != 3 {
+		t.Fatalf("non-consecutive identicals must stay separate; want 3, got %d: %+v", len(got.Steps), got.Steps)
+	}
+	if got.Steps[0].Count != 0 {
+		t.Fatalf("single occurrence must leave Count=0, got %d", got.Steps[0].Count)
+	}
+}
+
 func TestSQLite_Finish_Missing(t *testing.T) {
 	if err := openJobStore(t).Finish(context.Background(), "nope", JobSucceeded, ""); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)

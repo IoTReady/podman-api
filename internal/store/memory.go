@@ -210,7 +210,7 @@ func (m *Memory) AppendStep(_ context.Context, id string, step JobStep) error {
 	defer m.mu.Unlock()
 	for i := range m.jobs {
 		if m.jobs[i].ID == id {
-			m.jobs[i].Steps = append(m.jobs[i].Steps, step)
+			m.jobs[i].Steps = coalesceStep(m.jobs[i].Steps, step)
 			return nil
 		}
 	}
