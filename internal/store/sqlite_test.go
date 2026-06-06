@@ -191,14 +191,17 @@ func TestMigrateAddsDomainsColumn(t *testing.T) {
 	require.Equal(t, []string{"x.example.com"}, got.Domains)
 }
 
-func TestSQLite_GetSpec_WrongKey_IsErrSpecCorrupt(t *testing.T) {
+func TestSQLite_GetSpec_WrongKey_IsErrSecretsUndecryptable(t *testing.T) {
 	ctx := context.Background()
 	ks := NewKeyStore(testKey(0x11))
 	s := openTestStore(t, ks)
 	require.NoError(t, s.PutSpec(ctx, sampleSpec()))
 	ks.Store(testKey(0x22)) // rotate to the wrong key → decrypt fails
 	_, err := s.GetSpec(ctx, "h1", "postgres", "demo")
-	require.ErrorIs(t, err, ErrSpecCorrupt)
+	// A wrong/missing key is recoverable by a restart with the correct key — it is
+	// NOT the permanent-corruption ErrSpecCorrupt.
+	require.ErrorIs(t, err, ErrSecretsUndecryptable)
+	require.NotErrorIs(t, err, ErrSpecCorrupt)
 }
 
 func TestSQLite_GetSpec_CorruptParamsJSON_IsErrSpecCorrupt(t *testing.T) {

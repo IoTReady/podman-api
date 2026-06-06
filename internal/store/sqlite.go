@@ -360,7 +360,7 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 		}
 		secJSON, err := open(s.keys.Load(), blob)
 		if err != nil {
-			return Spec{}, fmt.Errorf("%w: decrypt secrets: %v", ErrSpecCorrupt, err)
+			return Spec{}, fmt.Errorf("%w: decrypt secrets: %v", ErrSecretsUndecryptable, err)
 		}
 		if err := json.Unmarshal(secJSON, &secrets); err != nil {
 			return Spec{}, fmt.Errorf("%w: secrets: %v", ErrSpecCorrupt, err)
