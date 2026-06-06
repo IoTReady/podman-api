@@ -22,7 +22,7 @@ func (u *UI) secretsFormData(ctx context.Context, host, tmpl, slug string) (map[
 	}
 	set, err := u.cfg.Svc.InstanceSecretState(ctx, host, tmpl, slug)
 	if err != nil {
-		if errors.Is(err, store.ErrSpecCorrupt) {
+		if errors.Is(err, store.ErrSpecCorrupt) || errors.Is(err, store.ErrSecretsUndecryptable) {
 			data["Corrupt"] = true
 			return data, nil
 		}

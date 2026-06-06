@@ -100,7 +100,8 @@ func errorStatus(err error) int {
 	case errors.Is(err, instance.ErrHostDraining):
 		return http.StatusLocked
 	case errors.Is(err, instance.ErrHostSecretMissing),
-		errors.Is(err, store.ErrSpecCorrupt):
+		errors.Is(err, store.ErrSpecCorrupt),
+		errors.Is(err, store.ErrSecretsUndecryptable):
 		return http.StatusUnprocessableEntity
 	case errors.Is(err, instance.ErrImagePull):
 		return http.StatusBadGateway

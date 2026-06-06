@@ -163,6 +163,25 @@ func (corruptSpecStore) GetSpec(context.Context, string, string, string) (store.
 	return store.Spec{}, store.ErrSpecCorrupt
 }
 
+func TestSecretsFormUndecryptableSpecDegrades(t *testing.T) {
+	u, mem := uiWithSecretInstance(t)
+	u.cfg.Svc.SetStore(undecryptableSpecStore{mem})
+	body := authedGet(t, u, "/ui/hosts/edge-1/instances/demo/main/secrets").Body.String()
+	if !strings.Contains(body, "manual cleanup") {
+		t.Error("an undecryptable spec should degrade to a cleanup notice")
+	}
+	if strings.Contains(body, `type="password"`) {
+		t.Error("no rotate inputs should render for an undecryptable spec")
+	}
+}
+
+// undecryptableSpecStore makes GetSpec report a wrong/missing-key blob.
+type undecryptableSpecStore struct{ *store.Memory }
+
+func (undecryptableSpecStore) GetSpec(context.Context, string, string, string) (store.Spec, error) {
+	return store.Spec{}, store.ErrSecretsUndecryptable
+}
+
 // TestSecretsFormHidesRotateWhenNoDeclaredSecrets: reaching the form for an
 // instance whose template declares no per-instance secrets (e.g. a direct URL —
 // the gated control wouldn't link here) shows an explanation and no Rotate button
