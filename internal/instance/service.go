@@ -36,6 +36,13 @@ var (
 type ApplyOptions struct {
 	Replace  bool // if false and the pod exists, return ErrInstanceExists
 	SkipPull bool // if true, do not pre-pull container images (CI / local-only refs)
+	// AllowMissingSecrets relaxes the "every PerInstance secret must be present"
+	// validation rule for this Apply. It is used by the secret-rotation path:
+	// rotation overlays new values onto a stored spec and re-applies it, and must
+	// not be blocked just because a PerInstance secret was already unset in that
+	// spec (e.g. a template that gained a secret after the instance was deployed).
+	// The "unknown secret" check still applies. Deploys never set this.
+	AllowMissingSecrets bool
 }
 
 // ApplyRequest is the body of POST /instances and PUT /instances/{...}.
@@ -254,7 +261,11 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	// and render, so callers can omit optional params for a one-click deploy.
 	// Caller-supplied values always win; only absent keys are filled.
 	req.Parameters = render.ApplyDefaults(tmpl.Meta, req.Parameters)
-	if err := render.Validate(tmpl.Meta, req.Parameters, req.Secrets); err != nil {
+	validate := render.Validate
+	if opts.AllowMissingSecrets {
+		validate = render.ValidateAllowMissingSecrets
+	}
+	if err := validate(tmpl.Meta, req.Parameters, req.Secrets); err != nil {
 		return fmt.Errorf("validate: %w", err)
 	}
 	// Reject a secret-bearing deploy on a key-less store BEFORE any host mutation.
@@ -618,7 +629,7 @@ func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug st
 		Parameters: spec.Parameters,
 		Secrets:    merged,
 		Domains:    spec.Domains,
-	}, ApplyOptions{Replace: true})
+	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
 }
 
 // InstanceSecretState reports, per stored per-instance secret name, that a value

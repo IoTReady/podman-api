@@ -2,6 +2,9 @@ package ui
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -70,4 +73,92 @@ func TestInstanceDetailHidesManageSecretsWhenNoneDeclared(t *testing.T) {
 	if strings.Contains(body, "Manage secrets") {
 		t.Error("instance detail must NOT show 'Manage secrets' when the template declares no per-instance secrets")
 	}
+}
+
+func TestSecretsFormListsDeclaredNamesWithStatus(t *testing.T) {
+	u, _ := uiWithSecretInstance(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1/instances/demo/main/secrets")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `name="secret.password"`) || !strings.Contains(body, `name="secret.apikey"`) {
+		t.Error("form should render a password input per declared per-instance secret")
+	}
+	if !strings.Contains(body, "(set)") || !strings.Contains(body, "(not set)") {
+		t.Error("form should show set/not-set status (password set, apikey not set)")
+	}
+	if !strings.Contains(body, `hx-post="/ui/hosts/edge-1/instances/demo/main/secrets"`) {
+		t.Error("the rotate form must POST (secrets must never ride a GET URL)")
+	}
+}
+
+func TestSecretsFormUnknownHostIs404(t *testing.T) {
+	u, _ := uiWithSecretInstance(t)
+	w := authedGet(t, u, "/ui/hosts/nope/instances/demo/main/secrets")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", w.Code)
+	}
+}
+
+func TestSecretsRotateRequiresCSRF(t *testing.T) {
+	u, _ := uiWithSecretInstance(t)
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{"secret.password": {"new"}} // no csrf_token
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/instances/demo/main/secrets", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 (missing CSRF)", w.Code)
+	}
+}
+
+func TestSecretsRotatePersistsNewValue(t *testing.T) {
+	u, mem := uiWithSecretInstance(t)
+	w := authedPost(t, u, "/ui/hosts/edge-1/instances/demo/main/secrets",
+		url.Values{"secret.password": {"rotated"}})
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	sp, err := mem.GetSpec(context.Background(), "edge-1", "demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sp.Secrets["password"] != "rotated" {
+		t.Errorf("password = %q, want rotated", sp.Secrets["password"])
+	}
+}
+
+func TestSecretsRotateEmptyIsRejected(t *testing.T) {
+	u, _ := uiWithSecretInstance(t)
+	// authedPost adds csrf_token but no secret.* fields → nothing to rotate.
+	w := authedPost(t, u, "/ui/hosts/edge-1/instances/demo/main/secrets", url.Values{})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (no secrets to rotate)", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), `name="secret.password"`) {
+		t.Error("an empty submit should re-render the form, not drop it")
+	}
+}
+
+func TestSecretsFormCorruptSpecDegrades(t *testing.T) {
+	u, mem := uiWithSecretInstance(t)
+	u.cfg.Svc.SetStore(corruptSpecStore{mem})
+	body := authedGet(t, u, "/ui/hosts/edge-1/instances/demo/main/secrets").Body.String()
+	if !strings.Contains(body, "manual cleanup") {
+		t.Error("a corrupt/undecryptable spec should degrade to a cleanup notice")
+	}
+	if strings.Contains(body, `type="password"`) {
+		t.Error("no rotate inputs should render for a corrupt spec")
+	}
+}
+
+// corruptSpecStore makes GetSpec report a permanently-undecryptable row, the way
+// a key-loss/rotation leaves a sealed secrets blob.
+type corruptSpecStore struct{ *store.Memory }
+
+func (corruptSpecStore) GetSpec(context.Context, string, string, string) (store.Spec, error) {
+	return store.Spec{}, store.ErrSpecCorrupt
 }
