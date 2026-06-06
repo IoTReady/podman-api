@@ -229,3 +229,21 @@ func TestSQLite_GetSpec_NotFound_IsNotErrSpecCorrupt(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 	require.NotErrorIs(t, err, ErrSpecCorrupt)
 }
+
+// TestSQLite_GetSpec_CorruptSecretsJSON_IsErrSpecCorrupt covers the one wrapped
+// path that touches decrypted plaintext: a blob that decrypts cleanly under the
+// live key but yields non-JSON. Sealing "{bad" under the keystore's key exercises
+// the post-decrypt json.Unmarshal failure that the other corruption tests can't.
+func TestSQLite_GetSpec_CorruptSecretsJSON_IsErrSpecCorrupt(t *testing.T) {
+	ctx := context.Background()
+	ks := NewKeyStore(testKey(0x11))
+	s := openTestStore(t, ks)
+	require.NoError(t, s.PutSpec(ctx, sampleSpec()))
+	blob, err := seal(ks.Load(), []byte("{bad"))
+	require.NoError(t, err)
+	_, err = s.db.ExecContext(ctx,
+		`UPDATE specs SET secrets=? WHERE host='h1' AND template='postgres' AND slug='demo'`, blob)
+	require.NoError(t, err)
+	_, err = s.GetSpec(ctx, "h1", "postgres", "demo")
+	require.ErrorIs(t, err, ErrSpecCorrupt)
+}
