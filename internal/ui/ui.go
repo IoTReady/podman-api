@@ -89,6 +89,7 @@ func (u *UI) Handler() http.Handler {
 	mux.Handle("GET /ui/hosts/{host}/instances/{template}/{slug}", guard(u.instanceDetail))
 	mux.Handle("GET /ui/hosts/{host}/deploy", guard(u.deployForm))
 	mux.Handle("POST /ui/hosts/{host}/deploy", guardW(u.deployCreate))
+	mux.Handle("POST /ui/hosts/{host}/deploy/form", guardW(u.deployFormPost))
 	mux.Handle("GET /ui/hosts/{host}/instances/{template}/{slug}/upgrade", guard(u.upgradeForm))
 	mux.Handle("POST /ui/hosts/{host}/instances/{template}/{slug}/upgrade", guardW(u.upgradeApply))
 	mux.Handle("GET /ui/hosts/{host}/instances/{template}/{slug}/logs", guard(u.logsTail))

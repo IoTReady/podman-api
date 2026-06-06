@@ -204,6 +204,29 @@ func (u *UI) deployForm(w http.ResponseWriter, r *http.Request) {
 	u.render(w, r, http.StatusOK, "deploy-form", u.pageData(data))
 }
 
+// deployFormPost re-renders the deploy form for a newly selected template. The
+// template <select> POSTs here (rather than GETs the deploy route) so typed
+// per-instance secrets travel in the request body, not the URL (#99). It mirrors
+// deployForm but reads the selected template, slug, and typed values from the
+// POST body.
+func (u *UI) deployFormPost(w http.ResponseWriter, r *http.Request) {
+	host := r.PathValue("host")
+	if !u.hostExists(host) {
+		u.renderError(w, r, instance.ErrUnknownHost)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	data, err := u.deployFormData(r, host, r.FormValue("template"), r.FormValue("slug"), typedValues(r.PostForm))
+	if err != nil {
+		u.renderError(w, r, err)
+		return
+	}
+	u.render(w, r, http.StatusOK, "deploy-form", u.pageData(data))
+}
+
 func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	if err := r.ParseForm(); err != nil {

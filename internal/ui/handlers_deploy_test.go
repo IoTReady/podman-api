@@ -164,9 +164,31 @@ func TestUpgradeFormRendersImageField(t *testing.T) {
 	}
 }
 
+// authedPost drives a POST through a real session as x-www-form-urlencoded,
+// injecting a valid CSRF token field. The caller supplies the other fields.
+func authedPost(t *testing.T, u *UI, path string, form url.Values) *httptest.ResponseRecorder {
+	t.Helper()
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form.Set(csrfField, csrfToken(tok))
+	r := httptest.NewRequest("POST", path, strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	return w
+}
+
+// TestDeployFormPreservesTypedValuesOnTemplateSwitch drives the POST re-render
+// endpoint (#99): typed params, the typed secret, and the slug all travel in
+// the request body and are re-populated into the fragment — no secret in the URL.
 func TestDeployFormPreservesTypedValuesOnTemplateSwitch(t *testing.T) {
 	u := uiWithTemplate(t)
-	w := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&slug=web&param.version=1.2.3&secret.password=hunter2")
+	w := authedPost(t, u, "/ui/hosts/edge-1/deploy/form", url.Values{
+		"template":        {"demo"},
+		"slug":            {"web"},
+		"param.version":   {"1.2.3"},
+		"secret.password": {"hunter2"},
+	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
@@ -184,12 +206,31 @@ func TestDeployFormPreservesTypedValuesOnTemplateSwitch(t *testing.T) {
 
 func TestDeployFormDropsValuesForFieldsNotInTemplate(t *testing.T) {
 	u := uiWithTemplate(t)
-	w := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&param.bogus=keepme")
+	w := authedPost(t, u, "/ui/hosts/edge-1/deploy/form", url.Values{
+		"template":    {"demo"},
+		"param.bogus": {"keepme"},
+	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d", w.Code)
 	}
 	if strings.Contains(w.Body.String(), "keepme") {
 		t.Error("a value for a field not declared by the selected template must not render")
+	}
+}
+
+// TestDeployFormPostRequiresCSRF verifies the POST re-render endpoint is behind
+// the write guard: a POST with a valid session but no CSRF token is rejected.
+func TestDeployFormPostRequiresCSRF(t *testing.T) {
+	u := uiWithTemplate(t)
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{"template": {"demo"}} // no csrf_token field, no header
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/deploy/form", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 for a POST switch without CSRF", w.Code)
 	}
 }
 
