@@ -48,6 +48,7 @@ func stubReal(t *testing.T, probe func(context.Context) (string, error)) *Real {
 	t.Helper()
 	r, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}})
 	require.NoError(t, err)
+	// Pre-seed before any concurrent use; no lock needed.
 	r.ctx["h1"] = context.Background()
 	r.versionProbe = probe
 	return r
@@ -83,6 +84,7 @@ func TestOpCtxFor_InPlaceUpgradeRecovers(t *testing.T) {
 	require.Error(t, err)
 	_, err = r.opCtxFor(context.Background(), "h1")
 	require.NoError(t, err, "no daemon restart needed after host upgrade")
+	assert.Equal(t, 2, calls, "failed check is not cached; probe re-ran")
 }
 
 func TestOpCtxFor_ProbeErrorIsNotVerified(t *testing.T) {

@@ -163,9 +163,9 @@ func (r *Real) ensureVerified(c context.Context, id string) error {
 	return nil
 }
 
-// opCtxFor is ctxFor plus the MinPodmanVersion gate. Every operation method
-// uses it; diagnostics (Ping, Version, HostInfo) use raw ctxFor so GET /hosts
-// can still display an unsupported host's version (#85).
+// opCtxFor is ctxFor plus the MinPodmanVersion gate. Operation methods must
+// call this instead of ctxFor; diagnostics (Ping, Version, HostInfo) use raw
+// ctxFor so GET /hosts can still display an unsupported host's version (#85).
 func (r *Real) opCtxFor(parent context.Context, id string) (context.Context, error) {
 	c, err := r.ctxFor(parent, id)
 	if err != nil {
