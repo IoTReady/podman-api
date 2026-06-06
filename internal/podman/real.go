@@ -4,8 +4,10 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -45,14 +47,19 @@ import (
 type Real struct {
 	hosts map[string]config.Host
 
-	mu  sync.Mutex
-	ctx map[string]context.Context // hostID -> connection-bearing ctx
+	mu       sync.Mutex
+	ctx      map[string]context.Context // hostID -> connection-bearing ctx
+	verified map[string]bool            // hostID -> passed the MinPodmanVersion check
+
+	// versionProbe overrides the version lookup in tests; nil means
+	// system.Info over the supplied connection ctx.
+	versionProbe func(context.Context) (string, error)
 }
 
 // NewReal validates host configs and registers them. Connections are not
 // opened here; first use opens them.
 func NewReal(hosts []config.Host) (*Real, error) {
-	r := &Real{hosts: map[string]config.Host{}, ctx: map[string]context.Context{}}
+	r := &Real{hosts: map[string]config.Host{}, ctx: map[string]context.Context{}, verified: map[string]bool{}}
 	for _, h := range hosts {
 		if h.ID == "" {
 			return nil, fmt.Errorf("host with empty id")
@@ -122,6 +129,121 @@ func (r *Real) ctxFor(parent context.Context, id string) (context.Context, error
 	return c, nil
 }
 
+// probeVersion fetches the podman version over an established connection ctx.
+func (r *Real) probeVersion(c context.Context) (string, error) {
+	if r.versionProbe != nil {
+		return r.versionProbe(c)
+	}
+	info, err := system.Info(c, &system.InfoOptions{})
+	if err != nil {
+		return "", err
+	}
+	return info.Version.Version, nil
+}
+
+// ensureVerified enforces MinPodmanVersion once per host per process. On
+// failure the host stays unverified (and the connection stays cached), so a
+// host whose podman is upgraded in place starts passing without a restart.
+// The probe runs outside the mutex; a concurrent duplicate probe is harmless.
+func (r *Real) ensureVerified(c context.Context, id string) error {
+	r.mu.Lock()
+	ok := r.verified[id]
+	r.mu.Unlock()
+	if ok {
+		return nil
+	}
+	v, err := r.probeVersion(c)
+	if err != nil {
+		return fmt.Errorf("verify host %q podman version: %w", id, err)
+	}
+	if err := checkVersion(id, v); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	r.verified[id] = true
+	r.mu.Unlock()
+	return nil
+}
+
+// opCtxFor is ctxFor plus the MinPodmanVersion gate. Operation methods must
+// call this instead of ctxFor; diagnostics (Ping, Version, HostInfo) use raw
+// ctxFor so GET /hosts can still display an unsupported host's version (#85).
+func (r *Real) opCtxFor(parent context.Context, id string) (context.Context, error) {
+	c, err := r.ctxFor(parent, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.ensureVerified(c, id); err != nil {
+		return nil, err
+	}
+	return c, nil
+}
+
+// preflightTimeout bounds each host's boot-time connect+version probe.
+// var (not const) so tests can shrink it.
+var preflightTimeout = 10 * time.Second
+
+// Preflight enforces MinPodmanVersion at boot. ALL reachable hosts are checked
+// and any below the floor are collected; the returned error aggregates every
+// offender via errors.Join so operators see every problem in a single boot
+// attempt (main treats it as fatal — the daemon refuses to start). An
+// unreachable or slow host is logged and left unverified; the check re-runs on
+// its first successful connect (opCtxFor), so a down-at-boot old host still
+// cannot sneak in. See #85.
+func (r *Real) Preflight(ctx context.Context) error {
+	var errs []error
+	for id := range r.hosts {
+		if err := r.preflightHost(ctx, id); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (r *Real) preflightHost(ctx context.Context, id string) error {
+	type result struct {
+		version string
+		err     error
+	}
+	ch := make(chan result, 1)
+	// The dial cannot take a deadline: ctxFor deliberately roots cached
+	// connections at context.Background() (per-request cancellation must not
+	// kill them), so the attempt is bounded externally. On timeout the
+	// goroutine is abandoned; if it completes later it merely caches a usable
+	// connection for first use — caching grants no unverified access, it only
+	// avoids a second dial (opCtxFor still runs the version gate).
+	go func() {
+		c, err := r.ctxFor(ctx, id)
+		if err != nil {
+			ch <- result{err: err}
+			return
+		}
+		v, err := r.probeVersion(c)
+		ch <- result{version: v, err: err}
+	}()
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			log.Printf("preflight: host %q unreachable, podman version check deferred to first use: %v", id, res.err)
+			return nil
+		}
+		if err := checkVersion(id, res.version); err != nil {
+			return err
+		}
+		r.mu.Lock()
+		r.verified[id] = true
+		r.mu.Unlock()
+		log.Printf("preflight: host %q podman %s ok (>= %s)", id, res.version, MinPodmanVersion)
+		return nil
+	case <-time.After(preflightTimeout):
+		log.Printf("preflight: host %q did not answer within %s, podman version check deferred to first use", id, preflightTimeout)
+		return nil
+	case <-ctx.Done():
+		log.Printf("preflight: host %q check cancelled, podman version check deferred to first use: %v", id, ctx.Err())
+		return nil
+	}
+}
+
 func (r *Real) Ping(ctx context.Context, id string) error {
 	c, err := r.ctxFor(ctx, id)
 	if err != nil {
@@ -136,15 +258,11 @@ func (r *Real) Version(ctx context.Context, id string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	info, err := system.Info(c, &system.InfoOptions{})
-	if err != nil {
-		return "", err
-	}
-	return info.Version.Version, nil
+	return r.probeVersion(c)
 }
 
 func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool, networks ...string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -171,7 +289,7 @@ func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool, netwo
 }
 
 func (r *Real) PodInspect(ctx context.Context, id, name string) (Pod, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return Pod{}, err
 	}
@@ -236,7 +354,7 @@ func enrichContainer(c *Container, ins *define.InspectContainerData) {
 }
 
 func (r *Real) PodList(ctx context.Context, id string, filters map[string]string) ([]Pod, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -270,7 +388,7 @@ func (r *Real) PodList(ctx context.Context, id string, filters map[string]string
 }
 
 func (r *Real) PodStart(ctx context.Context, id, name string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -279,7 +397,7 @@ func (r *Real) PodStart(ctx context.Context, id, name string) error {
 }
 
 func (r *Real) PodStop(ctx context.Context, id, name string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -288,7 +406,7 @@ func (r *Real) PodStop(ctx context.Context, id, name string) error {
 }
 
 func (r *Real) PodRestart(ctx context.Context, id, name string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -297,7 +415,7 @@ func (r *Real) PodRestart(ctx context.Context, id, name string) error {
 }
 
 func (r *Real) PodRemove(ctx context.Context, id, name string, force bool) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -311,7 +429,7 @@ func (r *Real) PodRemove(ctx context.Context, id, name string, force bool) error
 }
 
 func (r *Real) SecretCreate(ctx context.Context, id, name string, value []byte) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -321,7 +439,7 @@ func (r *Real) SecretCreate(ctx context.Context, id, name string, value []byte) 
 }
 
 func (r *Real) SecretList(ctx context.Context, id string) ([]Secret, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -337,7 +455,7 @@ func (r *Real) SecretList(ctx context.Context, id string) ([]Secret, error) {
 }
 
 func (r *Real) SecretInspect(ctx context.Context, id, name string) (Secret, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return Secret{}, err
 	}
@@ -349,7 +467,7 @@ func (r *Real) SecretInspect(ctx context.Context, id, name string) (Secret, erro
 }
 
 func (r *Real) SecretRemove(ctx context.Context, id, name string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -357,7 +475,7 @@ func (r *Real) SecretRemove(ctx context.Context, id, name string) error {
 }
 
 func (r *Real) VolumeInspect(ctx context.Context, id, name string) (Volume, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return Volume{}, err
 	}
@@ -371,7 +489,7 @@ func (r *Real) VolumeInspect(ctx context.Context, id, name string) (Volume, erro
 }
 
 func (r *Real) VolumeRemove(ctx context.Context, id, name string, force bool) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -389,7 +507,7 @@ func (r *Real) VolumeRemove(ctx context.Context, id, name string, force bool) er
 // because that binding copies into an io.Writer, whereas our contract must hand
 // back a live io.ReadCloser for pipe streaming.
 func (r *Real) VolumeExport(ctx context.Context, id, name string) (io.ReadCloser, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -411,7 +529,7 @@ func (r *Real) VolumeExport(ctx context.Context, id, name string) (io.ReadCloser
 
 // VolumeImport unpacks an uncompressed tar into an existing volume on the host.
 func (r *Real) VolumeImport(ctx context.Context, id, name string, src io.Reader) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -421,7 +539,7 @@ func (r *Real) VolumeImport(ctx context.Context, id, name string, src io.Reader)
 // VolumeCreate creates an empty named volume. An already-existing name is
 // treated as success so migrate's create-then-copy step is idempotent on retry.
 func (r *Real) VolumeCreate(ctx context.Context, id, name string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -445,7 +563,7 @@ func (r *Real) VolumeCreate(ctx context.Context, id, name string) error {
 // via the API, so we fail with the one-time fix instead of silently keeping it
 // disabled (which IgnoreIfExists would do).
 func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -470,7 +588,7 @@ func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
 }
 
 func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []string) (ExecResult, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return ExecResult{}, err
 	}
@@ -503,7 +621,7 @@ func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []st
 }
 
 func (r *Real) CopyToContainer(ctx context.Context, id, container, destDir, name string, content []byte) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -600,7 +718,7 @@ func podFromList(p *entities.ListPodsReport) Pod {
 // request; mergedCtx derives from c but can be independently cancelled so
 // the streaming call is torn down without killing the cached connection.
 func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts LogOptions) (<-chan LogLine, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -681,7 +799,7 @@ func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts Log
 }
 
 func (r *Real) ImagePull(ctx context.Context, id, ref string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -690,7 +808,7 @@ func (r *Real) ImagePull(ctx context.Context, id, ref string) error {
 }
 
 func (r *Real) UsedHostPorts(ctx context.Context, id string) ([]PortMapping, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -848,7 +966,7 @@ func sumPrune(reps []*reports.PruneReport) PruneReport {
 }
 
 func (r *Real) ImagePrune(ctx context.Context, id string, all bool) (PruneReport, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return PruneReport{}, err
 	}
@@ -860,7 +978,7 @@ func (r *Real) ImagePrune(ctx context.Context, id string, all bool) (PruneReport
 }
 
 func (r *Real) ContainerPrune(ctx context.Context, id string) (PruneReport, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return PruneReport{}, err
 	}
@@ -872,7 +990,7 @@ func (r *Real) ContainerPrune(ctx context.Context, id string) (PruneReport, erro
 }
 
 func (r *Real) BuildCachePrune(ctx context.Context, id string) (PruneReport, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return PruneReport{}, err
 	}
@@ -886,7 +1004,7 @@ func (r *Real) BuildCachePrune(ctx context.Context, id string) (PruneReport, err
 }
 
 func (r *Real) VolumePrune(ctx context.Context, id string, filters map[string][]string) (PruneReport, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return PruneReport{}, err
 	}
