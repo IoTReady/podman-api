@@ -136,6 +136,27 @@ func mergeParamDefaults(values map[string]string, tmpl store.Template) {
 	}
 }
 
+// paramPlaceholders builds the placeholder text for each parameter, keyed by
+// param name. An explicit ParamDef.Placeholder wins; otherwise a parameter with
+// a default advertises it as "default: <value>", communicating that deploying
+// the field empty applies that default (see mergeParamDefaults). The default
+// hint is gated on the SAME Default != nil check as mergeParamDefaults — not
+// template truthiness — so a falsy non-nil default (false, 0) still gets a hint
+// (#100). Computing this server-side keeps the value-fill and placeholder halves
+// of the policy in one place with one nil-check semantics.
+func paramPlaceholders(tmpl store.Template) map[string]string {
+	ph := map[string]string{}
+	for _, p := range tmpl.Meta.Parameters {
+		switch {
+		case p.Placeholder != "":
+			ph[p.Name] = p.Placeholder
+		case p.Default != nil:
+			ph[p.Name] = fmt.Sprintf("default: %v", p.Default)
+		}
+	}
+	return ph
+}
+
 func (u *UI) deployForm(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	if !u.hostExists(host) {
@@ -159,13 +180,14 @@ func (u *UI) deployForm(w http.ResponseWriter, r *http.Request) {
 	vals := typedValues(r.URL.Query())
 	mergeParamDefaults(vals, tmpl)
 	u.render(w, r, http.StatusOK, "deploy-form", u.pageData(map[string]any{
-		"Host":      host,
-		"Templates": tmpls,
-		"Selected":  sel,
-		"Tmpl":      tmpl,
-		"HostRefs":  refs,
-		"Slug":      r.URL.Query().Get("slug"),
-		"Values":    vals,
+		"Host":         host,
+		"Templates":    tmpls,
+		"Selected":     sel,
+		"Tmpl":         tmpl,
+		"HostRefs":     refs,
+		"Slug":         r.URL.Query().Get("slug"),
+		"Values":       vals,
+		"Placeholders": paramPlaceholders(tmpl),
 	}))
 }
 
@@ -196,14 +218,15 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 		vals := typedValues(r.PostForm)
 		mergeParamDefaults(vals, tmpl)
 		u.render(w, r, errorStatus(applyErr), "deploy-form", u.pageData(map[string]any{
-			"Host":      host,
-			"Templates": tmpls,
-			"Selected":  req.Template,
-			"Tmpl":      tmpl,
-			"HostRefs":  refs,
-			"Slug":      req.Slug,
-			"Values":    vals,
-			"Error":     applyErr.Error(),
+			"Host":         host,
+			"Templates":    tmpls,
+			"Selected":     req.Template,
+			"Tmpl":         tmpl,
+			"HostRefs":     refs,
+			"Slug":         req.Slug,
+			"Values":       vals,
+			"Placeholders": paramPlaceholders(tmpl),
+			"Error":        applyErr.Error(),
 		}))
 		return
 	}
