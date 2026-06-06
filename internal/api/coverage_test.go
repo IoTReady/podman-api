@@ -12,6 +12,7 @@ import (
 
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 // postJSON issues an authed request carrying a JSON body and returns the response.
@@ -203,6 +204,7 @@ func TestClassify_RemainingSentinels(t *testing.T) {
 		{instance.ErrImagePull, "upstream_error", http.StatusBadGateway},
 		{instance.ErrHostDraining, "host_draining", http.StatusLocked},
 		{podman.ErrNotFound, "instance_not_found", http.StatusNotFound},
+		{store.ErrSecretsUndecryptable, "secrets_undecryptable", http.StatusUnprocessableEntity},
 	}
 	for _, c := range cases {
 		rr := httptest.NewRecorder()

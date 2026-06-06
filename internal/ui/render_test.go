@@ -59,6 +59,7 @@ func TestErrorStatus(t *testing.T) {
 		instance.ErrStoreDisabled:     http.StatusNotImplemented,
 		instance.ErrSameHost:          http.StatusBadRequest,
 		store.ErrSecretsNeedKey:       http.StatusBadRequest,
+		store.ErrSecretsUndecryptable: http.StatusUnprocessableEntity,
 		errors.New("boom"):            http.StatusInternalServerError,
 	}
 	for err, want := range cases {

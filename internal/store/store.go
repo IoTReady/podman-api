@@ -16,12 +16,22 @@ var ErrNotFound = errors.New("store: not found")
 // that was opened without an encryption key (-spec-key-file).
 var ErrSecretsNeedKey = errors.New("secrets require an encryption key (-spec-key-file)")
 
-// ErrSpecCorrupt marks a permanently unreadable spec row: the secrets blob no
-// longer decrypts (key loss/rotation) or a JSON column is malformed. It is
-// distinct from transient store errors (context cancellation, SQLITE_BUSY) and
-// from the definitive ErrNotFound, so callers (e.g. boot reconciliation) can
-// stop retrying a row that will never become readable.
-var ErrSpecCorrupt = errors.New("store: spec row corrupt or undecryptable")
+// ErrSpecCorrupt marks a permanently unreadable spec row: a JSON column is
+// malformed, or the secrets blob decrypts cleanly but its plaintext is not valid
+// JSON. It is distinct from transient store errors (context cancellation,
+// SQLITE_BUSY) and from the definitive ErrNotFound, so callers (e.g. boot
+// reconciliation) can stop retrying a row that will never become readable. A
+// decrypt failure (wrong/missing key) is NOT covered here — that recoverable
+// case is ErrSecretsUndecryptable.
+var ErrSpecCorrupt = errors.New("store: spec row corrupt (malformed)")
+
+// ErrSecretsUndecryptable marks a spec whose sealed secrets blob will not open
+// under the loaded key: the daemon was started with the WRONG -spec-key-file
+// (or, rarer, the ciphertext is corrupt — the two are indistinguishable at the
+// GCM layer). Unlike ErrSpecCorrupt (permanently malformed plaintext) this is
+// recoverable: a restart with the correct key file makes the row readable again,
+// so callers (boot reconciliation) keep retrying rather than failing terminally.
+var ErrSecretsUndecryptable = errors.New("store: spec secrets undecryptable (wrong or missing -spec-key-file)")
 
 // Spec is the desired state of one instance.
 type Spec struct {

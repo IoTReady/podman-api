@@ -155,12 +155,31 @@ func TestSecretsFormCorruptSpecDegrades(t *testing.T) {
 	}
 }
 
-// corruptSpecStore makes GetSpec report a permanently-undecryptable row, the way
-// a key-loss/rotation leaves a sealed secrets blob.
+// corruptSpecStore makes GetSpec report a permanently-corrupt (malformed) row —
+// distinct from the recoverable, wrong-key undecryptableSpecStore below.
 type corruptSpecStore struct{ *store.Memory }
 
 func (corruptSpecStore) GetSpec(context.Context, string, string, string) (store.Spec, error) {
 	return store.Spec{}, store.ErrSpecCorrupt
+}
+
+func TestSecretsFormUndecryptableSpecDegrades(t *testing.T) {
+	u, mem := uiWithSecretInstance(t)
+	u.cfg.Svc.SetStore(undecryptableSpecStore{mem})
+	body := authedGet(t, u, "/ui/hosts/edge-1/instances/demo/main/secrets").Body.String()
+	if !strings.Contains(body, "manual cleanup") {
+		t.Error("an undecryptable spec should degrade to a cleanup notice")
+	}
+	if strings.Contains(body, `type="password"`) {
+		t.Error("no rotate inputs should render for an undecryptable spec")
+	}
+}
+
+// undecryptableSpecStore makes GetSpec report a wrong/missing-key blob.
+type undecryptableSpecStore struct{ *store.Memory }
+
+func (undecryptableSpecStore) GetSpec(context.Context, string, string, string) (store.Spec, error) {
+	return store.Spec{}, store.ErrSecretsUndecryptable
 }
 
 // TestSecretsFormHidesRotateWhenNoDeclaredSecrets: reaching the form for an

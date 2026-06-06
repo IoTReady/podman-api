@@ -607,8 +607,8 @@ func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image stri
 // absent from newSecrets keep their existing value — callers are write-only and
 // never see current values. An empty newSecrets is rejected so a blank submit
 // does not pointlessly restart the instance. Returns ErrInstanceNotFound when no
-// spec is stored, or the store's error (incl. store.ErrSpecCorrupt) when the
-// spec cannot be read.
+// spec is stored, or the store's error (incl. store.ErrSpecCorrupt or
+// store.ErrSecretsUndecryptable) when the spec cannot be read.
 func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug string, newSecrets map[string]string) error {
 	if len(newSecrets) == 0 {
 		return errors.New("no secrets to rotate")
@@ -640,7 +640,8 @@ func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug st
 // is present — presence only, never the value (the secret model is write-only).
 // Names a template declares but the instance never set are simply absent from the
 // map. Returns ErrInstanceNotFound when no spec is stored, or the store's error
-// (incl. store.ErrSpecCorrupt) when the spec cannot be read.
+// (incl. store.ErrSpecCorrupt or store.ErrSecretsUndecryptable) when the spec
+// cannot be read.
 func (s *Service) InstanceSecretState(ctx context.Context, host, tmpl, slug string) (map[string]bool, error) {
 	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
 	if err != nil {
