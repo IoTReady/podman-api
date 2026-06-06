@@ -115,6 +115,15 @@ func typedValues(form map[string][]string) map[string]string {
 // missing key from a typed-empty one (index returns "" for both), so doing it
 // here lets a fresh form show defaults while a field the operator cleared
 // (submitted empty) stays empty rather than silently reverting to the default.
+//
+// This is display-only. The apply path treats empty and absent the same: a
+// cleared defaulted field is dropped by formValues, then back-filled by
+// render.ApplyDefaults in Service.Apply, so deploying it still applies the
+// default — the parameter model has no way to express "explicitly empty". The
+// form communicates that by advertising the default as the input's placeholder
+// (see instance-fields.html). NB: this is the UI's copy of the same
+// fill-absent-from-defaults rule implemented in render.ApplyDefaults and
+// api/templates.go; keep them consistent.
 func mergeParamDefaults(values map[string]string, tmpl store.Template) {
 	for _, p := range tmpl.Meta.Parameters {
 		if p.Default == nil {

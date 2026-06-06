@@ -132,6 +132,19 @@ reshaped the deploy form's substrate. The fix above was rebased onto it; the
    (default on a fresh form, typed wins on switch) and
    `TestDeployFormClearedDefaultedFieldStaysEmpty` (a cleared field stays empty).
 
+   *Apply-path coupling (display-only fix).* `mergeParamDefaults` only governs
+   what the form shows. The apply path treats empty and absent identically — a
+   cleared field is dropped by `formValues`, then back-filled by
+   `render.ApplyDefaults` in `Service.Apply` — so deploying a cleared defaulted
+   field still applies the default. The parameter model has no "explicitly empty",
+   so rather than pretend otherwise, a defaulted param advertises its default as
+   the input **placeholder** (`default: <value>`, unless the template sets an
+   explicit one); an empty/cleared field then visibly communicates that deploying
+   it applies the default. `TestDeployFormDefaultedFieldShowsDefaultPlaceholder`
+   covers it. (`mergeParamDefaults` is the UI's copy of the same
+   fill-absent-from-defaults rule in `render.ApplyDefaults` and `api/templates.go`;
+   the comment cross-references them.)
+
 3. **No-store on rendered pages.** Because the form now re-populates typed
    per-instance secrets into the HTML, the central `render` helper sets
    `Cache-Control: no-store` so responses aren't cached by a browser or

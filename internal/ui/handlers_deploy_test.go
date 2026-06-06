@@ -238,6 +238,18 @@ func TestDeployFormClearedDefaultedFieldStaysEmpty(t *testing.T) {
 	}
 }
 
+// TestDeployFormDefaultedFieldShowsDefaultPlaceholder documents that a defaulted
+// param advertises its default via the placeholder, so an empty (e.g. cleared)
+// field communicates that deploying it empty applies the default — matching the
+// apply path's render.ApplyDefaults behavior.
+func TestDeployFormDefaultedFieldShowsDefaultPlaceholder(t *testing.T) {
+	u := defaultedParamUI(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo").Body.String()
+	if !strings.Contains(body, `placeholder="default: 9.9"`) {
+		t.Error("a defaulted param should advertise its default via the placeholder")
+	}
+}
+
 // TestDeployFormSetsNoStore verifies rendered pages are non-cacheable, since they
 // now re-populate typed per-instance secrets into the HTML.
 func TestDeployFormSetsNoStore(t *testing.T) {
