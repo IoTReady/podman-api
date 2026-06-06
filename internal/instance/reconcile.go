@@ -118,8 +118,8 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 		if spec == specCorrupt {
 			// The dest spec row exists but will never decode (decrypt failure or a
 			// malformed column). Retrying is futile — fail terminally.
-			step("reconcile-spec-corrupt", "destination spec unreadable")
-			return true, false, "destination spec unreadable (corrupt/undecryptable); manual cleanup required", nil
+			step("reconcile-spec-corrupt", "destination spec corrupt (malformed)")
+			return true, false, "destination spec corrupt (malformed); manual cleanup required", nil
 		}
 		if spec == specPersisted {
 			// Dest is a complete, committed replacement. Repair its ingress routes

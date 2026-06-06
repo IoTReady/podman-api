@@ -334,9 +334,9 @@ func TestReconcileMigrate_DestSpecLookupError_Inconclusive(t *testing.T) {
 }
 
 // TestReconcileMigrate_DestSpecCorrupt_Terminal verifies a permanently
-// undecryptable dest spec (ErrSpecCorrupt) ends the reconcile as terminal
-// `failed` — not an inconclusive retry — while mutating neither host. An
-// undecryptable row never becomes readable, so retrying forever is wrong.
+// corrupt dest spec (ErrSpecCorrupt) ends the reconcile as terminal
+// `failed` — not an inconclusive retry — while mutating neither host. A
+// malformed row never becomes readable, so retrying forever is wrong.
 func TestReconcileMigrate_DestSpecCorrupt_Terminal(t *testing.T) {
 	svc, fc, st := reconcileSvc(t)
 	svc.SetStore(&getSpecErrStore{Memory: st, err: store.ErrSpecCorrupt})
@@ -350,8 +350,8 @@ func TestReconcileMigrate_DestSpecCorrupt_Terminal(t *testing.T) {
 	if !resolved || ok {
 		t.Fatalf("got resolved=%v ok=%v, want true/false (terminal failed)", resolved, ok)
 	}
-	if !strings.Contains(msg, "unreadable") {
-		t.Fatalf("message = %q, want it to mention the spec is unreadable", msg)
+	if !strings.Contains(msg, "corrupt") {
+		t.Fatalf("message = %q, want it to mention the spec is corrupt", msg)
 	}
 	// Neither host may be mutated on a terminal corrupt-spec result.
 	if _, err := fc.PodInspect(context.Background(), "h2", "web-x"); err != nil {
