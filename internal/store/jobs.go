@@ -151,3 +151,19 @@ func newJobID() string {
 	_, _ = io.ReadFull(rand.Reader, b[:])
 	return fmt.Sprintf("%016x-%x", uint64(time.Now().UnixNano()), b)
 }
+
+// coalesceStep appends step to steps, collapsing a consecutive identical
+// (Step, Detail) into an occurrence-count bump + timestamp refresh on the
+// last element instead of growing the slice. Count holds total occurrences,
+// materialized only when >1. (#117)
+func coalesceStep(steps []JobStep, step JobStep) []JobStep {
+	if n := len(steps); n > 0 && steps[n-1].Step == step.Step && steps[n-1].Detail == step.Detail {
+		if steps[n-1].Count == 0 {
+			steps[n-1].Count = 1
+		}
+		steps[n-1].Count++
+		steps[n-1].TS = step.TS
+		return steps
+	}
+	return append(steps, step)
+}

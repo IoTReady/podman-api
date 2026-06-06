@@ -450,8 +450,11 @@ func (s *SQLite) GetHostSecret(ctx context.Context, host, name string) ([]byte, 
 	val, err := open(s.keys.Load(), blob)
 	if err != nil {
 		// A wrong/missing key is recoverable by a restart with the correct
-		// -spec-key-file; surface the typed sentinel so the API/UI classify it
-		// 422 (coherent with GetSpec), not a raw 500. (#117)
+		// -spec-key-file. Surface the typed sentinel (not a raw GCM error) so this
+		// key fault classifies consistently with GetSpec: any HTTP path that routes
+		// a store read through api/errors.go gets 422 rather than 500. Today
+		// GetHostSecret is reached only via the migrate/evacuate job path, so this
+		// is forward-looking consistency, not an observable status change yet. (#117)
 		return nil, fmt.Errorf("%w: decrypt host secret: %v", ErrSecretsUndecryptable, err)
 	}
 	return val, nil
@@ -653,18 +656,7 @@ func (s *SQLite) AppendStep(ctx context.Context, id string, step JobStep) error 
 	if err := json.Unmarshal([]byte(steps), &arr); err != nil {
 		return err
 	}
-	if n := len(arr); n > 0 && arr[n-1].Step == step.Step && arr[n-1].Detail == step.Detail {
-		// Collapse a consecutive identical step (e.g. a reconcile loop stuck on
-		// the same condition): bump the occurrence count and refresh the
-		// timestamp to the latest attempt rather than growing the array. (#117)
-		if arr[n-1].Count == 0 {
-			arr[n-1].Count = 1
-		}
-		arr[n-1].Count++
-		arr[n-1].TS = step.TS
-	} else {
-		arr = append(arr, step)
-	}
+	arr = coalesceStep(arr, step)
 	b, err := json.Marshal(arr)
 	if err != nil {
 		return err
