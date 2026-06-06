@@ -247,12 +247,31 @@ func instanceSecretName(tmpl, slug, name string) string {
 	return tmpl + "-" + slug + "-" + name
 }
 
-// Apply creates or replaces an instance. If opts.Replace is false and the
-// pod exists, returns ErrInstanceExists. Unless opts.SkipPull is set, every
-// container image referenced in the rendered Pod spec is pulled before the
-// manifest is played — this surfaces registry errors fast and avoids the
-// opaque timeout from play kube's implicit pull.
+// Apply creates or replaces an instance. If opts.Replace is false and the pod
+// exists, returns ErrInstanceExists. Unless opts.SkipPull is set, every container
+// image referenced in the rendered Pod spec is pulled before the manifest is
+// played. Apply acquires the per-host lock (domain-carrying requests only, taken
+// before the instance lock — a consistent order so the two never deadlock) and the
+// per-instance lock, then runs applyLocked.
 func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts ApplyOptions) error {
+	if len(req.Domains) > 0 {
+		hl := s.hostLock(host)
+		hl.Lock()
+		defer hl.Unlock()
+	}
+	lock := s.instanceLock(host, req.Template, req.Slug)
+	lock.Lock()
+	defer lock.Unlock()
+	return s.applyLocked(ctx, host, req, opts)
+}
+
+// applyLocked is the lock-free core of Apply: it performs the full create/replace
+// (validate → play → persist → ingress) assuming the caller already holds the
+// per-instance lock (and, for domain-carrying requests, the per-host lock). It
+// exists so the read-modify-write callers (RotateInstanceSecrets, UpgradeImage)
+// can hold one lock across GetSpec + re-apply without re-entering Apply's lock
+// (which is non-reentrant). Apply is the public, lock-acquiring entry point.
+func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest, opts ApplyOptions) error {
 	tmpl, err := s.lookup(ctx, host, req.Template)
 	if err != nil {
 		return err
@@ -287,14 +306,6 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	// fully concurrent. Taken before the instanceLock (consistent order → no
 	// deadlock) and only when domains are present; a request with no domains can
 	// never create a claim, so it needs no host-wide serialization. (#82)
-	if len(req.Domains) > 0 {
-		hl := s.hostLock(host)
-		hl.Lock()
-		defer hl.Unlock()
-	}
-	lock := s.instanceLock(host, req.Template, req.Slug)
-	lock.Lock()
-	defer lock.Unlock()
 
 	// Validate ingress rules BEFORE playing the pod or persisting the spec, so a
 	// rejected request never leaves a poison spec in the store — a persisted spec
