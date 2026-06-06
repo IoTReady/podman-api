@@ -79,6 +79,8 @@ func classify(err error) (code string, status int, msg string) {
 		return "not_found", http.StatusNotFound, err.Error()
 	case errors.Is(err, store.ErrSecretsNeedKey):
 		return "secrets_need_key", http.StatusBadRequest, "secrets require an encryption key (-spec-key-file)"
+	case errors.Is(err, store.ErrSpecCorrupt):
+		return "spec_corrupt", http.StatusUnprocessableEntity, err.Error()
 	case errors.Is(err, instance.ErrPortConflict):
 		return "port_conflict", http.StatusConflict, err.Error()
 	case errors.Is(err, instance.ErrSameHost):

@@ -571,7 +571,11 @@ func (s *Service) Upgrade(ctx context.Context, host string, req ApplyRequest, im
 // UpgradeImage performs an image-only upgrade: it loads the instance's stored
 // spec (parameters + secrets), overrides the "image" parameter, and re-applies
 // with Replace. Existing secrets and parameters are reused as-is — the operator
-// supplies only the new image; rotating a secret is a separate operation.
+// supplies only the new image; rotating a secret is a separate operation. Like
+// RotateInstanceSecrets it sets AllowMissingSecrets, so a template that gained a
+// required per-instance secret after the instance was deployed does not block an
+// image upgrade of that already-running instance (the missing secret was already
+// missing; the upgrade never worsens the pod).
 // Returns ErrInstanceNotFound when no spec is stored for the instance.
 func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image string) error {
 	if image == "" {
@@ -595,7 +599,7 @@ func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image stri
 		Parameters: params,
 		Secrets:    spec.Secrets,
 		Domains:    spec.Domains,
-	}, ApplyOptions{Replace: true})
+	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
 }
 
 // RotateInstanceSecrets overlays newSecrets onto the instance's stored

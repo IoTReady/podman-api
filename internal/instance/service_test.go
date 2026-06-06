@@ -439,6 +439,33 @@ func TestRotateInstanceSecrets_OverlaysAndReapplies(t *testing.T) {
 	assert.Equal(t, "img:1", got.Parameters["image"])   // params preserved
 }
 
+// TestUpgradeImage_AllowsMissingRequiredSecret guards the Upgrade/Rotate
+// consistency decision: like rotation, an image-only upgrade must not be blocked
+// because the stored spec lacks a per-instance secret the template now requires
+// (a secret added after the instance was deployed).
+func TestUpgradeImage_AllowsMissingRequiredSecret(t *testing.T) {
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	svc, mem := newSvcWith(t, fake.New(), hosts, twoSecretTemplate())
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", ApplyRequest{
+		Template:   "twosec",
+		Slug:       "demo",
+		Parameters: map[string]any{"slug": "demo", "image": "img:1"},
+		Secrets:    map[string]string{"password": "p", "token": "t"},
+	}, ApplyOptions{Replace: true}))
+	// Simulate a template that gained "token" after deploy: drop it from the spec.
+	sp, err := mem.GetSpec(ctx, "h1", "twosec", "demo")
+	require.NoError(t, err)
+	delete(sp.Secrets, "token")
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	require.NoError(t, svc.UpgradeImage(ctx, "h1", "twosec", "demo", "img:2"))
+
+	got, err := mem.GetSpec(ctx, "h1", "twosec", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, "img:2", got.Parameters["image"])
+}
+
 func TestRotateInstanceSecrets_EmptyIsRejected(t *testing.T) {
 	svc, _, _ := newSvcMem(t)
 	ctx := context.Background()

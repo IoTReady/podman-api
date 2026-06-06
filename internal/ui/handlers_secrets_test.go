@@ -163,6 +163,29 @@ func (corruptSpecStore) GetSpec(context.Context, string, string, string) (store.
 	return store.Spec{}, store.ErrSpecCorrupt
 }
 
+// TestSecretsRotateIgnoresQueryStringSecret locks the body-only invariant (#99):
+// a secret smuggled into the query string must be ignored (the handler reads
+// r.PostForm), so the body — carrying only the CSRF token — is an empty rotation.
+func TestSecretsRotateIgnoresQueryStringSecret(t *testing.T) {
+	u, mem := uiWithSecretInstance(t)
+	w := authedPost(t, u,
+		"/ui/hosts/edge-1/instances/demo/main/secrets?secret.password=fromquery",
+		url.Values{})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (query-string secret ignored → empty submit)", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "fromquery") {
+		t.Error("a query-string secret value must never be reflected into the response")
+	}
+	sp, err := mem.GetSpec(context.Background(), "edge-1", "demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sp.Secrets["password"] != "stored" {
+		t.Errorf("password = %q, want unchanged 'stored' (a query-string secret must not rotate)", sp.Secrets["password"])
+	}
+}
+
 // TestSecretsRotateFailureNeverEchoesSubmittedValue locks down the most
 // security-sensitive branch: when a rotation fails and the form is re-rendered
 // with the error, the submitted secret value must never appear in the response.
