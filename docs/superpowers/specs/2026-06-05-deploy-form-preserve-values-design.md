@@ -108,3 +108,26 @@ secret `password`) and `authedGet` helper:
 - Client-side field preservation (rejected: adds JS to a deliberately JS-light UI).
 - Persisting draft form state across navigation/sessions.
 - Any change to the apply/validation semantics of `formValues`.
+
+## Rebase addendum (2026-06-06) — onto the #98 typed-template model
+
+After this design was written, #98 (DB-backed template catalog, #61) landed and
+reshaped the deploy form's substrate. The fix above was rebased onto it; the
+`typedValues`/`Values` mechanism is unchanged, but two details adapted:
+
+1. **Typed parameters.** `Meta.Parameters` is now `[]render.ParamDef` (not the old
+   `Required`/`Optional` name lists). `instance-fields.html` iterates
+   `{{range .Tmpl.Meta.Parameters}}` over `.Name`/`.Required`/`.Placeholder`/`.Default`.
+   `Meta.Secrets.PerInstance` (`[]string`) is unchanged, so secret inputs are
+   re-populated exactly as designed.
+2. **Default precedence.** Each param input now carries a one-click `Default` from
+   #61. The value rule became *typed value wins, else the parameter default*:
+   `value="{{if $typed}}{{$typed}}{{else if .Default}}{{.Default}}{{end}}"` (the
+   `else if .Default` guard avoids rendering a nil `any` default into the
+   attribute). A new test, `TestDeployFormTypedValueBeatsParamDefault`, locks this
+   ordering in.
+
+Handler signatures also gained `error` returns (`Templates(ctx)`,
+`sortedTemplates(ctx)`, `fieldData`) and `config.Template`/`HasStore` were removed
+(store is always present) — all threaded through `renderError`, no behavior change
+to this fix.
