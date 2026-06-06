@@ -261,6 +261,29 @@ func TestDeployFormGetEmptyTemplateDefaultsToFirst(t *testing.T) {
 	}
 }
 
+// TestDeployFormGetDropsSecretFromQuery guards the GET-path residual (#111,
+// folded into #99): a hand-crafted GET carrying a secret.* query param must not
+// reflect it back into the form, which would round-trip the secret through the
+// request line/logs and the response HTML. Secrets only travel via the POST
+// switch body.
+func TestDeployFormGetDropsSecretFromQuery(t *testing.T) {
+	u := uiWithTemplate(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&secret.password=hunter2").Body.String()
+	if strings.Contains(body, "hunter2") {
+		t.Error("a secret.* value from the GET query string must not be reflected into the form")
+	}
+}
+
+// TestDeployFormGetPreservesParamFromQuery confirms the GET filter is secret-only:
+// a param.* deep-link value still round-trips.
+func TestDeployFormGetPreservesParamFromQuery(t *testing.T) {
+	u := uiWithTemplate(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo&param.version=1.2.3").Body.String()
+	if !strings.Contains(body, `value="1.2.3"`) {
+		t.Error("a param.* value from the GET query string should still be preserved")
+	}
+}
+
 // TestDeployFormPostRequiresCSRF verifies the POST re-render endpoint is behind
 // the write guard: a POST with a valid session but no CSRF token is rejected.
 func TestDeployFormPostRequiresCSRF(t *testing.T) {

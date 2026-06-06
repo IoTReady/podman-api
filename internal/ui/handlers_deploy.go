@@ -101,6 +101,22 @@ func typedValues(form map[string][]string) map[string]string {
 	return vals
 }
 
+// queryTypedValues collects typed values from a GET query string but drops any
+// secret.* keys. The deploy form never links to a secret-bearing URL, and
+// reflecting a hand-crafted ?secret.x=… back into the form would round-trip the
+// secret through the request line (logs) and the response HTML — the very leak
+// the POST switch exists to close (#99). Secrets only ever travel via the POST
+// switch body, so the GET path keeps params only.
+func queryTypedValues(form map[string][]string) map[string]string {
+	vals := typedValues(form)
+	for k := range vals {
+		if strings.HasPrefix(k, "secret.") {
+			delete(vals, k)
+		}
+	}
+	return vals
+}
+
 // mergeParamDefaults fills each parameter's one-click default into values, but
 // only for keys the request did not submit at all. This resolves the
 // typed-value-vs-default precedence server-side: the template can't tell a
@@ -197,7 +213,7 @@ func (u *UI) deployForm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
-	data, err := u.deployFormData(r, host, q.Get("template"), q.Get("slug"), typedValues(q), true)
+	data, err := u.deployFormData(r, host, q.Get("template"), q.Get("slug"), queryTypedValues(q), true)
 	if err != nil {
 		u.renderError(w, r, err)
 		return

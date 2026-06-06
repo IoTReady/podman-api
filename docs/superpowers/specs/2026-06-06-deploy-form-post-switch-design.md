@@ -200,9 +200,19 @@ same helper, so the data-build coverage is shared.
 - `gofmt -l internal/ui` empty (`.go` files only; not the `.html` templates).
 - `go vet` clean.
 
+## GET-path hardening (folded in during PR #110 review)
+
+Originally scoped out, then folded in: the GET `deployForm` previously echoed
+`secret.*` values from a hand-crafted query string back into the form, round-
+tripping a secret through the request line (logs) and the response HTML. The UI
+never produces such a URL (the switch is now POST), but the residual is closed
+by `queryTypedValues`, which drops `secret.*` keys on the GET path (params still
+deep-link). This fully closes the URL-leak surface; issue #111 is closed by this
+PR rather than left as a follow-up.
+
 ## Out of scope
 
-- Secrets appearing in the response **HTML body** (mitigated by `no-store` from
-  #95) — not addressed here.
+- Secrets appearing in the response **HTML body** for the legitimate POST-switch
+  round-trip (mitigated by `no-store` from #95) — not addressed here.
 - The catalog UI rewrite (#61 follow-up) and per-instance secret management
   (#92) remain separate work.
