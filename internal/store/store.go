@@ -23,7 +23,7 @@ var ErrSecretsNeedKey = errors.New("secrets require an encryption key (-spec-key
 // reconciliation) can stop retrying a row that will never become readable. A
 // decrypt failure (wrong/missing key) is NOT covered here — that recoverable
 // case is ErrSecretsUndecryptable.
-var ErrSpecCorrupt = errors.New("store: spec row corrupt or undecryptable")
+var ErrSpecCorrupt = errors.New("store: spec row corrupt (malformed)")
 
 // ErrSecretsUndecryptable marks a spec whose sealed secrets blob will not open
 // under the loaded key: the daemon was started with the WRONG -spec-key-file
