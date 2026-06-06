@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -109,4 +110,47 @@ func TestVersion_BypassesEnforcement(t *testing.T) {
 	v, err := r.Version(context.Background(), "h1")
 	require.NoError(t, err, "diagnostics stay readable on unsupported hosts")
 	assert.Equal(t, "5.4.2", v)
+}
+
+func TestPreflight_FatalOnReachableOldHost(t *testing.T) {
+	r := stubReal(t, func(context.Context) (string, error) { return "5.4.2", nil })
+	err := r.Preflight(context.Background())
+	require.Error(t, err, "reachable host below floor must refuse boot")
+	assert.True(t, errors.Is(err, ErrHostVersionUnsupported))
+}
+
+func TestPreflight_MarksVerified_NoReprobe(t *testing.T) {
+	calls := 0
+	r := stubReal(t, func(context.Context) (string, error) { calls++; return "5.8.2", nil })
+	require.NoError(t, r.Preflight(context.Background()))
+	_, err := r.opCtxFor(context.Background(), "h1")
+	require.NoError(t, err)
+	assert.Equal(t, 1, calls, "preflight pass is cached; first op does not re-probe")
+}
+
+func TestPreflight_ToleratesUnreachable(t *testing.T) {
+	// No pre-seeded ctx: ctxFor dials the (nonexistent) unix socket and fails.
+	r, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: "/nonexistent/podman.sock"}})
+	require.NoError(t, err)
+	require.NoError(t, r.Preflight(context.Background()),
+		"unreachable host is a warning, not a boot failure")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	assert.False(t, r.verified["h1"], "unreachable host stays unverified")
+}
+
+func TestPreflight_TimeoutDefers(t *testing.T) {
+	old := preflightTimeout
+	preflightTimeout = 50 * time.Millisecond
+	defer func() { preflightTimeout = old }()
+
+	r := stubReal(t, func(context.Context) (string, error) {
+		time.Sleep(500 * time.Millisecond)
+		return "5.4.2", nil
+	})
+	require.NoError(t, r.Preflight(context.Background()),
+		"slow host is treated as unreachable at boot")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	assert.False(t, r.verified["h1"])
 }

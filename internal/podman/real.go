@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"math"
 	"net/http"
 	"os"
@@ -175,6 +176,64 @@ func (r *Real) opCtxFor(parent context.Context, id string) (context.Context, err
 		return nil, err
 	}
 	return c, nil
+}
+
+// preflightTimeout bounds each host's boot-time connect+version probe.
+// var (not const) so tests can shrink it.
+var preflightTimeout = 10 * time.Second
+
+// Preflight enforces MinPodmanVersion at boot. A reachable host below the
+// floor returns an error (main treats it as fatal — the daemon refuses to
+// start). An unreachable or slow host is logged and left unverified; the
+// check re-runs on its first successful connect (opCtxFor), so a down-at-boot
+// old host still cannot sneak in. See #85.
+func (r *Real) Preflight(ctx context.Context) error {
+	for id := range r.hosts {
+		if err := r.preflightHost(ctx, id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *Real) preflightHost(ctx context.Context, id string) error {
+	type result struct {
+		version string
+		err     error
+	}
+	ch := make(chan result, 1)
+	// The dial cannot take a deadline: ctxFor deliberately roots cached
+	// connections at context.Background() (per-request cancellation must not
+	// kill them), so the attempt is bounded externally. On timeout the
+	// goroutine is abandoned; if it completes later it merely caches a usable
+	// connection for first use.
+	go func() {
+		c, err := r.ctxFor(ctx, id)
+		if err != nil {
+			ch <- result{err: err}
+			return
+		}
+		v, err := r.probeVersion(c)
+		ch <- result{version: v, err: err}
+	}()
+	select {
+	case res := <-ch:
+		if res.err != nil {
+			log.Printf("preflight: host %q unreachable, podman version check deferred to first use: %v", id, res.err)
+			return nil
+		}
+		if err := checkVersion(id, res.version); err != nil {
+			return err
+		}
+		r.mu.Lock()
+		r.verified[id] = true
+		r.mu.Unlock()
+		log.Printf("preflight: host %q podman %s ok (>= %s)", id, res.version, MinPodmanVersion)
+		return nil
+	case <-time.After(preflightTimeout):
+		log.Printf("preflight: host %q did not answer within %s, podman version check deferred to first use", id, preflightTimeout)
+		return nil
+	}
 }
 
 func (r *Real) Ping(ctx context.Context, id string) error {
