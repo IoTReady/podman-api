@@ -19,8 +19,8 @@ signal of an unsupported host is an operation failing.
   hosts with a logged warning (transient network must not take the daemon down).
 - **Deferred enforcement**: hosts that skipped the boot check are version-verified on
   first successful connect; below-floor hosts fail operations with a typed error.
-- **Diagnostics exempt**: `Ping`/`Version` bypass enforcement so `GET /hosts` can still
-  display the actual (unsupported) version.
+- **Diagnostics exempt**: `Ping`/`Version`/`HostInfo` bypass enforcement so `GET /hosts`
+  can still display the actual (unsupported) version and host load.
 - **Error surface**: sentinel `podman.ErrHostVersionUnsupported`, classified by the API
   layer as code `host_version_unsupported`, HTTP 422 (consistent with
   `host_secret_missing`).
@@ -71,7 +71,8 @@ cached or discarded safely.
   connection ctx stays cached, so a host whose podman is upgraded in place starts
   passing without a daemon restart.
 - All operation methods (`PlayKube`, volume export/import, pod ops, …) switch from
-  `ctxFor` to `opCtxFor`. `Ping` and `Version` keep raw `ctxFor` (diagnostics exempt).
+  `ctxFor` to `opCtxFor`. `Ping`, `Version`, and `HostInfo` (with its `hostLoadAvg`
+  helper) keep raw `ctxFor` — diagnostics exempt so `GET /hosts` stays informative.
 - Version check is at most one extra `system.Info` round-trip per host per process
   lifetime (plus retries while a host is failing the check).
 
