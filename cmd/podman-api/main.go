@@ -53,6 +53,7 @@ func main() {
 
 		migrateVerifyTimeout = flag.Duration("migrate-verify-timeout", 60*time.Second, "max wait for a migrated instance to become ready (running + declared healthchecks healthy) before reaping the source")
 		migrateVerifyVolumes = flag.Bool("migrate-verify-volumes", true, "verify each copied volume's content against the source before reaping the source (adds a re-export of source and dest per volume); false disables it")
+		deployVerifyTimeout  = flag.Duration("deploy-verify-timeout", 30*time.Second, "how long to wait for container healthchecks to pass after deploy or start (0 = disabled)")
 
 		pruneEnabled   = flag.Bool("prune-enabled", false, "enable scheduled host-health prune/cleanup")
 		pruneInterval  = flag.Duration("prune-interval", 24*time.Hour, "default interval between scheduled prunes per host")
@@ -116,6 +117,7 @@ func main() {
 
 	svc := instance.NewService(client, hosts)
 	instance.SetVerifyTimeout(*migrateVerifyTimeout)
+	instance.SetDeployVerifyTimeout(*deployVerifyTimeout)
 	svc.SetVerifyVolumes(*migrateVerifyVolumes)
 
 	// The store is the always-on backbone: it holds the template catalog and the
