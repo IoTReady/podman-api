@@ -16,6 +16,10 @@ import (
 // LocalDir is the OSS BlobStore: blobs are plain files under a root
 // directory, written via temp-file + rename so a partial write is never
 // visible as a complete blob.
+//
+// A process crash mid-write can leave a .tmp-* file behind. Because the temp
+// file lives inside the blob's key-prefix directory, a DeleteAll call on that
+// prefix (e.g. to clean up a failed backup) reclaims it automatically.
 type LocalDir struct {
 	root string
 }
@@ -59,8 +63,9 @@ type fileWriter struct {
 
 func (w *fileWriter) Write(p []byte) (int, error) { return w.f.Write(p) }
 
-// Commit fsyncs, closes, and renames the temp file into place — the blob
-// becomes visible atomically and durably.
+// Commit fsyncs, closes, and renames the temp file into place, then fsyncs the
+// parent directory so the rename itself is durable — the blob becomes visible
+// atomically and durably even across a crash immediately after the rename.
 func (w *fileWriter) Commit() error {
 	if err := w.f.Sync(); err != nil {
 		w.f.Close()
@@ -71,7 +76,17 @@ func (w *fileWriter) Commit() error {
 		os.Remove(w.f.Name())
 		return err
 	}
-	return os.Rename(w.f.Name(), w.final)
+	if err := os.Rename(w.f.Name(), w.final); err != nil {
+		return err
+	}
+	// Fsync the parent directory to make the rename durable on-disk.
+	dir, err := os.Open(filepath.Dir(w.final))
+	if err != nil {
+		return err
+	}
+	syncErr := dir.Sync()
+	dir.Close()
+	return syncErr
 }
 
 // Abort discards the temp file; the key remains absent.
