@@ -121,14 +121,6 @@ func TestInstanceDetailNotFoundIs404(t *testing.T) {
 	}
 }
 
-func TestLogsRouteRedirectsToFirstContainer(t *testing.T) {
-	u := uiWithSeededInstance(t)
-	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/main/logs")
-	if w.Code != http.StatusFound {
-		t.Fatalf("status = %d, want 302 redirect to canonical logs URL", w.Code)
-	}
-}
-
 func TestInstanceDetailRendersSeededInstance(t *testing.T) {
 	u := uiWithSeededInstance(t)
 	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/main")

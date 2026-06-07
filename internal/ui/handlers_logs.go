@@ -2,6 +2,7 @@ package ui
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/iotready/podman-api/internal/podman"
@@ -56,7 +57,7 @@ func (u *UI) logsPage(w http.ResponseWriter, r *http.Request) {
 		}
 		http.Redirect(w, r,
 			"/ui/hosts/"+host+"/instances/"+tmpl+"/"+slug+"/logs"+
-				"?container="+containers[0].Suffix+"&follow=true",
+				"?container="+url.QueryEscape(containers[0].Suffix)+"&follow=true",
 			http.StatusFound)
 		return
 	}
