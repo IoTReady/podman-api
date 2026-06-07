@@ -240,9 +240,10 @@ func (s *Service) CheckRestorable(ctx context.Context, backupID string) (store.B
 // Restore replaces an instance's volumes in place from a backup: stop, tear
 // down containers + volumes, recreate volumes from blobs, verify each against
 // the stored manifest, re-apply the CURRENT spec, wait healthy. There is no
-// rollback: a failure leaves the instance stopped with the job error naming
-// the failed step (that is why each volume is verified before declaring
-// success). step is a best-effort progress callback (may be nil).
+// rollback: a failure after teardown leaves the instance DOWN with volumes
+// partially restored, but the spec row is preserved so the restore can be
+// retried. The job error names the failed step.
+// step is a best-effort progress callback (may be nil).
 func (s *Service) Restore(ctx context.Context, req RestoreRequest, step func(step, detail string)) error {
 	if step == nil {
 		step = func(string, string) {}
@@ -276,6 +277,28 @@ func (s *Service) Restore(ctx context.Context, req RestoreRequest, step func(ste
 	}
 	step("teardown", b.Host)
 
+	if err := s.restorePostTeardown(ctx, b, spec, step); err != nil {
+		// Re-persist the desired-state row on a detached context: the teardown
+		// above deleted it, Apply (which re-persists it) was not reached or
+		// failed, and the failure may BE a ctx cancellation. Without this, a
+		// failed restore strands the instance spec-less and unretryable
+		// (CheckRestorable requires the spec) — losing desired state, which the
+		// no-rollback design does NOT permit. Volumes stay as the failure left
+		// them; the instance stays down; the job error names the failed step.
+		if perr := s.store.PutSpec(context.WithoutCancel(ctx), spec); perr != nil {
+			step("respec-failed", perr.Error())
+		} else {
+			step("respec", b.Host+"/"+b.Template+"/"+b.Slug)
+		}
+		return err
+	}
+	return nil
+}
+
+// restorePostTeardown runs the post-teardown steps of a restore: recreate
+// volumes from blobs, re-apply the spec, wait healthy. Any error here is
+// handled by the caller, which re-persists the spec row before returning.
+func (s *Service) restorePostTeardown(ctx context.Context, b store.Backup, spec store.Spec, step func(step, detail string)) error {
 	for _, bv := range b.Volumes {
 		if err := s.restoreVolume(ctx, b, bv); err != nil {
 			return fmt.Errorf("restore volume %q: %w", bv.Name, err)
@@ -299,7 +322,9 @@ func (s *Service) Restore(ctx context.Context, req RestoreRequest, step func(ste
 }
 
 // restoreVolume recreates one volume from its blob and verifies the imported
-// content against the manifest recorded at backup time (migrate's verify).
+// content against the manifest recorded at backup time. Unlike migrate, restore
+// always verifies regardless of the verifyVolumes flag — it is the only safety
+// mechanism available when restoring from a blob (no live source to compare against).
 func (s *Service) restoreVolume(ctx context.Context, b store.Backup, bv store.BackupVolume) error {
 	if err := s.client.VolumeCreate(ctx, b.Host, bv.Name); err != nil {
 		return fmt.Errorf("create: %w", err)

@@ -496,3 +496,80 @@ func TestBackup_SecondVolumeFailureCleansFirstVolumeBlob(t *testing.T) {
 	require.NoError(t, perr)
 	assert.Equal(t, "Running", p.Status, "instance must be restarted after failure")
 }
+
+// TestRestore_ImportFailureKeepsSpecRetryable verifies that a failure in the
+// post-teardown phase (VolumeImport here) does not strand the instance
+// spec-less: the spec row must survive so CheckRestorable succeeds and the
+// restore can be retried once the underlying fault is cleared.
+func TestRestore_ImportFailureKeepsSpecRetryable(t *testing.T) {
+	svc, f, mem, _, id := newRestoreSvc(t)
+	ctx := context.Background()
+
+	// Inject a VolumeImport failure: restore will fail mid-volume.
+	f.ImportErr = errors.New("import boom")
+
+	var steps []string
+	err := svc.Restore(ctx, RestoreRequest{BackupID: id}, recordSteps(&steps))
+	require.Error(t, err)
+
+	// The spec row must survive so the instance is still retryable.
+	_, serr := mem.GetSpec(ctx, "h1", "postgres", "a")
+	require.NoError(t, serr, "spec row must be preserved after import failure")
+
+	// CheckRestorable must succeed (retry possible).
+	_, cerr := svc.CheckRestorable(ctx, id)
+	require.NoError(t, cerr, "CheckRestorable must not fail after import failure (retry must be possible)")
+
+	// Confirm the respec breadcrumb was emitted.
+	assert.Contains(t, steps, "respec")
+
+	// Retry after clearing the fault: should succeed.
+	f.ImportErr = nil
+	// Re-seed the volume so the fake has content to export during the retry.
+	f.SetVolumeData("h1", "postgres-a-data", tarBytes(t, contentA()))
+	require.NoError(t, svc.Restore(ctx, RestoreRequest{BackupID: id}, nil))
+
+	// Pod running after successful retry.
+	p, perr := f.PodInspect(ctx, "h1", "postgres-a")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status)
+}
+
+// TestRestore_VerifyMismatchKeepsSpec extends TestRestore_VerifyMismatchFails
+// to also assert that the spec row survives after an ErrVolumeIntegrity
+// failure so the restore is retryable.
+func TestRestore_VerifyMismatchKeepsSpec(t *testing.T) {
+	svc, _, mem, blob, id := newRestoreSvc(t)
+	ctx := context.Background()
+
+	// Replace the complete row with one whose stored manifest disagrees with
+	// the blob's actual content (same surgery as TestRestore_VerifyMismatchFails).
+	orig, err := mem.GetBackup(ctx, id)
+	require.NoError(t, err)
+	require.NoError(t, mem.DeleteBackup(ctx, id))
+
+	var m Manifest
+	require.NoError(t, json.Unmarshal(orig.Volumes[0].Manifest, &m))
+	fi := m["f"]
+	fi.sha256 = "deadbeef"
+	m["f"] = fi
+	bad, err := json.Marshal(m)
+	require.NoError(t, err)
+
+	require.NoError(t, mem.CreateBackup(ctx, store.Backup{
+		ID: id, Host: orig.Host, Template: orig.Template, Slug: orig.Slug,
+	}))
+	ok, err := mem.CompleteBackup(ctx, id, []store.BackupVolume{
+		{Name: orig.Volumes[0].Name, SizeBytes: orig.Volumes[0].SizeBytes, Manifest: bad},
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+	_ = blob
+
+	err = svc.Restore(ctx, RestoreRequest{BackupID: id}, nil)
+	require.ErrorIs(t, err, ErrVolumeIntegrity)
+
+	// Spec row must survive so the operator can retry with a corrected backup.
+	_, serr := mem.GetSpec(ctx, "h1", "postgres", "a")
+	require.NoError(t, serr, "spec row must be preserved after verify-mismatch failure")
+}
