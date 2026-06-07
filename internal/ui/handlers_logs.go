@@ -20,11 +20,11 @@ type containerOpt struct {
 // resolveContainerSuffix returns the first container whose name starts with
 // "{tmpl}-{slug}-", stripping the prefix to get the suffix Svc.Logs expects.
 // Returns "" if no container matches.
-func resolveContainerSuffix(tmpl, slug string, containers []podman.Container) string {
+func resolveContainerSuffix(tmpl, slug string, names []string) string {
 	prefix := tmpl + "-" + slug + "-"
-	for _, c := range containers {
-		if strings.HasPrefix(c.Name, prefix) {
-			return strings.TrimPrefix(c.Name, prefix)
+	for _, name := range names {
+		if strings.HasPrefix(name, prefix) {
+			return strings.TrimPrefix(name, prefix)
 		}
 	}
 	return ""
@@ -107,17 +107,48 @@ func (u *UI) logsStream(w http.ResponseWriter, r *http.Request) {
 			}
 			return
 		}
-		// obs.Containers is []instance.ObservedContainer, not []podman.Container;
-		// resolveContainerSuffix expects the latter, so resolve inline.
+		names := make([]string, len(obs.Containers))
+		for i, c := range obs.Containers {
+			names[i] = c.Name
+		}
+		container = resolveContainerSuffix(tmpl, slug, names)
+		if container == "" {
+			http.Error(w, "no containers", http.StatusBadRequest)
+			return
+		}
+	} else {
+		// Validate the provided suffix belongs to this instance.
+		obs, err := u.cfg.Svc.Get(r.Context(), host, tmpl, slug)
+		if err != nil {
+			if errors.Is(err, instance.ErrInstanceNotFound) ||
+				errors.Is(err, instance.ErrUnknownHost) ||
+				errors.Is(err, instance.ErrUnknownTemplate) {
+				http.Error(w, "not found", http.StatusNotFound)
+			} else {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+			}
+			return
+		}
+		names := make([]string, len(obs.Containers))
+		for i, c := range obs.Containers {
+			names[i] = c.Name
+		}
+		if resolveContainerSuffix(tmpl, slug, names) == "" {
+			// No containers at all — unusual but possible during startup.
+			http.Error(w, "no containers", http.StatusBadRequest)
+			return
+		}
+		// Verify the requested suffix is actually present.
+		valid := false
 		prefix := tmpl + "-" + slug + "-"
-		for _, c := range obs.Containers {
-			if strings.HasPrefix(c.Name, prefix) {
-				container = strings.TrimPrefix(c.Name, prefix)
+		for _, name := range names {
+			if name == prefix+container {
+				valid = true
 				break
 			}
 		}
-		if container == "" {
-			http.Error(w, "no containers", http.StatusBadRequest)
+		if !valid {
+			http.Error(w, "unknown container", http.StatusBadRequest)
 			return
 		}
 	}
