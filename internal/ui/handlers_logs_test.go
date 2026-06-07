@@ -53,3 +53,35 @@ func TestLogsPageRedirectsWhenContainerAbsent(t *testing.T) {
 		t.Errorf("Location %q should contain follow=true", loc)
 	}
 }
+
+func TestLogsPageStaticRenderShowsLines(t *testing.T) {
+	u := uiWithSeededInstance(t)
+	// ?container=db&follow=false — static 200-line snapshot
+	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/main/logs?container=db&follow=false")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "database system is ready") {
+		t.Error("static logs page should contain the seeded log line")
+	}
+}
+
+func TestLogsPageFollowRenderHasSSEConnect(t *testing.T) {
+	u := uiWithSeededInstance(t)
+	// ?container=db&follow=true — SSE streaming mode
+	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/main/logs?container=db&follow=true")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "sse-connect") {
+		t.Error("follow mode page should contain sse-connect attribute")
+	}
+}
+
+func TestLogsPageNotFoundReturns404(t *testing.T) {
+	u := uiWithSeededInstance(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/ghost/logs?container=db")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for unknown slug", w.Code)
+	}
+}
