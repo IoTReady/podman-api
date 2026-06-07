@@ -13,11 +13,13 @@ import (
 // available since the desired-state store is always present. HasSecrets gates
 // the manage-secrets control on the template declaring any per-instance secrets.
 func (u *UI) instanceView(ctx context.Context, host string, obs instance.Observed) map[string]any {
+	backups, _ := u.cfg.Svc.ListBackups(ctx, host, obs.Template, obs.Slug, 0) // best-effort; nil on error
 	return map[string]any{
 		"Host":       host,
 		"Inst":       obs,
 		"CanUpgrade": true,
 		"HasSecrets": len(u.templatePerInstanceSecrets(ctx, obs.Template)) > 0,
+		"Backups":    backups,
 	}
 }
 
