@@ -19,6 +19,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestJobRegistry_IncludesBackupKinds(t *testing.T) {
+	// buildJobRegistry only stores the args inside handler/reconciler structs;
+	// it never calls methods on them, so nil/zero values are safe here.
+	svc := instance.NewService(fake.New(), nil)
+	reg, recs := buildJobRegistry(svc, nil, nil, 1, nil)
+
+	for _, kind := range []string{"migrate", "evacuate", "prune", "backup", "restore"} {
+		if _, ok := reg[kind]; !ok {
+			t.Errorf("registry missing kind %q", kind)
+		}
+	}
+	for _, kind := range []string{"migrate", "backup"} {
+		if _, ok := recs[kind]; !ok {
+			t.Errorf("reconcilers missing kind %q", kind)
+		}
+	}
+}
+
 func writeKey(t *testing.T) string {
 	t.Helper()
 	raw := make([]byte, 32)
