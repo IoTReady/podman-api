@@ -67,6 +67,14 @@ func classify(err error) (code string, status int, msg string) {
 		return "instance_not_found", http.StatusNotFound, err.Error()
 	case errors.Is(err, podman.ErrHostVersionUnsupported):
 		return "host_version_unsupported", http.StatusUnprocessableEntity, err.Error()
+	case errors.Is(err, instance.ErrBackupNotFound):
+		return "backup_not_found", http.StatusNotFound, err.Error()
+	case errors.Is(err, instance.ErrBackupNotRestorable):
+		return "backup_not_restorable", http.StatusUnprocessableEntity, err.Error()
+	case errors.Is(err, instance.ErrBackupBusy):
+		return "backup_busy", http.StatusConflict, err.Error()
+	case errors.Is(err, instance.ErrBackupsDisabled):
+		return "not_implemented", http.StatusNotImplemented, err.Error()
 	case errors.Is(err, render.ErrInvalidParameters):
 		return "invalid_parameters", http.StatusBadRequest, err.Error()
 	case errors.Is(err, errJobsDisabled):

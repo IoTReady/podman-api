@@ -91,6 +91,12 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 	// Migrate enqueues a job; 501 when the store is disabled.
 	mux.Handle("POST /migrate", guard("instances:write", http.HandlerFunc(h.migrate)))
 
+	// Backups: enqueue/list per instance; restore/delete per backup (#66).
+	mux.Handle("POST /hosts/{host}/instances/{template}/{slug}/backup", guard("instances:write", http.HandlerFunc(h.postBackup)))
+	mux.Handle("GET /hosts/{host}/instances/{template}/{slug}/backups", guard("instances:read", http.HandlerFunc(h.listBackups)))
+	mux.Handle("POST /backups/{id}/restore", guard("instances:write", http.HandlerFunc(h.postRestore)))
+	mux.Handle("DELETE /backups/{id}", guard("instances:write", http.HandlerFunc(h.deleteBackup)))
+
 	// Evacuate enqueues a parent job that fans out child migrate jobs; 501 when the store is disabled.
 	mux.Handle("POST /evacuate", guard("instances:write", http.HandlerFunc(h.evacuate)))
 
