@@ -1,12 +1,14 @@
 package ui
 
 import (
+	"errors"
 	"fmt"
 	"html"
 	"net/http"
 	"net/url"
 	"strings"
 
+	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman"
 )
 
@@ -96,9 +98,17 @@ func (u *UI) logsStream(w http.ResponseWriter, r *http.Request) {
 	if container == "" {
 		obs, err := u.cfg.Svc.Get(r.Context(), host, tmpl, slug)
 		if err != nil {
-			http.Error(w, "not found", http.StatusNotFound)
+			if errors.Is(err, instance.ErrInstanceNotFound) ||
+				errors.Is(err, instance.ErrUnknownHost) ||
+				errors.Is(err, instance.ErrUnknownTemplate) {
+				http.Error(w, "not found", http.StatusNotFound)
+			} else {
+				http.Error(w, err.Error(), http.StatusBadGateway)
+			}
 			return
 		}
+		// obs.Containers is []instance.ObservedContainer, not []podman.Container;
+		// resolveContainerSuffix expects the latter, so resolve inline.
 		prefix := tmpl + "-" + slug + "-"
 		for _, c := range obs.Containers {
 			if strings.HasPrefix(c.Name, prefix) {
