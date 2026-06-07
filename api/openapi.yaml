@@ -1157,7 +1157,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
         '501':
-          description: state store or blob store not enabled (-state-db / -backup-dir not set)
+          description: job runner or state store unavailable (e.g. blob store not wired in an embedded deployment); a standard deployment always has backups enabled
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
@@ -1231,7 +1231,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
         '501':
-          description: state store or blob store not enabled (-state-db / -backup-dir not set)
+          description: job runner or state store unavailable (e.g. blob store not wired in an embedded deployment); a standard deployment always has backups enabled
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}

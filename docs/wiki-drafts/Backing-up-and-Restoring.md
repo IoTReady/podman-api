@@ -24,6 +24,10 @@ same stopped moment — a consistent, SQLite-safe snapshot:
 (step 2). Export time is proportional to the total volume data. Live/zero-
 downtime backup is out of scope for the OSS tier.
 
+**Race warning.** Starting the instance manually while a backup job is running
+can capture a live (possibly inconsistent) volume export — let backup jobs
+finish before issuing lifecycle actions.
+
 Parameters, secrets, and domains are **not** captured — the backup is volumes
 only. The container image reference at backup time is recorded as an
 informational hint. Restore re-applies the instance's current spec (whatever

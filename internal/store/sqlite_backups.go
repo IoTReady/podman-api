@@ -14,7 +14,8 @@ func (s *SQLite) CreateBackup(ctx context.Context, b Backup) error {
 	if err != nil {
 		return fmt.Errorf("marshal volumes: %w", err)
 	}
-	if len(b.Volumes) == 0 {
+	if b.Volumes == nil {
+		// Only nil marshals to JSON null; a non-nil empty slice already yields [].
 		vols = []byte("[]")
 	}
 	return s.write(ctx, func() error {
@@ -31,7 +32,8 @@ func (s *SQLite) CompleteBackup(ctx context.Context, id string, vols []BackupVol
 	if err != nil {
 		return false, fmt.Errorf("marshal volumes: %w", err)
 	}
-	if len(vols) == 0 {
+	if vols == nil {
+		// Only nil marshals to JSON null; a non-nil empty slice already yields [].
 		raw = []byte("[]")
 	}
 	return s.casBackupState(ctx, id, BackupComplete, string(raw))

@@ -228,7 +228,7 @@ New sentinels mapped in `internal/api/errors.go`:
 | `ErrBackupNotFound` | 404 | `backup_not_found` |
 | `ErrBackupNotRestorable` (state ≠ `complete`, or blob missing) | 422 | `backup_not_restorable` |
 | `ErrBackupBusy` (delete during in-flight backup **or** restore) | 409 | `backup_busy` |
-| `ErrBackupsDisabled` (no blob store wired) | 501 | `not_implemented` |
+| `ErrBackupsDisabled` (blob store not wired, e.g. embedded without `SetBlobStore`) | 501 | `not_implemented` |
 
 **Amendment:** `ErrBackupBusy` covers both a backup job and a restore job in
 flight (the spec said "restore" only). See the DELETE discussion above.

@@ -163,6 +163,33 @@ func TestBackup_HappyPath(t *testing.T) {
 	assert.Contains(t, steps, "export-volume")
 }
 
+// TestBackup_DegradedInstanceRestarts verifies that an instance in Degraded
+// state (some containers up, some crashed) is treated as running: wasRunning
+// must be true so the instance is restarted after a successful backup rather
+// than left fully stopped, which would be a downgrade from its pre-backup state.
+func TestBackup_DegradedInstanceRestarts(t *testing.T) {
+	svc, f, _, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	// Mutate the seeded pod to Degraded status (one container crashed).
+	p, err := f.PodInspect(ctx, "h1", "pg-a")
+	require.NoError(t, err)
+	p.Status = "Degraded"
+	f.AddPod("h1", p)
+
+	req := newBackupReq()
+	require.NoError(t, svc.Backup(ctx, req, nil))
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	assert.Equal(t, store.BackupComplete, b.State)
+
+	// The instance must be running again — Degraded counts as "was running".
+	pod, err := f.PodInspect(ctx, "h1", "pg-a")
+	require.NoError(t, err)
+	assert.Equal(t, "Running", pod.Status, "Degraded instance must be restarted after backup")
+}
+
 func TestBackup_StoppedInstanceStaysStopped(t *testing.T) {
 	svc, f, _, _ := newBackupSvc(t)
 	ctx := context.Background()

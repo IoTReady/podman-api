@@ -72,7 +72,10 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 	if err != nil {
 		return err
 	}
-	wasRunning := obs.Pod.Status == "Running"
+	// wasRunning gates the post-backup restart. Degraded (some containers up,
+	// some crashed) counts as running: the instance was serving before the
+	// backup, so leaving it fully stopped afterwards would be a downgrade.
+	wasRunning := obs.Pod.Status == "Running" || obs.Pod.Status == "Degraded"
 	image := ""
 	if len(obs.Containers) > 0 {
 		image = obs.Containers[0].Image
@@ -492,6 +495,10 @@ func BackupDeletable(ctx context.Context, js store.JobStore, backupID string) er
 // jobTargetsBackup scans active jobs of the given kind for one whose args
 // carry backupID. Returns true if found. It is the shared inner loop for
 // RestoreInFlight and BackupInFlight.
+//
+// The scan covers at most store.MaxJobLimit (1000) active jobs per state, so a
+// deployment exceeding that limit could theoretically slip the busy gate —
+// accepted at current scale.
 func jobTargetsBackup(ctx context.Context, js store.JobStore, kind, backupID string, unmarshal func([]byte) (string, error)) (bool, error) {
 	for _, st := range []store.JobState{store.JobQueued, store.JobRunning, store.JobReconciling} {
 		jobsList, err := js.ListJobs(ctx, store.JobFilter{State: st, Kind: kind, Limit: store.MaxJobLimit})
