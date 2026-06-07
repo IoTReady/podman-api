@@ -13,7 +13,7 @@ var errReadyTimeout = errors.New("readiness timeout")
 var deployVerifyTimeout = 30 * time.Second
 
 // SetDeployVerifyTimeout configures the readiness wait applied after Apply and
-// Start. No-op for d <= 0. Called once at startup from -deploy-verify-timeout.
+// Start. No-op for d <= 0. Called at startup via -deploy-verify-timeout flag.
 func SetDeployVerifyTimeout(d time.Duration) {
 	if d > 0 {
 		deployVerifyTimeout = d
