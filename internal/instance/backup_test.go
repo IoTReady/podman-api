@@ -16,15 +16,19 @@ import (
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/podman/fake"
+	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
 )
 
 // memBlob is an in-memory BlobStore: committed blobs land in data; aborted
-// writes vanish. PutErr forces Put to fail.
+// writes vanish. PutErr forces Put to fail. WriteErrAfter + WriteErr inject a
+// write failure mid-stream (after WriteErrAfter bytes have been accepted).
 type memBlob struct {
-	mu     sync.Mutex
-	data   map[string][]byte
-	PutErr error
+	mu            sync.Mutex
+	data          map[string][]byte
+	PutErr        error
+	WriteErrAfter int   // 0 = no error injection
+	WriteErr      error // error to return once WriteErrAfter bytes written
 }
 
 func newMemBlob() *memBlob { return &memBlob{data: map[string][]byte{}} }
@@ -37,12 +41,20 @@ func (m *memBlob) Put(_ context.Context, key string) (BlobWriter, error) {
 }
 
 type memBlobWriter struct {
-	m   *memBlob
-	key string
-	buf bytes.Buffer
+	m       *memBlob
+	key     string
+	buf     bytes.Buffer
+	written int
 }
 
-func (w *memBlobWriter) Write(p []byte) (int, error) { return w.buf.Write(p) }
+func (w *memBlobWriter) Write(p []byte) (int, error) {
+	if w.m.WriteErrAfter > 0 && w.m.WriteErr != nil && w.written >= w.m.WriteErrAfter {
+		return 0, w.m.WriteErr
+	}
+	n, err := w.buf.Write(p)
+	w.written += n
+	return n, err
+}
 func (w *memBlobWriter) Commit() error {
 	w.m.mu.Lock()
 	defer w.m.mu.Unlock()
@@ -209,4 +221,91 @@ func TestBackup_NoBlobStore(t *testing.T) {
 	req := newBackupReq()
 	err := svc.Backup(context.Background(), req, nil)
 	require.ErrorIs(t, err, ErrBackupsDisabled)
+}
+
+func TestBackup_BlobWriteFailureMarksFailedRestartsAndCleansBlobs(t *testing.T) {
+	svc, f, _, blob := newBackupSvc(t)
+	ctx := context.Background()
+
+	// Inject a write error after the first byte — forces backupVolume to abort.
+	blob.WriteErrAfter = 1
+	blob.WriteErr = errors.New("disk full")
+
+	req := newBackupReq()
+	err := svc.Backup(ctx, req, nil)
+	require.Error(t, err)
+
+	b, gerr := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, gerr)
+	assert.Equal(t, store.BackupFailed, b.State)
+
+	assert.Equal(t, 0, blob.len(), "aborted blob must not appear in store")
+
+	p, perr := f.PodInspect(ctx, "h1", "pg-a")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status, "instance must be restarted after failure")
+}
+
+// newBackupSvcTwoVols is newBackupSvc extended with a second "logs" volume so
+// tests can exercise multi-volume cleanup paths.
+func newBackupSvcTwoVols(t *testing.T) (*Service, *fake.Fake, *store.Memory, *memBlob) {
+	t.Helper()
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	f := fake.New()
+
+	tmpl := pgTemplate()
+	tmpl.Meta.ID = "pg"
+	// Add a second volume declaration alongside the existing "data" volume.
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "logs", Backup: "none"})
+	svc, mem := newSvcWith(t, f, hosts, tmpl)
+
+	require.NoError(t, mem.PutSpec(context.Background(), store.Spec{
+		Host: "h1", Template: "pg", Slug: "a",
+		Parameters: map[string]any{"slug": "a", "image": "pg:16", "port": 5432, "db": "d", "user": "u"},
+	}))
+
+	f.AddPod("h1", podman.Pod{
+		Name: "pg-a", ID: "pg-a", Status: "Running",
+		Containers: []podman.Container{{Name: "pg-a-db", Image: "pg:16", Status: "Running"}},
+		Labels:     map[string]string{"podman-api/template": "pg", "podman-api/slug": "a"},
+	})
+
+	// Volume pg-a-data has valid tar; pg-a-logs will be made to fail via ExportReader.
+	f.SetVolumeData("h1", "pg-a-data", tarBytes(t, map[string]string{"PG_VERSION": "16", "base/1": "data"}))
+	f.SetVolumeData("h1", "pg-a-logs", tarBytes(t, map[string]string{"app.log": "ok"}))
+
+	blob := newMemBlob()
+	svc.SetBlobStore(blob)
+	return svc, f, mem, blob
+}
+
+func TestBackup_SecondVolumeFailureCleansFirstVolumeBlob(t *testing.T) {
+	svc, f, _, blob := newBackupSvcTwoVols(t)
+	ctx := context.Background()
+
+	boom := errors.New("logs export failed")
+	// ExportReader lets us fail only the second volume by name.
+	f.ExportReader = func(host, name string) io.ReadCloser {
+		if name == "pg-a-logs" {
+			return &midStreamReader{err: boom}
+		}
+		// First volume: serve the real seeded bytes.
+		data := f.VolumeData(host, name)
+		return io.NopCloser(bytes.NewReader(data))
+	}
+
+	req := newBackupReq()
+	err := svc.Backup(ctx, req, nil)
+	require.Error(t, err)
+
+	b, gerr := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, gerr)
+	assert.Equal(t, store.BackupFailed, b.State)
+
+	// The first volume's committed blob must have been cleaned up by DeleteAll.
+	assert.Equal(t, 0, blob.len(), "all blobs including the first volume must be cleaned up")
+
+	p, perr := f.PodInspect(ctx, "h1", "pg-a")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status, "instance must be restarted after failure")
 }

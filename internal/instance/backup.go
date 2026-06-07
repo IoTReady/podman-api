@@ -149,6 +149,15 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 // backupVolume exports one volume, teeing the tar into the blob store and
 // the manifest builder in a single pass. The blob is committed only after a
 // clean EOF + manifest build.
+//
+// Integrity assumption: Go's archive/tar returns a clean io.EOF (not
+// io.ErrUnexpectedEOF) when a stream is truncated on a 512-byte entry
+// boundary, so buildManifest would fingerprint a well-formed-but-short tar
+// without error. The integrity of the committed blob therefore rests on the
+// transport surfacing short reads as errors — which Go's net/http body does
+// for all three framing modes (Content-Length, chunked, connection-close) when
+// a connection drops mid-transfer. A truncated tar emitted by podman itself
+// would not be detected: no expected-size oracle exists on this path.
 func (s *Service) backupVolume(ctx context.Context, req BackupRequest, name string) (store.BackupVolume, error) {
 	rc, err := s.client.VolumeExport(ctx, req.Host, name)
 	if err != nil {
