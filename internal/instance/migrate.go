@@ -363,23 +363,13 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 // waitRunning polls the dest pod until Running, bounded by verifyTimeout and the
 // caller's context.
 func (s *Service) waitRunning(ctx context.Context, host, tmpl, slug string) error {
-	deadline := time.Now().Add(verifyTimeout)
-	ticker := time.NewTicker(verifyInterval)
-	defer ticker.Stop()
-	for {
-		p, err := s.client.PodInspect(ctx, host, podName(tmpl, slug))
-		if err == nil && podReady(p) {
-			return nil
-		}
-		if time.Now().After(deadline) {
+	if err := s.waitReady(ctx, host, tmpl, slug, verifyTimeout); err != nil {
+		if errors.Is(err, errReadyTimeout) {
 			return fmt.Errorf("pod %s not running within %s", podName(tmpl, slug), verifyTimeout)
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		}
+		return err
 	}
+	return nil
 }
 
 // podReady reports whether the pod is up and serving: the pod is Running, every
