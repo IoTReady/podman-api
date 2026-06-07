@@ -11,10 +11,12 @@ import (
 type Observed struct {
 	Template   string              `json:"template"`
 	Slug       string              `json:"slug"`
+	Ready      bool                `json:"ready"`
 	Pod        ObservedPod         `json:"pod"`
 	Containers []ObservedContainer `json:"containers"`
 	Volumes    []ObservedVolume    `json:"volumes,omitempty"`
 	EnvSummary map[string]string   `json:"env_summary,omitempty"`
+	Warnings   []string            `json:"warnings,omitempty"`
 }
 
 type ObservedPod struct {
@@ -28,6 +30,7 @@ type ObservedContainer struct {
 	Image        string                `json:"image"`
 	ImageTag     string                `json:"image_tag,omitempty"`
 	Status       string                `json:"status"`
+	Health       string                `json:"health,omitempty"`
 	StartedAt    time.Time             `json:"started_at,omitempty"`
 	RestartCount int                   `json:"restart_count"`
 	Ports        []ObservedPortMapping `json:"ports,omitempty"`
@@ -56,10 +59,12 @@ func Normalize(p podman.Pod, template, slug string, vols []podman.Volume, secret
 		Slug:     slug,
 		Pod:      ObservedPod{ID: p.ID, Status: p.Status, Created: p.Created},
 	}
+	ready := true
 	for _, c := range p.Containers {
 		oc := ObservedContainer{
 			Name: c.Name, Image: c.Image, ImageTag: c.ImageTag,
-			Status: c.Status, StartedAt: c.StartedAt, RestartCount: c.RestartCount,
+			Status: c.Status, Health: c.Health,
+			StartedAt: c.StartedAt, RestartCount: c.RestartCount,
 		}
 		for _, port := range c.Ports {
 			oc.Ports = append(oc.Ports, ObservedPortMapping{
@@ -68,7 +73,11 @@ func Normalize(p podman.Pod, template, slug string, vols []podman.Volume, secret
 			})
 		}
 		out.Containers = append(out.Containers, oc)
+		if c.Health != "" && c.Health != "healthy" {
+			ready = false
+		}
 	}
+	out.Ready = ready
 	for _, v := range vols {
 		out.Volumes = append(out.Volumes, ObservedVolume{Name: v.Name, SizeBytes: v.SizeBytes})
 	}
