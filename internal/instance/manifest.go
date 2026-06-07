@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"io"
 	"path"
 	"sort"
@@ -21,6 +22,28 @@ type fileInfo struct {
 
 // Manifest fingerprints a volume's tar export, keyed by cleaned path.
 type Manifest map[string]fileInfo
+
+// fileInfoJSON is fileInfo's serialized form, used to persist a backup's
+// manifest in the backups table (#66). Field set mirrors fileInfo exactly.
+type fileInfoJSON struct {
+	Type   byte   `json:"type"`
+	Size   int64  `json:"size,omitempty"`
+	Sha256 string `json:"sha256,omitempty"`
+	Link   string `json:"link,omitempty"`
+}
+
+func (f fileInfo) MarshalJSON() ([]byte, error) {
+	return json.Marshal(fileInfoJSON{Type: f.typ, Size: f.size, Sha256: f.sha256, Link: f.link})
+}
+
+func (f *fileInfo) UnmarshalJSON(b []byte) error {
+	var j fileInfoJSON
+	if err := json.Unmarshal(b, &j); err != nil {
+		return err
+	}
+	*f = fileInfo{typ: j.Type, size: j.Size, sha256: j.Sha256, link: j.Link}
+	return nil
+}
 
 // buildManifest parses an uncompressed tar stream (as produced by VolumeExport)
 // into a Manifest. It always drains r to EOF — even after a parse error — so the
