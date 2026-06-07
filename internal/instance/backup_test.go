@@ -535,6 +535,96 @@ func TestRestore_ImportFailureKeepsSpecRetryable(t *testing.T) {
 	assert.Equal(t, "Running", p.Status)
 }
 
+// TestReconcileBackup_RowNeverCreated verifies that a BackupID with no row
+// resolves immediately as terminal failed — the job died before CreateBackup,
+// so there is nothing to clean up.
+func TestReconcileBackup_RowNeverCreated(t *testing.T) {
+	svc, _, _, _ := newBackupSvc(t)
+	req := BackupRequest{BackupID: store.NewBackupID(), Host: "h1", Template: "pg", Slug: "a"}
+
+	resolved, ok, msg, err := svc.ReconcileBackup(context.Background(), req, nil)
+
+	require.NoError(t, err)
+	assert.True(t, resolved)
+	assert.False(t, ok)
+	assert.Contains(t, msg, "before the backup row was created")
+}
+
+// TestReconcileBackup_HostGoneResolvesTerminal verifies that when the host is
+// removed from config after a backup row is created, ReconcileBackup marks the
+// row failed (store-local) and returns a terminal result rather than retrying
+// forever. Without the host guard, Start → lookup returns ErrUnknownHost,
+// which the old else-branch would propagate as a non-nil err, causing the
+// runner to retry every sweep in an infinite loop.
+func TestReconcileBackup_HostGoneResolvesTerminal(t *testing.T) {
+	svc, _, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	id := store.NewBackupID()
+	require.NoError(t, mem.CreateBackup(ctx, store.Backup{
+		ID: id, Host: "h1", Template: "pg", Slug: "a", State: store.BackupCreating,
+	}))
+
+	// Remove all hosts from config so the guard triggers.
+	svc.SetHosts(nil)
+
+	req := BackupRequest{BackupID: id, Host: "h1", Template: "pg", Slug: "a"}
+	resolved, ok, msg, err := svc.ReconcileBackup(ctx, req, nil)
+
+	require.NoError(t, err)
+	assert.True(t, resolved)
+	assert.False(t, ok)
+	assert.Contains(t, msg, "no longer configured")
+
+	// Row must be marked failed even though the host is gone (FailBackup is
+	// store-local and runs before the host guard).
+	b, gerr := mem.GetBackup(ctx, id)
+	require.NoError(t, gerr)
+	assert.Equal(t, store.BackupFailed, b.State)
+}
+
+// TestReconcileBackup_InstanceGoneSkipsRestart verifies that when the pod has
+// been removed from the host, ReconcileBackup still resolves terminally (row
+// failed, blobs cleaned) without returning an error — the "instance gone" path
+// is intentional and not a retryable fault.
+func TestReconcileBackup_InstanceGoneSkipsRestart(t *testing.T) {
+	svc, f, mem, blob := newBackupSvc(t)
+	ctx := context.Background()
+
+	id := store.NewBackupID()
+	require.NoError(t, mem.CreateBackup(ctx, store.Backup{
+		ID: id, Host: "h1", Template: "pg", Slug: "a", State: store.BackupCreating,
+	}))
+
+	// Plant a stray blob so we can verify DeleteAll ran.
+	key := "h1/pg/a/" + id + "/pg-a-data.tar"
+	w, err := blob.Put(ctx, key)
+	require.NoError(t, err)
+	_, err = w.Write([]byte("partial"))
+	require.NoError(t, err)
+	require.NoError(t, w.Commit())
+
+	// Remove the pod so Start returns ErrInstanceNotFound.
+	require.NoError(t, f.PodRemove(ctx, "h1", "pg-a", false))
+
+	var steps []string
+	req := BackupRequest{BackupID: id, Host: "h1", Template: "pg", Slug: "a"}
+	resolved, ok, _, err := svc.ReconcileBackup(ctx, req, recordSteps(&steps))
+
+	require.NoError(t, err)
+	assert.True(t, resolved)
+	assert.False(t, ok)
+	assert.Contains(t, steps, "reconcile-restart-skipped")
+
+	// Partial blob must be cleaned up.
+	assert.Equal(t, 0, blob.len())
+
+	// Row must be marked failed.
+	b, gerr := mem.GetBackup(ctx, id)
+	require.NoError(t, gerr)
+	assert.Equal(t, store.BackupFailed, b.State)
+}
+
 // TestRestore_VerifyMismatchKeepsSpec extends TestRestore_VerifyMismatchFails
 // to also assert that the spec row survives after an ErrVolumeIntegrity
 // failure so the restore is retryable.

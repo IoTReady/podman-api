@@ -44,10 +44,11 @@ func TestReconciler_MarksCreatingFailedCleansBlobsAndRestarts(t *testing.T) {
 		BackupID: id, Host: "h1", Template: "postgres", Slug: "a",
 	})
 	require.NoError(t, err)
-	job := store.Job{ID: "j1", Kind: "backup", Args: args}
+	job, err := mem.Enqueue(ctx, "backup", args, "")
+	require.NoError(t, err)
 
 	r := &Reconciler{Svc: svc}
-	state, _, resolved, rerr := r.Reconcile(ctx, job, jobs.NewJobContext(mem, "j1"))
+	state, _, resolved, rerr := r.Reconcile(ctx, job, jobs.NewJobContext(mem, job.ID))
 	require.NoError(t, rerr)
 	assert.True(t, resolved)
 	assert.Equal(t, store.JobFailed, state)
@@ -80,10 +81,11 @@ func TestReconciler_CompletedRowResolvesSucceeded(t *testing.T) {
 		BackupID: id, Host: "h1", Template: "postgres", Slug: "a",
 	})
 	require.NoError(t, err)
-	job := store.Job{ID: "j1", Kind: "backup", Args: args}
+	job, err := mem.Enqueue(ctx, "backup", args, "")
+	require.NoError(t, err)
 
 	r := &Reconciler{Svc: svc}
-	state, _, resolved, rerr := r.Reconcile(ctx, job, jobs.NewJobContext(mem, "j1"))
+	state, _, resolved, rerr := r.Reconcile(ctx, job, jobs.NewJobContext(mem, job.ID))
 	require.NoError(t, rerr)
 	assert.True(t, resolved)
 	assert.Equal(t, store.JobSucceeded, state)

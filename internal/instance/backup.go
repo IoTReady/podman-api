@@ -400,6 +400,12 @@ func (s *Service) DeleteBackup(ctx context.Context, id string) error {
 // (ok=true) when the backup actually completed, (ok=false, message) when it
 // was failed. resolved=false only when the host is unreachable and the
 // restart attempt was inconclusive.
+//
+// Unlike Backup, which only restarts if the instance was running before the
+// snapshot began, ReconcileBackup always attempts to restart: post-crash the
+// prior run-state is unknowable, so reconcile errs on the side of
+// availability. A deliberately-stopped instance interrupted mid-backup may
+// therefore come back running.
 func (s *Service) ReconcileBackup(ctx context.Context, req BackupRequest, step func(step, detail string)) (resolved, ok bool, message string, err error) {
 	if step == nil {
 		step = func(string, string) {}
@@ -421,16 +427,34 @@ func (s *Service) ReconcileBackup(ctx context.Context, req BackupRequest, step f
 		// Work finished; only the job's terminal write was lost.
 		return true, true, "", nil
 	}
-	if _, ferr := s.store.FailBackup(ctx, req.BackupID); ferr != nil {
+
+	// Mutations run on a detached context so a sweep/shutdown cancellation
+	// cannot strand a half-finished compensation, mirroring Backup's own
+	// fail/restart helpers.
+	dctx := context.WithoutCancel(ctx)
+
+	if _, ferr := s.store.FailBackup(dctx, req.BackupID); ferr != nil {
 		return false, false, "", ferr
 	}
 	step("reconcile-mark-failed", req.BackupID)
-	if derr := s.blobs.DeleteAll(ctx, backupBlobPrefix(req.Host, req.Template, req.Slug, req.BackupID)); derr != nil {
+	if derr := s.blobs.DeleteAll(dctx, backupBlobPrefix(req.Host, req.Template, req.Slug, req.BackupID)); derr != nil {
 		step("reconcile-cleanup-blobs-failed", derr.Error())
 	}
+
+	// Guard before Start: if the host left the config, Start returns
+	// ErrUnknownHost (via lookup), which is not ErrInstanceNotFound, so
+	// without this check the else-branch below would return a non-nil err and
+	// the runner would retry every sweep forever — the same infinite-retry-loop
+	// ReconcileMigrate's host guards prevent.
+	// FailBackup and DeleteAll above are store-local / API-server-local and
+	// succeed regardless of host reachability, so they run unconditionally.
+	if _, ok := s.host(req.Host); !ok {
+		return true, false, "host " + req.Host + " is no longer configured; manual cleanup may be required", nil
+	}
+
 	// Restart best-effort: Start of a running pod is harmless; an unreachable
 	// host leaves the job reconciling for the next sweep.
-	if serr := s.Start(ctx, req.Host, req.Template, req.Slug); serr != nil {
+	if serr := s.Start(dctx, req.Host, req.Template, req.Slug); serr != nil {
 		if errors.Is(serr, ErrInstanceNotFound) || errors.Is(serr, podman.ErrNotFound) {
 			step("reconcile-restart-skipped", "instance gone")
 		} else {
