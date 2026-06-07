@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 
 	"github.com/iotready/podman-api/internal/store"
 )
@@ -195,4 +196,195 @@ func (c *countingWriter) Write(p []byte) (int, error) {
 	n, err := c.w.Write(p)
 	c.n += int64(n)
 	return n, err
+}
+
+// RestoreRequest is the restore job's args.
+type RestoreRequest struct {
+	BackupID string `json:"backup_id"`
+}
+
+// CheckRestorable runs the synchronous validation the POST handler needs and
+// returns the backup row: row exists and is complete, host known and not
+// draining, instance (spec) still present. The drain check is upfront so a
+// draining host can't fail the job after teardown.
+func (s *Service) CheckRestorable(ctx context.Context, backupID string) (store.Backup, error) {
+	if s.blobs == nil {
+		return store.Backup{}, ErrBackupsDisabled
+	}
+	b, err := s.store.GetBackup(ctx, backupID)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return store.Backup{}, fmt.Errorf("%w: %s", ErrBackupNotFound, backupID)
+		}
+		return store.Backup{}, err
+	}
+	if b.State != store.BackupComplete {
+		return store.Backup{}, fmt.Errorf("%w: state %s", ErrBackupNotRestorable, b.State)
+	}
+	hostCfg, ok := s.host(b.Host)
+	if !ok {
+		return store.Backup{}, ErrUnknownHost
+	}
+	if hostCfg.Drain {
+		return store.Backup{}, ErrHostDraining
+	}
+	if _, err := s.store.GetSpec(ctx, b.Host, b.Template, b.Slug); err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return store.Backup{}, ErrInstanceNotFound
+		}
+		return store.Backup{}, err
+	}
+	return b, nil
+}
+
+// Restore replaces an instance's volumes in place from a backup: stop, tear
+// down containers + volumes, recreate volumes from blobs, verify each against
+// the stored manifest, re-apply the CURRENT spec, wait healthy. There is no
+// rollback: a failure leaves the instance stopped with the job error naming
+// the failed step (that is why each volume is verified before declaring
+// success). step is a best-effort progress callback (may be nil).
+func (s *Service) Restore(ctx context.Context, req RestoreRequest, step func(step, detail string)) error {
+	if step == nil {
+		step = func(string, string) {}
+	}
+	b, err := s.CheckRestorable(ctx, req.BackupID)
+	if err != nil {
+		return err
+	}
+
+	lk := s.migrateLock(b.Template, b.Slug)
+	lk.Lock()
+	defer lk.Unlock()
+
+	// Re-check under the lock (a concurrent delete may have raced us).
+	b, err = s.CheckRestorable(ctx, req.BackupID)
+	if err != nil {
+		return err
+	}
+	spec, err := s.store.GetSpec(ctx, b.Host, b.Template, b.Slug)
+	if err != nil {
+		return err
+	}
+	step("load", b.Host+"/"+b.Template+"/"+b.Slug)
+
+	// Teardown: pod + volumes (a referenced volume can't be removed). Keep
+	// per-instance secrets — Apply below re-pushes them from the spec anyway,
+	// and host-scoped secrets must survive. Delete also reconciles away the
+	// spec row; Apply re-persists it. Tolerate an already-gone pod.
+	if err := s.Delete(ctx, b.Host, b.Template, b.Slug, DeleteOptions{PruneVolumes: true}); err != nil && !errors.Is(err, ErrInstanceNotFound) {
+		return fmt.Errorf("teardown: %w", err)
+	}
+	step("teardown", b.Host)
+
+	for _, bv := range b.Volumes {
+		if err := s.restoreVolume(ctx, b, bv); err != nil {
+			return fmt.Errorf("restore volume %q: %w", bv.Name, err)
+		}
+		step("restore-volume", bv.Name)
+	}
+
+	if err := s.Apply(ctx, b.Host, ApplyRequest{
+		Template: b.Template, Slug: b.Slug,
+		Parameters: spec.Parameters, Secrets: spec.Secrets, Domains: spec.Domains,
+	}, ApplyOptions{Replace: false}); err != nil {
+		return fmt.Errorf("apply: %w", err)
+	}
+	step("apply", b.Host)
+
+	if err := s.waitRunning(ctx, b.Host, b.Template, b.Slug); err != nil {
+		return fmt.Errorf("verify: %w", err)
+	}
+	step("verify", b.Host)
+	return nil
+}
+
+// restoreVolume recreates one volume from its blob and verifies the imported
+// content against the manifest recorded at backup time (migrate's verify).
+func (s *Service) restoreVolume(ctx context.Context, b store.Backup, bv store.BackupVolume) error {
+	if err := s.client.VolumeCreate(ctx, b.Host, bv.Name); err != nil {
+		return fmt.Errorf("create: %w", err)
+	}
+	rc, err := s.blobs.Get(ctx, backupBlobKey(b.Host, b.Template, b.Slug, b.ID, bv.Name))
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("%w: blob for volume %q missing", ErrBackupNotRestorable, bv.Name)
+		}
+		return fmt.Errorf("open blob: %w", err)
+	}
+	defer rc.Close()
+	if err := s.client.VolumeImport(ctx, b.Host, bv.Name, rc); err != nil {
+		return fmt.Errorf("import: %w", err)
+	}
+
+	var want Manifest
+	if err := json.Unmarshal(bv.Manifest, &want); err != nil {
+		return fmt.Errorf("stored manifest corrupt: %w", err)
+	}
+	got, err := s.volumeManifest(ctx, b.Host, bv.Name)
+	if err != nil {
+		return fmt.Errorf("re-export for verify: %w", err)
+	}
+	if diff, ok := want.firstDiff(got); !ok {
+		return fmt.Errorf("%w: volume %q differs at %q", ErrVolumeIntegrity, bv.Name, diff)
+	}
+	return nil
+}
+
+// ListBackups returns an instance's backups, newest first.
+func (s *Service) ListBackups(ctx context.Context, host, tmpl, slug string, limit int) ([]store.Backup, error) {
+	if _, ok := s.host(host); !ok {
+		return nil, ErrUnknownHost
+	}
+	return s.store.ListBackups(ctx, host, tmpl, slug, limit)
+}
+
+// GetBackup returns one backup row, mapping absence to ErrBackupNotFound.
+func (s *Service) GetBackup(ctx context.Context, id string) (store.Backup, error) {
+	b, err := s.store.GetBackup(ctx, id)
+	if errors.Is(err, store.ErrNotFound) {
+		return store.Backup{}, fmt.Errorf("%w: %s", ErrBackupNotFound, id)
+	}
+	return b, err
+}
+
+// DeleteBackup removes a backup's blobs, then its row — in that order, so a
+// crash between the two leaves a harmless blob-less row rather than orphaned
+// blobs. The caller (API/UI) must check RestoreInFlight first.
+func (s *Service) DeleteBackup(ctx context.Context, id string) error {
+	if s.blobs == nil {
+		return ErrBackupsDisabled
+	}
+	b, err := s.GetBackup(ctx, id)
+	if err != nil {
+		return err
+	}
+	if err := s.blobs.DeleteAll(ctx, backupBlobPrefix(b.Host, b.Template, b.Slug, b.ID)); err != nil {
+		return fmt.Errorf("delete blobs: %w", err)
+	}
+	if err := s.store.DeleteBackup(ctx, id); err != nil && !errors.Is(err, store.ErrNotFound) {
+		return err
+	}
+	return nil
+}
+
+// RestoreInFlight reports whether any active (queued/running/reconciling)
+// restore job targets backupID. Shared by the API and UI delete handlers to
+// refuse deleting a backup mid-restore (ErrBackupBusy).
+func RestoreInFlight(ctx context.Context, js store.JobStore, backupID string) (bool, error) {
+	for _, st := range []store.JobState{store.JobQueued, store.JobRunning, store.JobReconciling} {
+		jobsList, err := js.ListJobs(ctx, store.JobFilter{State: st, Kind: "restore", Limit: store.MaxJobLimit})
+		if err != nil {
+			return false, err
+		}
+		for _, j := range jobsList {
+			var req RestoreRequest
+			if err := json.Unmarshal(j.Args, &req); err != nil {
+				continue
+			}
+			if req.BackupID == backupID {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
