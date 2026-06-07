@@ -1,6 +1,8 @@
 package ui
 
 import (
+	"fmt"
+	"html"
 	"net/http"
 	"net/url"
 	"strings"
@@ -85,4 +87,55 @@ func (u *UI) logsPage(w http.ResponseWriter, r *http.Request) {
 		"Host": host, "Template": tmpl, "Slug": slug,
 		"Container": container, "Containers": containers, "Follow": false, "Lines": lines,
 	}))
+}
+
+func (u *UI) logsStream(w http.ResponseWriter, r *http.Request) {
+	host, tmpl, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
+
+	container := r.URL.Query().Get("container")
+	if container == "" {
+		obs, err := u.cfg.Svc.Get(r.Context(), host, tmpl, slug)
+		if err != nil {
+			http.Error(w, "not found", http.StatusNotFound)
+			return
+		}
+		prefix := tmpl + "-" + slug + "-"
+		for _, c := range obs.Containers {
+			if strings.HasPrefix(c.Name, prefix) {
+				container = strings.TrimPrefix(c.Name, prefix)
+				break
+			}
+		}
+		if container == "" {
+			http.Error(w, "no containers", http.StatusBadRequest)
+			return
+		}
+	}
+
+	ch, err := u.cfg.Svc.Logs(r.Context(), host, tmpl, slug, container, podman.LogOptions{Follow: true, Tail: 100})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.WriteHeader(http.StatusOK)
+
+	flusher, _ := w.(http.Flusher)
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case line, ok := <-ch:
+			if !ok {
+				return
+			}
+			fmt.Fprintf(w, "event: log\ndata: <span class=\"line\">%s</span>\n\n",
+				html.EscapeString(line.Line))
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}
 }

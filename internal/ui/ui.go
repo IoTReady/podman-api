@@ -95,6 +95,7 @@ func (u *UI) Handler() http.Handler {
 	mux.Handle("GET /ui/hosts/{host}/instances/{template}/{slug}/secrets", guard(u.secretsForm))
 	mux.Handle("POST /ui/hosts/{host}/instances/{template}/{slug}/secrets", guardW(u.secretsRotate))
 	mux.Handle("GET /ui/hosts/{host}/instances/{template}/{slug}/logs", guard(u.logsPage))
+	mux.Handle("GET /ui/hosts/{host}/instances/{template}/{slug}/logs/stream", guard(u.logsStream))
 	mux.Handle("POST /ui/hosts/{host}/instances/{template}/{slug}/backup", guardW(u.backupNow))
 	mux.Handle("POST /ui/backups/{id}/restore", guardW(u.restoreBackup))
 	mux.Handle("POST /ui/backups/{id}/delete", guardW(u.deleteBackup))

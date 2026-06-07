@@ -1,11 +1,17 @@
 package ui
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/iotready/podman-api/internal/config"
+	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/podman/fake"
+	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 func TestResolveContainerSuffix(t *testing.T) {
@@ -83,5 +89,49 @@ func TestLogsPageNotFoundReturns404(t *testing.T) {
 	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/ghost/logs?container=db")
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404 for unknown slug", w.Code)
+	}
+}
+
+func TestLogsStreamSSEHeaders(t *testing.T) {
+	u := uiWithSeededInstance(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/main/logs/stream?container=db")
+	if ct := w.Header().Get("Content-Type"); ct != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", ct)
+	}
+	if !strings.Contains(w.Body.String(), "event: log") {
+		t.Error("SSE stream should contain 'event: log' lines")
+	}
+}
+
+func TestLogsStreamHTMLEscapesLogLines(t *testing.T) {
+	fc := fake.New()
+	hosts := []config.Host{{ID: "edge-1"}}
+	fc.AddPod("edge-1", podman.Pod{
+		Name: "postgres-main",
+		Containers: []podman.Container{
+			{Name: "postgres-main-db", Image: "postgres:16", Status: "Running"},
+		},
+	})
+	fc.LogLines = []podman.LogLine{{Container: "postgres-main-db", Line: `<script>alert(1)</script>`}}
+	mem := store.NewMemory()
+	_ = mem.PutTemplate(context.Background(), store.Template{Meta: render.Meta{ID: "postgres"}})
+	svc := instance.NewService(fc, hosts)
+	svc.SetStore(mem)
+	hash, _ := config.HashToken("pw")
+	u, err := New(Config{
+		Svc:  svc,
+		Auth: NewOperatorAuthenticator(config.Operator{Username: "op", PasswordHash: hash}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/main/logs/stream?container=db")
+	body := w.Body.String()
+	if strings.Contains(body, "<script>") {
+		t.Error("log line must be HTML-escaped; raw <script> tag found in SSE output")
+	}
+	if !strings.Contains(body, "&lt;script&gt;") {
+		t.Error("log line should appear as HTML-escaped &lt;script&gt; in SSE output")
 	}
 }
