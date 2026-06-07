@@ -375,7 +375,7 @@ func (s *Service) GetBackup(ctx context.Context, id string) (store.Backup, error
 
 // DeleteBackup removes a backup's blobs, then its row — in that order, so a
 // crash between the two leaves a harmless blob-less row rather than orphaned
-// blobs. The caller (API/UI) must check RestoreInFlight first.
+// blobs. Callers must check BackupDeletable first.
 func (s *Service) DeleteBackup(ctx context.Context, id string) error {
 	if s.blobs == nil {
 		return ErrBackupsDisabled
@@ -464,6 +464,29 @@ func (s *Service) ReconcileBackup(ctx context.Context, req BackupRequest, step f
 		step("reconcile-restart", req.Host)
 	}
 	return true, false, "backup interrupted by daemon restart; instance restarted", nil
+}
+
+// BackupDeletable checks whether a backup is safe to delete: returns nil if
+// neither a backup nor a restore job is active for it, ErrBackupBusy if one
+// is. When js is nil (jobs disabled) the backup is always considered deletable.
+// Callers must invoke this before Service.DeleteBackup.
+func BackupDeletable(ctx context.Context, js store.JobStore, backupID string) error {
+	if js == nil {
+		return nil
+	}
+	for _, check := range []func(context.Context, store.JobStore, string) (bool, error){
+		RestoreInFlight,
+		BackupInFlight,
+	} {
+		busy, err := check(ctx, js, backupID)
+		if err != nil {
+			return err
+		}
+		if busy {
+			return ErrBackupBusy
+		}
+	}
+	return nil
 }
 
 // jobTargetsBackup scans active jobs of the given kind for one whose args

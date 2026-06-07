@@ -1,7 +1,6 @@
 package api
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -129,21 +128,9 @@ func (h *handlers) postRestore(w http.ResponseWriter, r *http.Request) {
 // 409 while a backup or restore of it is in flight.
 func (h *handlers) deleteBackup(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if h.jobs != nil {
-		for _, check := range []func(context.Context, store.JobStore, string) (bool, error){
-			instance.RestoreInFlight,
-			instance.BackupInFlight,
-		} {
-			busy, err := check(r.Context(), h.jobs, id)
-			if err != nil {
-				WriteError(w, err)
-				return
-			}
-			if busy {
-				WriteError(w, instance.ErrBackupBusy)
-				return
-			}
-		}
+	if err := instance.BackupDeletable(r.Context(), h.jobs, id); err != nil {
+		WriteError(w, err)
+		return
 	}
 	if err := h.svc.DeleteBackup(r.Context(), id); err != nil {
 		WriteError(w, err)

@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"context"
 	"encoding/json"
 	"net/http"
 
@@ -62,6 +61,10 @@ func (u *UI) restoreBackup(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	b, err := u.cfg.Svc.CheckRestorable(ctx, id)
 	if err != nil {
+		// CheckRestorable failures use the bare error page: the backup row may
+		// not exist or isn't returned on error paths, so we have no host/template/slug
+		// to re-render the instance detail (unlike deleteBackup, which fetches the
+		// row first).
 		u.renderError(w, r, err)
 		return
 	}
@@ -87,18 +90,9 @@ func (u *UI) deleteBackup(w http.ResponseWriter, r *http.Request) {
 		u.renderError(w, r, err)
 		return
 	}
-	if u.cfg.Jobs != nil {
-		for _, inFlight := range []func(context.Context, store.JobStore, string) (bool, error){instance.RestoreInFlight, instance.BackupInFlight} {
-			busy, berr := inFlight(ctx, u.cfg.Jobs, id)
-			if berr != nil {
-				u.renderError(w, r, berr)
-				return
-			}
-			if busy {
-				u.renderInstanceActionError(w, r, b.Host, b.Template, b.Slug, instance.ErrBackupBusy)
-				return
-			}
-		}
+	if err := instance.BackupDeletable(ctx, u.cfg.Jobs, id); err != nil {
+		u.renderInstanceActionError(w, r, b.Host, b.Template, b.Slug, err)
+		return
 	}
 	if err := u.cfg.Svc.DeleteBackup(ctx, id); err != nil {
 		u.renderInstanceActionError(w, r, b.Host, b.Template, b.Slug, err)

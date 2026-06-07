@@ -214,6 +214,9 @@ func TestUI_DeleteBusyShowsError(t *testing.T) {
 	}
 
 	w := authedAction(t, u, "/ui/backups/"+id+"/delete")
+	if w.Code != http.StatusConflict {
+		t.Errorf("status = %d, want %d (Conflict)", w.Code, http.StatusConflict)
+	}
 	if !strings.Contains(w.Body.String(), instance.ErrBackupBusy.Error()) {
 		t.Errorf("delete of a busy backup should surface the busy error\n%s", w.Body.String())
 	}
