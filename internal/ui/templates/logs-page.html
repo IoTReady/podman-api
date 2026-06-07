@@ -1,0 +1,47 @@
+{{define "logs-page"}}
+<div class="inst-head">
+  <strong>{{.Template}} / {{.Slug}}</strong> — Logs
+  <a class="pure-button"
+     href="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}"
+     hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}"
+     hx-target="#main" hx-push-url="true">← Instance</a>
+</div>
+<div class="log-controls">
+  <select name="container"
+          hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs"
+          hx-target="#main" hx-push-url="true"
+          hx-trigger="change" hx-include="[name='follow']">
+    {{range .Containers}}
+    <option value="{{.Suffix}}" {{if eq .Suffix $.Container}}selected{{end}}>{{.Name}}</option>
+    {{end}}
+  </select>
+  <input type="hidden" name="follow" value="{{.Follow}}">
+  {{if .Follow}}
+  <button hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs?container={{.Container}}&follow=false"
+          hx-target="#main" hx-push-url="true">Pause</button>
+  {{else}}
+  <button hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs?container={{.Container}}&follow=true"
+          hx-target="#main" hx-push-url="true">Follow</button>
+  {{end}}
+</div>
+{{if .Follow}}
+<script src="/ui/static/htmx-ext-sse.min.js"></script>
+<pre id="log-lines"
+     hx-ext="sse"
+     sse-connect="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs/stream?container={{.Container}}"
+     sse-swap="log"
+     hx-swap="beforeend"></pre>
+<script>
+(function(){
+  var pre = document.getElementById('log-lines');
+  document.body.addEventListener('htmx:sseMessage', function() {
+    while (pre.children.length > 1000) { pre.removeChild(pre.firstChild); }
+    pre.scrollTop = pre.scrollHeight;
+  });
+})();
+</script>
+{{else}}
+<pre id="log-lines">{{range .Lines}}{{.}}
+{{end}}</pre>
+{{end}}
+{{end}}

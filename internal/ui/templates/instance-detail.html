@@ -33,6 +33,8 @@
 {{end}}
 <div class="label">ENV</div>
 {{range $k, $v := .Inst.EnvSummary}}<div>{{$k}}={{$v}}</div>{{end}}
-<button hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/logs" hx-target="#logs">View logs</button>
-<pre id="logs"></pre>
+<a class="pure-button"
+   href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/logs?follow=true"
+   hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/logs?follow=true"
+   hx-target="#main" hx-push-url="true">Logs</a>
 {{end}}

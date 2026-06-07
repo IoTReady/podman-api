@@ -3,10 +3,8 @@ package ui
 import (
 	"context"
 	"net/http"
-	"strings"
 
 	"github.com/iotready/podman-api/internal/instance"
-	"github.com/iotready/podman-api/internal/podman"
 )
 
 // instanceView builds the instance-detail render data. Upgrade is always
@@ -98,47 +96,4 @@ func (u *UI) lifecycle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(ctx, host, obs)))
-}
-
-// logsTail renders the last N log lines of one container as static text. The
-// container is taken from the ?container= query (a name suffix), defaulting to
-// the instance's first container. Service.Logs caps output server-side via
-// LogOptions.Tail; the drain is bounded by that and is safe for a static render.
-func (u *UI) logsTail(w http.ResponseWriter, r *http.Request) {
-	host, tmpl, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
-
-	container := r.URL.Query().Get("container")
-	if container == "" {
-		obs, err := u.cfg.Svc.Get(r.Context(), host, tmpl, slug)
-		if err != nil {
-			u.renderError(w, r, err)
-			return
-		}
-		// Service.Logs reconstructs the container name as "<tmpl>-<slug>-<arg>";
-		// Observed carries the full container name. Pick the first container whose
-		// name actually carries that prefix (skipping any infra/pause or renamed
-		// container) and strip it to recover the suffix Logs expects.
-		prefix := tmpl + "-" + slug + "-"
-		for _, c := range obs.Containers {
-			if strings.HasPrefix(c.Name, prefix) {
-				container = strings.TrimPrefix(c.Name, prefix)
-				break
-			}
-		}
-		if container == "" {
-			u.render(w, r, http.StatusOK, "logs", u.pageData(map[string]any{"Host": host, "Template": tmpl, "Slug": slug, "Lines": nil}))
-			return
-		}
-	}
-
-	ch, err := u.cfg.Svc.Logs(r.Context(), host, tmpl, slug, container, podman.LogOptions{Tail: 200})
-	if err != nil {
-		u.renderError(w, r, err)
-		return
-	}
-	var lines []string
-	for ln := range ch {
-		lines = append(lines, ln.Line)
-	}
-	u.render(w, r, http.StatusOK, "logs", u.pageData(map[string]any{"Host": host, "Template": tmpl, "Slug": slug, "Lines": lines}))
 }

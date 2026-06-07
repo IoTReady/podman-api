@@ -121,17 +121,6 @@ func TestInstanceDetailNotFoundIs404(t *testing.T) {
 	}
 }
 
-func TestLogsTailRendersLines(t *testing.T) {
-	u := uiWithSeededInstance(t)
-	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/main/logs")
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200", w.Code)
-	}
-	if !strings.Contains(w.Body.String(), "database system is ready") {
-		t.Error("logs view should show the seeded log line")
-	}
-}
-
 func TestInstanceDetailRendersSeededInstance(t *testing.T) {
 	u := uiWithSeededInstance(t)
 	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/main")
