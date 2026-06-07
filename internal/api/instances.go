@@ -66,11 +66,7 @@ func (h *handlers) createInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts := instance.ApplyOptions{Replace: false, SkipPull: queryBool(r, "skip_pull")}
-	if err := h.svc.Apply(r.Context(), host, req, opts); err != nil {
-		WriteError(w, err)
-		return
-	}
-	obs, err := h.svc.Get(r.Context(), host, req.Template, req.Slug)
+	obs, err := h.svc.ApplyAndObserve(r.Context(), host, req, opts)
 	if err != nil {
 		WriteError(w, err)
 		return
@@ -106,11 +102,7 @@ func (h *handlers) applyInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	opts := instance.ApplyOptions{Replace: true, SkipPull: queryBool(r, "skip_pull")}
-	if err := h.svc.Apply(r.Context(), host, req, opts); err != nil {
-		WriteError(w, err)
-		return
-	}
-	obs, err := h.svc.Get(r.Context(), host, req.Template, req.Slug)
+	obs, err := h.svc.ApplyAndObserve(r.Context(), host, req, opts)
 	if err != nil {
 		WriteError(w, err)
 		return
@@ -158,11 +150,12 @@ func (h *handlers) startInstance(w http.ResponseWriter, r *http.Request) {
 	if !validInstancePath(w, tmpl, slug) {
 		return
 	}
-	if err := h.svc.Start(r.Context(), r.PathValue("host"), tmpl, slug); err != nil {
+	obs, err := h.svc.Start(r.Context(), r.PathValue("host"), tmpl, slug)
+	if err != nil {
 		WriteError(w, err)
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	WriteJSON(w, http.StatusOK, obs)
 }
 
 func (h *handlers) stopInstance(w http.ResponseWriter, r *http.Request) {

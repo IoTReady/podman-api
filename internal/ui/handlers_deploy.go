@@ -257,7 +257,8 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 		Parameters: params,
 		Secrets:    secrets,
 	}
-	if applyErr := u.cfg.Svc.Apply(r.Context(), host, req, instance.ApplyOptions{Replace: false}); applyErr != nil {
+	obs, applyErr := u.cfg.Svc.ApplyAndObserve(r.Context(), host, req, instance.ApplyOptions{Replace: false})
+	if applyErr != nil {
 		data, derr := u.deployFormData(r, host, req.Template, req.Slug, typedValues(r.PostForm), false)
 		if derr != nil {
 			u.renderError(w, r, derr)
@@ -267,12 +268,11 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 		u.render(w, r, errorStatus(applyErr), "deploy-form", u.pageData(data))
 		return
 	}
-	obs, err := u.cfg.Svc.Get(r.Context(), host, req.Template, req.Slug)
-	if err != nil {
-		u.renderError(w, r, err)
-		return
+	data := u.instanceView(r.Context(), host, obs)
+	if len(obs.Warnings) > 0 {
+		data["Notice"] = strings.Join(obs.Warnings, "; ")
 	}
-	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(r.Context(), host, obs)))
+	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(data))
 }
 
 // upgradeForm renders the image-only upgrade form. The upgrade reuses the

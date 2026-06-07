@@ -179,7 +179,7 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 	// interrupted before commit — dest must not be treated as source of truth).
 	if srcPresent {
 		// Roll back: restore source, reap any partial dest.
-		if rerr := s.Start(mctx, req.FromHost, req.Template, req.Slug); rerr != nil {
+		if _, rerr := s.Start(mctx, req.FromHost, req.Template, req.Slug); rerr != nil {
 			step("reconcile-inconclusive", "restore source: "+rerr.Error())
 			return false, false, "", nil
 		}

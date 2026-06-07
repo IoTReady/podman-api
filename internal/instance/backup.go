@@ -106,7 +106,7 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 		if !wasRunning {
 			return
 		}
-		if rerr := s.Start(context.WithoutCancel(ctx), req.Host, req.Template, req.Slug); rerr != nil {
+		if _, rerr := s.Start(context.WithoutCancel(ctx), req.Host, req.Template, req.Slug); rerr != nil {
 			step("restart-failed", rerr.Error())
 		} else {
 			step("restart", req.Host)
@@ -457,7 +457,7 @@ func (s *Service) ReconcileBackup(ctx context.Context, req BackupRequest, step f
 
 	// Restart best-effort: Start of a running pod is harmless; an unreachable
 	// host leaves the job reconciling for the next sweep.
-	if serr := s.Start(dctx, req.Host, req.Template, req.Slug); serr != nil {
+	if _, serr := s.Start(dctx, req.Host, req.Template, req.Slug); serr != nil {
 		if errors.Is(serr, ErrInstanceNotFound) || errors.Is(serr, podman.ErrNotFound) {
 			step("reconcile-restart-skipped", "instance gone")
 		} else {

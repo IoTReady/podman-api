@@ -22,7 +22,8 @@ func TestService_Lifecycle_ErrorPaths(t *testing.T) {
 	ctx := context.Background()
 
 	// Unknown template flows through lifecycle's lookup.
-	require.ErrorIs(t, svc.Start(ctx, "h1", "nope", "x"), ErrUnknownTemplate)
+	_, startErr := svc.Start(ctx, "h1", "nope", "x")
+	require.ErrorIs(t, startErr, ErrUnknownTemplate)
 	// Unknown host likewise.
 	require.ErrorIs(t, svc.Stop(ctx, "nope", "postgres", "x"), ErrUnknownHost)
 	// A known template+host but never-applied slug maps podman's not-found to

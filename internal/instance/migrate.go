@@ -254,7 +254,7 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 		// ctx.Err()), and the source must still be restarted and the partial
 		// destination reaped regardless.
 		rbctx := context.WithoutCancel(ctx)
-		if rerr := s.Start(rbctx, req.FromHost, req.Template, req.Slug); rerr != nil {
+		if _, rerr := s.Start(rbctx, req.FromHost, req.Template, req.Slug); rerr != nil {
 			step("rollback-restore-failed", rerr.Error())
 		}
 		if rerr := s.Delete(rbctx, req.ToHost, req.Template, req.Slug, DeleteOptions{PruneVolumes: true, PruneSecrets: true}); rerr != nil {

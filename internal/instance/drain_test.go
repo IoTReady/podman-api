@@ -65,7 +65,8 @@ func TestService_Drain_AllowsLifecycleAndDelete(t *testing.T) {
 	// Stop / Start / Restart / Delete are operationally what drain is FOR
 	// (so operators can wind a host down). They must not be blocked.
 	require.NoError(t, svc.Stop(ctx, "h1", "postgres", "lifeok"))
-	require.NoError(t, svc.Start(ctx, "h1", "postgres", "lifeok"))
+	_, startErr := svc.Start(ctx, "h1", "postgres", "lifeok")
+	require.NoError(t, startErr)
 	require.NoError(t, svc.Restart(ctx, "h1", "postgres", "lifeok"))
 	require.NoError(t, svc.Delete(ctx, "h1", "postgres", "lifeok", DeleteOptions{}))
 }

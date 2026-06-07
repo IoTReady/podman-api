@@ -288,6 +288,28 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	return s.applyLocked(ctx, host, req, opts)
 }
 
+// ApplyAndObserve creates or replaces an instance (via Apply), waits for
+// container healthchecks to pass (up to deployVerifyTimeout), then returns the
+// observed state. On readiness timeout the operation still succeeds but
+// Observed.Warnings carries a human-readable message.
+func (s *Service) ApplyAndObserve(ctx context.Context, host string, req ApplyRequest, opts ApplyOptions) (Observed, error) {
+	if err := s.Apply(ctx, host, req, opts); err != nil {
+		return Observed{}, err
+	}
+	readyErr := s.waitReady(ctx, host, req.Template, req.Slug, deployVerifyTimeout)
+	obs, err := s.Get(ctx, host, req.Template, req.Slug)
+	if err != nil {
+		return Observed{}, err
+	}
+	if errors.Is(readyErr, errReadyTimeout) {
+		obs.Warnings = append(obs.Warnings, fmt.Sprintf(
+			"readiness timeout: healthcheck did not pass within %s — the app may still be initialising",
+			deployVerifyTimeout,
+		))
+	}
+	return obs, nil
+}
+
 // applyLocked is the lock-free core of Apply: it performs the full create/replace
 // (validate → play → persist → ingress) assuming the caller already holds the
 // per-instance lock (and, for domain-carrying requests, the per-host lock).
@@ -545,8 +567,25 @@ func (s *Service) HostCounts(ctx context.Context, host string) (instances, conta
 	return len(all), containers, nil
 }
 
-func (s *Service) Start(ctx context.Context, host, tmpl, slug string) error {
-	return s.lifecycle(ctx, host, tmpl, slug, s.client.PodStart)
+// Start starts a stopped instance and waits for container healthchecks to pass
+// (up to deployVerifyTimeout). On readiness timeout the call still succeeds and
+// Observed.Warnings carries a human-readable message.
+func (s *Service) Start(ctx context.Context, host, tmpl, slug string) (Observed, error) {
+	if err := s.lifecycle(ctx, host, tmpl, slug, s.client.PodStart); err != nil {
+		return Observed{}, err
+	}
+	readyErr := s.waitReady(ctx, host, tmpl, slug, deployVerifyTimeout)
+	obs, err := s.Get(ctx, host, tmpl, slug)
+	if err != nil {
+		return Observed{}, err
+	}
+	if errors.Is(readyErr, errReadyTimeout) {
+		obs.Warnings = append(obs.Warnings, fmt.Sprintf(
+			"readiness timeout: healthcheck did not pass within %s — the app may still be initialising",
+			deployVerifyTimeout,
+		))
+	}
+	return obs, nil
 }
 func (s *Service) Stop(ctx context.Context, host, tmpl, slug string) error {
 	return s.lifecycle(ctx, host, tmpl, slug, s.client.PodStop)

@@ -177,7 +177,8 @@ func TestService_Lifecycle(t *testing.T) {
 	obs, _ := svc.Get(ctx, "h1", "postgres", "demo")
 	assert.Equal(t, "Exited", obs.Pod.Status)
 
-	require.NoError(t, svc.Start(ctx, "h1", "postgres", "demo"))
+	_, startErr := svc.Start(ctx, "h1", "postgres", "demo")
+	require.NoError(t, startErr)
 	obs, _ = svc.Get(ctx, "h1", "postgres", "demo")
 	assert.Equal(t, "Running", obs.Pod.Status)
 
@@ -575,4 +576,64 @@ func TestInstanceSecretState_NoSpecIsNotFound(t *testing.T) {
 	svc, _, _ := newSvcMem(t)
 	_, err := svc.InstanceSecretState(context.Background(), "h1", "postgres", "ghost")
 	require.ErrorIs(t, err, ErrInstanceNotFound)
+}
+
+func TestApplyAndObserve_ReadyOnSuccess(t *testing.T) {
+	defer setVerifyKnobs(50*time.Millisecond, 5*time.Millisecond)()
+	f := fake.New()
+	f.PlayKubeContainerHealth = "healthy"
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	svc, _ := newSvcWith(t, f, hosts, webTemplate())
+	obs, err := svc.ApplyAndObserve(context.Background(), "h1", ApplyRequest{
+		Template:   "web",
+		Slug:       "s1",
+		Parameters: map[string]any{"slug": "s1", "image": "nginx"},
+	}, ApplyOptions{})
+	require.NoError(t, err)
+	assert.True(t, obs.Ready)
+	assert.Empty(t, obs.Warnings)
+}
+
+func TestApplyAndObserve_WarningOnTimeout(t *testing.T) {
+	defer setVerifyKnobs(50*time.Millisecond, 5*time.Millisecond)()
+	f := fake.New()
+	f.PlayKubeContainerHealth = "starting"
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	svc, _ := newSvcWith(t, f, hosts, webTemplate())
+	obs, err := svc.ApplyAndObserve(context.Background(), "h1", ApplyRequest{
+		Template:   "web",
+		Slug:       "s1",
+		Parameters: map[string]any{"slug": "s1", "image": "nginx"},
+	}, ApplyOptions{})
+	require.NoError(t, err)
+	assert.False(t, obs.Ready)
+	require.Len(t, obs.Warnings, 1)
+	assert.Contains(t, obs.Warnings[0], "readiness timeout")
+}
+
+func TestStart_ReadyOnSuccess(t *testing.T) {
+	defer setVerifyKnobs(50*time.Millisecond, 5*time.Millisecond)()
+	f := fake.New()
+	f.AddPod("h1", podman.Pod{Name: "web-s1", Status: "Running",
+		Containers: []podman.Container{{Status: "Running", Health: "healthy"}}})
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	svc, _ := newSvcWith(t, f, hosts, webTemplate())
+	obs, err := svc.Start(context.Background(), "h1", "web", "s1")
+	require.NoError(t, err)
+	assert.True(t, obs.Ready)
+	assert.Empty(t, obs.Warnings)
+}
+
+func TestStart_WarningOnTimeout(t *testing.T) {
+	defer setVerifyKnobs(50*time.Millisecond, 5*time.Millisecond)()
+	f := fake.New()
+	f.AddPod("h1", podman.Pod{Name: "web-s1", Status: "Running",
+		Containers: []podman.Container{{Status: "Running", Health: "starting"}}})
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	svc, _ := newSvcWith(t, f, hosts, webTemplate())
+	obs, err := svc.Start(context.Background(), "h1", "web", "s1")
+	require.NoError(t, err)
+	assert.False(t, obs.Ready)
+	require.Len(t, obs.Warnings, 1)
+	assert.Contains(t, obs.Warnings[0], "readiness timeout")
 }

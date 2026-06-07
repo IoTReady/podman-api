@@ -85,7 +85,7 @@ func (h *handlers) runBulkOp(r *http.Request, host string, idx int, op bulkOp) b
 	var err error
 	switch op.Action {
 	case "start":
-		err = h.svc.Start(r.Context(), host, op.Template, op.Slug)
+		_, err = h.svc.Start(r.Context(), host, op.Template, op.Slug)
 	case "stop":
 		err = h.svc.Stop(r.Context(), host, op.Template, op.Slug)
 	case "restart":

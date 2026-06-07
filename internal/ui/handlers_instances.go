@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/iotready/podman-api/internal/instance"
 )
@@ -46,16 +47,23 @@ func (u *UI) instanceDetail(w http.ResponseWriter, r *http.Request) {
 
 // lifecycle dispatches start/stop/restart/delete, then re-renders the instance
 // detail (or the host instance list, after a delete). Upgrade is NOT handled
-// here — it is a separate form flow (Task 9).
+// here — it is a separate form flow.
 func (u *UI) lifecycle(w http.ResponseWriter, r *http.Request) {
 	host, tmpl, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
 	action := r.PathValue("action")
 	ctx := r.Context()
 
-	var err error
+	var (
+		err    error
+		notice string
+	)
 	switch action {
 	case "start":
-		err = u.cfg.Svc.Start(ctx, host, tmpl, slug)
+		var obs instance.Observed
+		obs, err = u.cfg.Svc.Start(ctx, host, tmpl, slug)
+		if err == nil && len(obs.Warnings) > 0 {
+			notice = strings.Join(obs.Warnings, "; ")
+		}
 	case "stop":
 		err = u.cfg.Svc.Stop(ctx, host, tmpl, slug)
 	case "restart":
@@ -67,10 +75,6 @@ func (u *UI) lifecycle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil {
-		// Keep the detail panel in place and surface the failure as a banner,
-		// rather than replacing #main with a bare error (which would drop the
-		// action buttons). Fall back to a plain error only if the instance is
-		// gone (so we can't render its detail).
 		obs, gerr := u.cfg.Svc.Get(ctx, host, tmpl, slug)
 		if gerr != nil {
 			u.renderError(w, r, err)
@@ -95,5 +99,9 @@ func (u *UI) lifecycle(w http.ResponseWriter, r *http.Request) {
 		u.renderError(w, r, gerr)
 		return
 	}
-	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(ctx, host, obs)))
+	data := u.instanceView(ctx, host, obs)
+	if notice != "" {
+		data["Notice"] = notice
+	}
+	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(data))
 }

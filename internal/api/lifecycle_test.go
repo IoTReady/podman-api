@@ -18,13 +18,18 @@ func TestLifecycle_StartStopRestart(t *testing.T) {
 	resp, _ := http.DefaultClient.Do(req)
 	resp.Body.Close()
 
+	wantStatus := map[string]int{
+		"stop":    http.StatusNoContent,
+		"start":   http.StatusOK,
+		"restart": http.StatusNoContent,
+	}
 	for _, action := range []string{"stop", "start", "restart"} {
 		req, _ := http.NewRequest("POST", srv.URL+"/hosts/h1/instances/app/lf/"+action, nil)
 		req.Header.Set("Authorization", "Bearer "+tok)
 		resp, err := http.DefaultClient.Do(req)
 		require.NoError(t, err)
 		resp.Body.Close()
-		assert.Equal(t, http.StatusNoContent, resp.StatusCode, "action %s", action)
+		assert.Equal(t, wantStatus[action], resp.StatusCode, "action %s", action)
 	}
 }
 
