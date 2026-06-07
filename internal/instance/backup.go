@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 
+	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/store"
 )
 
@@ -390,6 +391,55 @@ func (s *Service) DeleteBackup(ctx context.Context, id string) error {
 		return err
 	}
 	return nil
+}
+
+// ReconcileBackup drives a backup interrupted by a daemon restart to a
+// terminal state: mark the row failed (CAS — a row that already completed
+// means the job finished its work and only the terminal write was lost),
+// delete any partial blobs, and restart the instance. Returns
+// (ok=true) when the backup actually completed, (ok=false, message) when it
+// was failed. resolved=false only when the host is unreachable and the
+// restart attempt was inconclusive.
+func (s *Service) ReconcileBackup(ctx context.Context, req BackupRequest, step func(step, detail string)) (resolved, ok bool, message string, err error) {
+	if step == nil {
+		step = func(string, string) {}
+	}
+	lk := s.migrateLock(req.Template, req.Slug)
+	lk.Lock()
+	defer lk.Unlock()
+
+	b, gerr := s.store.GetBackup(ctx, req.BackupID)
+	if gerr != nil {
+		if errors.Is(gerr, store.ErrNotFound) {
+			// Row never created — the job died before CreateBackup. Nothing on
+			// disk, nothing to clean.
+			return true, false, "interrupted before the backup row was created", nil
+		}
+		return false, false, "", gerr
+	}
+	if b.State == store.BackupComplete {
+		// Work finished; only the job's terminal write was lost.
+		return true, true, "", nil
+	}
+	if _, ferr := s.store.FailBackup(ctx, req.BackupID); ferr != nil {
+		return false, false, "", ferr
+	}
+	step("reconcile-mark-failed", req.BackupID)
+	if derr := s.blobs.DeleteAll(ctx, backupBlobPrefix(req.Host, req.Template, req.Slug, req.BackupID)); derr != nil {
+		step("reconcile-cleanup-blobs-failed", derr.Error())
+	}
+	// Restart best-effort: Start of a running pod is harmless; an unreachable
+	// host leaves the job reconciling for the next sweep.
+	if serr := s.Start(ctx, req.Host, req.Template, req.Slug); serr != nil {
+		if errors.Is(serr, ErrInstanceNotFound) || errors.Is(serr, podman.ErrNotFound) {
+			step("reconcile-restart-skipped", "instance gone")
+		} else {
+			return false, false, "", fmt.Errorf("restart instance: %w", serr)
+		}
+	} else {
+		step("reconcile-restart", req.Host)
+	}
+	return true, false, "backup interrupted by daemon restart; instance restarted", nil
 }
 
 // RestoreInFlight reports whether any active (queued/running/reconciling)
