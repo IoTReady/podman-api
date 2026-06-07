@@ -69,9 +69,10 @@ func TestBuildManifest_NotTar(t *testing.T) {
 
 func TestManifest_JSONRoundTrip(t *testing.T) {
 	m := Manifest{
-		"data/file": fileInfo{typ: tar.TypeReg, size: 5, sha256: "abc123"},
-		"data/link": fileInfo{typ: tar.TypeSymlink, link: "file"},
-		"data":      fileInfo{typ: tar.TypeDir},
+		"data/file":  fileInfo{typ: tar.TypeReg, size: 5, sha256: "abc123"},
+		"data/link":  fileInfo{typ: tar.TypeSymlink, link: "file"},
+		"data":       fileInfo{typ: tar.TypeDir},
+		"data/empty": fileInfo{typ: tar.TypeReg, size: 0, sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
 	}
 	raw, err := json.Marshal(m)
 	require.NoError(t, err)

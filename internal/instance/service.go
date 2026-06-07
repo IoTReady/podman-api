@@ -30,6 +30,11 @@ var (
 	ErrSameHost          = errors.New("source and destination host are the same")
 	ErrStoreDisabled     = errors.New("migrate requires the state store")
 	ErrVolumeIntegrity   = errors.New("volume copy failed integrity check")
+
+	ErrBackupNotFound      = errors.New("backup not found")
+	ErrBackupNotRestorable = errors.New("backup is not restorable")
+	ErrBackupBusy          = errors.New("backup has a restore in flight")
+	ErrBackupsDisabled     = errors.New("backups require a blob store (-backup-dir)")
 )
 
 // ApplyOptions controls the side effects of Apply beyond the request body.
@@ -67,6 +72,7 @@ type DeleteOptions struct {
 type Store interface {
 	store.Store
 	store.TemplateStore
+	store.BackupStore
 }
 
 // Service orchestrates instance operations against podman hosts.
@@ -76,6 +82,7 @@ type Service struct {
 	store      Store                                  // template catalog + desired-state store; set via SetStore before use
 	ingress    ingress.Controller                     // never nil; ingress.Disabled{} when off
 	ingressNet string                                 // shared ingress network; "" when ingress disabled
+	blobs      BlobStore                              // backup artifact store; set via SetBlobStore (nil → backups disabled)
 
 	verifyVolumes bool // verify each migrated volume's content before reaping the source
 
@@ -117,6 +124,10 @@ func (s *Service) SetHosts(hosts []config.Host) {
 // must call this at startup, before the server begins accepting requests
 // (tests pass a store.Memory). Unlike SetHosts it is NOT a concurrent hot-swap.
 func (s *Service) SetStore(st Store) { s.store = st }
+
+// SetBlobStore wires the backup artifact store. Backups/restores are refused
+// (ErrBackupsDisabled) until this is set; main always sets it.
+func (s *Service) SetBlobStore(bs BlobStore) { s.blobs = bs }
 
 // SetIngress enables ingress reconciliation. network is the shared podman
 // network app pods join; passing a real controller marks ingress enabled so
