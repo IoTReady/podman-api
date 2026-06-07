@@ -133,11 +133,6 @@ func (u *UI) logsStream(w http.ResponseWriter, r *http.Request) {
 		for i, c := range obs.Containers {
 			names[i] = c.Name
 		}
-		if resolveContainerSuffix(tmpl, slug, names) == "" {
-			// No containers at all — unusual but possible during startup.
-			http.Error(w, "no containers", http.StatusBadRequest)
-			return
-		}
 		// Verify the requested suffix is actually present.
 		valid := false
 		prefix := tmpl + "-" + slug + "-"
@@ -161,6 +156,7 @@ func (u *UI) logsStream(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 
 	flusher, _ := w.(http.Flusher)

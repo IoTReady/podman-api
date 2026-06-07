@@ -25,7 +25,7 @@
   {{end}}
 </div>
 {{if .Follow}}
-<script src="/ui/static/htmx-ext-sse.min.js" defer></script>
+<script src="/ui/static/htmx-ext-sse.min.js"></script>
 <pre id="log-lines"
      hx-ext="sse"
      sse-connect="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs/stream?container={{.Container}}"

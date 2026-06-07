@@ -89,6 +89,9 @@ func TestLogsStreamSSEHeaders(t *testing.T) {
 	if ct := w.Header().Get("Content-Type"); ct != "text/event-stream" {
 		t.Errorf("Content-Type = %q, want text/event-stream", ct)
 	}
+	if ab := w.Header().Get("X-Accel-Buffering"); ab != "no" {
+		t.Errorf("X-Accel-Buffering = %q, want \"no\"", ab)
+	}
 	if !strings.Contains(w.Body.String(), "event: log") {
 		t.Error("SSE stream should contain 'event: log' lines")
 	}
