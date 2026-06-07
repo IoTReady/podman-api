@@ -8,3 +8,7 @@ main { flex: 1; padding: 1rem; }
 .error { color: #a00; padding: .5rem; }
 .notice { color: #1b5e20; background: #e8f5e9; border: 1px solid #a5d6a7; padding: .5rem; }
 .login { max-width: 20rem; margin: 4rem auto; }
+.health-dot { font-size: 0.85em; margin-left: 4px; }
+.health-dot.healthy { color: #2ecc71; }
+.health-dot.starting { color: #f39c12; }
+.health-dot.unhealthy { color: #e74c3c; }
