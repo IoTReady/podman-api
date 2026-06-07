@@ -22,6 +22,7 @@ This README is the quick reference. The **[wiki](/tej/podman-api/wiki)** is the 
 - Pre-pulls every container image before play, so a bad tag fails fast with a clear registry error instead of a 30-second timeout.
 - Streams **logs** as plain text or SSE.
 - **Migrates and evacuates** instances across hosts (opt-in, requires the state store): `POST /migrate` moves one instance, `POST /evacuate` clears a whole host, both as async jobs. Movement is cold-copy (stop → copy volumes → re-apply → verify → reap source) with rollback if the destination doesn't come up.
+- **Backs up and restores** instance volumes on demand (#66, OSS primitive): `POST .../backup` stops the instance, snapshots every volume into local artifact files, and restarts (if it was running). `POST /backups/{id}/restore` restores in-place from any complete backup, verifying content before declaring success. Artifacts live under `-backup-dir` (default `<state-db dir>/backups`). See the wiki: [Backing up and Restoring](/tej/podman-api/wiki/Backing-up-and-Restoring).
 - Exposes **Prometheus metrics** on a separate, opt-in listener so they aren't world-readable on the public port.
 
 ## What it doesn't do
@@ -246,6 +247,7 @@ Design spec: [`docs/superpowers/specs/2026-06-04-admin-ui-shell-design.md`](docs
 The daemon always persists desired state — the template catalog, each instance's parameters, and AES-256-GCM-encrypted secrets — to a local SQLite database. The store backs the `/templates` catalog as well as the migrate/evacuate features, so it is never off; it defaults to `/var/lib/podman-api/state.db`. With it the daemon is a **stateful controller**: it holds desired state beside the podman actuator, so it can move an instance to another host by name without the client re-supplying secrets.
 
 - **`-state-db <path>`** — location of the desired-state store (default `/var/lib/podman-api/state.db`).
+- **`-backup-dir <path>`** — directory for volume backup artifacts (default `<state-db dir>/backups`). Always enabled alongside the state store; the seam where the commercial S3 backend slots in (#107).
 - **`-spec-key-file <path>`** — **optional** 32-byte AES-256-GCM key that gates **secret values only**. Key-less operation works fine for templates and for specs that carry no secrets; a secret-bearing deploy without a key returns a clear error. When set, the key is loaded once at startup (no runtime reload — see the rotation caveat below). Keep the file `0600` and **separate from the database** — leaking secrets requires compromise of both.
 - **`-jobs-retention <dur>`** — when set (e.g. `168h`), a background sweep prunes terminal (`succeeded`/`failed`) jobs older than the duration, keeping parent/child families intact (a parent is removed only once it has no surviving child). Default `0` (disabled; the `jobs` table accumulates until manual cleanup).
 - **`-evacuate-concurrency <n>`** — max child migrations an evacuate runs at once (default `2`, clamped to `1..32`). A request body's `"concurrency"` overrides it per call.
@@ -455,6 +457,11 @@ DELETE /hosts/{host}/volumes/{name}
 
 POST   /migrate   body: {from_host,to_host,template,slug,parameters?} instances:write
 POST   /evacuate   body: {from_host, map:{slug:to_host}}              instances:write
+
+POST   /hosts/{host}/instances/{template}/{slug}/backup               instances:write
+GET    /hosts/{host}/instances/{template}/{slug}/backups?limit=        instances:read
+POST   /backups/{id}/restore                                           instances:write
+DELETE /backups/{id}                                                   instances:write
 
 GET    /jobs?state=&kind=&parent_id=                                  jobs:read
 GET    /jobs/{id}                                                     jobs:read

@@ -129,22 +129,22 @@ func TestMigrateAddsTemplatesTable(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "web", got.Meta.ID)
 
-	// user_version must be 6 (v6 made specs.secrets nullable).
+	// user_version must be 7 (v7 added the backups table).
 	var v int
 	require.NoError(t, s.db.QueryRow(`PRAGMA user_version`).Scan(&v))
-	require.Equal(t, 6, v)
+	require.Equal(t, 7, v)
 }
 
-// TestFreshDB_UserVersion6 asserts that a brand-new DB opened via OpenSQLite
-// has user_version == 6.
-func TestFreshDB_UserVersion6(t *testing.T) {
+// TestFreshDB_UserVersion7 asserts that a brand-new DB opened via OpenSQLite
+// has user_version == 7.
+func TestFreshDB_UserVersion7(t *testing.T) {
 	s, err := OpenSQLite(filepath.Join(t.TempDir(), "s.db"), NewKeyStore(testKey(0x11)))
 	require.NoError(t, err)
 	defer s.Close()
 
 	var v int
 	require.NoError(t, s.db.QueryRow(`PRAGMA user_version`).Scan(&v))
-	require.Equal(t, 6, v)
+	require.Equal(t, 7, v)
 }
 
 func TestSQLite_KeylessRejectsSecretsButAllowsTemplates(t *testing.T) {
@@ -203,15 +203,15 @@ func TestMigrateV6_PreservesExistingSecretsBlob(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, raw.Close())
 
-	// Reopen via OpenSQLite — this should run the v6 migration.
+	// Reopen via OpenSQLite — this should run the v6 and v7 migrations.
 	s, err := OpenSQLite(path, ks)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 
-	// Confirm the migration ran.
+	// Confirm all migrations ran.
 	var v int
 	require.NoError(t, s.db.QueryRow(`PRAGMA user_version`).Scan(&v))
-	require.Equal(t, 6, v)
+	require.Equal(t, 7, v)
 
 	// The sealed blob must survive the recreate: GetSpec must decrypt it correctly.
 	got, err := s.GetSpec(context.Background(), "h1", "pg", "demo")

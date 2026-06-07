@@ -94,6 +94,14 @@ func errorStatus(err error) int {
 		errors.Is(err, instance.ErrInstanceNotFound),
 		errors.Is(err, store.ErrNotFound):
 		return http.StatusNotFound
+	case errors.Is(err, instance.ErrBackupNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, instance.ErrBackupNotRestorable):
+		return http.StatusUnprocessableEntity
+	case errors.Is(err, instance.ErrBackupBusy):
+		return http.StatusConflict
+	case errors.Is(err, instance.ErrBackupsDisabled):
+		return http.StatusNotImplemented
 	case errors.Is(err, instance.ErrInstanceExists),
 		errors.Is(err, instance.ErrPortConflict):
 		return http.StatusConflict

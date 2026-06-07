@@ -23,6 +23,7 @@ tags:
   - name: volumes
   - name: jobs
   - name: migrate
+  - name: backups
 
 components:
   securitySchemes:
@@ -416,6 +417,48 @@ components:
       required: [job_id]
       properties:
         job_id: {type: string}
+
+    BackupAccepted:
+      type: object
+      required: [job_id, backup_id]
+      properties:
+        job_id: {type: string}
+        backup_id:
+          type: string
+          description: id of the backup row the job will populate (returned before the job runs)
+
+    Backup:
+      type: object
+      description: >-
+        One backup row. Per-volume name+size are exposed; the internal sha256
+        manifests used to verify a restore are not.
+      required: [id, host, template, slug, state, created]
+      properties:
+        id: {type: string}
+        host: {type: string}
+        template: {type: string}
+        slug: {type: string}
+        state:
+          type: string
+          enum: [creating, complete, failed]
+        image:
+          type: string
+          description: image ref at backup time; informational hint only
+        volumes:
+          type: array
+          items: {$ref: '#/components/schemas/BackupVolume'}
+        created: {type: string, format: date-time}
+        finished:
+          type: string
+          format: date-time
+          description: omitted until the backup reaches a terminal (complete/failed) state
+
+    BackupVolume:
+      type: object
+      required: [name, size_bytes]
+      properties:
+        name: {type: string, description: full volume name (<template>-<slug>-<vol>)}
+        size_bytes: {type: integer, format: int64, description: exported tar size in bytes}
 
     SecretValue:
       type: object
@@ -1083,6 +1126,136 @@ paths:
         '404': {$ref: '#/components/responses/NotFound'}
         '501':
           description: state store not enabled (-state-db not set)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+      x-required-scope: instances:write
+
+  /hosts/{host}/instances/{template}/{slug}/backup:
+    post:
+      tags: [backups]
+      summary: enqueue a backup of an instance's volumes (requires -state-db and -backup-dir)
+      description: >-
+        Validates synchronously (known host/template, an existing stored spec, a
+        wired blob store) and enqueues a backup job, returning the job id and the
+        id of the backup row it will populate. The export itself (stop, snapshot
+        each volume, restart) runs inside the job; failures surface via
+        GET /jobs/{id}, not as the POST status.
+      parameters:
+        - {name: host, in: path, required: true, schema: {type: string}}
+        - {name: template, in: path, required: true, schema: {type: string}}
+        - {name: slug, in: path, required: true, schema: {type: string}}
+      responses:
+        '202':
+          description: backup job accepted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BackupAccepted'}
+        '404':
+          description: unknown host, unknown template, or no such instance (codes unknown_host, unknown_template, instance_not_found)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '501':
+          description: job runner or state store unavailable (e.g. blob store not wired in an embedded deployment); a standard deployment always has backups enabled
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+      x-required-scope: instances:write
+
+  /hosts/{host}/instances/{template}/{slug}/backups:
+    get:
+      tags: [backups]
+      summary: list an instance's backups, newest first (requires -state-db)
+      parameters:
+        - {name: host, in: path, required: true, schema: {type: string}}
+        - {name: template, in: path, required: true, schema: {type: string}}
+        - {name: slug, in: path, required: true, schema: {type: string}}
+        - name: limit
+          in: query
+          required: false
+          description: max backups to return (newest first); absent or <=0 uses the default of 100, values above 1000 are clamped to 1000
+          schema: {type: integer, default: 100, maximum: 1000}
+      responses:
+        '200':
+          description: list of backups (newest first)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [backups]
+                properties:
+                  backups:
+                    type: array
+                    items: {$ref: '#/components/schemas/Backup'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404':
+          description: unknown host (code unknown_host)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+      x-required-scope: instances:read
+
+  /backups/{id}/restore:
+    post:
+      tags: [backups]
+      summary: enqueue a restore of an instance from a backup (requires -state-db and -backup-dir)
+      description: >-
+        Validates synchronously (the backup exists and is complete, its host is
+        known and not draining, the instance's spec still exists) and enqueues a
+        restore job. The restore replaces the instance's volumes in place from
+        the backup's blobs and re-applies the current spec; there is no rollback,
+        so a mid-restore failure leaves the instance down with the spec preserved
+        for retry. Failures surface via GET /jobs/{id}.
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '202':
+          description: restore job accepted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/JobAccepted'}
+        '404':
+          description: no such backup, the backup's instance no longer exists, or the backup's host is no longer configured (codes backup_not_found, instance_not_found, unknown_host)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '422':
+          description: backup is not in a restorable state (code backup_not_restorable)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '423':
+          description: the backup's host is draining (code host_draining)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '501':
+          description: job runner or state store unavailable (e.g. blob store not wired in an embedded deployment); a standard deployment always has backups enabled
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+      x-required-scope: instances:write
+
+  /backups/{id}:
+    delete:
+      tags: [backups]
+      summary: delete a backup's blobs and metadata (requires -state-db)
+      description: >-
+        Synchronously removes the backup's blobs and then its row. Refused with
+        409 while a backup or restore of this backup is in flight.
+      parameters:
+        - {name: id, in: path, required: true, schema: {type: string}}
+      responses:
+        '204':
+          description: backup deleted
+        '404':
+          description: no such backup (code backup_not_found)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '409':
+          description: a backup or restore of this backup is in flight (code backup_busy)
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}

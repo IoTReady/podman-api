@@ -57,7 +57,19 @@ CREATE TABLE IF NOT EXISTS templates (
   origin  TEXT NOT NULL,
   created INTEGER NOT NULL,
   updated INTEGER NOT NULL
-);`
+);
+CREATE TABLE IF NOT EXISTS backups (
+  id       TEXT PRIMARY KEY,
+  host     TEXT NOT NULL,
+  template TEXT NOT NULL,
+  slug     TEXT NOT NULL,
+  state    TEXT NOT NULL,
+  volumes  TEXT NOT NULL DEFAULT '[]',
+  image    TEXT NOT NULL DEFAULT '',
+  created  INTEGER NOT NULL,
+  finished INTEGER
+);
+CREATE INDEX IF NOT EXISTS backups_instance ON backups(host, template, slug);`
 
 // maxOpenConns bounds the SQLite connection pool. WAL allows many concurrent
 // readers + one writer; setting the pool above the job worker count
@@ -194,6 +206,7 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 // migrateSchema brings an existing DB up to the current schema version.
 // v4 added specs.domains. v5 added the templates table.
 // v6 made specs.secrets nullable (NULL = no secrets; key-less open allowed).
+// v7 added the backups table + backups_instance index.
 // Each step is guarded by user_version so OpenSQLite is idempotent.
 func migrateSchema(db *sql.DB) error {
 	var v int
@@ -275,6 +288,32 @@ func migrateSchema(db *sql.DB) error {
 		if err := tx.Commit(); err != nil {
 			return fmt.Errorf("migrateSchema v6: commit: %w", err)
 		}
+		v = 6
+	}
+	if v < 7 {
+		// backups table + backups_instance index are created by schemaSQL on a
+		// fresh DB but absent on a pre-v7 DB. CREATE TABLE/INDEX IF NOT EXISTS is
+		// safe for both cases.
+		if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS backups (
+  id       TEXT PRIMARY KEY,
+  host     TEXT NOT NULL,
+  template TEXT NOT NULL,
+  slug     TEXT NOT NULL,
+  state    TEXT NOT NULL,
+  volumes  TEXT NOT NULL DEFAULT '[]',
+  image    TEXT NOT NULL DEFAULT '',
+  created  INTEGER NOT NULL,
+  finished INTEGER
+)`); err != nil {
+			return fmt.Errorf("migrateSchema v7: create backups table: %w", err)
+		}
+		if _, err := db.Exec(`CREATE INDEX IF NOT EXISTS backups_instance ON backups(host, template, slug)`); err != nil {
+			return fmt.Errorf("migrateSchema v7: create backups_instance index: %w", err)
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 7`); err != nil {
+			return fmt.Errorf("migrateSchema v7: set user_version: %w", err)
+		}
+		v = 7
 	}
 	return nil
 }

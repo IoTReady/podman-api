@@ -17,6 +17,20 @@
 {{range .Inst.Containers}}<div>{{.Name}} — {{.Image}} — {{.Status}} (restarts {{.RestartCount}})</div>{{end}}
 <div class="label">VOLUMES</div>
 {{range .Inst.Volumes}}<div>{{.Name}} {{.SizeBytes}}</div>{{end}}
+<div class="label">BACKUPS</div>
+<button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/backup" hx-target="#main"
+        hx-confirm="Back up {{.Inst.Template}}/{{.Inst.Slug}} now? The instance is stopped for the duration of the backup.">Back up now</button>
+{{range .Backups}}
+<div>
+  {{.ID}} · {{.Created.UTC.Format "2006-01-02 15:04:05"}} · {{.State}}{{if .Image}} · {{.Image}}{{end}}
+  {{if eq .State "complete"}}
+  <button hx-post="/ui/backups/{{.ID}}/restore" hx-target="#main"
+          hx-confirm="Restore {{.ID}}? This stops the instance and OVERWRITES its current data.">Restore</button>
+  {{end}}
+  <button hx-post="/ui/backups/{{.ID}}/delete" hx-target="#main"
+          hx-confirm="Delete backup {{.ID}}?">Delete</button>
+</div>
+{{end}}
 <div class="label">ENV</div>
 {{range $k, $v := .Inst.EnvSummary}}<div>{{$k}}={{$v}}</div>{{end}}
 <button hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/logs" hx-target="#logs">View logs</button>

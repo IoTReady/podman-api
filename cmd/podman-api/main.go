@@ -21,6 +21,7 @@ import (
 
 	"github.com/iotready/podman-api/internal/api"
 	"github.com/iotready/podman-api/internal/auth"
+	backuppkg "github.com/iotready/podman-api/internal/backup"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/evacuate"
 	"github.com/iotready/podman-api/internal/ingress"
@@ -45,6 +46,7 @@ func main() {
 		auditLogFile  = flag.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
 		stateDB       = flag.String("state-db", "/var/lib/podman-api/state.db", "SQLite path for the always-on template catalog + desired-state store")
 		specKeyFile   = flag.String("spec-key-file", "", "path to the 32-byte secret encryption key; optional — without it the store runs key-less (templates and no-secret specs work, secret ops are refused)")
+		backupDir     = flag.String("backup-dir", "", "directory for volume backup artifacts; empty derives <state-db dir>/backups")
 		jobsRetention = flag.Duration("jobs-retention", 0, "if >0, prune terminal jobs older than this (e.g. 168h); 0 disables")
 		evacConc      = flag.Int("evacuate-concurrency", 2, "max child migrations an evacuate runs at once (1..32); a request's \"concurrency\" overrides per call")
 		jobWorkers    = flag.Int("job-workers", jobs.DefaultWorkers, "size of the background job worker pool (<=0 uses the built-in default)")
@@ -138,6 +140,19 @@ func main() {
 		log.Fatalf("templates: count: %v", err)
 	}
 
+	// Backup artifacts rest on local disk next to the state DB by default;
+	// the BlobStore seam is where the commercial S3 backend slots in (#66).
+	bdir := *backupDir
+	if bdir == "" {
+		bdir = filepath.Join(filepath.Dir(*stateDB), "backups")
+	}
+	blobs, err := backuppkg.NewLocalDir(bdir)
+	if err != nil {
+		log.Fatalf("backup dir: %v", err)
+	}
+	svc.SetBlobStore(blobs)
+	log.Printf("backups enabled: %s", bdir)
+
 	// runnerCtx is cancelled by the shutdown handler to stop the job runner.
 	runnerCtx, cancelRunner := context.WithCancel(context.Background())
 	defer cancelRunner()
@@ -162,20 +177,14 @@ func main() {
 	}
 	jobStore = db
 	pruneMetrics := obs.NewPruneMetrics(prometheus.DefaultRegisterer)
-	registry := jobs.Registry{
-		"migrate":  &migrate.Handler{Svc: svc},
-		"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: *evacConc},
-		"prune":    &prune.Handler{Client: client, Jobs: db, Metrics: pruneMetrics},
-	}
+	registry, reconcilers := buildJobRegistry(svc, client, db, *evacConc, pruneMetrics)
 	workers := *jobWorkers
 	if workers <= 0 {
 		workers = jobs.DefaultWorkers
 	}
 	runner := jobs.NewRunner(db, registry, workers)
 	canceller = runner
-	runner.SetReconcilers(jobs.Reconcilers{
-		"migrate": &migrate.Reconciler{Svc: svc},
-	})
+	runner.SetReconcilers(reconcilers)
 	runner.Start(runnerCtx)
 	if *jobsRetention > 0 {
 		runner.StartRetention(runnerCtx, *jobsRetention)
@@ -387,6 +396,24 @@ func main() {
 		log.Fatal(err)
 	}
 	<-idleClosed
+}
+
+// buildJobRegistry constructs the job registry and reconcilers map for the
+// runner. Extracted so main_test.go can assert both maps include every
+// registered kind without spinning up HTTP or a real podman host.
+func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics) (jobs.Registry, jobs.Reconcilers) {
+	reg := jobs.Registry{
+		"migrate":  &migrate.Handler{Svc: svc},
+		"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: evacConc},
+		"prune":    &prune.Handler{Client: client, Jobs: db, Metrics: pruneMetrics},
+		"backup":   &backuppkg.Handler{Svc: svc},
+		"restore":  &backuppkg.RestoreHandler{Svc: svc},
+	}
+	recs := jobs.Reconcilers{
+		"migrate": &migrate.Reconciler{Svc: svc},
+		"backup":  &backuppkg.Reconciler{Svc: svc},
+	}
+	return reg, recs
 }
 
 // composeHandler mounts the admin UI under /ui on top of the API router when

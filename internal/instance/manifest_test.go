@@ -3,6 +3,7 @@ package instance
 import (
 	"archive/tar"
 	"bytes"
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -64,4 +65,29 @@ func TestBuildManifest_EmptyStream(t *testing.T) {
 func TestBuildManifest_NotTar(t *testing.T) {
 	_, err := buildManifest(bytes.NewReader([]byte("this is definitely not a tar archive")))
 	require.Error(t, err)
+}
+
+func TestManifest_JSONRoundTrip(t *testing.T) {
+	m := Manifest{
+		"data/file":  fileInfo{typ: tar.TypeReg, size: 5, sha256: "abc123"},
+		"data/link":  fileInfo{typ: tar.TypeSymlink, link: "file"},
+		"data":       fileInfo{typ: tar.TypeDir},
+		"data/empty": fileInfo{typ: tar.TypeReg, size: 0, sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"},
+	}
+	raw, err := json.Marshal(m)
+	require.NoError(t, err)
+	var got Manifest
+	require.NoError(t, json.Unmarshal(raw, &got))
+	diff, equal := m.firstDiff(got)
+	assert.True(t, equal, "round-trip changed manifest at %q", diff)
+}
+
+func TestManifest_JSONRoundTrip_DetectsDiff(t *testing.T) {
+	m := Manifest{"f": fileInfo{typ: tar.TypeReg, size: 1, sha256: "aa"}}
+	raw, _ := json.Marshal(m)
+	var got Manifest
+	require.NoError(t, json.Unmarshal(raw, &got))
+	got["f"] = fileInfo{typ: tar.TypeReg, size: 1, sha256: "bb"}
+	_, equal := m.firstDiff(got)
+	assert.False(t, equal)
 }
