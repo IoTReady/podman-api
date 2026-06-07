@@ -14,7 +14,19 @@
   </span>
 </div>
 <div class="label">CONTAINERS</div>
-{{range .Inst.Containers}}<div>{{.Name}} — {{.Image}} — {{.Status}} (restarts {{.RestartCount}})</div>{{end}}
+{{range .Inst.Containers}}
+<div class="container-row">
+  <span>{{.Name}}</span>
+  <span>{{.Image}}</span>
+  <span>{{.Status}} (restarts {{.RestartCount}})</span>
+  <span>
+    {{if eq .Health "healthy"}}<span class="health-dot healthy" title="healthy">● healthy</span>
+    {{else if eq .Health "starting"}}<span class="health-dot starting" title="starting">● starting</span>
+    {{else if eq .Health "unhealthy"}}<span class="health-dot unhealthy" title="unhealthy">● unhealthy</span>
+    {{else}}—{{end}}
+  </span>
+</div>
+{{end}}
 <div class="label">VOLUMES</div>
 {{range .Inst.Volumes}}<div>{{.Name}} {{.SizeBytes}}</div>{{end}}
 <div class="label">BACKUPS</div>
