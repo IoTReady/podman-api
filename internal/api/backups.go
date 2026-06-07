@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -36,8 +37,9 @@ func (h *handlers) postBackup(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusAccepted, map[string]string{"job_id": job.ID, "backup_id": req.BackupID})
 }
 
-// listBackups returns an instance's backups, newest first. ?limit= clamps
-// like the jobs list.
+// listBackups returns an instance's backups, newest first. ?limit= clamps to
+// [1, 1000]; absent or <=0 uses the default of 100. The response envelope is
+// {"backups":[...]} (deliberately wrapped for future extensibility).
 func (h *handlers) listBackups(w http.ResponseWriter, r *http.Request) {
 	host, tmpl, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
 	limit := 0
@@ -78,7 +80,7 @@ type BackupVolumeView struct {
 }
 
 // toBackupViews maps store rows to their public JSON shape. Times are
-// formatted exactly like the jobs view (UTC, RFC3339); Finished is empty
+// formatted as UTC RFC3339 (same format as the jobs view). Finished is empty
 // while zero. Always returns a non-nil slice so the list field is [] not null.
 func toBackupViews(bs []store.Backup) []BackupView {
 	out := make([]BackupView, 0, len(bs))
@@ -123,19 +125,24 @@ func (h *handlers) postRestore(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusAccepted, map[string]string{"job_id": job.ID})
 }
 
-// deleteBackup synchronously removes a backup's blobs and row; refused while
-// a restore of it is in flight.
+// deleteBackup synchronously removes a backup's blobs and row; refused with
+// 409 while a backup or restore of it is in flight.
 func (h *handlers) deleteBackup(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if h.jobs != nil {
-		busy, err := instance.RestoreInFlight(r.Context(), h.jobs, id)
-		if err != nil {
-			WriteError(w, err)
-			return
-		}
-		if busy {
-			WriteError(w, instance.ErrBackupBusy)
-			return
+		for _, check := range []func(context.Context, store.JobStore, string) (bool, error){
+			instance.RestoreInFlight,
+			instance.BackupInFlight,
+		} {
+			busy, err := check(r.Context(), h.jobs, id)
+			if err != nil {
+				WriteError(w, err)
+				return
+			}
+			if busy {
+				WriteError(w, instance.ErrBackupBusy)
+				return
+			}
 		}
 	}
 	if err := h.svc.DeleteBackup(r.Context(), id); err != nil {

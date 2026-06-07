@@ -466,24 +466,52 @@ func (s *Service) ReconcileBackup(ctx context.Context, req BackupRequest, step f
 	return true, false, "backup interrupted by daemon restart; instance restarted", nil
 }
 
-// RestoreInFlight reports whether any active (queued/running/reconciling)
-// restore job targets backupID. Shared by the API and UI delete handlers to
-// refuse deleting a backup mid-restore (ErrBackupBusy).
-func RestoreInFlight(ctx context.Context, js store.JobStore, backupID string) (bool, error) {
+// jobTargetsBackup scans active jobs of the given kind for one whose args
+// carry backupID. Returns true if found. It is the shared inner loop for
+// RestoreInFlight and BackupInFlight.
+func jobTargetsBackup(ctx context.Context, js store.JobStore, kind, backupID string, unmarshal func([]byte) (string, error)) (bool, error) {
 	for _, st := range []store.JobState{store.JobQueued, store.JobRunning, store.JobReconciling} {
-		jobsList, err := js.ListJobs(ctx, store.JobFilter{State: st, Kind: "restore", Limit: store.MaxJobLimit})
+		jobsList, err := js.ListJobs(ctx, store.JobFilter{State: st, Kind: kind, Limit: store.MaxJobLimit})
 		if err != nil {
 			return false, err
 		}
 		for _, j := range jobsList {
-			var req RestoreRequest
-			if err := json.Unmarshal(j.Args, &req); err != nil {
+			id, err := unmarshal(j.Args)
+			if err != nil {
 				continue
 			}
-			if req.BackupID == backupID {
+			if id == backupID {
 				return true, nil
 			}
 		}
 	}
 	return false, nil
+}
+
+// RestoreInFlight reports whether any active (queued/running/reconciling)
+// restore job targets backupID. Shared by the API and UI delete handlers to
+// refuse deleting a backup mid-restore (ErrBackupBusy).
+func RestoreInFlight(ctx context.Context, js store.JobStore, backupID string) (bool, error) {
+	return jobTargetsBackup(ctx, js, "restore", backupID, func(raw []byte) (string, error) {
+		var req RestoreRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return "", err
+		}
+		return req.BackupID, nil
+	})
+}
+
+// BackupInFlight reports whether any active (queued/running/reconciling)
+// backup job targets backupID. Used by the delete handler to refuse deleting a
+// backup while it is still being written (ErrBackupBusy). Note: the gate is
+// intentionally job-based, not row-state-based — a crashed daemon can leave a
+// creating row with no live job, and that row must stay deletable.
+func BackupInFlight(ctx context.Context, js store.JobStore, backupID string) (bool, error) {
+	return jobTargetsBackup(ctx, js, "backup", backupID, func(raw []byte) (string, error) {
+		var req BackupRequest
+		if err := json.Unmarshal(raw, &req); err != nil {
+			return "", err
+		}
+		return req.BackupID, nil
+	})
 }

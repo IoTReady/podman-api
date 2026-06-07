@@ -1174,8 +1174,8 @@ paths:
         - name: limit
           in: query
           required: false
-          description: max backups to return (newest first); defaults to 100, values above 1000 are clamped
-          schema: {type: integer, default: 100, minimum: 1, maximum: 1000}
+          description: max backups to return (newest first); absent or <=0 uses the default of 100, values above 1000 are clamped to 1000
+          schema: {type: integer, default: 100, maximum: 1000}
       responses:
         '200':
           description: list of backups (newest first)
@@ -1189,6 +1189,11 @@ paths:
                     type: array
                     items: {$ref: '#/components/schemas/Backup'}
         '400': {$ref: '#/components/responses/BadRequest'}
+        '404':
+          description: unknown host (code unknown_host)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
       x-required-scope: instances:read
 
   /backups/{id}/restore:
@@ -1211,7 +1216,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/JobAccepted'}
         '404':
-          description: no such backup, or the backup's instance no longer exists (codes backup_not_found, instance_not_found)
+          description: no such backup, the backup's instance no longer exists, or the backup's host is no longer configured (codes backup_not_found, instance_not_found, unknown_host)
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
@@ -1238,7 +1243,7 @@ paths:
       summary: delete a backup's blobs and metadata (requires -state-db)
       description: >-
         Synchronously removes the backup's blobs and then its row. Refused with
-        409 while a restore of this backup is in flight.
+        409 while a backup or restore of this backup is in flight.
       parameters:
         - {name: id, in: path, required: true, schema: {type: string}}
       responses:
@@ -1250,7 +1255,7 @@ paths:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
         '409':
-          description: a restore of this backup is in flight (code backup_busy)
+          description: a backup or restore of this backup is in flight (code backup_busy)
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}

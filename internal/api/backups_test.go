@@ -274,6 +274,15 @@ func TestAPI_DeleteBackup_RemovesRowAndBlobs(t *testing.T) {
 	assert.Equal(t, "backup_not_found", body.Code)
 }
 
+func TestAPI_ListBackups_BadLimit400(t *testing.T) {
+	srv, tok, _, _, _ := newBackupSrv(t)
+	resp := backupReq(t, "GET", srv.URL+"/hosts/h1/instances/postgres/a/backups?limit=abc", tok)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var body ErrorBody
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	assert.Equal(t, "invalid_request", body.Code)
+}
+
 func TestAPI_DeleteBackup_RestoreInFlight409(t *testing.T) {
 	srv, tok, _, mem, _ := newBackupSrv(t)
 	ctx := context.Background()
@@ -288,6 +297,26 @@ func TestAPI_DeleteBackup_RestoreInFlight409(t *testing.T) {
 	args, err := json.Marshal(instance.RestoreRequest{BackupID: id})
 	require.NoError(t, err)
 	_, err = mem.Enqueue(ctx, "restore", args, "")
+	require.NoError(t, err)
+
+	resp := backupReq(t, "DELETE", srv.URL+"/backups/"+id, tok)
+	require.Equal(t, http.StatusConflict, resp.StatusCode)
+	var body ErrorBody
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	assert.Equal(t, "backup_busy", body.Code)
+}
+
+func TestAPI_DeleteBackup_BackupInFlight409(t *testing.T) {
+	srv, tok, _, mem, _ := newBackupSrv(t)
+	ctx := context.Background()
+
+	id := store.NewBackupID()
+	require.NoError(t, mem.CreateBackup(ctx, store.Backup{ID: id, Host: "h1", Template: "postgres", Slug: "a"}))
+
+	// Enqueue (don't run) a backup job whose args carry this backup_id.
+	args, err := json.Marshal(instance.BackupRequest{BackupID: id, Host: "h1", Template: "postgres", Slug: "a"})
+	require.NoError(t, err)
+	_, err = mem.Enqueue(ctx, "backup", args, "")
 	require.NoError(t, err)
 
 	resp := backupReq(t, "DELETE", srv.URL+"/backups/"+id, tok)

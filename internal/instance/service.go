@@ -33,7 +33,7 @@ var (
 
 	ErrBackupNotFound      = errors.New("backup not found")
 	ErrBackupNotRestorable = errors.New("backup is not restorable")
-	ErrBackupBusy          = errors.New("backup has a restore in flight")
+	ErrBackupBusy          = errors.New("backup has a backup or restore in flight")
 	ErrBackupsDisabled     = errors.New("backups require a blob store (-backup-dir)")
 )
 

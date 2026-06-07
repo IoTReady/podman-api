@@ -466,6 +466,35 @@ func TestRestoreInFlight(t *testing.T) {
 	assert.False(t, in)
 }
 
+func TestBackupInFlight(t *testing.T) {
+	ctx := context.Background()
+	mem := store.NewMemory()
+
+	args, err := json.Marshal(BackupRequest{BackupID: "bk_X", Host: "h1", Template: "pg", Slug: "a"})
+	require.NoError(t, err)
+	job, err := mem.Enqueue(ctx, "backup", args, "")
+	require.NoError(t, err)
+
+	in, err := BackupInFlight(ctx, mem, "bk_X")
+	require.NoError(t, err)
+	assert.True(t, in)
+
+	in, err = BackupInFlight(ctx, mem, "bk_other")
+	require.NoError(t, err)
+	assert.False(t, in)
+
+	// Claim then finish (terminal) — no longer in flight.
+	claimed, ok, err := mem.ClaimNext(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, job.ID, claimed.ID)
+	require.NoError(t, mem.Finish(ctx, job.ID, store.JobFailed, "x"))
+
+	in, err = BackupInFlight(ctx, mem, "bk_X")
+	require.NoError(t, err)
+	assert.False(t, in)
+}
+
 func TestBackup_SecondVolumeFailureCleansFirstVolumeBlob(t *testing.T) {
 	svc, f, _, blob := newBackupSvcTwoVols(t)
 	ctx := context.Background()
