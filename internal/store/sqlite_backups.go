@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -116,7 +117,7 @@ func scanBackup(r rowScanner) (Backup, error) {
 	var state, vols string
 	var created, finished int64
 	if err := r.Scan(&b.ID, &b.Host, &b.Template, &b.Slug, &state, &vols, &b.Image, &created, &finished); err != nil {
-		if err == sql.ErrNoRows {
+		if errors.Is(err, sql.ErrNoRows) {
 			return Backup{}, ErrNotFound
 		}
 		return Backup{}, err

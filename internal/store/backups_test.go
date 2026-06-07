@@ -174,6 +174,20 @@ func TestBackups_DeleteAndNotFound(t *testing.T) {
 	}
 }
 
+func TestBackups_CreateDuplicateIDErrors(t *testing.T) {
+	for name, bs := range backupStores(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			id := NewBackupID()
+			b := Backup{ID: id, Host: "h1", Template: "pg", Slug: "a"}
+
+			require.NoError(t, bs.CreateBackup(ctx, b))
+			err := bs.CreateBackup(ctx, b)
+			require.Error(t, err, "second CreateBackup with the same ID must error")
+		})
+	}
+}
+
 func TestBackups_SQLitePersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()

@@ -397,6 +397,9 @@ var _ Store = (*Memory)(nil)
 func (m *Memory) CreateBackup(_ context.Context, b Backup) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if _, exists := m.backups[b.ID]; exists {
+		return fmt.Errorf("backup %s already exists", b.ID)
+	}
 	b.State = BackupCreating
 	b.Created = time.Now()
 	b.Finished = time.Time{}
