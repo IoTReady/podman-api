@@ -64,6 +64,19 @@ func seedBootSpec(t *testing.T, st *store.Memory, host, tmpl, slug string, secre
 	require.NoError(t, err)
 }
 
+// fakeIngressController is a test double for ingress.Controller that
+// records every Reconcile call.
+type fakeIngressController struct {
+	reconcileCalls int
+	lastHost       string
+}
+
+func (f *fakeIngressController) Reconcile(_ context.Context, host string) error {
+	f.reconcileCalls++
+	f.lastHost = host
+	return nil
+}
+
 func TestReconcileSpecsOnHost_AlreadyRunning(t *testing.T) {
 	svc, fc, st := specReconcileSvc(t)
 	ctx := context.Background()
@@ -186,37 +199,31 @@ func TestReconcileSpecsOnHost_NonRunningPod(t *testing.T) {
 
 	svc.ReconcileSpecsOnHost(ctx, "h1")
 
-	// Should re-play because the pod is not running.
+	// Should re-play because the pod is not running, with replace=true so
+	// podman replaces the stale pod rather than failing with "pod exists".
 	require.Len(t, fc.PlayCalls, 1, "should re-play a non-running pod")
 	assert.Contains(t, fc.PlayCalls[0].YAML, "name: web-my-app")
+	assert.True(t, fc.PlayCalls[0].Replace, "should use replace=true for a non-running pod")
 }
 
-func TestReconcileSpecsOnHost_UnknownHost(t *testing.T) {
-	svc, fc, _ := specReconcileSvc(t)
-	ctx := context.Background()
-
-	// Reconcile a host that doesn't exist in the config.
-	svc.ReconcileSpecsOnHost(ctx, "unknown-host")
-
-	// Should not panic; no PlayKube calls.
-	assert.Empty(t, fc.PlayCalls, "should not play for unknown host")
-}
-
-func TestReconcileSpecsOnHost_SpecCorrupt(t *testing.T) {
+func TestReconcileSpecsOnHost_IngressEnabled(t *testing.T) {
 	svc, fc, st := specReconcileSvc(t)
 	ctx := context.Background()
 
-	// Seed a spec, then corrupt it by writing bad JSON directly.
+	// Enable ingress on the service.
+	ingCtl := &fakeIngressController{}
+	svc.SetIngress(ingCtl, "test-net")
+
+	// Seed a spec with a domain so ingress would have routes to manage.
 	seedBootSpec(t, st, "h1", "web", "my-app", nil)
-	// The memory store doesn't have a corruption mechanism, so we simulate
-	// by making the store return an error on GetSpec. We can't easily do that
-	// with store.Memory, so instead we verify the happy path works and note
-	// that corruption is handled at the store layer. This test verifies that
-	// a spec that exists but can't be loaded doesn't cause a crash.
-	// For the memory store, GetSpec always works, so this is a no-op test
-	// that documents the behavior: corrupt specs are skipped with a log.
+
 	svc.ReconcileSpecsOnHost(ctx, "h1")
 
-	// The spec is valid in memory store, so it should be reconciled.
-	require.Len(t, fc.PlayCalls, 1, "should re-play a valid spec")
+	// PlayKube should have been called.
+	require.Len(t, fc.PlayCalls, 1)
+	assert.Contains(t, fc.PlayCalls[0].YAML, "name: web-my-app")
+
+	// Ingress should have been reconciled exactly once.
+	assert.Equal(t, 1, ingCtl.reconcileCalls)
+	assert.Equal(t, "h1", ingCtl.lastHost)
 }

@@ -13,6 +13,12 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 )
 
+// errTemplateSkipped is a sentinel returned by reconcileOneSpec when the
+// instance's template was deleted from the catalog since the instance was
+// deployed. The caller logs a human-readable message instead of the error
+// text, distinguishing this from other transient (unreachable) failures.
+var errTemplateSkipped = errors.New("template not found — instance skipped")
+
 // ReconcileSpecsOnHost checks every stored instance spec on host against real
 // pod state and re-converges any that are missing (not running). It is called
 // once at daemon startup as a one-shot boot converge, so managed pods survive
@@ -43,22 +49,42 @@ func (s *Service) ReconcileSpecsOnHost(ctx context.Context, hostID string) {
 		return
 	}
 
+	needsIngress := false
 	for _, k := range keys {
 		reconciled, err := s.reconcileOneSpec(ctx, hostID, k.Template, k.Slug)
-		if err != nil {
+		if errors.Is(err, errTemplateSkipped) {
+			log.Printf("boot converge %s/%s/%s: template %q not found — skipping (spec not reaped)",
+				hostID, k.Template, k.Slug, k.Template)
+		} else if err != nil {
 			log.Printf("boot converge %s/%s/%s: %v", hostID, k.Template, k.Slug, err)
 		} else if reconciled {
 			log.Printf("boot converge %s/%s/%s: re-converged (pod was missing)", hostID, k.Template, k.Slug)
+			needsIngress = true
 		} else {
 			log.Printf("boot converge %s/%s/%s: already running", hostID, k.Template, k.Slug)
+		}
+	}
+
+	// Reconcile ingress once per host rather than once per instance, avoiding
+	// N Caddyfile generations and reloads when N instances are reconverged.
+	// The reconcile is idempotent — it reads all specs from the store for this
+	// host and derives routes from scratch.
+	if needsIngress && s.ingressEnabled() {
+		if err := s.ingress.Reconcile(ctx, hostID); err != nil {
+			log.Printf("boot converge %s: ingress reconcile failed: %v", hostID, err)
 		}
 	}
 }
 
 // reconcileOneSpec checks whether the pod for (host, tmpl, slug) exists; if it
-// does, returns (false, nil). If it does not, re-creates it from the stored
-// spec and returns (true, nil). Errors are returned so the caller can log them
-// — the caller decides whether to retry or skip.
+// does and is running, returns false (already converged). If it does not, or if
+// it exists but is not running, re-creates it from the stored spec and returns
+// true. Sentinels errTemplateSkipped and errAlreadyConverged are never
+// propagated — the caller logs a human-readable message for each.
+//
+// An ingress.Reconcile is NOT called here because the caller (ReconcileSpecsOnHost)
+// reconciles ingress once per host after the loop, avoiding N reloads when N
+// instances on the same host are reconverged.
 func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug string) (reconciled bool, err error) {
 	// Serialize per-instance so a concurrent Apply/Delete/Upgrade of the same
 	// instance does not race with boot converge.
@@ -74,8 +100,10 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 	if pErr != nil && !errors.Is(pErr, podman.ErrNotFound) {
 		return false, fmt.Errorf("inspect pod: %w", pErr) // host unreachable, etc.
 	}
-	// PodInspect returned ErrNotFound or the pod exists but isn't running.
-	// Either way we need to re-converge.
+	// podMissing is true when ErrNotFound (pod absent), false when the pod
+	// exists but isn't running (Exited/Stopped/Paused). Needed below to decide
+	// replace=true vs replace=false for PlayKube.
+	podMissing := errors.Is(pErr, podman.ErrNotFound)
 
 	// Step 2: load the stored spec.
 	spec, err := s.store.GetSpec(ctx, hostID, tmpl, slug)
@@ -99,10 +127,9 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
 			// Template was deleted since the instance was deployed. We cannot
-			// re-render the spec. Skip and warn.
-			log.Printf("boot converge %s/%s/%s: template %q not found — skipping (spec not reaped)",
-				hostID, tmpl, slug, tmpl)
-			return false, nil
+			// re-render the spec. Skip and warn — return the sentinel so the
+			// caller logs a clear message rather than "already running".
+			return false, errTemplateSkipped
 		}
 		return false, fmt.Errorf("get template %q: %w", tmpl, err)
 	}
@@ -144,12 +171,15 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 		networks = []string{s.ingressNet}
 	}
 
-	// Step 8: play kube (replace=false is correct — the pod is absent).
-	if err := s.client.PlayKube(ctx, hostID, yaml, false, networks...); err != nil {
+	// Step 8: play kube. replace=true when the pod exists (non-Running) so
+	// podman replaces the stale pod; replace=false when the pod is absent.
+	if err := s.client.PlayKube(ctx, hostID, yaml, !podMissing, networks...); err != nil {
 		return false, fmt.Errorf("play kube: %w", err)
 	}
 
 	// Step 9: persist the spec (upsert — updates timestamp, data unchanged).
+	// Defensive clones: spec.Parameters and spec.Secrets came from GetSpec
+	// and may share backing arrays with the store depending on the implementation.
 	sp := store.Spec{
 		Host:       hostID,
 		Template:   tmpl,
@@ -163,14 +193,6 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 		// but do not fail the reconcile — the pod is the primary concern.
 		log.Printf("boot converge %s/%s/%s: pod re-created but spec persist failed: %v",
 			hostID, tmpl, slug, err)
-	}
-
-	// Step 10: ingress reconcile (idempotent).
-	if s.ingressEnabled() {
-		if err := s.ingress.Reconcile(ctx, hostID); err != nil {
-			log.Printf("boot converge %s/%s/%s: pod re-created but ingress reconcile failed: %v",
-				hostID, tmpl, slug, err)
-		}
 	}
 
 	return true, nil

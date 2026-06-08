@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -227,9 +228,15 @@ func main() {
 		case <-runnerCtx.Done():
 			return
 		}
+		var wg sync.WaitGroup
 		for _, h := range *hostsHolder.Load() {
-			svc.ReconcileSpecsOnHost(runnerCtx, h.ID)
+			wg.Add(1)
+			go func(id string) {
+				defer wg.Done()
+				svc.ReconcileSpecsOnHost(runnerCtx, id)
+			}(h.ID)
 		}
+		wg.Wait()
 	}()
 
 	metrics := obs.New()
