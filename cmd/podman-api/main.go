@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -213,6 +214,30 @@ func main() {
 		})
 		log.Printf("prune scheduler enabled (interval %s, disk threshold %d%%, scopes %v)", *pruneInterval, *pruneThreshold, def.Scope)
 	}
+
+	// Boot converge: asynchronously ensure every stored instance spec is
+	// running on its host. This is a one-shot reconcile — distinct from the
+	// job-runner boot reconcile (#96) which only resolves interrupted
+	// migrate/backup jobs. A short initial delay lets the HTTP server start
+	// first so the daemon is ready to serve requests immediately.
+	go func() {
+		// Use a short delay so ListenAndServe can bind before we start
+		// making podman calls. runnerCtx cancellation (shutdown) aborts.
+		select {
+		case <-time.After(2 * time.Second):
+		case <-runnerCtx.Done():
+			return
+		}
+		var wg sync.WaitGroup
+		for _, h := range *hostsHolder.Load() {
+			wg.Add(1)
+			go func(id string) {
+				defer wg.Done()
+				svc.ReconcileSpecsOnHost(runnerCtx, id)
+			}(h.ID)
+		}
+		wg.Wait()
+	}()
 
 	metrics := obs.New()
 
