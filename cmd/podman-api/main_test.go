@@ -23,7 +23,7 @@ func TestJobRegistry_IncludesBackupKinds(t *testing.T) {
 	// buildJobRegistry only stores the args inside handler/reconciler structs;
 	// it never calls methods on them, so nil/zero values are safe here.
 	svc := instance.NewService(fake.New(), nil)
-	reg, recs := buildJobRegistry(svc, nil, nil, 1, nil)
+	reg, recs := buildJobRegistry(svc, nil, nil, 1, nil, nil)
 
 	for _, kind := range []string{"migrate", "evacuate", "prune", "backup", "restore"} {
 		if _, ok := reg[kind]; !ok {

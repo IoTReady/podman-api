@@ -180,12 +180,14 @@ func main() {
 	}
 	jobStore = db
 	pruneMetrics := obs.NewPruneMetrics(prometheus.DefaultRegisterer)
-	registry, reconcilers := buildJobRegistry(svc, client, db, *evacConc, pruneMetrics)
+	jobMetrics := obs.NewJobMetrics(prometheus.DefaultRegisterer)
+	registry, reconcilers := buildJobRegistry(svc, client, db, *evacConc, pruneMetrics, jobMetrics)
 	workers := *jobWorkers
 	if workers <= 0 {
 		workers = jobs.DefaultWorkers
 	}
 	runner := jobs.NewRunner(db, registry, workers)
+	runner.Metrics = jobMetrics
 	canceller = runner
 	runner.SetReconcilers(reconcilers)
 	runner.Start(runnerCtx)
@@ -429,10 +431,10 @@ func main() {
 // buildJobRegistry constructs the job registry and reconcilers map for the
 // runner. Extracted so main_test.go can assert both maps include every
 // registered kind without spinning up HTTP or a real podman host.
-func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics) (jobs.Registry, jobs.Reconcilers) {
+func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics) (jobs.Registry, jobs.Reconcilers) {
 	reg := jobs.Registry{
-		"migrate":  &migrate.Handler{Svc: svc},
-		"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: evacConc},
+		"migrate":  &migrate.Handler{Svc: svc, Metrics: jobMetrics},
+		"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: evacConc, Metrics: jobMetrics},
 		"prune":    &prune.Handler{Client: client, Jobs: db, Metrics: pruneMetrics},
 		"backup":   &backuppkg.Handler{Svc: svc},
 		"restore":  &backuppkg.RestoreHandler{Svc: svc},
