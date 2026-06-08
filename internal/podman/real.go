@@ -127,6 +127,13 @@ func hostConnEq(a, b config.Host) bool {
 
 // URIFor returns the libpod URI for hostID. unix-only when addr=="unix".
 func (r *Real) URIFor(id string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.uriForLocked(id)
+}
+
+// uriForLocked is the unsynchronized body of URIFor; callers must hold r.mu.
+func (r *Real) uriForLocked(id string) (string, error) {
 	h, ok := r.hosts[id]
 	if !ok {
 		return "", fmt.Errorf("unknown host %q", id)
@@ -151,7 +158,7 @@ func (r *Real) ctxFor(parent context.Context, id string) (context.Context, error
 	if !ok {
 		return nil, fmt.Errorf("unknown host %q", id)
 	}
-	uri, err := r.URIFor(id)
+	uri, err := r.uriForLocked(id)
 	if err != nil {
 		return nil, err
 	}

@@ -515,6 +515,7 @@ func (f *Fake) Knows(id string) bool {
 // SetHosts is a no-op: the fake has no persistent host map — it services any
 // host ID, so a reload does not change behaviour.
 func (f *Fake) SetHosts(_ []config.Host) {}
+
 func (f *Fake) HostInfo(_ context.Context, _ string) (podman.HostInfo, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
