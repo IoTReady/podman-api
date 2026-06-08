@@ -35,9 +35,12 @@ For each spec key on the host:
 7. **Render YAML** (`render.RenderBody`).
 8. **Create per-instance secrets** on host (deterministic names, remove+create).
 9. **Ensure ingress network** if template declares ingress.
-10. **`PlayKube(replace=false)`** to recreate the pod.
+10. **`PlayKube`** — `replace=false` when the pod is absent, `replace=true`
+    when the pod exists but is not running (Exited/Stopped/Paused), so podman
+    replaces the stale pod rather than returning "pod already exists".
 11. **`PutSpec`** (upsert — updates timestamp).
-12. **`Ingress.Reconcile`** if ingress enabled.
+12. **`Ingress.Reconcile`** if any instance was reconverged (once per host,
+    not once per instance).
 
 ### Startup wiring
 

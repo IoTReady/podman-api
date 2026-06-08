@@ -206,6 +206,61 @@ func TestReconcileSpecsOnHost_NonRunningPod(t *testing.T) {
 	assert.True(t, fc.PlayCalls[0].Replace, "should use replace=true for a non-running pod")
 }
 
+// errStore wraps a store.Memory and injects errors on GetSpec for a specific
+// (template, slug) pair.
+type errStore struct {
+	*store.Memory
+	corruptTmpl string
+	corruptSlug string
+}
+
+func (e *errStore) GetSpec(ctx context.Context, host, template, slug string) (store.Spec, error) {
+	if template == e.corruptTmpl && slug == e.corruptSlug {
+		return store.Spec{}, store.ErrSpecCorrupt
+	}
+	return e.Memory.GetSpec(ctx, host, template, slug)
+}
+
+// listErrStore wraps a store.Memory and fails ListSpecKeys.
+type listErrStore struct {
+	*store.Memory
+}
+
+func (l *listErrStore) ListSpecKeys(_ context.Context, _ string) ([]store.SpecKey, error) {
+	return nil, assert.AnError
+}
+
+func TestReconcileSpecsOnHost_SpecCorrupt(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	// Replace the store with one that returns ErrSpecCorrupt for "web/my-app".
+	es := &errStore{Memory: st, corruptTmpl: "web", corruptSlug: "my-app"}
+	svc.SetStore(es)
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+
+	svc.ReconcileSpecsOnHost(ctx, "h1")
+
+	// PlayKube should NOT have been called — spec was corrupt.
+	assert.Empty(t, fc.PlayCalls, "should not re-play when spec is corrupt")
+}
+
+func TestReconcileSpecsOnHost_StoreListError(t *testing.T) {
+	fc := fake.New()
+	ctx := context.Background()
+
+	// Service with no templates — ListSpecKeys on the error store returns error
+	// before any template lookup is needed.
+	svc := NewService(fc, []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}})
+	svc.SetStore(&listErrStore{Memory: store.NewMemory()})
+
+	svc.ReconcileSpecsOnHost(ctx, "h1")
+
+	// Should not error or panic; just log and return.
+	assert.Empty(t, fc.PlayCalls, "should not play when store list fails")
+}
+
 func TestReconcileSpecsOnHost_IngressEnabled(t *testing.T) {
 	svc, fc, st := specReconcileSvc(t)
 	ctx := context.Background()
