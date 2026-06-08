@@ -196,3 +196,42 @@ func TestRunner_CancelUnknown(t *testing.T) {
 		t.Fatal("Cancel of unknown id returned true")
 	}
 }
+
+type mockMetrics struct {
+	started        bool
+	finishedResult string
+	durationKind   string
+	finishedKind   string
+}
+
+func (m *mockMetrics) JobStarted(kind string)                  { m.started = true }
+func (m *mockMetrics) JobFinished(kind, result string)         { m.finishedKind, m.finishedResult = kind, result }
+func (m *mockMetrics) ObserveDuration(kind string, d time.Duration) { m.durationKind = kind }
+func (m *mockMetrics) JobEnqueued(string)                      {}
+func (m *mockMetrics) Rollback(string)                         {}
+func (m *mockMetrics) ChildFailure(string)                     {}
+
+func TestRunnerMetrics(t *testing.T) {
+	t.Parallel()
+	js := store.NewMemory()
+	m := &mockMetrics{}
+	r := NewRunner(js, Registry{"test": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+		return nil
+	})}, 1)
+	r.Metrics = m
+
+	// Run one worker iteration
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	r.run(ctx, store.Job{ID: "test-job", Kind: "test"})
+
+	if !m.started {
+		t.Error("JobStarted not called")
+	}
+	if m.finishedResult != "succeeded" {
+		t.Errorf("JobFinished result = %q, want %q", m.finishedResult, "succeeded")
+	}
+	if m.durationKind != "test" {
+		t.Errorf("ObserveDuration kind = %q, want %q", m.durationKind, "test")
+	}
+}
