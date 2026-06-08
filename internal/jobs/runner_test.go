@@ -204,12 +204,14 @@ type mockMetrics struct {
 	finishedKind   string
 }
 
-func (m *mockMetrics) JobStarted(kind string)                  { m.started = true }
-func (m *mockMetrics) JobFinished(kind, result string)         { m.finishedKind, m.finishedResult = kind, result }
+func (m *mockMetrics) JobStarted(kind string) { m.started = true }
+func (m *mockMetrics) JobFinished(kind, result string) {
+	m.finishedKind, m.finishedResult = kind, result
+}
 func (m *mockMetrics) ObserveDuration(kind string, d time.Duration) { m.durationKind = kind }
-func (m *mockMetrics) JobEnqueued(string)                      {}
-func (m *mockMetrics) Rollback(string)                         {}
-func (m *mockMetrics) ChildFailure(string)                     {}
+func (m *mockMetrics) JobEnqueued(string)                           {}
+func (m *mockMetrics) Rollback(string)                              {}
+func (m *mockMetrics) ChildFailure(string)                          {}
 
 func TestRunnerMetrics(t *testing.T) {
 	t.Parallel()

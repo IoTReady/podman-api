@@ -14,12 +14,12 @@ var _ jobs.Metrics = (*JobMetrics)(nil)
 // an explicit Registerer so production registers on the default registry
 // (NewJobMetrics(prometheus.DefaultRegisterer)) and tests use a private one.
 type JobMetrics struct {
-	enqueued      *prometheus.GaugeVec    // kind — current queued count
-	jobs          *prometheus.CounterVec  // kind, result — started/succeeded/failed/canceled
+	enqueued      *prometheus.GaugeVec     // kind — current queued count
+	jobs          *prometheus.CounterVec   // kind, result — started/succeeded/failed/canceled
 	duration      *prometheus.HistogramVec // kind
-	inFlight      *prometheus.GaugeVec    // kind
-	rollbacks     *prometheus.CounterVec  // kind
-	childFailures *prometheus.CounterVec  // kind
+	inFlight      *prometheus.GaugeVec     // kind
+	rollbacks     *prometheus.CounterVec   // kind
+	childFailures *prometheus.CounterVec   // kind
 }
 
 // NewJobMetrics builds and registers the collectors on reg.

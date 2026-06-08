@@ -104,12 +104,12 @@ type inflightJob struct {
 // noopMetrics is a nil-safe default for *Runner.Metrics.
 type noopMetrics struct{}
 
-func (noopMetrics) JobStarted(string)              {}
-func (noopMetrics) JobFinished(string, string)      {}
+func (noopMetrics) JobStarted(string)                     {}
+func (noopMetrics) JobFinished(string, string)            {}
 func (noopMetrics) ObserveDuration(string, time.Duration) {}
-func (noopMetrics) JobEnqueued(string)              {}
-func (noopMetrics) Rollback(string)                 {}
-func (noopMetrics) ChildFailure(string)             {}
+func (noopMetrics) JobEnqueued(string)                    {}
+func (noopMetrics) Rollback(string)                       {}
+func (noopMetrics) ChildFailure(string)                   {}
 
 // NewRunner builds a runner. workers <= 0 uses DefaultWorkers.
 // The handler registry must not be modified after this call.
