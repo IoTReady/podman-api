@@ -328,6 +328,7 @@ func main() {
 			if newHosts, err := config.LoadHosts(*hostsDir); err != nil {
 				log.Printf("hosts reload FAILED, keeping previous set: %v", err)
 			} else {
+				client.SetHosts(newHosts)
 				svc.SetHosts(newHosts)
 				// newHosts is never reassigned after this point, so storing its
 				// address publishes the freshly-loaded set to the prune scheduler's

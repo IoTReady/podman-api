@@ -74,12 +74,66 @@ func NewReal(hosts []config.Host) (*Real, error) {
 
 // Knows reports whether the host is registered.
 func (r *Real) Knows(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	_, ok := r.hosts[id]
 	return ok
 }
 
+// SetHosts replaces the client's host map at runtime, diff-invalidating cached
+// connections so that:
+//   - newly added hosts become connectable on first use (lazy ctxFor);
+//   - removed hosts are dropped (cached context garbage-collected);
+//   - hosts whose addr/socket/ssh_key changed get their cached connection and
+//     verified flag cleared so the next call reopens with the new params;
+//   - unchanged hosts keep their live cached connection.
+func (r *Real) SetHosts(hosts []config.Host) {
+	newMap := make(map[string]config.Host, len(hosts))
+	for _, h := range hosts {
+		if h.ID != "" {
+			newMap[h.ID] = h
+		}
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	// Remove hosts that were deleted.
+	for id := range r.hosts {
+		if _, keep := newMap[id]; !keep {
+			delete(r.hosts, id)
+			delete(r.ctx, id)
+			delete(r.verified, id)
+		}
+	}
+
+	// Add or update hosts.
+	for id, h := range newMap {
+		if old, exists := r.hosts[id]; exists && !hostConnEq(old, h) {
+			// Connection params changed: invalidate cached state.
+			delete(r.ctx, id)
+			delete(r.verified, id)
+		}
+		r.hosts[id] = h
+	}
+}
+
+// hostConnEq reports whether two host configs share the same connection
+// parameters (address, socket path, SSH key). Other fields (Drain, Labels,
+// Prune, etc.) do NOT affect the cached podman connection.
+func hostConnEq(a, b config.Host) bool {
+	return a.Addr == b.Addr && a.Socket == b.Socket && a.SSHKey == b.SSHKey
+}
+
 // URIFor returns the libpod URI for hostID. unix-only when addr=="unix".
 func (r *Real) URIFor(id string) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.uriForLocked(id)
+}
+
+// uriForLocked is the unsynchronized body of URIFor; callers must hold r.mu.
+func (r *Real) uriForLocked(id string) (string, error) {
 	h, ok := r.hosts[id]
 	if !ok {
 		return "", fmt.Errorf("unknown host %q", id)
@@ -104,7 +158,7 @@ func (r *Real) ctxFor(parent context.Context, id string) (context.Context, error
 	if !ok {
 		return nil, fmt.Errorf("unknown host %q", id)
 	}
-	uri, err := r.URIFor(id)
+	uri, err := r.uriForLocked(id)
 	if err != nil {
 		return nil, err
 	}
@@ -893,8 +947,9 @@ func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
 // over a short-lived SSH session bounded by ctx. Any error yields nil so the
 // metric is absent.
 func (r *Real) hostLoadAvg(ctx context.Context, id string) *[3]float64 {
-	// r.hosts is immutable after NewReal, so no r.mu needed here.
+	r.mu.Lock()
 	h, ok := r.hosts[id]
+	r.mu.Unlock()
 	if !ok {
 		return nil
 	}
