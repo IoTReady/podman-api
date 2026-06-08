@@ -178,13 +178,18 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 	}
 
 	// Step 9: persist the spec (upsert — updates timestamp, data unchanged).
+	// Use spec.Parameters (raw stored params) rather than params (which has
+	// ApplyDefaults merged in). If the template's defaults changed since the
+	// original deploy, persisting params would silently overwrite the stored
+	// values and create drift between what the pod is running and the spec
+	// row. spec.Parameters preserves the original deploy-time values.
 	// Defensive clones: spec.Parameters and spec.Secrets came from GetSpec
 	// and may share backing arrays with the store depending on the implementation.
 	sp := store.Spec{
 		Host:       hostID,
 		Template:   tmpl,
 		Slug:       slug,
-		Parameters: maps.Clone(params),
+		Parameters: maps.Clone(spec.Parameters),
 		Secrets:    maps.Clone(spec.Secrets),
 		Domains:    slices.Clone(spec.Domains),
 	}
