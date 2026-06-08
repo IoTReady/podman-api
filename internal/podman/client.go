@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+
+	"github.com/iotready/podman-api/internal/config"
 )
 
 // Client is the contract every consumer of podman speaks. The real
@@ -80,9 +82,14 @@ type Client interface {
 	// Host
 	HostInfo(ctx context.Context, hostID string) (HostInfo, error)
 	// Knows reports whether hostID is a registered host this client can reach.
-	// The host set is fixed at construction, so a host added via config reload is
-	// not Knows() until the daemon (and client) restarts.
+	// The host set is updated at construction and whenever SetHosts is called
+	// (e.g. after a SIGHUP host-config reload).
 	Knows(hostID string) bool
+	// SetHosts replaces the client's host map at runtime. New hosts become
+	// connectable; removed hosts are dropped (and their cached connections
+	// cleaned up); changed connection params (addr/socket/ssh_key) invalidate
+	// the cached context so the next call reopens the connection.
+	SetHosts(hosts []config.Host)
 }
 
 // ExecResult is the outcome of ContainerExec.
