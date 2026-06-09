@@ -19,12 +19,26 @@
        .Shell (not .Hosts) keeps the chrome even when zero hosts are configured. */}}
   {{if .Shell}}
   <div class="shell">
+    <button id="hamburger" class="hamburger" type="button" aria-label="Toggle navigation">☰</button>
     {{template "nav" .}}
+    <div class="sidebar-backdrop"></div>
     <main id="main">{{template "body" .}}</main>
   </div>
   {{else}}
   {{template "body" .}}
   {{end}}
+<script>
+(function(){
+  var h = document.getElementById('hamburger');
+  var s = document.querySelector('.sidebar');
+  var b = document.querySelector('.sidebar-backdrop');
+  if (!h || !s || !b) return;
+  function close() { s.classList.remove('open'); b.classList.remove('open'); }
+  h.addEventListener('click', function(e) { e.stopPropagation(); s.classList.toggle('open'); b.classList.toggle('open'); });
+  b.addEventListener('click', close);
+  document.body.addEventListener('htmx:afterSwap', close);
+})();
+</script>
 </body>
 </html>{{end}}
 
