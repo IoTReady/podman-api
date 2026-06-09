@@ -18,10 +18,10 @@
   <input type="hidden" name="follow" value="{{.Follow}}">
   {{if .Follow}}
   <button hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs?container={{.Container}}&follow=false"
-          hx-target="#main" hx-push-url="true" hx-disable>Pause</button>
+          hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Pause</button>
   {{else}}
   <button hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs?container={{.Container}}&follow=true"
-          hx-target="#main" hx-push-url="true" hx-disable>Follow</button>
+          hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Follow</button>
   {{end}}
 </div>
 {{if .Follow}}

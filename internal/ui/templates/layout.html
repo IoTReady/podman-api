@@ -33,10 +33,10 @@
   <div class="label">HOSTS</div>
   <ul>
     {{range .Hosts}}
-    <li{{if eq .ID $.ActiveHost}} class="active"{{end}}><a href="/ui/hosts/{{.ID}}" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true" hx-disable>{{.ID}}</a></li>
+    <li{{if eq .ID $.ActiveHost}} class="active"{{end}}><a href="/ui/hosts/{{.ID}}" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">{{.ID}}</a></li>
     {{end}}
   </ul>
-  <a href="/ui/jobs" hx-get="/ui/jobs" hx-target="#main" hx-push-url="true" hx-disable{{if eq "jobs" $.ActivePage}} class="active"{{end}}>Jobs</a>
+  <a href="/ui/jobs" hx-get="/ui/jobs" hx-target="#main" hx-push-url="true" hx-disabled-elt="this"{{if eq "jobs" $.ActivePage}} class="active"{{end}}>Jobs</a>
   <form method="post" action="/ui/logout">
     <input type="hidden" name="csrf_token" value="{{.CSRF}}">
     <button type="submit">Sign out</button>
