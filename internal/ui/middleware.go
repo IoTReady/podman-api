@@ -46,6 +46,11 @@ func (rl *ipRateLimiter) Allow(ip string) bool {
 		}
 	}
 	rl.attempts[ip] = recent
+	// Free the map entry when no timestamps survive pruning so a host of
+	// one-shot visitors doesn't accumulate entries forever.
+	if len(recent) == 0 {
+		delete(rl.attempts, ip)
+	}
 
 	if len(recent) >= rl.maxAttempts {
 		return false
