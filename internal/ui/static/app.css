@@ -38,10 +38,16 @@ button:disabled {
 .container-row span { display: inline-block; }
 .container-row span:nth-child(2) { word-break: break-all; }
 
-/* Hamburger toggle for mobile sidebar */
+/* Log pre — wrapping is always beneficial, height limit is mobile-only */
+pre#log-lines { white-space: pre-wrap; }
+
+/* Hamburger toggle — hidden on desktop, shown as fixed button on mobile */
 .hamburger { display: none; }
 
+/* Mobile: ≤640px */
 @media (max-width: 640px) {
+
+  /* --- Sidebar: hamburger overlay --- */
   .hamburger {
     display: block;
     position: fixed;
@@ -56,19 +62,17 @@ button:disabled {
     cursor: pointer;
     line-height: 1;
   }
-}
-
-@media (max-width: 640px) {
   .sidebar {
     position: fixed;
     top: 0;
-    left: -220px;
+    left: 0;
     height: 100vh;
     z-index: 1000;
-    transition: left 0.2s ease;
+    transform: translateX(-100%);
+    transition: transform 0.2s ease;
   }
   .sidebar.open {
-    left: 0;
+    transform: translateX(0);
   }
   .sidebar-backdrop {
     display: none;
@@ -81,9 +85,8 @@ button:disabled {
   .sidebar-backdrop.open {
     display: block;
   }
-}
 
-@media (max-width: 640px) {
+  /* --- Tables: card layout --- */
   .pure-table thead {
     display: none;
   }
@@ -109,18 +112,14 @@ button:disabled {
     font-weight: 700;
     color: #555;
   }
-}
 
-@media (max-width: 640px) {
+  /* --- Instance detail: stacked layout --- */
   .inst-head .actions {
     display: flex;
     flex-wrap: wrap;
     gap: 0.4rem;
     margin-top: 0.5rem;
   }
-}
-
-@media (max-width: 640px) {
   .container-row {
     display: flex;
     flex-direction: column;
@@ -129,15 +128,12 @@ button:disabled {
     border-bottom: 1px solid #eee;
   }
   .container-row:last-child { border-bottom: none; }
-}
+  pre#log-lines {
+    max-height: 60vh;
+    overflow-y: auto;
+  }
 
-pre#log-lines {
-  white-space: pre-wrap;
-  max-height: 60vh;
-  overflow-y: auto;
-}
-
-@media (max-width: 640px) {
+  /* --- Tighter spacing --- */
   .shell { padding: 0; }
   main { padding: 0.5rem; }
   h1, h2 { font-size: 1.1rem; }
@@ -145,4 +141,5 @@ pre#log-lines {
   .host-head, .inst-head { display: flex; flex-direction: column; gap: 0.3rem; }
   .host-head a, .inst-head a, .inst-head button { align-self: flex-start; }
   .inst-head { margin-bottom: 0.5rem; }
+
 }

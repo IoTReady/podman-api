@@ -19,9 +19,9 @@
        .Shell (not .Hosts) keeps the chrome even when zero hosts are configured. */}}
   {{if .Shell}}
   <div class="shell">
-    <button id="hamburger" class="hamburger" aria-label="Toggle navigation">☰</button>
-	    {{template "nav" .}}
-	    <div class="sidebar-backdrop"></div>
+    <button id="hamburger" class="hamburger" type="button" aria-label="Toggle navigation">☰</button>
+    {{template "nav" .}}
+    <div class="sidebar-backdrop"></div>
     <main id="main">{{template "body" .}}</main>
   </div>
   {{else}}
