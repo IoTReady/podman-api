@@ -34,10 +34,115 @@ button:disabled {
   cursor: wait;
 }
 
-/* Responsive: stack sidebar on top on narrow viewports */
+/* Container row (desktop) — inline spans */
+.container-row span { display: inline-block; }
+.container-row span:nth-child(2) { word-break: break-all; }
+
+/* Hamburger toggle for mobile sidebar */
+.hamburger { display: none; }
+
 @media (max-width: 640px) {
-  .shell { flex-direction: column; }
-  .sidebar { min-width: unset; border-right: none; border-bottom: 1px solid #ddd; }
-  .sidebar ul { display: flex; flex-wrap: wrap; gap: .5rem; }
-  .sidebar form { margin-top: .5rem; }
+  .hamburger {
+    display: block;
+    position: fixed;
+    top: 0.5rem;
+    left: 0.5rem;
+    z-index: 1001;
+    background: #fff;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    padding: 0.4rem 0.6rem;
+    font-size: 1.2rem;
+    cursor: pointer;
+    line-height: 1;
+  }
+}
+
+@media (max-width: 640px) {
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: -220px;
+    height: 100vh;
+    z-index: 1000;
+    transition: left 0.2s ease;
+  }
+  .sidebar.open {
+    left: 0;
+  }
+  .sidebar-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.3);
+    z-index: 999;
+  }
+  .sidebar.open + .sidebar-backdrop,
+  .sidebar-backdrop.open {
+    display: block;
+  }
+}
+
+@media (max-width: 640px) {
+  .pure-table thead {
+    display: none;
+  }
+  .pure-table,
+  .pure-table tbody,
+  .pure-table tr,
+  .pure-table td {
+    display: block;
+    border: none;
+  }
+  .pure-table tr {
+    border: 1px solid #ddd;
+    margin-bottom: 0.5rem;
+    padding: 0.5rem;
+    border-radius: 4px;
+  }
+  .pure-table td {
+    padding: 0.2rem 0;
+    text-align: left;
+  }
+  .pure-table td::before {
+    content: attr(data-label) ": ";
+    font-weight: 700;
+    color: #555;
+  }
+}
+
+@media (max-width: 640px) {
+  .inst-head .actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-top: 0.5rem;
+  }
+}
+
+@media (max-width: 640px) {
+  .container-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    padding: 0.4rem 0;
+    border-bottom: 1px solid #eee;
+  }
+  .container-row:last-child { border-bottom: none; }
+}
+
+pre#log-lines {
+  white-space: pre-wrap;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+@media (max-width: 640px) {
+  .shell { padding: 0; }
+  main { padding: 0.5rem; }
+  h1, h2 { font-size: 1.1rem; }
+  .login { margin: 2rem 0.5rem; }
+  .host-head, .inst-head { display: flex; flex-direction: column; gap: 0.3rem; }
+  .host-head a, .inst-head a, .inst-head button { align-self: flex-start; }
+  .inst-head { margin-bottom: 0.5rem; }
 }

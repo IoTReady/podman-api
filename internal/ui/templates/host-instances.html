@@ -7,8 +7,8 @@
   <tbody>
   {{range .Instances}}
     <tr class="clickable" hx-get="/ui/hosts/{{$.Host}}/instances/{{.Template}}/{{.Slug}}" hx-target="#main" hx-push-url="true">
-      <td>{{.Template}} / {{.Slug}}</td>
-      <td>
+      <td data-label="Template/Slug">{{.Template}} / {{.Slug}}</td>
+      <td data-label="Status">
         {{.Pod.Status}}
         {{if eq .Pod.Status "Running"}}
           {{if .Ready}}<span class="health-dot healthy" title="healthy">●</span>{{else}}<span class="health-dot starting" title="not yet healthy">●</span>{{end}}

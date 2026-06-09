@@ -7,7 +7,7 @@
   <tbody>
   {{range .Jobs}}
     <tr class="clickable" hx-get="/ui/jobs/{{.ID}}" hx-target="#main" hx-push-url="true">
-      <td>{{.ID}}</td><td>{{.Kind}}</td><td>{{.State}}</td>
+      <td data-label="ID">{{.ID}}</td><td data-label="Kind">{{.Kind}}</td><td data-label="State">{{.State}}</td>
     </tr>
   {{end}}
   </tbody>

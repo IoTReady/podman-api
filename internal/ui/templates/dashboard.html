@@ -7,7 +7,7 @@
   <tbody>
   {{range .HostSummaries}}
   <tr class="clickable" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true">
-    <td>{{.ID}}</td><td>{{.Instances}}</td>
+    <td data-label="Host">{{.ID}}</td><td data-label="Instances">{{.Instances}}</td>
   </tr>
   {{end}}
   </tbody>
