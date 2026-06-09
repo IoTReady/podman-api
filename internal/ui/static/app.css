@@ -15,7 +15,41 @@ main { flex: 1; padding: 1rem; min-width: 0; }
 .error { color: #a00; padding: .5rem; }
 .notice { color: #1b5e20; background: #e8f5e9; border: 1px solid #a5d6a7; padding: .5rem; }
 .subtitle { color: #666; font-size: .9em; }
+/* --- Detail view responsive grid --- */
+.detail-section { margin-bottom: 1.5rem; }
+.detail-section .section-title {
+  font-size: .75rem; letter-spacing: .05em; color: #888;
+  text-transform: uppercase;
+  margin-bottom: 0.5rem;
+}
+
+.detail-grid .grid-row {
+  display: grid;
+  grid-template-columns: var(--grid-cols, 1fr);
+  gap: 0.5rem;
+  padding: 0.4rem 0;
+  border-bottom: 1px solid #eee;
+  align-items: center;
+}
+.detail-grid .grid-row:last-child { border-bottom: none; }
+.detail-grid .grid-cell.actions { white-space: nowrap; }
+
+.containers { --grid-cols: minmax(0, 2fr) minmax(0, 3fr) minmax(0, 1.5fr) minmax(0, 1fr); }
+.volumes   { --grid-cols: 1fr auto; }
+.backups   { --grid-cols: 1fr auto auto; }
+.env       { --grid-cols: minmax(0, 1fr) minmax(0, 2fr); }
+
 .login { max-width: 20rem; margin: 4rem auto; }
+
+.inst-head {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 1rem;
+  align-items: center;
+  margin-bottom: 1rem;
+}
+.inst-head .inst-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.inst-head .actions { justify-self: end; }
 
 /* Health dots */
 .health-dot { font-size: 0.85em; margin-left: 4px; }
@@ -33,10 +67,6 @@ button:disabled {
   opacity: 0.6;
   cursor: wait;
 }
-
-/* Container row (desktop) — inline spans */
-.container-row span { display: inline-block; }
-.container-row span:nth-child(2) { word-break: break-all; }
 
 /* Log pre — wrapping is always beneficial, height limit is mobile-only */
 pre#log-lines { white-space: pre-wrap; }
@@ -113,21 +143,7 @@ pre#log-lines { white-space: pre-wrap; }
     color: #555;
   }
 
-  /* --- Instance detail: stacked layout --- */
-  .inst-head .actions {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem;
-    margin-top: 0.5rem;
-  }
-  .container-row {
-    display: flex;
-    flex-direction: column;
-    gap: 0.2rem;
-    padding: 0.4rem 0;
-    border-bottom: 1px solid #eee;
-  }
-  .container-row:last-child { border-bottom: none; }
+  /* --- Log lines height cap --- */
   pre#log-lines {
     max-height: 60vh;
     overflow-y: auto;
@@ -141,5 +157,31 @@ pre#log-lines { white-space: pre-wrap; }
   .host-head, .inst-head { display: flex; flex-direction: column; gap: 0.3rem; }
   .host-head a, .inst-head a, .inst-head button { align-self: flex-start; }
   .inst-head { margin-bottom: 0.5rem; }
+
+  /* --- Detail grid -> cards --- */
+  .detail-grid .grid-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    padding: 0.5rem;
+    border: 1px solid #ddd;
+    border-radius: 4px;
+    margin-bottom: 0.5rem;
+  }
+  .detail-grid .grid-row:last-child { margin-bottom: 0; }
+  .detail-grid .grid-cell[data-label]::before {
+    content: attr(data-label) ": ";
+    font-weight: 700;
+    color: #555;
+  }
+
+  /* --- Detail header stack --- */
+  .inst-head {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 0.5rem;
+  }
+  .inst-head .actions { justify-self: start; }
+  .inst-head .inst-title { white-space: normal; }
 
 }
