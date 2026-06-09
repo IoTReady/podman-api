@@ -8,15 +8,15 @@ import (
 
 func (u *UI) jobsList(w http.ResponseWriter, r *http.Request) {
 	if u.cfg.Jobs == nil {
-		u.render(w, r, http.StatusOK, "jobs", u.pageData(map[string]any{"Disabled": true}))
+		u.render(w, r, http.StatusOK, "jobs", u.pageData(map[string]any{"ActivePage": "jobs", "Disabled": true}))
 		return
 	}
-	jobs, err := u.cfg.Jobs.ListJobs(r.Context(), store.JobFilter{})
+	jobs, err := u.cfg.Jobs.ListJobs(r.Context(), store.JobFilter{Limit: 50})
 	if err != nil {
 		u.renderError(w, r, err)
 		return
 	}
-	u.render(w, r, http.StatusOK, "jobs", u.pageData(map[string]any{"Jobs": jobs}))
+	u.render(w, r, http.StatusOK, "jobs", u.pageData(map[string]any{"ActivePage": "jobs", "Jobs": jobs}))
 }
 
 func (u *UI) jobDetail(w http.ResponseWriter, r *http.Request) {

@@ -196,6 +196,7 @@ func (u *UI) deployFormData(r *http.Request, host, selected, slug string, vals m
 	mergeParamDefaults(vals, tmpl)
 	return map[string]any{
 		"Host":         host,
+		"ActiveHost":   host,
 		"Templates":    tmpls,
 		"Selected":     selected,
 		"Tmpl":         tmpl,
@@ -288,6 +289,7 @@ func (u *UI) upgradeForm(w http.ResponseWriter, r *http.Request) {
 	}
 	u.render(w, r, http.StatusOK, "upgrade-form", u.pageData(map[string]any{
 		"Host":         host,
+		"ActiveHost":   host,
 		"Template":     tmplID,
 		"Slug":         slug,
 		"CurrentImage": firstContainerImage(obs),
@@ -300,7 +302,7 @@ func (u *UI) upgradeApply(w http.ResponseWriter, r *http.Request) {
 	if image == "" {
 		obs, _ := u.cfg.Svc.Get(r.Context(), host, tmplID, slug)
 		u.render(w, r, http.StatusBadRequest, "upgrade-form", u.pageData(map[string]any{
-			"Host": host, "Template": tmplID, "Slug": slug,
+			"Host": host, "ActiveHost": host, "Template": tmplID, "Slug": slug,
 			"CurrentImage": firstContainerImage(obs),
 			"Error":        "image is required",
 		}))
@@ -309,7 +311,7 @@ func (u *UI) upgradeApply(w http.ResponseWriter, r *http.Request) {
 	if err := u.cfg.Svc.UpgradeImage(r.Context(), host, tmplID, slug, image); err != nil {
 		obs, _ := u.cfg.Svc.Get(r.Context(), host, tmplID, slug)
 		u.render(w, r, errorStatus(err), "upgrade-form", u.pageData(map[string]any{
-			"Host": host, "Template": tmplID, "Slug": slug,
+			"Host": host, "ActiveHost": host, "Template": tmplID, "Slug": slug,
 			"CurrentImage": firstContainerImage(obs),
 			"Error":        err.Error(),
 		}))

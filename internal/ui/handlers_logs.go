@@ -54,7 +54,7 @@ func (u *UI) logsPage(w http.ResponseWriter, r *http.Request) {
 	if container == "" {
 		if len(containers) == 0 {
 			u.render(w, r, http.StatusOK, "logs-page", u.pageData(map[string]any{
-				"Host": host, "Template": tmpl, "Slug": slug,
+				"Host": host, "ActiveHost": host, "Template": tmpl, "Slug": slug,
 				"Container": "", "Containers": containers, "Follow": false, "Lines": nil,
 			}))
 			return
@@ -70,7 +70,7 @@ func (u *UI) logsPage(w http.ResponseWriter, r *http.Request) {
 
 	if follow {
 		u.render(w, r, http.StatusOK, "logs-page", u.pageData(map[string]any{
-			"Host": host, "Template": tmpl, "Slug": slug,
+			"Host": host, "ActiveHost": host, "Template": tmpl, "Slug": slug,
 			"Container": container, "Containers": containers, "Follow": true, "Lines": nil,
 		}))
 		return
@@ -86,66 +86,55 @@ func (u *UI) logsPage(w http.ResponseWriter, r *http.Request) {
 		lines = append(lines, ln.Line)
 	}
 	u.render(w, r, http.StatusOK, "logs-page", u.pageData(map[string]any{
-		"Host": host, "Template": tmpl, "Slug": slug,
+		"Host": host, "ActiveHost": host, "Template": tmpl, "Slug": slug,
 		"Container": container, "Containers": containers, "Follow": false, "Lines": lines,
 	}))
+}
+
+// lookupContainer resolves the container suffix for a log stream. When the
+// caller provides a non-empty suffix it is validated against the instance's
+// containers; when empty the first matching container is picked. Returns "" with
+// a written error response when the instance or container is not found.
+func (u *UI) lookupContainer(w http.ResponseWriter, r *http.Request, host, tmpl, slug, suffix string) string {
+	obs, err := u.cfg.Svc.Get(r.Context(), host, tmpl, slug)
+	if err != nil {
+		if errors.Is(err, instance.ErrInstanceNotFound) ||
+			errors.Is(err, instance.ErrUnknownHost) ||
+			errors.Is(err, instance.ErrUnknownTemplate) {
+			http.Error(w, "not found", http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+		}
+		return ""
+	}
+	names := make([]string, len(obs.Containers))
+	for i, c := range obs.Containers {
+		names[i] = c.Name
+	}
+	if suffix == "" {
+		suffix = resolveContainerSuffix(tmpl, slug, names)
+		if suffix == "" {
+			http.Error(w, "no containers", http.StatusBadRequest)
+			return ""
+		}
+		return suffix
+	}
+	prefix := tmpl + "-" + slug + "-"
+	for _, name := range names {
+		if name == prefix+suffix {
+			return suffix
+		}
+	}
+	http.Error(w, "unknown container", http.StatusBadRequest)
+	return ""
 }
 
 func (u *UI) logsStream(w http.ResponseWriter, r *http.Request) {
 	host, tmpl, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
 
-	container := r.URL.Query().Get("container")
+	container := u.lookupContainer(w, r, host, tmpl, slug, r.URL.Query().Get("container"))
 	if container == "" {
-		obs, err := u.cfg.Svc.Get(r.Context(), host, tmpl, slug)
-		if err != nil {
-			if errors.Is(err, instance.ErrInstanceNotFound) ||
-				errors.Is(err, instance.ErrUnknownHost) ||
-				errors.Is(err, instance.ErrUnknownTemplate) {
-				http.Error(w, "not found", http.StatusNotFound)
-			} else {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-			}
-			return
-		}
-		names := make([]string, len(obs.Containers))
-		for i, c := range obs.Containers {
-			names[i] = c.Name
-		}
-		container = resolveContainerSuffix(tmpl, slug, names)
-		if container == "" {
-			http.Error(w, "no containers", http.StatusBadRequest)
-			return
-		}
-	} else {
-		// Validate the provided suffix belongs to this instance.
-		obs, err := u.cfg.Svc.Get(r.Context(), host, tmpl, slug)
-		if err != nil {
-			if errors.Is(err, instance.ErrInstanceNotFound) ||
-				errors.Is(err, instance.ErrUnknownHost) ||
-				errors.Is(err, instance.ErrUnknownTemplate) {
-				http.Error(w, "not found", http.StatusNotFound)
-			} else {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-			}
-			return
-		}
-		names := make([]string, len(obs.Containers))
-		for i, c := range obs.Containers {
-			names[i] = c.Name
-		}
-		// Verify the requested suffix is actually present.
-		valid := false
-		prefix := tmpl + "-" + slug + "-"
-		for _, name := range names {
-			if name == prefix+container {
-				valid = true
-				break
-			}
-		}
-		if !valid {
-			http.Error(w, "unknown container", http.StatusBadRequest)
-			return
-		}
+		return // error already written
 	}
 
 	ch, err := u.cfg.Svc.Logs(r.Context(), host, tmpl, slug, container, podman.LogOptions{Follow: true, Tail: 100})

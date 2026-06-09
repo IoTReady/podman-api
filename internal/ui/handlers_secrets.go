@@ -15,10 +15,11 @@ import (
 // it sets Corrupt and omits Set so the form degrades to a cleanup notice.
 func (u *UI) secretsFormData(ctx context.Context, host, tmpl, slug string) (map[string]any, error) {
 	data := map[string]any{
-		"Host":     host,
-		"Template": tmpl,
-		"Slug":     slug,
-		"Names":    u.templatePerInstanceSecrets(ctx, tmpl),
+		"Host":       host,
+		"ActiveHost": host,
+		"Template":   tmpl,
+		"Slug":       slug,
+		"Names":      u.templatePerInstanceSecrets(ctx, tmpl),
 	}
 	set, err := u.cfg.Svc.InstanceSecretState(ctx, host, tmpl, slug)
 	if err != nil {

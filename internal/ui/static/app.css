@@ -3,12 +3,41 @@ body { margin: 0; }
 .sidebar { min-width: 200px; padding: 1rem; background: #f5f5f5; border-right: 1px solid #ddd; }
 .sidebar .label { font-size: .75rem; letter-spacing: .05em; color: #888; }
 .sidebar ul { list-style: none; padding: 0; }
-main { flex: 1; padding: 1rem; }
+.sidebar a { text-decoration: none; color: #333; display: block; padding: .25rem 0; }
+.sidebar a:hover { text-decoration: underline; }
+.sidebar li.active a,
+.sidebar a.active { font-weight: 700; color: #000; }
+main { flex: 1; padding: 1rem; min-width: 0; }
 .clickable { cursor: pointer; }
+.clickable:hover td { background: #f0f0f0; }
+
+/* Error / notice / subtitle */
 .error { color: #a00; padding: .5rem; }
 .notice { color: #1b5e20; background: #e8f5e9; border: 1px solid #a5d6a7; padding: .5rem; }
+.subtitle { color: #666; font-size: .9em; }
 .login { max-width: 20rem; margin: 4rem auto; }
+
+/* Health dots */
 .health-dot { font-size: 0.85em; margin-left: 4px; }
 .health-dot.healthy { color: #2ecc71; }
 .health-dot.starting { color: #f39c12; }
 .health-dot.unhealthy { color: #e74c3c; }
+
+/* Focus-visible for keyboard navigation */
+:focus-visible { outline: 2px solid #66afe9; outline-offset: 2px; }
+
+/* Loading / disabled states for HTMX mutations */
+button.htmx-request,
+.htmx-request button:disabled,
+button:disabled {
+  opacity: 0.6;
+  cursor: wait;
+}
+
+/* Responsive: stack sidebar on top on narrow viewports */
+@media (max-width: 640px) {
+  .shell { flex-direction: column; }
+  .sidebar { min-width: unset; border-right: none; border-bottom: 1px solid #ddd; }
+  .sidebar ul { display: flex; flex-wrap: wrap; gap: .5rem; }
+  .sidebar form { margin-top: .5rem; }
+}

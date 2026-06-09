@@ -6,6 +6,6 @@
   <input type="hidden" name="csrf_token" value="{{.CSRF}}">
   {{if .CurrentImage}}<p class="subtitle">Current: <code>{{.CurrentImage}}</code></p>{{end}}
   <label>New image <input name="image" value="{{.CurrentImage}}" placeholder="docker.io/library/postgres:16" required></label>
-  <button type="submit" class="pure-button pure-button-primary">Upgrade</button>
+  <button type="submit" class="pure-button pure-button-primary" hx-disabled-elt="this">Upgrade</button>
 </form>
 {{end}}

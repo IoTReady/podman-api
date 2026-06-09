@@ -1,7 +1,7 @@
 {{define "host-instances"}}
 <div class="host-head">
   <strong>{{.Host}}</strong> · {{len .Instances}} instances
-  <a class="pure-button" href="/ui/hosts/{{.Host}}/deploy" hx-get="/ui/hosts/{{.Host}}/deploy" hx-target="#main" hx-push-url="true">+ Deploy</a>
+  <a class="pure-button" href="/ui/hosts/{{.Host}}/deploy" hx-get="/ui/hosts/{{.Host}}/deploy" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">+ Deploy</a>
 </div>
 <table class="pure-table">
   <tbody>

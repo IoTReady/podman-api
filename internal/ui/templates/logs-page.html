@@ -18,10 +18,10 @@
   <input type="hidden" name="follow" value="{{.Follow}}">
   {{if .Follow}}
   <button hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs?container={{.Container}}&follow=false"
-          hx-target="#main" hx-push-url="true">Pause</button>
+          hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Pause</button>
   {{else}}
   <button hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs?container={{.Container}}&follow=true"
-          hx-target="#main" hx-push-url="true">Follow</button>
+          hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Follow</button>
   {{end}}
 </div>
 {{if .Follow}}
@@ -35,7 +35,11 @@
 (function(){
   var pre = document.getElementById('log-lines');
   document.body.addEventListener('htmx:sseMessage', function() {
-    while (pre.children.length > 1000) { pre.removeChild(pre.firstChild); }
+    if (pre.children.length > 1000) {
+      // Batch-remove the oldest 200 lines at once instead of one at a time.
+      var i = 0;
+      while (i++ < 200 && pre.firstChild) { pre.removeChild(pre.firstChild); }
+    }
     pre.scrollTop = pre.scrollHeight;
   });
 })();

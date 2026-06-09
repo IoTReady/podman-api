@@ -10,3 +10,5 @@ coverage.txt
 /auth/operator.yaml
 /podman-api
 /hosts/ec2.yaml
+hosts/test-1.yaml
+docs/superpowers/plans/2026-06-05-deploy-form-preserve-values.md

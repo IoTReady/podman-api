@@ -4,13 +4,13 @@
 <div class="inst-head">
   <strong>{{.Inst.Template}} / {{.Inst.Slug}}</strong> · {{.Inst.Pod.Status}}
   <span class="actions">
-    <button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/start"   hx-target="#main">Start</button>
-    <button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/stop"    hx-target="#main">Stop</button>
-    <button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/restart" hx-target="#main">Restart</button>
-    {{if .CanUpgrade}}<a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-target="#main" hx-push-url="true">Upgrade</a>{{end}}
-    {{if .HasSecrets}}<a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/secrets" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/secrets" hx-target="#main" hx-push-url="true">Manage secrets</a>{{end}}
-    <button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/delete" hx-target="#main"
-            hx-confirm="Delete {{.Inst.Template}}/{{.Inst.Slug}}?">Delete</button>
+    <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/start"   hx-target="#main" hx-disabled-elt="this">Start</button>
+    <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/stop"    hx-target="#main" hx-disabled-elt="this">Stop</button>
+    <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/restart" hx-target="#main" hx-disabled-elt="this">Restart</button>
+    {{if .CanUpgrade}}<a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Upgrade</a>{{end}}
+    {{if .HasSecrets}}<a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/secrets" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/secrets" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Manage secrets</a>{{end}}
+    <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/delete" hx-target="#main"
+            hx-confirm="Delete {{.Inst.Template}}/{{.Inst.Slug}}?" hx-disabled-elt="this">Delete</button>
   </span>
 </div>
 <div class="label">CONTAINERS</div>
@@ -28,19 +28,19 @@
 </div>
 {{end}}
 <div class="label">VOLUMES</div>
-{{range .Inst.Volumes}}<div>{{.Name}} {{.SizeBytes}}</div>{{end}}
+{{range .Inst.Volumes}}<div>{{.Name}} {{.SizeBytes | formatBytes}}</div>{{end}}
 <div class="label">BACKUPS</div>
-<button hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/backup" hx-target="#main"
-        hx-confirm="Back up {{.Inst.Template}}/{{.Inst.Slug}} now? The instance is stopped for the duration of the backup.">Back up now</button>
+<button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/backup" hx-target="#main"
+        hx-confirm="Back up {{.Inst.Template}}/{{.Inst.Slug}} now? The instance is stopped for the duration of the backup." hx-disabled-elt="this">Back up now</button>
 {{range .Backups}}
 <div>
   {{.ID}} · {{.Created.UTC.Format "2006-01-02 15:04:05"}} · {{.State}}{{if .Image}} · {{.Image}}{{end}}
   {{if eq .State "complete"}}
-  <button hx-post="/ui/backups/{{.ID}}/restore" hx-target="#main"
-          hx-confirm="Restore {{.ID}}? This stops the instance and OVERWRITES its current data.">Restore</button>
+  <button class="pure-button" hx-post="/ui/backups/{{.ID}}/restore" hx-target="#main"
+          hx-confirm="Restore {{.ID}}? This stops the instance and OVERWRITES its current data." hx-disabled-elt="this">Restore</button>
   {{end}}
-  <button hx-post="/ui/backups/{{.ID}}/delete" hx-target="#main"
-          hx-confirm="Delete backup {{.ID}}?">Delete</button>
+  <button class="pure-button" hx-post="/ui/backups/{{.ID}}/delete" hx-target="#main"
+          hx-confirm="Delete backup {{.ID}}?" hx-disabled-elt="this">Delete</button>
 </div>
 {{end}}
 <div class="label">ENV</div>

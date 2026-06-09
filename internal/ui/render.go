@@ -32,7 +32,7 @@ func (u *UI) render(w http.ResponseWriter, r *http.Request, status int, block st
 	data["CSRF"] = csrfFromRequest(r)
 
 	if u.tmpl.Lookup(block) == nil {
-		log.Printf("ui: render: unknown template block %q", block)
+		log.Printf("ui: render: unknown template block %q [%s %s]", block, r.Method, r.URL.Path)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -53,7 +53,7 @@ func (u *UI) render(w http.ResponseWriter, r *http.Request, status int, block st
 		}
 	}
 	if err != nil {
-		log.Printf("ui: render %q: %v", block, err)
+		log.Printf("ui: render %q: %v [%s %s]", block, err, r.Method, r.URL.Path)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}

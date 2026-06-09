@@ -9,6 +9,7 @@
   <meta name="htmx-config" content='{"responseHandling":[{"code":"204","swap":false},{"code":"[1-5]..","swap":true}]}'>
   <link rel="stylesheet" href="/ui/static/pure-min.css">
   <link rel="stylesheet" href="/ui/static/app.css">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2280%22>🐳</text></svg>">
   <script src="/ui/static/htmx.min.js" defer></script>
 </head>
 <!-- The header name is the well-known csrfHeader constant (internal/ui/session.go); hardcoded here so a missing data field can't silently produce an empty header and break every htmx mutation. -->
@@ -32,10 +33,10 @@
   <div class="label">HOSTS</div>
   <ul>
     {{range .Hosts}}
-    <li><a href="/ui/hosts/{{.ID}}" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true">{{.ID}}</a></li>
+    <li{{if eq .ID $.ActiveHost}} class="active"{{end}}><a href="/ui/hosts/{{.ID}}" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">{{.ID}}</a></li>
     {{end}}
   </ul>
-  <a href="/ui/jobs" hx-get="/ui/jobs" hx-target="#main" hx-push-url="true">Jobs</a>
+  <a href="/ui/jobs" hx-get="/ui/jobs" hx-target="#main" hx-push-url="true" hx-disabled-elt="this"{{if eq "jobs" $.ActivePage}} class="active"{{end}}>Jobs</a>
   <form method="post" action="/ui/logout">
     <input type="hidden" name="csrf_token" value="{{.CSRF}}">
     <button type="submit">Sign out</button>
