@@ -36,7 +36,7 @@ func NewJobMetrics(reg prometheus.Registerer) *JobMetrics {
 		duration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Name:    "podman_api_job_duration_seconds",
 			Help:    "Job handler duration by kind.",
-			Buckets: prometheus.DefBuckets,
+			Buckets: []float64{1, 5, 15, 30, 60, 120, 300, 600},
 		}, []string{"kind"}),
 		inFlight: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "podman_api_jobs_in_flight",
@@ -58,7 +58,6 @@ func NewJobMetrics(reg prometheus.Registerer) *JobMetrics {
 // JobStarted records a job being claimed and started.
 func (m *JobMetrics) JobStarted(kind string) {
 	m.jobs.WithLabelValues(kind, "started").Inc()
-	m.enqueued.WithLabelValues(kind).Dec()
 	m.inFlight.WithLabelValues(kind).Inc()
 }
 

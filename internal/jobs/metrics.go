@@ -3,7 +3,7 @@ package jobs
 import "time"
 
 // Metrics records job lifecycle events. Implementations must be safe for
-// concurrent use. A nil *Metrics is valid (all methods are no-ops).
+// concurrent use. Runner.Metrics may be nil; a noop implementation is used in that case.
 type Metrics interface {
 	JobStarted(kind string)
 	JobFinished(kind, result string)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/jobs"
@@ -26,9 +27,14 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 		return fmt.Errorf("decode migrate args: %w", err)
 	}
 
+	// rollback detection relies on the step name contract with
+	// instance.Service.Migrate, which emits "rollback"/"rollback-restore-failed"/
+	// "rollback-reap-failed" during compensation. HasPrefix captures all variants
+	// and counts one Rollback call per migrate attempt regardless of how many
+	// compensation steps fire.
 	var rolledBack bool
 	wrappedStep := func(step, detail string) {
-		if step == "rollback" {
+		if strings.HasPrefix(step, "rollback") {
 			rolledBack = true
 		}
 		jc.Step(step, detail)

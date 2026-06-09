@@ -25,7 +25,7 @@ func TestJobMetricsRecord(t *testing.T) {
 	}
 
 	// After the sequence above:
-	//   enqueued =  1 (enqueued) - 1 (started decrements) = 0
+	//   enqueued =  1 (enqueued, JobStarted no longer decrements it)
 	//   jobs_total = 1 (started) + 1 (succeeded) = 2
 	//   duration   = 1 observation
 	//   in_flight  = 1 (started) - 1 (finished) = 0
@@ -38,8 +38,8 @@ func TestJobMetricsRecord(t *testing.T) {
 		{"enqueued", func(t *testing.T) {
 			for _, mf := range mfs {
 				if mf.GetName() == "podman_api_jobs_enqueued" {
-					if got := sumGauge(mf.Metric); got != 0 {
-						t.Fatalf("enqueued = %v, want 0 (after start finishes)", got)
+					if got := sumGauge(mf.Metric); got != 1 {
+						t.Fatalf("enqueued = %v, want 1", got)
 					}
 					return
 				}
