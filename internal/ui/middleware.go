@@ -3,6 +3,8 @@ package ui
 import (
 	"context"
 	"net/http"
+	"sync"
+	"time"
 )
 
 type ctxKey int
@@ -11,6 +13,67 @@ const (
 	identityKey ctxKey = iota
 	sessionTokenKey
 )
+
+// rateLimiter is a per-IP sliding-window rate limiter for the login endpoint.
+// It allows burst up to maxAttempts within a window, then returns 429 until the
+// window expires. Thread-safe.
+type ipRateLimiter struct {
+	mu          sync.Mutex
+	attempts    map[string][]time.Time
+	maxAttempts int
+	window      time.Duration
+}
+
+func newIPRateLimiter(maxAttempts int, window time.Duration) *ipRateLimiter {
+	return &ipRateLimiter{
+		attempts:    make(map[string][]time.Time),
+		maxAttempts: maxAttempts,
+		window:      window,
+	}
+}
+
+func (rl *ipRateLimiter) Allow(ip string) bool {
+	now := time.Now()
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	// Prune entries older than the window.
+	cutoff := now.Add(-rl.window)
+	recent := rl.attempts[ip][:0]
+	for _, t := range rl.attempts[ip] {
+		if t.After(cutoff) {
+			recent = append(recent, t)
+		}
+	}
+	rl.attempts[ip] = recent
+
+	if len(recent) >= rl.maxAttempts {
+		return false
+	}
+	rl.attempts[ip] = append(rl.attempts[ip], now)
+	return true
+}
+
+// loginThrottle wraps a login handler with per-IP rate limiting. Returns 429
+// Too Many Requests when the limit is exceeded.
+func (u *UI) loginThrottle(next http.HandlerFunc) http.Handler {
+	rl := newIPRateLimiter(5, 10*time.Second) // 5 attempts per 10s per IP
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Strip port from RemoteAddr for the IP key.
+		ip := r.RemoteAddr
+		for i := len(ip) - 1; i >= 0; i-- {
+			if ip[i] == ':' {
+				ip = ip[:i]
+				break
+			}
+		}
+		if !rl.Allow(ip) {
+			http.Error(w, "too many login attempts", http.StatusTooManyRequests)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 // requireSession resolves the session cookie to an Identity and injects both the
 // Identity and the raw session token into the context, or redirects to

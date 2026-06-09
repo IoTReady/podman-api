@@ -95,7 +95,7 @@ func (u *UI) Handler() http.Handler {
 	// session yet, and it is itself the credential check (protected by
 	// SameSite=Lax on the cookie it sets).
 	mux.HandleFunc("GET /ui/login", u.loginForm)
-	mux.HandleFunc("POST /ui/login", u.login)
+	mux.Handle("POST /ui/login", u.loginThrottle(u.login))
 	mux.Handle("/ui/static/", u.staticHandler())
 
 	guard := func(h http.HandlerFunc) http.Handler { return u.requireSession(h) }

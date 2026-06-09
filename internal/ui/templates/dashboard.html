@@ -1,4 +1,20 @@
 {{define "dashboard"}}
-<h1>Hosts</h1>
-<p>Select a host from the sidebar to see its instances.</p>
+<h1>Dashboard</h1>
+{{if .HostSummaries}}
+<p>{{.TotalInstances}} instance(s) across {{.HostCount}} host(s).</p>
+<table class="pure-table">
+  <thead><tr><th>Host</th><th>Instances</th></tr></thead>
+  <tbody>
+  {{range .HostSummaries}}
+  <tr class="clickable" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true">
+    <td>{{.ID}}</td><td>{{.Instances}}</td>
+  </tr>
+  {{end}}
+  </tbody>
+</table>
+{{else if .Hosts}}
+<p>No instances deployed yet. Select a host from the sidebar to deploy one.</p>
+{{else}}
+<p>No hosts configured. Add hosts to the configuration file and restart or send SIGHUP to the daemon.</p>
+{{end}}
 {{end}}
