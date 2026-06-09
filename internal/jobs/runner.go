@@ -89,6 +89,7 @@ type Runner struct {
 	wg                sync.WaitGroup
 	mu                sync.Mutex
 	inflight          map[string]*inflightJob
+	Metrics           Metrics // optional; nil-safe
 }
 
 // inflightJob tracks a currently-running job so an operator request can cancel
@@ -99,6 +100,16 @@ type inflightJob struct {
 	cancel   context.CancelFunc
 	canceled bool
 }
+
+// noopMetrics is a nil-safe default for *Runner.Metrics.
+type noopMetrics struct{}
+
+func (noopMetrics) JobStarted(string)                     {}
+func (noopMetrics) JobFinished(string, string)            {}
+func (noopMetrics) ObserveDuration(string, time.Duration) {}
+func (noopMetrics) JobEnqueued(string)                    {}
+func (noopMetrics) Rollback(string)                       {}
+func (noopMetrics) ChildFailure(string)                   {}
 
 // NewRunner builds a runner. workers <= 0 uses DefaultWorkers.
 // The handler registry must not be modified after this call.
@@ -359,12 +370,25 @@ func (r *Runner) finish(id string, state store.JobState, errMsg string) {
 	}
 }
 
+// metric returns the runner's Metrics or a nil-safe no-op default.
+func (r *Runner) metric() Metrics {
+	if r.Metrics == nil {
+		return noopMetrics{}
+	}
+	return r.Metrics
+}
+
 func (r *Runner) run(ctx context.Context, job store.Job) {
 	h, ok := r.handlers[job.Kind]
 	if !ok {
 		r.finish(job.ID, store.JobFailed, "no handler for kind "+job.Kind)
 		return
 	}
+
+	r.metric().JobStarted(job.Kind)
+	defer func(start time.Time, kind string) {
+		r.metric().ObserveDuration(kind, time.Since(start))
+	}(time.Now(), job.Kind)
 
 	jctx, cancel := context.WithCancel(ctx)
 	entry := &inflightJob{cancel: cancel}
@@ -383,9 +407,12 @@ func (r *Runner) run(ctx context.Context, job store.Job) {
 	switch {
 	case canceled:
 		r.finish(job.ID, store.JobCanceled, "canceled by operator")
+		r.metric().JobFinished(job.Kind, "canceled")
 	case err != nil:
 		r.finish(job.ID, store.JobFailed, err.Error())
+		r.metric().JobFinished(job.Kind, "failed")
 	default:
 		r.finish(job.ID, store.JobSucceeded, "")
+		r.metric().JobFinished(job.Kind, "succeeded")
 	}
 }

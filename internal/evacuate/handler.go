@@ -57,8 +57,9 @@ func effectiveConcurrency(handlerDefault, reqOverride int) int {
 // Acceptable at current scale; if many concurrent evacuates become common, give
 // the runner headroom or a separate orchestration pool.
 type Handler struct {
-	Svc  *instance.Service
-	Jobs store.JobStore
+	Svc     *instance.Service
+	Jobs    store.JobStore
+	Metrics jobs.Metrics // optional; nil-safe
 	// Concurrency is the default child-migration bound (0 -> defaultEvacuateConcurrency).
 	// A request's Concurrency overrides it per call. See effectiveConcurrency.
 	Concurrency int
@@ -136,6 +137,9 @@ func (h *Handler) runChild(ctx context.Context, parentID string, m instance.Migr
 
 	state, errMsg := store.JobSucceeded, ""
 	if migErr != nil {
+		if h.Metrics != nil {
+			h.Metrics.ChildFailure("evacuate")
+		}
 		state, errMsg = store.JobFailed, migErr.Error()
 		if errors.Is(migErr, context.Canceled) {
 			// Parent was canceled: the child rolled back (source intact) on the

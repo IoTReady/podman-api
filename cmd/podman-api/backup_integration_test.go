@@ -113,7 +113,8 @@ func TestBackupRestore_RoundTrip_LocalOnly(t *testing.T) {
 	svc.SetBlobStore(blobs)
 
 	pruneMetrics := obs.NewPruneMetrics(prometheus.NewRegistry())
-	registry, reconcilers := buildJobRegistry(svc, client, db, 2, pruneMetrics)
+	jobMetrics := obs.NewJobMetrics(prometheus.NewRegistry())
+	registry, reconcilers := buildJobRegistry(svc, client, db, 2, pruneMetrics, jobMetrics)
 	runner := jobs.NewRunner(db, registry, jobs.DefaultWorkers)
 	runner.SetReconcilers(reconcilers)
 	runnerCtx, cancelRunner := context.WithCancel(ctx)
