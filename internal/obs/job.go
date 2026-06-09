@@ -56,6 +56,9 @@ func NewJobMetrics(reg prometheus.Registerer) *JobMetrics {
 }
 
 // JobStarted records a job being claimed and started.
+//
+// When JobEnqueued is wired at dispatch sites, restore m.enqueued.Dec() here
+// so the queue-depth gauge increments on enqueue and decrements on start.
 func (m *JobMetrics) JobStarted(kind string) {
 	m.jobs.WithLabelValues(kind, "started").Inc()
 	m.inFlight.WithLabelValues(kind).Inc()
