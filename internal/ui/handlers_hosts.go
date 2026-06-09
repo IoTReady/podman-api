@@ -14,7 +14,8 @@ func (u *UI) hostInstances(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u.render(w, r, http.StatusOK, "host-instances", u.pageData(map[string]any{
-		"Host":      host,
-		"Instances": obs,
+		"Host":       host,
+		"ActiveHost": host,
+		"Instances":  obs,
 	}))
 }

@@ -12,9 +12,10 @@ import (
 // available since the desired-state store is always present. HasSecrets gates
 // the manage-secrets control on the template declaring any per-instance secrets.
 func (u *UI) instanceView(ctx context.Context, host string, obs instance.Observed) map[string]any {
-	backups, _ := u.cfg.Svc.ListBackups(ctx, host, obs.Template, obs.Slug, 0) // best-effort; nil on error
+	backups, _ := u.cfg.Svc.ListBackups(ctx, host, obs.Template, obs.Slug, 20) // best-effort; nil on error
 	return map[string]any{
 		"Host":       host,
+		"ActiveHost": host,
 		"Inst":       obs,
 		"CanUpgrade": true,
 		"HasSecrets": len(u.templatePerInstanceSecrets(ctx, obs.Template)) > 0,
@@ -91,7 +92,7 @@ func (u *UI) lifecycle(w http.ResponseWriter, r *http.Request) {
 			u.renderError(w, r, lerr)
 			return
 		}
-		u.render(w, r, http.StatusOK, "host-instances", u.pageData(map[string]any{"Host": host, "Instances": obs}))
+		u.render(w, r, http.StatusOK, "host-instances", u.pageData(map[string]any{"Host": host, "ActiveHost": host, "Instances": obs}))
 		return
 	}
 	obs, gerr := u.cfg.Svc.Get(ctx, host, tmpl, slug)

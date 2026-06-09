@@ -1,6 +1,7 @@
 package ui
 
 import (
+	"fmt"
 	"html/template"
 	"net/http"
 	"time"
@@ -9,7 +10,21 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 )
 
-// Config wires the UI's dependencies. New defaults SessionTTL (12h) and
+// formatBytes renders a byte count as a human-readable string (KB, MB, GB, etc).
+func formatBytes(b int64) string {
+	const unit = 1024
+	if b < unit {
+		return fmt.Sprintf("%d B", b)
+	}
+	div, exp := int64(unit), 0
+	for n := b / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "KMGTPE"[exp])
+}
+
+// New wires the UI's dependencies. New defaults SessionTTL (12h) and
 // Sessions (an in-process MemorySessionStore) when they are left zero/nil. Auth
 // is NOT defaulted — the caller must supply it before serving authenticated
 // routes (the binary wires the single-operator Authenticator). New still
@@ -31,7 +46,8 @@ type UI struct {
 }
 
 func New(cfg Config) (*UI, error) {
-	t, err := template.ParseFS(templateFS, "templates/*.html")
+	funcMap := template.FuncMap{"formatBytes": formatBytes}
+	t, err := template.New("").Funcs(funcMap).ParseFS(templateFS, "templates/*.html")
 	if err != nil {
 		return nil, err
 	}

@@ -10,6 +10,6 @@
   </label>
   <label>Slug <input name="slug" value="{{.Slug}}" required></label>
   {{template "instance-fields" .}}
-  <button type="submit" class="pure-button pure-button-primary">Deploy</button>
+  <button type="submit" class="pure-button pure-button-primary" hx-disable>Deploy</button>
 </form>
 {{end}}
