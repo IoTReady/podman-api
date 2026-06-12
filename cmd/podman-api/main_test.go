@@ -15,15 +15,14 @@ import (
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/store"
 	"github.com/iotready/podman-api/internal/ui"
+	"github.com/iotready/podman-api/server"
 	"github.com/iotready/podman-api/templates"
 	"github.com/stretchr/testify/require"
 )
 
 func TestJobRegistry_IncludesBackupKinds(t *testing.T) {
-	// buildJobRegistry only stores the args inside handler/reconciler structs;
-	// it never calls methods on them, so nil/zero values are safe here.
 	svc := instance.NewService(fake.New(), nil)
-	reg, recs := buildJobRegistry(svc, nil, nil, 1, nil, nil)
+	reg, recs := server.BuildJobRegistry(svc, nil, nil, 1, nil, nil)
 
 	for _, kind := range []string{"migrate", "evacuate", "prune", "backup", "restore"} {
 		if _, ok := reg[kind]; !ok {
@@ -59,10 +58,8 @@ func storeSpecFixture() store.Spec {
 }
 
 func TestOpenStore_KeyLess(t *testing.T) {
-	// No key file: the store opens key-less. The template catalog and no-secret
-	// specs work; secret ops are refused with store.ErrSecretsNeedKey.
 	db := filepath.Join(t.TempDir(), "state.db")
-	st, err := openStore(db, "")
+	st, err := server.OpenStore(db, "")
 	if err != nil {
 		t.Fatalf("key-less openStore: %v", err)
 	}
@@ -78,10 +75,8 @@ func TestOpenStore_KeyLess(t *testing.T) {
 }
 
 func TestOpenStore_CreatesParentDir(t *testing.T) {
-	// openStore must MkdirAll the parent so a default path like
-	// /var/lib/podman-api/state.db works on a fresh host.
 	db := filepath.Join(t.TempDir(), "nested", "dir", "state.db")
-	st, err := openStore(db, writeKey(t))
+	st, err := server.OpenStore(db, writeKey(t))
 	if err != nil {
 		t.Fatalf("openStore with nested parent: %v", err)
 	}
@@ -92,14 +87,14 @@ func TestOpenStore_BadKey(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.db")
 	bad := filepath.Join(t.TempDir(), "bad.key")
 	_ = os.WriteFile(bad, []byte("not-32-bytes"), 0o600)
-	if _, err := openStore(db, bad); err == nil {
+	if _, err := server.OpenStore(db, bad); err == nil {
 		t.Fatal("expected error for invalid key file")
 	}
 }
 
 func TestOpenStore_Enabled(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.db")
-	st, err := openStore(db, writeKey(t))
+	st, err := server.OpenStore(db, writeKey(t))
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -119,24 +114,15 @@ func TestSeedTemplates_OnEmptyOnly(t *testing.T) {
 	db, err := store.OpenSQLite(filepath.Join(t.TempDir(), "s.db"), nil)
 	require.NoError(t, err)
 	defer db.Close()
-	n, err := seedTemplates(ctx, db, templates.Files)
+	n, err := server.SeedTemplates(ctx, db, templates.Files)
 	require.NoError(t, err)
 	require.Positive(t, n)
-	again, err := seedTemplates(ctx, db, templates.Files)
+	again, err := server.SeedTemplates(ctx, db, templates.Files)
 	require.NoError(t, err)
 	require.Zero(t, again, "must not re-seed a populated store")
 }
 
 func TestSeedTemplates_RejectsMalformed(t *testing.T) {
-	// A seed whose ingress names a container the body never declares passes
-	// ParseMeta but must fail ValidateTemplate, so seedTemplates returns an
-	// error and persists nothing (boot fails fast rather than storing garbage).
-	//
-	// The fixture pairs a VALID seed (alphabetically first) with the broken one
-	// so a single validate+put loop would persist the good one before hitting the
-	// bad one. seedTemplates is two-pass / all-or-nothing, so the store must stay
-	// empty — otherwise the next boot (CountTemplates > 0) would never re-seed and
-	// the catalog would be permanently partial (#61).
 	ctx := context.Background()
 	db, err := store.OpenSQLite(filepath.Join(t.TempDir(), "s.db"), nil)
 	require.NoError(t, err)
@@ -174,7 +160,7 @@ func TestSeedTemplates_RejectsMalformed(t *testing.T) {
 		)},
 	}
 
-	n, err := seedTemplates(ctx, db, seeds)
+	n, err := server.SeedTemplates(ctx, db, seeds)
 	require.Error(t, err)
 	require.Zero(t, n)
 	require.Contains(t, err.Error(), "broken")
@@ -194,9 +180,8 @@ func TestComposeHandlerRootRedirectsToUI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := composeHandler(http.NewServeMux(), uiApp)
+	h := server.ComposeHandler(http.NewServeMux(), uiApp)
 
-	// Bare GET / → 303 to /ui.
 	r := httptest.NewRequest("GET", "/", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
@@ -204,7 +189,6 @@ func TestComposeHandlerRootRedirectsToUI(t *testing.T) {
 		t.Fatalf("GET / → %d %q; want 303 /ui", w.Code, w.Header().Get("Location"))
 	}
 
-	// GET /ui without a session → 303 to /ui/login.
 	r = httptest.NewRequest("GET", "/ui", nil)
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, r)
@@ -216,7 +200,7 @@ func TestComposeHandlerRootRedirectsToUI(t *testing.T) {
 func TestComposeHandlerNilUIReturnsAPIRouter(t *testing.T) {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
-	h := composeHandler(api, nil)
+	h := server.ComposeHandler(api, nil)
 	r := httptest.NewRequest("GET", "/healthz", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
