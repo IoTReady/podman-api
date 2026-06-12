@@ -21,7 +21,7 @@ import (
 
 func TestJobRegistry_IncludesBackupKinds(t *testing.T) {
 	svc := instance.NewService(fake.New(), nil)
-	reg, recs := BuildJobRegistry(svc, nil, nil, 1, nil, nil)
+	reg, recs := buildJobRegistry(svc, nil, nil, 1, nil, nil)
 
 	for _, kind := range []string{"migrate", "evacuate", "prune", "backup", "restore"} {
 		if _, ok := reg[kind]; !ok {
@@ -58,7 +58,7 @@ func storeSpecFixture() store.Spec {
 
 func TestOpenStore_KeyLess(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.db")
-	st, err := OpenStore(db, "")
+	st, err := openStore(db, "")
 	if err != nil {
 		t.Fatalf("key-less openStore: %v", err)
 	}
@@ -75,7 +75,7 @@ func TestOpenStore_KeyLess(t *testing.T) {
 
 func TestOpenStore_CreatesParentDir(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "nested", "dir", "state.db")
-	st, err := OpenStore(db, writeKey(t))
+	st, err := openStore(db, writeKey(t))
 	if err != nil {
 		t.Fatalf("openStore with nested parent: %v", err)
 	}
@@ -86,14 +86,14 @@ func TestOpenStore_BadKey(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.db")
 	bad := filepath.Join(t.TempDir(), "bad.key")
 	_ = os.WriteFile(bad, []byte("not-32-bytes"), 0o600)
-	if _, err := OpenStore(db, bad); err == nil {
+	if _, err := openStore(db, bad); err == nil {
 		t.Fatal("expected error for invalid key file")
 	}
 }
 
 func TestOpenStore_Enabled(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.db")
-	st, err := OpenStore(db, writeKey(t))
+	st, err := openStore(db, writeKey(t))
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -113,10 +113,10 @@ func TestSeedTemplates_OnEmptyOnly(t *testing.T) {
 	db, err := store.OpenSQLite(filepath.Join(t.TempDir(), "s.db"), nil)
 	require.NoError(t, err)
 	defer db.Close()
-	n, err := SeedTemplates(ctx, db, templates.Files)
+	n, err := seedTemplates(ctx, db, templates.Files)
 	require.NoError(t, err)
 	require.Positive(t, n)
-	again, err := SeedTemplates(ctx, db, templates.Files)
+	again, err := seedTemplates(ctx, db, templates.Files)
 	require.NoError(t, err)
 	require.Zero(t, again, "must not re-seed a populated store")
 }
@@ -164,7 +164,7 @@ func TestSeedTemplates_RejectsMalformed(t *testing.T) {
 		)},
 	}
 
-	n, err := SeedTemplates(ctx, db, seeds)
+	n, err := seedTemplates(ctx, db, seeds)
 	require.Error(t, err)
 	require.Zero(t, n)
 	require.Contains(t, err.Error(), "broken")
@@ -184,7 +184,7 @@ func TestComposeHandlerRootRedirectsToUI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := ComposeHandler(http.NewServeMux(), uiApp)
+	h := composeHandler(http.NewServeMux(), uiApp)
 
 	r := httptest.NewRequest("GET", "/", nil)
 	w := httptest.NewRecorder()
@@ -204,7 +204,7 @@ func TestComposeHandlerRootRedirectsToUI(t *testing.T) {
 func TestComposeHandlerNilUIReturnsAPIRouter(t *testing.T) {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
-	h := ComposeHandler(api, nil)
+	h := composeHandler(api, nil)
 	r := httptest.NewRequest("GET", "/healthz", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
