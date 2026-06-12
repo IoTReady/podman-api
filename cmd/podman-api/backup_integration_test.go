@@ -26,6 +26,7 @@ import (
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
+	"github.com/iotready/podman-api/server"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -114,7 +115,7 @@ func TestBackupRestore_RoundTrip_LocalOnly(t *testing.T) {
 
 	pruneMetrics := obs.NewPruneMetrics(prometheus.NewRegistry())
 	jobMetrics := obs.NewJobMetrics(prometheus.NewRegistry())
-	registry, reconcilers := buildJobRegistry(svc, client, db, 2, pruneMetrics, jobMetrics)
+	registry, reconcilers := server.BuildJobRegistry(svc, client, db, 2, pruneMetrics, jobMetrics)
 	runner := jobs.NewRunner(db, registry, jobs.DefaultWorkers)
 	runner.SetReconcilers(reconcilers)
 	runnerCtx, cancelRunner := context.WithCancel(ctx)

@@ -187,7 +187,7 @@ func RunWithFlags(opts ...Option) error {
 	jobStore = db
 	pruneMetrics := obs.NewPruneMetrics(prometheus.DefaultRegisterer)
 	jobMetrics := obs.NewJobMetrics(prometheus.DefaultRegisterer)
-	registry, reconcilers := buildJobRegistry(svc, client, db, *evacConc, pruneMetrics, jobMetrics)
+	registry, reconcilers := BuildJobRegistry(svc, client, db, *evacConc, pruneMetrics, jobMetrics)
 	workers := *jobWorkers
 	if workers <= 0 {
 		workers = jobs.DefaultWorkers
@@ -397,7 +397,7 @@ func RunWithFlags(opts ...Option) error {
 	return nil
 }
 
-func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics) (jobs.Registry, jobs.Reconcilers) {
+func BuildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics) (jobs.Registry, jobs.Reconcilers) {
 	reg := jobs.Registry{
 		"migrate":  &migrate.Handler{Svc: svc, Metrics: jobMetrics},
 		"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: evacConc, Metrics: jobMetrics},

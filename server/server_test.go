@@ -21,7 +21,7 @@ import (
 
 func TestJobRegistry_IncludesBackupKinds(t *testing.T) {
 	svc := instance.NewService(fake.New(), nil)
-	reg, recs := buildJobRegistry(svc, nil, nil, 1, nil, nil)
+	reg, recs := BuildJobRegistry(svc, nil, nil, 1, nil, nil)
 
 	for _, kind := range []string{"migrate", "evacuate", "prune", "backup", "restore"} {
 		if _, ok := reg[kind]; !ok {
