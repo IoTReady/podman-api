@@ -6,13 +6,13 @@ It is opinionated, single-binary, and deliberately narrow: one host group, beare
 
 ## Documentation
 
-This README is the quick reference. The **[wiki](/tej/podman-api/wiki)** is the operator's handbook:
+This README is the quick reference. The **[wiki](https://github.com/iotready/podman-api/wiki)** is the operator's handbook:
 
-- [Building](/tej/podman-api/wiki/Building) — why the build needs tags, `make` targets, static/cross builds.
-- [Provisioning a Podman Host](/tej/podman-api/wiki/Provisioning-a-Podman-Host) — turn a fresh box into an SSH-drivable target.
-- [Deploying](/tej/podman-api/wiki/Deploying) — install the daemon: user, config tree, systemd, TLS.
-- [Operating](/tej/podman-api/wiki/Operating) — key rotation, audit-log shipping, metrics, health checks.
-- [Troubleshooting](/tej/podman-api/wiki/Troubleshooting) — common failures and their fixes.
+- [Building](https://github.com/iotready/podman-api/wiki/Building) — why the build needs tags, `make` targets, static/cross builds.
+- [Provisioning a Podman Host](https://github.com/iotready/podman-api/wiki/Provisioning-a-Podman-Host) — turn a fresh box into an SSH-drivable target.
+- [Deploying](https://github.com/iotready/podman-api/wiki/Deploying) — install the daemon: user, config tree, systemd, TLS.
+- [Operating](https://github.com/iotready/podman-api/wiki/Operating) — key rotation, audit-log shipping, metrics, health checks.
+- [Troubleshooting](https://github.com/iotready/podman-api/wiki/Troubleshooting) — common failures and their fixes.
 
 ## What it does
 
@@ -22,7 +22,7 @@ This README is the quick reference. The **[wiki](/tej/podman-api/wiki)** is the 
 - Pre-pulls every container image before play, so a bad tag fails fast with a clear registry error instead of a 30-second timeout.
 - Streams **logs** as plain text or SSE.
 - **Migrates and evacuates** instances across hosts as async jobs. Movement is cold-copy (stop → copy volumes → re-apply → verify → reap source) with rollback if the destination doesn't come up.
-- **Backs up and restores** instance volumes on demand: `POST .../backup` snapshots every volume; `POST /backups/{id}/restore` restores in-place with content verification. See [Backing up and Restoring](/tej/podman-api/wiki/Backing-up-and-Restoring).
+- **Backs up and restores** instance volumes on demand: `POST .../backup` snapshots every volume; `POST /backups/{id}/restore` restores in-place with content verification. See [Backing up and Restoring](https://github.com/iotready/podman-api/wiki/Backing-up-and-Restoring).
 - Exposes **Prometheus metrics** on a separate, opt-in listener so they aren't world-readable on the public port.
 
 ## What it doesn't do
@@ -54,11 +54,11 @@ Hosts are declared once in `hosts/*.yaml`. Templates live in the store. Bearer k
 make build          # -> bin/podman-api
 ```
 
-The podman v5 bindings require build tags to exclude CGO graph-driver headers. `make build` carries them. See [Building](/tej/podman-api/wiki/Building) for cross-compile and CI details.
+The podman v5 bindings require build tags to exclude CGO graph-driver headers. `make build` carries them. See [Building](https://github.com/iotready/podman-api/wiki/Building) for cross-compile and CI details.
 
 ## Configure and run
 
-See [Deploying](/tej/podman-api/wiki/Deploying) for the full setup guide (installer, systemd unit, TLS, bearer keys). The short version:
+See [Deploying](https://github.com/iotready/podman-api/wiki/Deploying) for the full setup guide (installer, systemd unit, TLS, bearer keys). The short version:
 
 ```sh
 podman-api \

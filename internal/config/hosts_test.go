@@ -24,10 +24,10 @@ func TestLoadHosts(t *testing.T) {
 	assert.Equal(t, "/run/user/1000/podman/podman.sock", local.Socket)
 	assert.Equal(t, "dev", local.Labels["env"])
 
-	prod, ok := byID["otp-prod-1"]
+	prod, ok := byID["prod-1"]
 	require.True(t, ok)
-	assert.Equal(t, "ubuntu@otp-prod-1", prod.Addr)
-	assert.Equal(t, "/etc/podman-api/ssh/otp-prod-1", prod.SSHKey)
+	assert.Equal(t, "ubuntu@prod-1", prod.Addr)
+	assert.Equal(t, "/etc/podman-api/ssh/prod-1", prod.SSHKey)
 }
 
 func TestLoadHosts_MissingDir(t *testing.T) {

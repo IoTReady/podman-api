@@ -1,6 +1,6 @@
 [Unit]
 Description=podman-api: REST wrapper around podman libpod
-Documentation=https://git.iotready.com/tej/podman-api
+Documentation=https://github.com/iotready/podman-api
 After=network-online.target
 Wants=network-online.target
 

@@ -1,7 +1,0 @@
-id: otp-prod-1
-addr: ubuntu@otp-prod-1
-socket: /run/user/1000/podman/podman.sock
-ssh_key: /etc/podman-api/ssh/otp-prod-1
-labels:
-  env: prod
-  region: in
