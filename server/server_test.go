@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"context"
@@ -20,8 +20,6 @@ import (
 )
 
 func TestJobRegistry_IncludesBackupKinds(t *testing.T) {
-	// buildJobRegistry only stores the args inside handler/reconciler structs;
-	// it never calls methods on them, so nil/zero values are safe here.
 	svc := instance.NewService(fake.New(), nil)
 	reg, recs := buildJobRegistry(svc, nil, nil, 1, nil, nil)
 
@@ -59,8 +57,6 @@ func storeSpecFixture() store.Spec {
 }
 
 func TestOpenStore_KeyLess(t *testing.T) {
-	// No key file: the store opens key-less. The template catalog and no-secret
-	// specs work; secret ops are refused with store.ErrSecretsNeedKey.
 	db := filepath.Join(t.TempDir(), "state.db")
 	st, err := openStore(db, "")
 	if err != nil {
@@ -78,8 +74,6 @@ func TestOpenStore_KeyLess(t *testing.T) {
 }
 
 func TestOpenStore_CreatesParentDir(t *testing.T) {
-	// openStore must MkdirAll the parent so a default path like
-	// /var/lib/podman-api/state.db works on a fresh host.
 	db := filepath.Join(t.TempDir(), "nested", "dir", "state.db")
 	st, err := openStore(db, writeKey(t))
 	if err != nil {
@@ -128,10 +122,6 @@ func TestSeedTemplates_OnEmptyOnly(t *testing.T) {
 }
 
 func TestSeedTemplates_RejectsMalformed(t *testing.T) {
-	// A seed whose ingress names a container the body never declares passes
-	// ParseMeta but must fail ValidateTemplate, so seedTemplates returns an
-	// error and persists nothing (boot fails fast rather than storing garbage).
-	//
 	// The fixture pairs a VALID seed (alphabetically first) with the broken one
 	// so a single validate+put loop would persist the good one before hitting the
 	// bad one. seedTemplates is two-pass / all-or-nothing, so the store must stay
@@ -196,7 +186,6 @@ func TestComposeHandlerRootRedirectsToUI(t *testing.T) {
 	}
 	h := composeHandler(http.NewServeMux(), uiApp)
 
-	// Bare GET / → 303 to /ui.
 	r := httptest.NewRequest("GET", "/", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
@@ -204,7 +193,6 @@ func TestComposeHandlerRootRedirectsToUI(t *testing.T) {
 		t.Fatalf("GET / → %d %q; want 303 /ui", w.Code, w.Header().Get("Location"))
 	}
 
-	// GET /ui without a session → 303 to /ui/login.
 	r = httptest.NewRequest("GET", "/ui", nil)
 	w = httptest.NewRecorder()
 	h.ServeHTTP(w, r)

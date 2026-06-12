@@ -20,10 +20,13 @@ import (
 	"github.com/iotready/podman-api/internal/auth"
 	backuppkg "github.com/iotready/podman-api/internal/backup"
 	"github.com/iotready/podman-api/internal/config"
+	"github.com/iotready/podman-api/internal/evacuate"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/jobs"
+	"github.com/iotready/podman-api/internal/migrate"
 	"github.com/iotready/podman-api/internal/obs"
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/prune"
 	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
 	"github.com/prometheus/client_golang/prometheus"
@@ -114,7 +117,17 @@ func TestBackupRestore_RoundTrip_LocalOnly(t *testing.T) {
 
 	pruneMetrics := obs.NewPruneMetrics(prometheus.NewRegistry())
 	jobMetrics := obs.NewJobMetrics(prometheus.NewRegistry())
-	registry, reconcilers := buildJobRegistry(svc, client, db, 2, pruneMetrics, jobMetrics)
+	registry := jobs.Registry{
+		"migrate":  &migrate.Handler{Svc: svc, Metrics: jobMetrics},
+		"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: 2, Metrics: jobMetrics},
+		"prune":    &prune.Handler{Client: client, Jobs: db, Metrics: pruneMetrics},
+		"backup":   &backuppkg.Handler{Svc: svc},
+		"restore":  &backuppkg.RestoreHandler{Svc: svc},
+	}
+	reconcilers := jobs.Reconcilers{
+		"migrate": &migrate.Reconciler{Svc: svc},
+		"backup":  &backuppkg.Reconciler{Svc: svc},
+	}
 	runner := jobs.NewRunner(db, registry, jobs.DefaultWorkers)
 	runner.SetReconcilers(reconcilers)
 	runnerCtx, cancelRunner := context.WithCancel(ctx)
