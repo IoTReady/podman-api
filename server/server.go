@@ -53,76 +53,78 @@ func RunWithFlags(opts ...Option) error {
 		o(&c)
 	}
 
+	fs := flag.NewFlagSet("podman-api", flag.ContinueOnError)
 	var (
-		addr          = flag.String("addr", "127.0.0.1:8080", "bind address for the API")
-		metricsAddr   = flag.String("metrics-addr", "", "if set, expose /metrics on this address (e.g. 127.0.0.1:9090); empty means no metrics endpoint")
-		hostsDir      = flag.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
-		keysFile      = flag.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
-		auditLogFile  = flag.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
-		stateDB       = flag.String("state-db", "/var/lib/podman-api/state.db", "SQLite path for the always-on template catalog + desired-state store")
-		specKeyFile   = flag.String("spec-key-file", "", "path to the 32-byte secret encryption key; optional — without it the store runs key-less (templates and no-secret specs work, secret ops are refused)")
-		backupDir     = flag.String("backup-dir", "", "directory for volume backup artifacts; empty derives <state-db dir>/backups")
-		jobsRetention = flag.Duration("jobs-retention", 0, "if >0, prune terminal jobs older than this (e.g. 168h); 0 disables")
-		evacConc      = flag.Int("evacuate-concurrency", 2, "max child migrations an evacuate runs at once (1..32); a request's \"concurrency\" overrides per call")
-		jobWorkers    = flag.Int("job-workers", jobs.DefaultWorkers, "size of the background job worker pool (<=0 uses the built-in default)")
+		addr          = fs.String("addr", "127.0.0.1:8080", "bind address for the API")
+		metricsAddr   = fs.String("metrics-addr", "", "if set, expose /metrics on this address (e.g. 127.0.0.1:9090); empty means no metrics endpoint")
+		hostsDir      = fs.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
+		keysFile      = fs.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
+		auditLogFile  = fs.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
+		stateDB       = fs.String("state-db", "/var/lib/podman-api/state.db", "SQLite path for the always-on template catalog + desired-state store")
+		specKeyFile   = fs.String("spec-key-file", "", "path to the 32-byte secret encryption key; optional — without it the store runs key-less (templates and no-secret specs work, secret ops are refused)")
+		backupDir     = fs.String("backup-dir", "", "directory for volume backup artifacts; empty derives <state-db dir>/backups")
+		jobsRetention = fs.Duration("jobs-retention", 0, "if >0, prune terminal jobs older than this (e.g. 168h); 0 disables")
+		evacConc      = fs.Int("evacuate-concurrency", 2, "max child migrations an evacuate runs at once (1..32); a request's \"concurrency\" overrides per call")
+		jobWorkers    = fs.Int("job-workers", jobs.DefaultWorkers, "size of the background job worker pool (<=0 uses the built-in default)")
 
-		migrateVerifyTimeout = flag.Duration("migrate-verify-timeout", 60*time.Second, "max wait for a migrated instance to become ready (running + declared healthchecks healthy) before reaping the source")
-		migrateVerifyVolumes = flag.Bool("migrate-verify-volumes", true, "verify each copied volume's content against the source before reaping the source (adds a re-export of source and dest per volume); false disables it")
-		deployVerifyTimeout  = flag.Duration("deploy-verify-timeout", 30*time.Second, "how long to wait for container healthchecks to pass after deploy or start (0 = disabled)")
+		migrateVerifyTimeout = fs.Duration("migrate-verify-timeout", 60*time.Second, "max wait for a migrated instance to become ready (running + declared healthchecks healthy) before reaping the source")
+		migrateVerifyVolumes = fs.Bool("migrate-verify-volumes", true, "verify each copied volume's content against the source before reaping the source (adds a re-export of source and dest per volume); false disables it")
+		deployVerifyTimeout  = fs.Duration("deploy-verify-timeout", 30*time.Second, "how long to wait for container healthchecks to pass after deploy or start (0 = disabled)")
 
-		pruneEnabled   = flag.Bool("prune-enabled", false, "enable scheduled host-health prune/cleanup")
-		pruneInterval  = flag.Duration("prune-interval", 24*time.Hour, "default interval between scheduled prunes per host")
-		pruneThreshold = flag.Int("prune-disk-threshold", 85, "disk used% high-water that triggers an early prune; 0 disables the threshold trigger")
-		pruneScope     = flag.String("prune-scope", "dangling", "default prune scopes, comma-separated: dangling,all-images,containers,build-cache,volumes")
-		pruneDryRun    = flag.Bool("prune-dry-run", false, "default dry-run: report reclaimable space without removing anything")
+		pruneEnabled   = fs.Bool("prune-enabled", false, "enable scheduled host-health prune/cleanup")
+		pruneInterval  = fs.Duration("prune-interval", 24*time.Hour, "default interval between scheduled prunes per host")
+		pruneThreshold = fs.Int("prune-disk-threshold", 85, "disk used% high-water that triggers an early prune; 0 disables the threshold trigger")
+		pruneScope     = fs.String("prune-scope", "dangling", "default prune scopes, comma-separated: dangling,all-images,containers,build-cache,volumes")
+		pruneDryRun    = fs.Bool("prune-dry-run", false, "default dry-run: report reclaimable space without removing anything")
 
-		ingressEnabled  = flag.Bool("ingress-enabled", false, "enable per-host Caddy ingress + auto-TLS")
-		ingressNetwork  = flag.String("ingress-network", "podman-api-ingress", "shared podman network app pods join for ingress")
-		ingressImage    = flag.String("ingress-caddy-image", "docker.io/library/caddy:2", "Caddy image for the per-host ingress pod; must include /bin/sh (the pod seeds its config via a small shell wrapper), so a shell-less distroless/scratch variant won't work")
-		ingressACME     = flag.String("ingress-acme-email", "", "ACME account email for Let's Encrypt (required when -ingress-enabled)")
-		ingressInterval = flag.Duration("ingress-reconcile-interval", 5*time.Minute, "periodic ingress drift-correction interval per host; 0 disables the periodic loop")
+		ingressEnabled  = fs.Bool("ingress-enabled", false, "enable per-host Caddy ingress + auto-TLS")
+		ingressNetwork  = fs.String("ingress-network", "podman-api-ingress", "shared podman network app pods join for ingress")
+		ingressImage    = fs.String("ingress-caddy-image", "docker.io/library/caddy:2", "Caddy image for the per-host ingress pod; must include /bin/sh (the pod seeds its config via a small shell wrapper), so a shell-less distroless/scratch variant won't work")
+		ingressACME     = fs.String("ingress-acme-email", "", "ACME account email for Let's Encrypt (required when -ingress-enabled)")
+		ingressInterval = fs.Duration("ingress-reconcile-interval", 5*time.Minute, "periodic ingress drift-correction interval per host; 0 disables the periodic loop")
 
-		operatorFile   = flag.String("operator-file", "", "if set, enable the admin UI and authenticate the single operator against this YAML file (username, password_hash)")
-		uiSecureCookie = flag.Bool("ui-secure-cookie", false, "set the Secure flag on the UI session cookie (enable when serving the UI over HTTPS / behind TLS)")
+		operatorFile   = fs.String("operator-file", "", "if set, enable the admin UI and authenticate the single operator against this YAML file (username, password_hash)")
+		uiSecureCookie = fs.Bool("ui-secure-cookie", false, "set the Secure flag on the UI session cookie (enable when serving the UI over HTTPS / behind TLS)")
 	)
-	flag.Parse()
+	if err := fs.Parse(os.Args[1:]); err != nil {
+		return err
+	}
 
-	if len(flag.Args()) > 0 && flag.Arg(0) == "hash-token" {
-		if len(flag.Args()) < 2 {
-			fmt.Fprintln(os.Stderr, "usage: podman-api hash-token <plaintext>")
-			os.Exit(2)
+	if len(fs.Args()) > 0 && fs.Arg(0) == "hash-token" {
+		if len(fs.Args()) < 2 {
+			return fmt.Errorf("usage: podman-api hash-token <plaintext>")
 		}
-		h, err := config.HashToken(flag.Arg(1))
+		h, err := config.HashToken(fs.Arg(1))
 		if err != nil {
-			log.Fatal(err)
+			return fmt.Errorf("hash-token: %w", err)
 		}
 		fmt.Println(h)
 		return nil
 	}
 
 	if *ingressEnabled && *ingressACME == "" {
-		log.Fatalf("ingress: -ingress-enabled requires -ingress-acme-email")
+		return fmt.Errorf("ingress: -ingress-enabled requires -ingress-acme-email")
 	}
 
 	hosts, err := config.LoadHosts(*hostsDir)
 	if err != nil {
-		log.Fatalf("hosts: %v", err)
+		return fmt.Errorf("hosts: %w", err)
 	}
 	var hostsHolder atomic.Pointer[[]config.Host]
 	hostsHolder.Store(&hosts)
 	keys, fp, err := loadKeys(*keysFile)
 	if err != nil {
-		log.Fatalf("keys: %v", err)
+		return fmt.Errorf("keys: %w", err)
 	}
 	keyStore := auth.NewKeyStore(keys)
 	log.Printf("keys loaded: %d entries, fingerprint=%s", len(keys), fp)
 
 	client, err := podman.NewReal(hosts)
 	if err != nil {
-		log.Fatalf("podman: %v", err)
+		return fmt.Errorf("podman: %w", err)
 	}
 	if err := client.Preflight(context.Background()); err != nil {
-		log.Fatalf("podman: %v", err)
+		return fmt.Errorf("podman: %w", err)
 	}
 
 	svc := instance.NewService(client, hosts)
@@ -130,23 +132,23 @@ func RunWithFlags(opts ...Option) error {
 	instance.SetDeployVerifyTimeout(*deployVerifyTimeout)
 	svc.SetVerifyVolumes(*migrateVerifyVolumes)
 
-	db, err := OpenStore(*stateDB, *specKeyFile)
+	db, err := openStore(*stateDB, *specKeyFile)
 	if err != nil {
-		log.Fatalf("store: %v", err)
+		return fmt.Errorf("store: %w", err)
 	}
 	defer db.Close()
 	svc.SetStore(db)
 
 	seedCtx := context.Background()
-	if n, err := SeedTemplates(seedCtx, db, templates.Files); err != nil {
-		log.Fatalf("seed templates: %v", err)
+	if n, err := seedTemplates(seedCtx, db, templates.Files); err != nil {
+		return fmt.Errorf("seed templates: %w", err)
 	} else if n > 0 {
 		log.Printf("seeded %d templates into empty catalog", n)
 	}
 
 	tmplCount, err := db.CountTemplates(seedCtx)
 	if err != nil {
-		log.Fatalf("templates: count: %v", err)
+		return fmt.Errorf("templates: count: %w", err)
 	}
 
 	if c.blobStore != nil {
@@ -159,7 +161,7 @@ func RunWithFlags(opts ...Option) error {
 		}
 		blobs, err := backuppkg.NewLocalDir(bdir)
 		if err != nil {
-			log.Fatalf("backup dir: %v", err)
+			return fmt.Errorf("backup dir: %w", err)
 		}
 		svc.SetBlobStore(blobs)
 		log.Printf("backups enabled: %s", bdir)
@@ -185,7 +187,7 @@ func RunWithFlags(opts ...Option) error {
 	jobStore = db
 	pruneMetrics := obs.NewPruneMetrics(prometheus.DefaultRegisterer)
 	jobMetrics := obs.NewJobMetrics(prometheus.DefaultRegisterer)
-	registry, reconcilers := BuildJobRegistry(svc, client, db, *evacConc, pruneMetrics, jobMetrics)
+	registry, reconcilers := buildJobRegistry(svc, client, db, *evacConc, pruneMetrics, jobMetrics)
 	workers := *jobWorkers
 	if workers <= 0 {
 		workers = jobs.DefaultWorkers
@@ -210,7 +212,7 @@ func RunWithFlags(opts ...Option) error {
 			DryRun:        *pruneDryRun,
 		}
 		if _, err := buildHostPolicies(*hostsHolder.Load(), def); err != nil {
-			log.Fatalf("prune policy: %v", err)
+			return fmt.Errorf("prune policy: %w", err)
 		}
 		pruneSched = &prune.Scheduler{Store: db, Client: client, Now: time.Now}
 		pruneSched.Start(runnerCtx, func() []prune.HostPolicy {
@@ -243,7 +245,7 @@ func RunWithFlags(opts ...Option) error {
 	if *auditLogFile != "" {
 		f, err := os.OpenFile(*auditLogFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
 		if err != nil {
-			log.Fatalf("audit log: %v", err)
+			return fmt.Errorf("audit log: %w", err)
 		}
 		defer f.Close()
 		auditSink = f
@@ -262,7 +264,7 @@ func RunWithFlags(opts ...Option) error {
 	if *operatorFile != "" {
 		op, fp, err := loadOperator(*operatorFile)
 		if err != nil {
-			log.Fatalf("operator: %v", err)
+			return fmt.Errorf("operator: %w", err)
 		}
 		opHolder.Store(&op)
 		authr := ui.AuthenticatorFunc(func(user, pass string) (ui.Identity, error) {
@@ -270,7 +272,7 @@ func RunWithFlags(opts ...Option) error {
 		})
 		uiApp, err = ui.New(ui.Config{Svc: svc, Jobs: jobStore, Auth: authr, Secure: *uiSecureCookie})
 		if err != nil {
-			log.Fatalf("ui: %v", err)
+			return fmt.Errorf("ui: %w", err)
 		}
 		log.Printf("admin UI enabled at /ui (operator=%s, fp=%s)", op.Username, fp)
 		if !*uiSecureCookie {
@@ -280,7 +282,7 @@ func RunWithFlags(opts ...Option) error {
 
 	srv := &http.Server{
 		Addr:              *addr,
-		Handler:           ComposeHandler(router, uiApp),
+		Handler:           composeHandler(router, uiApp),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -389,13 +391,13 @@ func RunWithFlags(opts ...Option) error {
 	log.Printf("podman-api listening on %s with %d hosts, %d templates, %d keys",
 		*addr, len(hosts), tmplCount, len(keyStore.Load()))
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatal(err)
+		return fmt.Errorf("server: %w", err)
 	}
 	<-idleClosed
 	return nil
 }
 
-func BuildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics) (jobs.Registry, jobs.Reconcilers) {
+func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics) (jobs.Registry, jobs.Reconcilers) {
 	reg := jobs.Registry{
 		"migrate":  &migrate.Handler{Svc: svc, Metrics: jobMetrics},
 		"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: evacConc, Metrics: jobMetrics},
@@ -410,7 +412,7 @@ func BuildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, 
 	return reg, recs
 }
 
-func ComposeHandler(apiRouter http.Handler, uiApp *ui.UI) http.Handler {
+func composeHandler(apiRouter http.Handler, uiApp *ui.UI) http.Handler {
 	if uiApp == nil {
 		return apiRouter
 	}
@@ -451,7 +453,7 @@ func loadKeys(path string) ([]config.APIKey, string, error) {
 	return keys, hex.EncodeToString(sum[:8]), nil
 }
 
-func OpenStore(path, keyFile string) (store.DB, error) {
+func openStore(path, keyFile string) (store.DB, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return nil, fmt.Errorf("state db dir: %w", err)
 	}
@@ -470,7 +472,7 @@ func OpenStore(path, keyFile string) (store.DB, error) {
 	return st, nil
 }
 
-func SeedTemplates(ctx context.Context, db store.TemplateStore, fsys fs.FS) (int, error) {
+func seedTemplates(ctx context.Context, db store.TemplateStore, fsys fs.FS) (int, error) {
 	n, err := db.CountTemplates(ctx)
 	if err != nil || n > 0 {
 		return 0, err

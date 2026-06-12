@@ -1,4 +1,4 @@
-package main
+package server
 
 import (
 	"context"
@@ -15,14 +15,13 @@ import (
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/store"
 	"github.com/iotready/podman-api/internal/ui"
-	"github.com/iotready/podman-api/server"
 	"github.com/iotready/podman-api/templates"
 	"github.com/stretchr/testify/require"
 )
 
 func TestJobRegistry_IncludesBackupKinds(t *testing.T) {
 	svc := instance.NewService(fake.New(), nil)
-	reg, recs := server.BuildJobRegistry(svc, nil, nil, 1, nil, nil)
+	reg, recs := BuildJobRegistry(svc, nil, nil, 1, nil, nil)
 
 	for _, kind := range []string{"migrate", "evacuate", "prune", "backup", "restore"} {
 		if _, ok := reg[kind]; !ok {
@@ -59,7 +58,7 @@ func storeSpecFixture() store.Spec {
 
 func TestOpenStore_KeyLess(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.db")
-	st, err := server.OpenStore(db, "")
+	st, err := OpenStore(db, "")
 	if err != nil {
 		t.Fatalf("key-less openStore: %v", err)
 	}
@@ -76,7 +75,7 @@ func TestOpenStore_KeyLess(t *testing.T) {
 
 func TestOpenStore_CreatesParentDir(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "nested", "dir", "state.db")
-	st, err := server.OpenStore(db, writeKey(t))
+	st, err := OpenStore(db, writeKey(t))
 	if err != nil {
 		t.Fatalf("openStore with nested parent: %v", err)
 	}
@@ -87,14 +86,14 @@ func TestOpenStore_BadKey(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.db")
 	bad := filepath.Join(t.TempDir(), "bad.key")
 	_ = os.WriteFile(bad, []byte("not-32-bytes"), 0o600)
-	if _, err := server.OpenStore(db, bad); err == nil {
+	if _, err := OpenStore(db, bad); err == nil {
 		t.Fatal("expected error for invalid key file")
 	}
 }
 
 func TestOpenStore_Enabled(t *testing.T) {
 	db := filepath.Join(t.TempDir(), "state.db")
-	st, err := server.OpenStore(db, writeKey(t))
+	st, err := OpenStore(db, writeKey(t))
 	if err != nil {
 		t.Fatalf("openStore: %v", err)
 	}
@@ -114,15 +113,20 @@ func TestSeedTemplates_OnEmptyOnly(t *testing.T) {
 	db, err := store.OpenSQLite(filepath.Join(t.TempDir(), "s.db"), nil)
 	require.NoError(t, err)
 	defer db.Close()
-	n, err := server.SeedTemplates(ctx, db, templates.Files)
+	n, err := SeedTemplates(ctx, db, templates.Files)
 	require.NoError(t, err)
 	require.Positive(t, n)
-	again, err := server.SeedTemplates(ctx, db, templates.Files)
+	again, err := SeedTemplates(ctx, db, templates.Files)
 	require.NoError(t, err)
 	require.Zero(t, again, "must not re-seed a populated store")
 }
 
 func TestSeedTemplates_RejectsMalformed(t *testing.T) {
+	// The fixture pairs a VALID seed (alphabetically first) with the broken one
+	// so a single validate+put loop would persist the good one before hitting the
+	// bad one. seedTemplates is two-pass / all-or-nothing, so the store must stay
+	// empty — otherwise the next boot (CountTemplates > 0) would never re-seed and
+	// the catalog would be permanently partial (#61).
 	ctx := context.Background()
 	db, err := store.OpenSQLite(filepath.Join(t.TempDir(), "s.db"), nil)
 	require.NoError(t, err)
@@ -160,7 +164,7 @@ func TestSeedTemplates_RejectsMalformed(t *testing.T) {
 		)},
 	}
 
-	n, err := server.SeedTemplates(ctx, db, seeds)
+	n, err := SeedTemplates(ctx, db, seeds)
 	require.Error(t, err)
 	require.Zero(t, n)
 	require.Contains(t, err.Error(), "broken")
@@ -180,7 +184,7 @@ func TestComposeHandlerRootRedirectsToUI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h := server.ComposeHandler(http.NewServeMux(), uiApp)
+	h := ComposeHandler(http.NewServeMux(), uiApp)
 
 	r := httptest.NewRequest("GET", "/", nil)
 	w := httptest.NewRecorder()
@@ -200,7 +204,7 @@ func TestComposeHandlerRootRedirectsToUI(t *testing.T) {
 func TestComposeHandlerNilUIReturnsAPIRouter(t *testing.T) {
 	api := http.NewServeMux()
 	api.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) })
-	h := server.ComposeHandler(api, nil)
+	h := ComposeHandler(api, nil)
 	r := httptest.NewRequest("GET", "/healthz", nil)
 	w := httptest.NewRecorder()
 	h.ServeHTTP(w, r)
