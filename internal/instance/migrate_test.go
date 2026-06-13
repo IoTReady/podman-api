@@ -21,9 +21,9 @@ var migrateFailErr = errors.New("injected failure")
 
 // setVerifyKnobs temporarily shrinks the verify-poll timing for tests.
 func setVerifyKnobs(timeout, interval time.Duration) func() {
-	ot, oi, od := verifyTimeout, verifyInterval, deployVerifyTimeout
-	verifyTimeout, verifyInterval, deployVerifyTimeout = timeout, interval, timeout
-	return func() { verifyTimeout, verifyInterval, deployVerifyTimeout = ot, oi, od }
+	ot, oi, od, osc := verifyTimeout, verifyInterval, deployVerifyTimeout, verifyStableCount
+	verifyTimeout, verifyInterval, deployVerifyTimeout, verifyStableCount = timeout, interval, timeout, 1
+	return func() { verifyTimeout, verifyInterval, deployVerifyTimeout, verifyStableCount = ot, oi, od, osc }
 }
 
 // portTemplate is a fixture whose rendered Pod declares a fixed hostPort, used

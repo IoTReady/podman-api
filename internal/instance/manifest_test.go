@@ -67,6 +67,50 @@ func TestBuildManifest_NotTar(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestExcludePath_Litestream(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"data/mydb.db-litestream/generations/abc123/wal/0000000000000001", true},
+		{"mydb.db-litestream/generations/abc123/snapshots/snap", true},
+		{".engine.db-litestream/generations/abc123/wal/0001", true},
+		{"data/file.txt", false},
+		{"subdir/other.log", false},
+		{"-litestream", true},
+		{"somedir/foo", false},
+	}
+	for _, tt := range tests {
+		got := excludePath(tt.path)
+		if got != tt.want {
+			t.Errorf("excludePath(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestBuildManifest_SkipsLitestreamDirs(t *testing.T) {
+	files := map[string]string{
+		"PG_VERSION": "16",
+		"mydb.db-litestream/generations/abc/wal/0001":       "wal content",
+		"mydb.db-litestream/generations/abc/snapshots/snap": "snap content",
+	}
+	m, err := buildManifest(bytes.NewReader(tarBytes(t, files)))
+	require.NoError(t, err)
+	// Only PG_VERSION should be in the manifest; litestream paths excluded.
+	if _, ok := m["PG_VERSION"]; !ok {
+		t.Error("expected PG_VERSION to be present")
+	}
+	if _, ok := m["mydb.db-litestream/generations/abc/wal/0001"]; ok {
+		t.Error("expected litestream WAL path to be excluded")
+	}
+	if _, ok := m["mydb.db-litestream/generations/abc/snapshots/snap"]; ok {
+		t.Error("expected litestream snapshot path to be excluded")
+	}
+	if len(m) != 1 {
+		t.Errorf("expected 1 entry, got %d", len(m))
+	}
+}
+
 func TestManifest_JSONRoundTrip(t *testing.T) {
 	m := Manifest{
 		"data/file":  fileInfo{typ: tar.TypeReg, size: 5, sha256: "abc123"},
