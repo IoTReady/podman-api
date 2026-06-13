@@ -69,6 +69,7 @@ func RunWithFlags(opts ...Option) error {
 
 		migrateVerifyTimeout = fs.Duration("migrate-verify-timeout", 180*time.Second, "max wait for a migrated instance to become ready (running + declared healthchecks healthy) before reaping the source")
 		migrateVerifyVolumes = fs.Bool("migrate-verify-volumes", true, "verify each copied volume's content against the source before reaping the source (adds a re-export of source and dest per volume); false disables it")
+		migrateVerifyStable  = fs.Int("migrate-verify-stable-count", 3, "number of consecutive ready polls required before a migrated instance is considered stable; higher values reduce false positives from brief restarts but increase the minimum verify time (poll interval * count)")
 		deployVerifyTimeout  = fs.Duration("deploy-verify-timeout", 30*time.Second, "how long to wait for container healthchecks to pass after deploy or start (0 = disabled)")
 
 		pruneEnabled   = fs.Bool("prune-enabled", false, "enable scheduled host-health prune/cleanup")
@@ -130,6 +131,7 @@ func RunWithFlags(opts ...Option) error {
 	svc := instance.NewService(client, hosts)
 	instance.SetVerifyTimeout(*migrateVerifyTimeout)
 	instance.SetDeployVerifyTimeout(*deployVerifyTimeout)
+	instance.SetVerifyStableCount(*migrateVerifyStable)
 	svc.SetVerifyVolumes(*migrateVerifyVolumes)
 
 	db, err := openStore(*stateDB, *specKeyFile)

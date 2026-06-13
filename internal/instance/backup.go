@@ -349,6 +349,14 @@ func (s *Service) restoreVolume(ctx context.Context, b store.Backup, bv store.Ba
 	if err := json.Unmarshal(bv.Manifest, &want); err != nil {
 		return fmt.Errorf("stored manifest corrupt: %w", err)
 	}
+	// Strip excluded paths from the stored manifest so old backups (captured
+	// before the exclusion filter existed) compare equally with the re-exported
+	// volume. (#142 review)
+	for k := range want {
+		if excludePath(k) {
+			delete(want, k)
+		}
+	}
 	got, err := s.volumeManifest(ctx, b.Host, bv.Name)
 	if err != nil {
 		return fmt.Errorf("re-export for verify: %w", err)

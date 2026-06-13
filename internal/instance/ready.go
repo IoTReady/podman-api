@@ -53,7 +53,7 @@ func (s *Service) waitReady(ctx context.Context, host, tmpl, slug string, timeou
 			if stable >= verifyStableCount {
 				return nil
 			}
-		} else {
+		} else if err == nil {
 			stable = 0
 		}
 		if time.Now().After(deadline) {

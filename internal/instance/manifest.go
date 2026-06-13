@@ -68,21 +68,29 @@ func parseTar(r io.Reader, m Manifest) error {
 		if err != nil {
 			return err
 		}
+		cleaned := path.Clean(hdr.Name)
+		excluded := excludePath(cleaned)
+
 		fi := fileInfo{typ: hdr.Typeflag}
 		switch hdr.Typeflag {
 		case tar.TypeReg:
-			h := sha256.New()
-			n, err := io.Copy(h, tr)
-			if err != nil {
-				return err
+			if excluded {
+				if _, err := io.Copy(io.Discard, tr); err != nil {
+					return err
+				}
+			} else {
+				h := sha256.New()
+				n, err := io.Copy(h, tr)
+				if err != nil {
+					return err
+				}
+				fi.size = n
+				fi.sha256 = hex.EncodeToString(h.Sum(nil))
 			}
-			fi.size = n
-			fi.sha256 = hex.EncodeToString(h.Sum(nil))
 		case tar.TypeSymlink, tar.TypeLink:
 			fi.link = hdr.Linkname
 		}
-		cleaned := path.Clean(hdr.Name)
-		if excludePath(cleaned) {
+		if excluded {
 			continue
 		}
 		// path.Clean can collapse distinct names (e.g. "./foo" and "foo") to one
@@ -130,10 +138,5 @@ func (m Manifest) firstDiff(other Manifest) (string, bool) {
 // captured during the copy phase to differ from the state re-exported during
 // the verify phase. (#142)
 func excludePath(name string) bool {
-	for _, part := range strings.Split(name, "/") {
-		if strings.HasSuffix(part, "-litestream") {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(name, "-litestream/") || strings.HasSuffix(name, "-litestream")
 }

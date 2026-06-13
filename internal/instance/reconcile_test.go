@@ -24,7 +24,7 @@ func reconcileSvc(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
 	t.Helper()
 	SetVerifyTimeout(time.Nanosecond)
 	SetVerifyStableCount(1)
-	t.Cleanup(func() { SetVerifyTimeout(60 * time.Second); SetVerifyStableCount(3) })
+	t.Cleanup(func() { SetVerifyTimeout(180 * time.Second); SetVerifyStableCount(3) })
 	fc := fake.New()
 	hosts := []config.Host{
 		{ID: "h1", Addr: "unix", Socket: "/a"},
