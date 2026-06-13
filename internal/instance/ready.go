@@ -3,6 +3,7 @@ package instance
 import (
 	"context"
 	"errors"
+	"log"
 	"time"
 )
 
@@ -54,7 +55,11 @@ func SetDeployVerifyStableCount(n int) {
 // waitReady polls until podReady returns true, or timeout elapses, or ctx is
 // cancelled. Returns nil on success, errReadyTimeout on timeout, ctx.Err() on
 // cancellation. timeout==0 disables the wait and returns nil immediately.
-// stableCount is the number of consecutive ready observations required.
+// stableCount is the required number of observations where PodInspect succeeds
+// AND podReady returns true. Transient PodInspect errors (e.g. SSH blips) do
+// NOT reset the counter, avoiding false negatives when the destination host has
+// intermittent reachability (#145). Only a successful PodInspect that reports
+// the pod as not-ready resets progress, preserving the anti-flap mechanism (#143).
 func (s *Service) waitReady(ctx context.Context, host, tmpl, slug string, timeout time.Duration, stableCount int) error {
 	if timeout == 0 {
 		return nil
@@ -65,13 +70,18 @@ func (s *Service) waitReady(ctx context.Context, host, tmpl, slug string, timeou
 	stable := 0
 	for {
 		p, err := s.client.PodInspect(ctx, host, podName(tmpl, slug))
-		if err == nil && podReady(p) {
+		switch {
+		case err == nil && podReady(p):
 			stable++
+			log.Printf("pod %s ready (stable=%d/%d)", podName(tmpl, slug), stable, stableCount)
 			if stable >= stableCount {
 				return nil
 			}
-		} else if err == nil || !errors.Is(err, ctx.Err()) {
+		case err == nil:
 			stable = 0
+			log.Printf("pod %s not ready (status=%q, stable reset to 0)", podName(tmpl, slug), p.Status)
+		default:
+			log.Printf("pod %s inspect error: %v (stable=%d/%d, not reset)", podName(tmpl, slug), err, stable, stableCount)
 		}
 		if time.Now().After(deadline) {
 			return errReadyTimeout
