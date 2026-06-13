@@ -415,12 +415,14 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 		}
 	}
 
+	step("apply-dest", req.ToHost)
+	applyStart := time.Now()
 	if err := s.Apply(ctx, req.ToHost, ApplyRequest{
 		Template: req.Template, Slug: req.Slug, Parameters: eff, Secrets: secrets, Domains: domains,
 	}, ApplyOptions{Replace: false}); err != nil {
 		return stoppedPaired, fmt.Errorf("apply on dest: %w", err)
 	}
-	step("apply-dest", req.ToHost)
+	step("apply-dest-done", fmt.Sprintf("%s (%s)", req.ToHost, time.Since(applyStart)))
 
 	if err := s.waitRunning(ctx, req.ToHost, req.Template, req.Slug); err != nil {
 		return stoppedPaired, fmt.Errorf("verify dest: %w", err)

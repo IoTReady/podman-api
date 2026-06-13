@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"slices"
 	"sync"
@@ -386,6 +387,7 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 	// only touched once we know the manifest will play.
 	if !opts.SkipPull {
 		for _, img := range containerImages(yaml) {
+			log.Printf("apply: pull image %s on %s", img, host)
 			if err := s.client.ImagePull(ctx, host, img); err != nil {
 				return fmt.Errorf("%w: %s: %v", ErrImagePull, img, err)
 			}
@@ -401,6 +403,7 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 	// Push per-instance secrets, then zero the local copies.
 	for k, v := range req.Secrets {
 		name := instanceSecretName(req.Template, req.Slug, k)
+		log.Printf("apply: secret %s on %s", name, host)
 		// Idempotency: if it already exists, remove and recreate (rotation).
 		if _, err := s.client.SecretInspect(ctx, host, name); err == nil {
 			if err := s.client.SecretRemove(ctx, host, name); err != nil {
@@ -417,6 +420,7 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 
 	var networks []string
 	if s.ingressEnabled() && tmpl.Meta.Ingress != nil {
+		log.Printf("apply: ensure ingress network %s on %s", s.ingressNet, host)
 		// The shared ingress network must exist before the app pod can join it.
 		// ensureProxy (during Reconcile, below) also ensures it, but that runs
 		// after this play, so the first ingress deploy on a host would otherwise
@@ -426,6 +430,7 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 		}
 		networks = []string{s.ingressNet}
 	}
+	log.Printf("apply: play kube on %s", host)
 	if err := s.client.PlayKube(ctx, host, yaml, opts.Replace, networks...); err != nil {
 		return fmt.Errorf("play kube: %w", err)
 	}
