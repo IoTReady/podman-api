@@ -296,7 +296,7 @@ func (s *Service) ApplyAndObserve(ctx context.Context, host string, req ApplyReq
 	if err := s.Apply(ctx, host, req, opts); err != nil {
 		return Observed{}, err
 	}
-	readyErr := s.waitReady(ctx, host, req.Template, req.Slug, deployVerifyTimeout)
+	readyErr := s.waitReady(ctx, host, req.Template, req.Slug, deployVerifyTimeout, deployVerifyStableCount)
 	obs, err := s.Get(ctx, host, req.Template, req.Slug)
 	if err != nil {
 		return Observed{}, err
@@ -574,7 +574,7 @@ func (s *Service) Start(ctx context.Context, host, tmpl, slug string) (Observed,
 	if err := s.lifecycle(ctx, host, tmpl, slug, s.client.PodStart); err != nil {
 		return Observed{}, err
 	}
-	readyErr := s.waitReady(ctx, host, tmpl, slug, deployVerifyTimeout)
+	readyErr := s.waitReady(ctx, host, tmpl, slug, deployVerifyTimeout, deployVerifyStableCount)
 	obs, err := s.Get(ctx, host, tmpl, slug)
 	if err != nil {
 		return Observed{}, err

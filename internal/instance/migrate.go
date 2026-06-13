@@ -432,7 +432,7 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 // waitRunning polls the dest pod until Running, bounded by verifyTimeout and the
 // caller's context.
 func (s *Service) waitRunning(ctx context.Context, host, tmpl, slug string) error {
-	if err := s.waitReady(ctx, host, tmpl, slug, verifyTimeout); err != nil {
+	if err := s.waitReady(ctx, host, tmpl, slug, verifyTimeout, verifyStableCount); err != nil {
 		if errors.Is(err, errReadyTimeout) {
 			return fmt.Errorf("pod %s not running within %s", podName(tmpl, slug), verifyTimeout)
 		}

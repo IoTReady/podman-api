@@ -27,7 +27,7 @@ func TestWaitReady_NilWhenReady(t *testing.T) {
 	f := fake.New()
 	f.AddPod("h1", podman.Pod{Name: "web-ok", Status: "Running",
 		Containers: []podman.Container{{Status: "Running", Health: "healthy"}}})
-	require.NoError(t, readySvc(t, f).waitReady(context.Background(), "h1", "web", "ok", 50*time.Millisecond))
+	require.NoError(t, readySvc(t, f).waitReady(context.Background(), "h1", "web", "ok", 50*time.Millisecond, 1))
 }
 
 func TestWaitReady_TimeoutSentinel(t *testing.T) {
@@ -35,7 +35,7 @@ func TestWaitReady_TimeoutSentinel(t *testing.T) {
 	f := fake.New()
 	f.AddPod("h1", podman.Pod{Name: "web-bad", Status: "Running",
 		Containers: []podman.Container{{Status: "Running", Health: "starting"}}})
-	err := readySvc(t, f).waitReady(context.Background(), "h1", "web", "bad", 50*time.Millisecond)
+	err := readySvc(t, f).waitReady(context.Background(), "h1", "web", "bad", 50*time.Millisecond, 1)
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, errReadyTimeout), "expected errReadyTimeout, got %v", err)
 }
@@ -47,7 +47,7 @@ func TestWaitReady_ContextCancel(t *testing.T) {
 		Containers: []podman.Container{{Status: "Running", Health: "starting"}}})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	err := readySvc(t, f).waitReady(ctx, "h1", "web", "slow", 200*time.Millisecond)
+	err := readySvc(t, f).waitReady(ctx, "h1", "web", "slow", 200*time.Millisecond, 1)
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.Canceled)
 }
@@ -55,7 +55,7 @@ func TestWaitReady_ContextCancel(t *testing.T) {
 func TestWaitReady_ZeroTimeout(t *testing.T) {
 	// timeout=0 means disabled: must return nil immediately without polling
 	f := fake.New() // no pods added — any poll would fail
-	require.NoError(t, readySvc(t, f).waitReady(context.Background(), "h1", "web", "x", 0))
+	require.NoError(t, readySvc(t, f).waitReady(context.Background(), "h1", "web", "x", 0, 1))
 }
 
 func TestWaitReady_NoHealthcheck(t *testing.T) {
@@ -64,5 +64,5 @@ func TestWaitReady_NoHealthcheck(t *testing.T) {
 	f := fake.New()
 	f.AddPod("h1", podman.Pod{Name: "web-nohc", Status: "Running",
 		Containers: []podman.Container{{Status: "Running"}}}) // Health==""
-	require.NoError(t, readySvc(t, f).waitReady(context.Background(), "h1", "web", "nohc", 50*time.Millisecond))
+	require.NoError(t, readySvc(t, f).waitReady(context.Background(), "h1", "web", "nohc", 50*time.Millisecond, 1))
 }
