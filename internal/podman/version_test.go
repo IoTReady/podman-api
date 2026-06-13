@@ -57,7 +57,7 @@ func stubReal(t *testing.T, probe func(context.Context) (string, error)) *Real {
 
 func TestOpCtxFor_RefusesOldVersion(t *testing.T) {
 	r := stubReal(t, func(context.Context) (string, error) { return "5.4.2", nil })
-	_, err := r.opCtxFor(context.Background(), "h1")
+	_, _, err := r.opCtxFor(context.Background(), "h1")
 	require.Error(t, err)
 	assert.True(t, errors.Is(err, ErrHostVersionUnsupported))
 }
@@ -66,7 +66,7 @@ func TestOpCtxFor_VerifiesOncePerHost(t *testing.T) {
 	calls := 0
 	r := stubReal(t, func(context.Context) (string, error) { calls++; return "5.8.2", nil })
 	for i := 0; i < 3; i++ {
-		_, err := r.opCtxFor(context.Background(), "h1")
+		_, _, err := r.opCtxFor(context.Background(), "h1")
 		require.NoError(t, err)
 	}
 	assert.Equal(t, 1, calls, "version probed once, then cached")
@@ -81,9 +81,9 @@ func TestOpCtxFor_InPlaceUpgradeRecovers(t *testing.T) {
 		}
 		return "5.8.2", nil // host upgraded in place
 	})
-	_, err := r.opCtxFor(context.Background(), "h1")
+	_, _, err := r.opCtxFor(context.Background(), "h1")
 	require.Error(t, err)
-	_, err = r.opCtxFor(context.Background(), "h1")
+	_, _, err = r.opCtxFor(context.Background(), "h1")
 	require.NoError(t, err, "no daemon restart needed after host upgrade")
 	assert.Equal(t, 2, calls, "failed check is not cached; probe re-ran")
 }
@@ -97,11 +97,11 @@ func TestOpCtxFor_ProbeErrorIsNotVerified(t *testing.T) {
 		}
 		return "5.8.2", nil
 	})
-	_, err := r.opCtxFor(context.Background(), "h1")
+	_, _, err := r.opCtxFor(context.Background(), "h1")
 	require.Error(t, err)
 	assert.False(t, errors.Is(err, ErrHostVersionUnsupported),
 		"transient probe failure is not a version verdict")
-	_, err = r.opCtxFor(context.Background(), "h1")
+	_, _, err = r.opCtxFor(context.Background(), "h1")
 	require.NoError(t, err)
 }
 
@@ -123,7 +123,7 @@ func TestPreflight_MarksVerified_NoReprobe(t *testing.T) {
 	calls := 0
 	r := stubReal(t, func(context.Context) (string, error) { calls++; return "5.8.2", nil })
 	require.NoError(t, r.Preflight(context.Background()))
-	_, err := r.opCtxFor(context.Background(), "h1")
+	_, _, err := r.opCtxFor(context.Background(), "h1")
 	require.NoError(t, err)
 	assert.Equal(t, 1, calls, "preflight pass is cached; first op does not re-probe")
 }

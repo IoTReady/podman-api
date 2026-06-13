@@ -222,20 +222,38 @@ func (r *Real) ensureVerified(c context.Context, id string) error {
 // opCtxFor is ctxFor plus the MinPodmanVersion gate. Operation methods must
 // call this instead of ctxFor; diagnostics (Ping, Version, HostInfo) use raw
 // ctxFor so GET /hosts can still display an unsupported host's version (#85).
-func (r *Real) opCtxFor(parent context.Context, id string) (context.Context, error) {
+//
+// The returned context is derived from the cached long-lived connection context
+// (rooted at context.Background) with a per-call deadline (callTimeout) so a
+// hung libpod/SSH call fails rather than blocking forever. Parent cancellation
+// is bridged into the derived context via context.AfterFunc, so job cancellations
+// and daemon shutdown tear down in-flight operations promptly.
+//
+// Callers MUST call the returned CancelFunc (typically via defer) to release
+// the WithTimeout timer and the AfterFunc registration when the operation
+// completes, regardless of success or failure.
+func (r *Real) opCtxFor(parent context.Context, id string) (context.Context, context.CancelFunc, error) {
 	c, err := r.ctxFor(parent, id)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := r.ensureVerified(c, id); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return c, nil
+	ctx, cancel := context.WithTimeout(c, callTimeout)
+	stop := context.AfterFunc(parent, cancel)
+	return ctx, func() { stop(); cancel() }, nil
 }
 
 // preflightTimeout bounds each host's boot-time connect+version probe.
 // var (not const) so tests can shrink it.
 var preflightTimeout = 10 * time.Second
+
+// callTimeout bounds each individual libpod operation so a hung SSH or
+// libpod call fails rather than blocking a job (e.g. a migrate between
+// copy-volume-done and apply-dest) forever. 10 minutes covers large image
+// pulls; tests that need faster failure can override this package var.
+var callTimeout = 10 * time.Minute
 
 // Preflight enforces MinPodmanVersion at boot. ALL reachable hosts are checked
 // and any below the floor are collected; the returned error aggregates every
@@ -316,10 +334,11 @@ func (r *Real) Version(ctx context.Context, id string) (string, error) {
 }
 
 func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool, networks ...string) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	tmp, err := os.CreateTemp("", "play-kube-*.yaml")
 	if err != nil {
 		return err
@@ -343,10 +362,11 @@ func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool, netwo
 }
 
 func (r *Real) PodInspect(ctx context.Context, id, name string) (Pod, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return Pod{}, err
 	}
+	defer cancel()
 	rep, err := pods.Inspect(c, name, &pods.InspectOptions{})
 	if err != nil {
 		if isNotFound(err) {
@@ -408,10 +428,11 @@ func enrichContainer(c *Container, ins *define.InspectContainerData) {
 }
 
 func (r *Real) PodList(ctx context.Context, id string, filters map[string]string) ([]Pod, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	opts := &pods.ListOptions{}
 	if len(filters) > 0 {
 		f := map[string][]string{}
@@ -442,37 +463,41 @@ func (r *Real) PodList(ctx context.Context, id string, filters map[string]string
 }
 
 func (r *Real) PodStart(ctx context.Context, id, name string) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	_, err = pods.Start(c, name, &pods.StartOptions{})
 	return mapNotFound(err)
 }
 
 func (r *Real) PodStop(ctx context.Context, id, name string) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	_, err = pods.Stop(c, name, &pods.StopOptions{})
 	return mapNotFound(err)
 }
 
 func (r *Real) PodRestart(ctx context.Context, id, name string) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	_, err = pods.Restart(c, name, &pods.RestartOptions{})
 	return mapNotFound(err)
 }
 
 func (r *Real) PodRemove(ctx context.Context, id, name string, force bool) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	opts := &pods.RemoveOptions{}
 	if force {
 		t := true
@@ -483,20 +508,22 @@ func (r *Real) PodRemove(ctx context.Context, id, name string, force bool) error
 }
 
 func (r *Real) SecretCreate(ctx context.Context, id, name string, value []byte) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	opts := &secrets.CreateOptions{Name: &name}
 	_, err = secrets.Create(c, bytes.NewReader(value), opts)
 	return err
 }
 
 func (r *Real) SecretList(ctx context.Context, id string) ([]Secret, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	reps, err := secrets.List(c, &secrets.ListOptions{})
 	if err != nil {
 		return nil, err
@@ -509,10 +536,11 @@ func (r *Real) SecretList(ctx context.Context, id string) ([]Secret, error) {
 }
 
 func (r *Real) SecretInspect(ctx context.Context, id, name string) (Secret, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return Secret{}, err
 	}
+	defer cancel()
 	rep, err := secrets.Inspect(c, name, &secrets.InspectOptions{})
 	if err != nil {
 		return Secret{}, mapNotFound(err)
@@ -521,18 +549,20 @@ func (r *Real) SecretInspect(ctx context.Context, id, name string) (Secret, erro
 }
 
 func (r *Real) SecretRemove(ctx context.Context, id, name string) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	return mapNotFound(secrets.Remove(c, name))
 }
 
 func (r *Real) VolumeInspect(ctx context.Context, id, name string) (Volume, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return Volume{}, err
 	}
+	defer cancel()
 	rep, err := volumes.Inspect(c, name, &volumes.InspectOptions{})
 	if err != nil {
 		return Volume{}, mapNotFound(err)
@@ -543,10 +573,11 @@ func (r *Real) VolumeInspect(ctx context.Context, id, name string) (Volume, erro
 }
 
 func (r *Real) VolumeRemove(ctx context.Context, id, name string, force bool) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	opts := &volumes.RemoveOptions{}
 	if force {
 		t := true
@@ -561,42 +592,47 @@ func (r *Real) VolumeRemove(ctx context.Context, id, name string, force bool) er
 // because that binding copies into an io.Writer, whereas our contract must hand
 // back a live io.ReadCloser for pipe streaming.
 func (r *Real) VolumeExport(ctx context.Context, id, name string) (io.ReadCloser, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	conn, err := bindings.GetClient(c)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	resp, err := conn.DoRequest(c, nil, http.MethodGet, "/volumes/%s/export", nil, nil, name)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
 	if !resp.IsSuccess() {
 		defer resp.Body.Close()
+		cancel()
 		// Process(nil) drains the body and returns podman's error for non-2xx.
 		return nil, mapNotFound(resp.Process(nil))
 	}
-	return resp.Body, nil
+	return &cancelReadCloser{ReadCloser: resp.Body, cancel: cancel}, nil
 }
 
 // VolumeImport unpacks an uncompressed tar into an existing volume on the host.
 func (r *Real) VolumeImport(ctx context.Context, id, name string, src io.Reader) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	return mapNotFound(volumes.Import(c, name, src))
 }
 
 // VolumeCreate creates an empty named volume. An already-existing name is
 // treated as success so migrate's create-then-copy step is idempotent on retry.
 func (r *Real) VolumeCreate(ctx context.Context, id, name string) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	if _, err := volumes.Create(c, entities.VolumeCreateOptions{Name: name}, nil); err != nil {
 		if strings.Contains(strings.ToLower(err.Error()), "already exists") {
 			return nil
@@ -617,10 +653,11 @@ func (r *Real) VolumeCreate(ctx context.Context, id, name string) error {
 // via the API, so we fail with the one-time fix instead of silently keeping it
 // disabled (which IgnoreIfExists would do).
 func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	if exists, err := network.Exists(c, name, nil); err != nil {
 		return err
 	} else if exists {
@@ -642,10 +679,11 @@ func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
 }
 
 func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []string) (ExecResult, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return ExecResult{}, err
 	}
+	defer cancel()
 	sessionID, err := containers.ExecCreate(c, container, &handlers.ExecCreateConfig{
 		ExecOptions: dockerContainer.ExecOptions{
 			Cmd:          cmd,
@@ -675,10 +713,11 @@ func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []st
 }
 
 func (r *Real) CopyToContainer(ctx context.Context, id, container, destDir, name string, content []byte) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	var tarBuf bytes.Buffer
 	tw := tar.NewWriter(&tarBuf)
 	if err := tw.WriteHeader(&tar.Header{
@@ -772,10 +811,12 @@ func podFromList(p *entities.ListPodsReport) Pod {
 // request; mergedCtx derives from c but can be independently cancelled so
 // the streaming call is torn down without killing the cached connection.
 func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts LogOptions) (<-chan LogLine, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cleanupOpCtx, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	// No defer cancel() here — the goroutines below own the lifecycle of c.
+	// cleanupOpCtx runs inside the fan-in goroutine when streaming ends.
 
 	// mergedCtx is derived from the connection context but independently
 	// cancellable. Cancelling it tears down the containers.Logs HTTP stream
@@ -798,7 +839,8 @@ func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts Log
 
 	go func() {
 		defer close(out)
-		defer cancel() // signal the bridge and producer to stop when fan-in exits
+		defer cancel()       // signal the bridge and producer to stop when fan-in exits
+		defer cleanupOpCtx() // release the WithTimeout timer and AfterFunc registration
 		for {
 			select {
 			case <-ctx.Done():
@@ -853,19 +895,21 @@ func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts Log
 }
 
 func (r *Real) ImagePull(ctx context.Context, id, ref string) error {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	defer cancel()
 	_, err = images.Pull(c, ref, &images.PullOptions{})
 	return err
 }
 
 func (r *Real) UsedHostPorts(ctx context.Context, id string) ([]PortMapping, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return nil, err
 	}
+	defer cancel()
 	all := true
 	conts, err := containers.List(c, &containers.ListOptions{All: &all})
 	if err != nil {
@@ -1021,10 +1065,11 @@ func sumPrune(reps []*reports.PruneReport) PruneReport {
 }
 
 func (r *Real) ImagePrune(ctx context.Context, id string, all bool) (PruneReport, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return PruneReport{}, err
 	}
+	defer cancel()
 	reps, err := images.Prune(c, new(images.PruneOptions).WithAll(all))
 	if err != nil {
 		return PruneReport{}, err
@@ -1033,10 +1078,11 @@ func (r *Real) ImagePrune(ctx context.Context, id string, all bool) (PruneReport
 }
 
 func (r *Real) ContainerPrune(ctx context.Context, id string) (PruneReport, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return PruneReport{}, err
 	}
+	defer cancel()
 	reps, err := containers.Prune(c, new(containers.PruneOptions))
 	if err != nil {
 		return PruneReport{}, err
@@ -1045,10 +1091,11 @@ func (r *Real) ContainerPrune(ctx context.Context, id string) (PruneReport, erro
 }
 
 func (r *Real) BuildCachePrune(ctx context.Context, id string) (PruneReport, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return PruneReport{}, err
 	}
+	defer cancel()
 	// Build cache is pruned through the images prune endpoint with the
 	// build-cache flag set (libpod has no standalone build-cache binding in v5).
 	reps, err := images.Prune(c, new(images.PruneOptions).WithBuildCache(true))
@@ -1059,10 +1106,11 @@ func (r *Real) BuildCachePrune(ctx context.Context, id string) (PruneReport, err
 }
 
 func (r *Real) VolumePrune(ctx context.Context, id string, filters map[string][]string) (PruneReport, error) {
-	c, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
 		return PruneReport{}, err
 	}
+	defer cancel()
 	opts := new(volumes.PruneOptions)
 	if len(filters) > 0 {
 		opts = opts.WithFilters(filters)
@@ -1072,6 +1120,20 @@ func (r *Real) VolumePrune(ctx context.Context, id string, filters map[string][]
 		return PruneReport{}, err
 	}
 	return sumPrune(reps), nil
+}
+
+// cancelReadCloser wraps an io.ReadCloser with a cancel function that is
+// called when the reader is closed. Used for VolumeExport: the caller reads
+// the live HTTP response body after the function returns, so context
+// cancellation must be deferred until the body is consumed.
+type cancelReadCloser struct {
+	io.ReadCloser
+	cancel func()
+}
+
+func (c *cancelReadCloser) Close() error {
+	c.cancel()
+	return c.ReadCloser.Close()
 }
 
 // Compile-time guarantee that Real satisfies the Client interface.

@@ -223,7 +223,7 @@ func TestMigrate_HappyPath(t *testing.T) {
 	_, err = mem.GetSpec(ctx, "h2", "postgres", "db1")
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{"load", "preflight", "stop-source", "copy-volume", "copy-volume-done", "verify-volume", "apply-dest", "verify", "commit"}, steps)
+	assert.Equal(t, []string{"load", "preflight", "stop-source", "copy-volume", "copy-volume-done", "verify-volume", "apply-dest", "apply-dest-done", "verify", "commit"}, steps)
 }
 
 func TestMigrate_AlsoStop(t *testing.T) {
