@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"maps"
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/ingress"
@@ -984,6 +986,18 @@ func (s *Service) volumeManifest(ctx context.Context, host, name string) (Manife
 // but never its disk. The destination volume must already exist. The source is
 // only ever read, so a failed copy leaves it untouched (migrate relies on this).
 func (s *Service) CopyVolume(ctx context.Context, fromHost, toHost, name string) error {
+	// Best-effort inspect to get the volume size for progress logging.
+	var size int64
+	if v, ierr := s.client.VolumeInspect(ctx, fromHost, name); ierr == nil {
+		size = v.SizeBytes
+	}
+	start := time.Now()
+	if size > 0 {
+		log.Printf("copy-volume %s -> %s: volume %s (%d bytes)", fromHost, toHost, name, size)
+	} else {
+		log.Printf("copy-volume %s -> %s: volume %s", fromHost, toHost, name)
+	}
+
 	rc, err := s.client.VolumeExport(ctx, fromHost, name)
 	if err != nil {
 		return fmt.Errorf("export volume %q from %s: %w", name, fromHost, err)
@@ -1015,6 +1029,13 @@ func (s *Service) CopyVolume(ctx context.Context, fromHost, toHost, name string)
 	// migrate handler (#34), which is this primitive's first caller.
 	if importErr != nil {
 		return fmt.Errorf("import volume %q to %s: %w", name, toHost, importErr)
+	}
+
+	elapsed := time.Since(start)
+	if size > 0 {
+		log.Printf("copy-volume %s -> %s: volume %s done (%d bytes in %s)", fromHost, toHost, name, size, elapsed)
+	} else {
+		log.Printf("copy-volume %s -> %s: volume %s done (%s)", fromHost, toHost, name, elapsed)
 	}
 	return nil
 }

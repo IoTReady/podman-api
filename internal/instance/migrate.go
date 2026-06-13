@@ -31,13 +31,22 @@ func SetVerifyTimeout(d time.Duration) {
 	}
 }
 
+// PairedInstanceRef identifies an instance (on FromHost) that shares volumes
+// with the instance being migrated. Stopping it before the volume copy prevents
+// concurrent writes that would cause a verification mismatch.
+type PairedInstanceRef struct {
+	Template string `json:"template"`
+	Slug     string `json:"slug"`
+}
+
 // MigrateRequest is the POST /migrate body and the migrate job's args.
 type MigrateRequest struct {
-	FromHost   string         `json:"from_host"`
-	ToHost     string         `json:"to_host"`
-	Template   string         `json:"template"`
-	Slug       string         `json:"slug"`
-	Parameters map[string]any `json:"parameters"`
+	FromHost   string              `json:"from_host"`
+	ToHost     string              `json:"to_host"`
+	Template   string              `json:"template"`
+	Slug       string              `json:"slug"`
+	Parameters map[string]any      `json:"parameters"`
+	AlsoStop   []PairedInstanceRef `json:"also_stop,omitempty"`
 }
 
 // migrateLock serialises migrates of the same instance without colliding with
@@ -191,6 +200,18 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 			}
 		}
 	}
+
+	// Fail fast if required images are not pullable on the destination host.
+	// ImagePull is idempotent for already-pulled images (#138).
+	rendered, rerr := render.RenderBody(tmpl.Body, eff)
+	if rerr != nil {
+		return append(issues, fmt.Errorf("render for image preflight: %w", rerr)), provisionable
+	}
+	for _, img := range containerImages(rendered) {
+		if err := s.client.ImagePull(ctx, req.ToHost, img); err != nil {
+			issues = append(issues, fmt.Errorf("%w: %s: %v", ErrImagePull, img, err))
+		}
+	}
 	return issues, provisionable
 }
 
@@ -247,6 +268,19 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 	}
 	step("stop-source", req.FromHost)
 
+	// Stop paired instances that share volumes with this instance before the
+	// copy, so they cannot modify the volume during export/verify.
+	for _, ps := range req.AlsoStop {
+		name := ps.Template + "/" + ps.Slug
+		if err := s.Stop(ctx, req.FromHost, ps.Template, ps.Slug); errors.Is(err, ErrInstanceNotFound) {
+			step("stop-paired-skipped", name)
+		} else if err != nil {
+			return fmt.Errorf("stop paired instance %s: %w", name, err)
+		} else {
+			step("stop-paired", name)
+		}
+	}
+
 	if err := s.migratePostStop(ctx, req, eff, tmpl, spec.Secrets, spec.Domains, step); err != nil {
 		step("rollback", err.Error())
 		// Compensate on a detached context: migratePostStop may have failed
@@ -260,6 +294,13 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 		if rerr := s.Delete(rbctx, req.ToHost, req.Template, req.Slug, DeleteOptions{PruneVolumes: true, PruneSecrets: true}); rerr != nil {
 			step("rollback-reap-failed", rerr.Error())
 		}
+		// Restart any stopped paired instances on rollback (best-effort).
+		for _, ps := range req.AlsoStop {
+			name := ps.Template + "/" + ps.Slug
+			if _, rerr := s.Start(rbctx, req.FromHost, ps.Template, ps.Slug); rerr != nil {
+				step("rollback-start-paired-failed", name)
+			}
+		}
 		return err
 	}
 
@@ -270,6 +311,18 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 		return fmt.Errorf("commit (delete source): %w", err)
 	}
 	step("commit", req.FromHost)
+
+	// Restart paired instances on the (still-live) source host after the source
+	// is reaped. The paired instances are separate instances that share volumes
+	// and are not deleted by the commit.
+	for _, ps := range req.AlsoStop {
+		name := ps.Template + "/" + ps.Slug
+		if _, serr := s.Start(context.WithoutCancel(ctx), req.FromHost, ps.Template, ps.Slug); serr != nil {
+			step("start-paired-failed", name)
+		} else {
+			step("start-paired", name)
+		}
+	}
 	return nil
 }
 
@@ -326,10 +379,10 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 		if err := s.client.VolumeCreate(ctx, req.ToHost, v.Name); err != nil {
 			return fmt.Errorf("create dest volume %q: %w", v.Name, err)
 		}
+		step("copy-volume", v.Name)
 		if err := s.CopyVolume(ctx, req.FromHost, req.ToHost, v.Name); err != nil {
 			return fmt.Errorf("copy volume %q: %w", v.Name, err)
 		}
-		step("copy-volume", v.Name)
 		if s.verifyVolumes {
 			src, err := s.volumeManifest(ctx, req.FromHost, v.Name)
 			if err != nil {
