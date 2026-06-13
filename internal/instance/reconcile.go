@@ -168,6 +168,15 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 					}
 				}
 			}
+			// Restart any paired instances on the source host after the source is
+			// reaped. Best-effort: a running pod is a no-op, a non-existent pod
+			// is silently skipped.
+			for _, ps := range req.AlsoStop {
+				if _, serr := s.Start(mctx, req.FromHost, ps.Template, ps.Slug); serr != nil && !errors.Is(serr, ErrInstanceNotFound) {
+					step("reconcile-inconclusive", "restore paired "+ps.Template+"/"+ps.Slug+": "+serr.Error())
+					return false, false, "", nil
+				}
+			}
 			step("reconcile-roll-forward", req.ToHost)
 			return true, true, "", nil
 		}
@@ -182,6 +191,14 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 		if _, rerr := s.Start(mctx, req.FromHost, req.Template, req.Slug); rerr != nil {
 			step("reconcile-inconclusive", "restore source: "+rerr.Error())
 			return false, false, "", nil
+		}
+		// Restart any paired instances that may have been stopped during
+		// the interrupted migration (best-effort, idempotent).
+		for _, ps := range req.AlsoStop {
+			if _, rerr := s.Start(mctx, req.FromHost, ps.Template, ps.Slug); rerr != nil && !errors.Is(rerr, ErrInstanceNotFound) {
+				step("reconcile-inconclusive", "restore paired "+ps.Template+"/"+ps.Slug+": "+rerr.Error())
+				return false, false, "", nil
+			}
 		}
 		if derr := s.Delete(mctx, req.ToHost, req.Template, req.Slug, DeleteOptions{PruneVolumes: true, PruneSecrets: true}); derr != nil {
 			step("reconcile-inconclusive", "reap dest: "+derr.Error())

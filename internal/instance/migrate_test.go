@@ -177,6 +177,17 @@ func TestMigrate_PreflightFailFast_SourceUntouched(t *testing.T) {
 		p, _ := f.PodInspect(ctx, "h1", "needs-host-secret-s1")
 		assert.Equal(t, "Running", p.Status)
 	})
+
+	t.Run("image not pullable on dest", func(t *testing.T) {
+		svc, f, mem := newMigrateSvc(t)
+		seedSpec(t, mem, "h1", "postgres", "db1", map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"})
+		f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
+		f.PullErr = map[string]error{"x": migrateFailErr}
+		err := svc.Migrate(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"}, nil)
+		require.ErrorIs(t, err, ErrImagePull)
+		p, _ := f.PodInspect(ctx, "h1", "postgres-db1")
+		assert.Equal(t, "Running", p.Status)
+	})
 }
 
 func TestMigrate_HappyPath(t *testing.T) {
@@ -212,7 +223,63 @@ func TestMigrate_HappyPath(t *testing.T) {
 	_, err = mem.GetSpec(ctx, "h2", "postgres", "db1")
 	require.NoError(t, err)
 
-	assert.Equal(t, []string{"load", "preflight", "stop-source", "copy-volume", "verify-volume", "apply-dest", "verify", "commit"}, steps)
+	assert.Equal(t, []string{"load", "preflight", "stop-source", "copy-volume", "copy-volume-done", "verify-volume", "apply-dest", "verify", "commit"}, steps)
+}
+
+func TestMigrate_AlsoStop(t *testing.T) {
+	ctx := context.Background()
+	hosts := []config.Host{
+		{ID: "h1", Addr: "unix", Socket: "/x"},
+		{ID: "h2", Addr: "unix", Socket: "/y"},
+	}
+	f := fake.New()
+
+	litestreamTmpl := store.Template{
+		Meta: render.Meta{
+			ID:         "litestream",
+			Parameters: requiredParams("slug"),
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: litestream-{{.slug}}
+spec:
+  containers:
+    - name: replica
+      image: litestream/litestream:latest
+`,
+		Origin: "seed",
+	}
+
+	svc, mem := newSvcWith(t, f, hosts, pgTemplate(), litestreamTmpl)
+
+	// Seed main instance on h1.
+	params := map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"}
+	require.NoError(t, mem.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "postgres", Slug: "db1",
+		Parameters: params, Secrets: map[string]string{"password": "p"},
+	}))
+	f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
+	srcTar := tarBytes(t, map[string]string{"PG_VERSION": "16"})
+	f.SetVolumeData("h1", "postgres-db1-data", srcTar)
+
+	// Seed paired instance on h1 using a different template/slug.
+	f.AddPod("h1", podman.Pod{Name: "litestream-db1", Status: "Running"})
+
+	var steps []string
+	err := svc.Migrate(ctx, MigrateRequest{
+		FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1",
+		AlsoStop: []PairedInstanceRef{{Template: "litestream", Slug: "db1"}},
+	}, func(s, _ string) { steps = append(steps, s) })
+	require.NoError(t, err)
+
+	// Paired instance was stopped during copy and restarted after commit.
+	p, err := f.PodInspect(ctx, "h1", "litestream-db1")
+	require.NoError(t, err)
+	assert.Equal(t, "Running", p.Status, "paired instance must be running after migrate")
+
+	assert.Contains(t, steps, "stop-paired")
+	assert.Contains(t, steps, "start-paired", "paired instance must be started after commit")
 }
 
 // An ingress instance carries public domains in its spec. Migrate must thread

@@ -119,7 +119,7 @@ func TestPreflightIssues_ProvisionableNotBlocking(t *testing.T) {
 	tmpl := templateWithHostSecret()
 	eff := map[string]any{"slug": "s1", "image": "img"}
 	req := MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "needs-host-secret", Slug: "s1"}
-	issues, provisionable := svc.preflightIssues(ctx, req, tmpl, eff)
+	issues, provisionable := svc.preflightIssues(ctx, req, tmpl, eff, false)
 
 	assert.Empty(t, issues, "provisionable secret must not be a blocking issue")
 	assert.Equal(t, []string{"shared-pull-token"}, provisionable)
@@ -131,7 +131,7 @@ func TestPreflightIssues_NotPersistedStillBlocks(t *testing.T) {
 	tmpl := templateWithHostSecret()
 	eff := map[string]any{"slug": "s1", "image": "img"}
 	req := MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "needs-host-secret", Slug: "s1"}
-	issues, provisionable := svc.preflightIssues(ctx, req, tmpl, eff)
+	issues, provisionable := svc.preflightIssues(ctx, req, tmpl, eff, false)
 
 	require.Len(t, issues, 1)
 	assert.ErrorIs(t, issues[0], ErrHostSecretMissing)
@@ -148,7 +148,7 @@ func TestPreflightIssues_PresentOnDestNotProvisioned(t *testing.T) {
 	tmpl := templateWithHostSecret()
 	eff := map[string]any{"slug": "s1", "image": "img"}
 	req := MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "needs-host-secret", Slug: "s1"}
-	issues, provisionable := svc.preflightIssues(ctx, req, tmpl, eff)
+	issues, provisionable := svc.preflightIssues(ctx, req, tmpl, eff, false)
 
 	assert.Empty(t, issues)
 	assert.Empty(t, provisionable, "present-on-dest secret is not in the provision list")
@@ -266,7 +266,7 @@ func TestPreflightIssues_StoreErrorCollectsAndContinues(t *testing.T) {
 	eff := map[string]any{"slug": "x", "image": "img"}
 	issues, prov := svc.preflightIssues(ctx,
 		MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "needs-both", Slug: "x"},
-		secretAndPortTemplate(), eff)
+		secretAndPortTemplate(), eff, false)
 
 	assert.Empty(t, prov)
 	require.Len(t, issues, 2, "store-lookup error must not short-circuit the port scan")
