@@ -3,6 +3,7 @@ package instance
 import (
 	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -13,6 +14,39 @@ import (
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/podman/fake"
 )
+
+// errAfterNClient wraps a podman.Client and injects an error once the call
+// counter passes N. Lets tests exercise error-freeze logic in waitReady.
+type errAfterNClient struct {
+	podman.Client
+	after int64
+	err   error
+	calls atomic.Int64
+}
+
+func (c *errAfterNClient) PodInspect(ctx context.Context, host, name string) (podman.Pod, error) {
+	if c.calls.Add(1) > c.after {
+		return podman.Pod{}, c.err
+	}
+	return c.Client.PodInspect(ctx, host, name)
+}
+
+// errOnceClient wraps a podman.Client and injects a single error on exactly
+// one preset call, then reverts to the underlying client. Lets tests verify
+// that a single transient error mid-accumulation resets the stable counter.
+type errOnceClient struct {
+	podman.Client
+	at    int64
+	err   error
+	calls atomic.Int64
+}
+
+func (c *errOnceClient) PodInspect(ctx context.Context, host, name string) (podman.Pod, error) {
+	if c.calls.Add(1) == c.at {
+		return podman.Pod{}, c.err
+	}
+	return c.Client.PodInspect(ctx, host, name)
+}
 
 func readySvc(t *testing.T, f *fake.Fake) *Service {
 	t.Helper()
@@ -65,4 +99,32 @@ func TestWaitReady_NoHealthcheck(t *testing.T) {
 	f.AddPod("h1", podman.Pod{Name: "web-nohc", Status: "Running",
 		Containers: []podman.Container{{Status: "Running"}}}) // Health==""
 	require.NoError(t, readySvc(t, f).waitReady(context.Background(), "h1", "web", "nohc", 50*time.Millisecond, 1))
+}
+
+func TestWaitReady_StableResetsOnError(t *testing.T) {
+	defer setVerifyKnobs(200*time.Millisecond, 5*time.Millisecond)()
+	f := fake.New()
+	f.AddPod("h1", podman.Pod{Name: "web-x", Status: "Running",
+		Containers: []podman.Container{{Status: "Running"}}})
+
+	t.Run("persistent error after 2 ready polls resets counter and times out", func(t *testing.T) {
+		// stableCount=3 so call 1 → stable=1, call 2 → stable=2, then
+		// error on call 3+ resets to 0 and prevents reaching 3.
+		wc := &errAfterNClient{Client: f, after: 2, err: errors.New("host unreachable")}
+		svc := readySvc(t, f)
+		svc.client = wc
+		err := svc.waitReady(context.Background(), "h1", "web", "x", 200*time.Millisecond, 3)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, errReadyTimeout)
+	})
+
+	t.Run("single transient error blip resets counter then recovers", func(t *testing.T) {
+		// stableCount=3. Error on call 3 only resets counter to 0,
+		// then calls 4,5,6 succeed → stable reaches 3 → success.
+		wc := &errOnceClient{Client: f, at: 3, err: errors.New("transient blip")}
+		svc := readySvc(t, f)
+		svc.client = wc
+		err := svc.waitReady(context.Background(), "h1", "web", "x", 200*time.Millisecond, 3)
+		require.NoError(t, err)
+	})
 }
