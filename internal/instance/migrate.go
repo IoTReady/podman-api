@@ -78,13 +78,9 @@ func (s *Service) CheckMigratable(ctx context.Context, req MigrateRequest) error
 	return nil
 }
 
-// requiredHostPorts renders the template with eff params and returns the host
+// requiredHostPorts parses the rendered template YAML and returns the host
 // ports its Pod(s) bind.
-func (s *Service) requiredHostPorts(tmpl store.Template, params map[string]any) ([]int, error) {
-	rendered, err := render.RenderBody(tmpl.Body, params)
-	if err != nil {
-		return nil, fmt.Errorf("render: %w", err)
-	}
+func (s *Service) requiredHostPorts(rendered string) ([]int, error) {
 	var ports []int
 	dec := yaml.NewDecoder(strings.NewReader(rendered))
 	for {
@@ -143,7 +139,12 @@ func (s *Service) hostSecretProvisionable(ctx context.Context, fromHost, name st
 // sentinel-wrapped blocking condition or an infrastructure error that made a
 // check inconclusive. preflightDest (the executor's fail-fast gate) and
 // PlanEvacuation (the collect-all preview) both build on this, so they never disagree.
-func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl store.Template, eff map[string]any) ([]error, []string) {
+//
+// When pullImages is true the method also attempts to pull every container image
+// referenced in the template on the destination host. This is a mutation (the
+// pull is idempotent for already-pulled images). The preview path
+// (PlanEvacuation) passes false to preserve its read-only contract.
+func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl store.Template, eff map[string]any, pullImages bool) ([]error, []string) {
 	var issues []error
 	var provisionable []string
 	hostCfg, _ := s.host(req.ToHost)
@@ -181,7 +182,13 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 		}
 		issues = append(issues, fmt.Errorf("%w: %s", ErrHostSecretMissing, name))
 	}
-	want, err := s.requiredHostPorts(tmpl, eff)
+	// Render the template body once and reuse it for the port check and, when
+	// pullImages is true, the image-pull preflight.
+	rendered, rerr := render.RenderBody(tmpl.Body, eff)
+	if rerr != nil {
+		return append(issues, fmt.Errorf("render: %w", rerr)), provisionable
+	}
+	want, err := s.requiredHostPorts(rendered)
 	if err != nil {
 		return append(issues, err), provisionable
 	}
@@ -201,15 +208,11 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 		}
 	}
 
-	// Fail fast if required images are not pullable on the destination host.
-	// ImagePull is idempotent for already-pulled images (#138).
-	rendered, rerr := render.RenderBody(tmpl.Body, eff)
-	if rerr != nil {
-		return append(issues, fmt.Errorf("render for image preflight: %w", rerr)), provisionable
-	}
-	for _, img := range containerImages(rendered) {
-		if err := s.client.ImagePull(ctx, req.ToHost, img); err != nil {
-			issues = append(issues, fmt.Errorf("%w: %s: %v", ErrImagePull, img, err))
+	if pullImages {
+		for _, img := range containerImages(rendered) {
+			if err := s.client.ImagePull(ctx, req.ToHost, img); err != nil {
+				issues = append(issues, fmt.Errorf("%w: %s: %v", ErrImagePull, img, err))
+			}
 		}
 	}
 	return issues, provisionable
@@ -220,7 +223,7 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 // order. It is the executor's guard; PlanEvacuation uses preflightIssues to
 // collect every problem instead.
 func (s *Service) preflightDest(ctx context.Context, req MigrateRequest, tmpl store.Template, eff map[string]any) error {
-	if errs, _ := s.preflightIssues(ctx, req, tmpl, eff); len(errs) > 0 {
+	if errs, _ := s.preflightIssues(ctx, req, tmpl, eff, true); len(errs) > 0 {
 		return errs[0]
 	}
 	return nil
@@ -268,20 +271,8 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 	}
 	step("stop-source", req.FromHost)
 
-	// Stop paired instances that share volumes with this instance before the
-	// copy, so they cannot modify the volume during export/verify.
-	for _, ps := range req.AlsoStop {
-		name := ps.Template + "/" + ps.Slug
-		if err := s.Stop(ctx, req.FromHost, ps.Template, ps.Slug); errors.Is(err, ErrInstanceNotFound) {
-			step("stop-paired-skipped", name)
-		} else if err != nil {
-			return fmt.Errorf("stop paired instance %s: %w", name, err)
-		} else {
-			step("stop-paired", name)
-		}
-	}
-
-	if err := s.migratePostStop(ctx, req, eff, tmpl, spec.Secrets, spec.Domains, step); err != nil {
+	stoppedPaired, err := s.migratePostStop(ctx, req, eff, tmpl, spec.Secrets, spec.Domains, step)
+	if err != nil {
 		step("rollback", err.Error())
 		// Compensate on a detached context: migratePostStop may have failed
 		// *because* ctx was cancelled/timed out (the verify poll returns
@@ -294,11 +285,11 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 		if rerr := s.Delete(rbctx, req.ToHost, req.Template, req.Slug, DeleteOptions{PruneVolumes: true, PruneSecrets: true}); rerr != nil {
 			step("rollback-reap-failed", rerr.Error())
 		}
-		// Restart any stopped paired instances on rollback (best-effort).
-		for _, ps := range req.AlsoStop {
-			name := ps.Template + "/" + ps.Slug
+		// Restart paired instances that were stopped before the copy
+		// (best-effort — these are separate instances sharing volumes).
+		for _, ps := range stoppedPaired {
 			if _, rerr := s.Start(rbctx, req.FromHost, ps.Template, ps.Slug); rerr != nil {
-				step("rollback-start-paired-failed", name)
+				step("rollback-start-paired-failed", rerr.Error())
 			}
 		}
 		return err
@@ -315,23 +306,25 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 	// Restart paired instances on the (still-live) source host after the source
 	// is reaped. The paired instances are separate instances that share volumes
 	// and are not deleted by the commit.
-	for _, ps := range req.AlsoStop {
-		name := ps.Template + "/" + ps.Slug
+	for _, ps := range stoppedPaired {
 		if _, serr := s.Start(context.WithoutCancel(ctx), req.FromHost, ps.Template, ps.Slug); serr != nil {
-			step("start-paired-failed", name)
+			step("start-paired-failed", serr.Error())
 		} else {
-			step("start-paired", name)
+			step("start-paired", ps.Template+"/"+ps.Slug)
 		}
 	}
 	return nil
 }
 
-// migratePostStop runs the destination-mutating steps: copy volumes, apply the
-// spec, verify health. Any error here is rolled back by the caller. domains are
-// the source spec's public hostnames, threaded through so an ingress instance
-// keeps its route on the destination (Apply re-validates host-wide uniqueness
-// and serializes the claim per host — #82 — so passing them here is sufficient).
-func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, tmpl store.Template, secrets map[string]string, domains []string, step func(step, detail string)) error {
+// migratePostStop runs the source-side preparation and destination-mutating
+// steps: stop paired instances, copy volumes, apply the spec, verify health.
+// Any error here is rolled back by the caller. It returns the list of paired
+// instances that were successfully stopped, so the caller can restart them
+// on rollback or after commit. domains are the source spec's public hostnames,
+// threaded through so an ingress instance keeps its route on the destination
+// (Apply re-validates host-wide uniqueness and serializes the claim per host —
+// #82 — so passing them here is sufficient).
+func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, tmpl store.Template, secrets map[string]string, domains []string, step func(step, detail string)) (stoppedPaired []PairedInstanceRef, err error) {
 	// Provision any persisted per-host secrets the destination is missing, from
 	// the source host's stored value. Idempotent: only creates what is absent.
 	// Provisioned secrets are intentionally left in place on rollback — they are
@@ -341,7 +334,7 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 		if _, err := s.client.SecretInspect(ctx, req.ToHost, name); err == nil {
 			continue // already present on dest
 		} else if !errors.Is(err, podman.ErrNotFound) {
-			return fmt.Errorf("inspect dest host secret %q: %w", name, err)
+			return nil, fmt.Errorf("inspect dest host secret %q: %w", name, err)
 		}
 		val, err := s.store.GetHostSecret(ctx, req.FromHost, name)
 		if errors.Is(err, store.ErrNotFound) {
@@ -351,7 +344,7 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("load host secret %q: %w", name, err)
+			return nil, fmt.Errorf("load host secret %q: %w", name, err)
 		}
 		if err := s.client.SecretCreate(ctx, req.ToHost, name, wrapAsKubeSecret(name, val)); err != nil {
 			// A concurrent move may have created it between inspect and create;
@@ -359,7 +352,7 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 			if _, ie := s.client.SecretInspect(ctx, req.ToHost, name); ie == nil {
 				continue
 			}
-			return fmt.Errorf("provision host secret %q: %w", name, err)
+			return nil, fmt.Errorf("provision host secret %q: %w", name, err)
 		}
 		step("provision-secret", name)
 		// Record the dest as a valid future provisioning source so multi-hop
@@ -371,29 +364,52 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 		}
 	}
 
+	// Stop paired instances that share volumes with this instance before the
+	// copy, so they cannot modify the volume during export/verify. This is the
+	// first mutation after secret provisioning; a failure here is rolled back
+	// by the caller (which restarts the main source instance).
+	for _, ps := range req.AlsoStop {
+		name := ps.Template + "/" + ps.Slug
+		if err := s.Stop(ctx, req.FromHost, ps.Template, ps.Slug); errors.Is(err, ErrInstanceNotFound) {
+			step("stop-paired-skipped", name)
+		} else if err != nil {
+			return nil, fmt.Errorf("stop paired instance %s: %w", name, err)
+		} else {
+			stoppedPaired = append(stoppedPaired, ps)
+			step("stop-paired", name)
+		}
+	}
+
 	vols, err := s.InstanceVolumes(ctx, req.FromHost, req.Template, req.Slug)
 	if err != nil {
-		return fmt.Errorf("list source volumes: %w", err)
+		return stoppedPaired, fmt.Errorf("list source volumes: %w", err)
 	}
 	for _, v := range vols {
 		if err := s.client.VolumeCreate(ctx, req.ToHost, v.Name); err != nil {
-			return fmt.Errorf("create dest volume %q: %w", v.Name, err)
+			return stoppedPaired, fmt.Errorf("create dest volume %q: %w", v.Name, err)
 		}
 		step("copy-volume", v.Name)
+		volStart := time.Now()
 		if err := s.CopyVolume(ctx, req.FromHost, req.ToHost, v.Name); err != nil {
-			return fmt.Errorf("copy volume %q: %w", v.Name, err)
+			return stoppedPaired, fmt.Errorf("copy volume %q: %w", v.Name, err)
+		}
+		elapsed := time.Since(volStart)
+		if v.SizeBytes > 0 {
+			step("copy-volume-done", fmt.Sprintf("%s (%d bytes, %s)", v.Name, v.SizeBytes, elapsed))
+		} else {
+			step("copy-volume-done", fmt.Sprintf("%s (%s)", v.Name, elapsed))
 		}
 		if s.verifyVolumes {
 			src, err := s.volumeManifest(ctx, req.FromHost, v.Name)
 			if err != nil {
-				return fmt.Errorf("verify volume %q: re-export source: %w", v.Name, err)
+				return stoppedPaired, fmt.Errorf("verify volume %q: re-export source: %w", v.Name, err)
 			}
 			dst, err := s.volumeManifest(ctx, req.ToHost, v.Name)
 			if err != nil {
-				return fmt.Errorf("verify volume %q: re-export dest: %w", v.Name, err)
+				return stoppedPaired, fmt.Errorf("verify volume %q: re-export dest: %w", v.Name, err)
 			}
 			if diff, ok := src.firstDiff(dst); !ok {
-				return fmt.Errorf("%w: volume %q differs at %q", ErrVolumeIntegrity, v.Name, diff)
+				return stoppedPaired, fmt.Errorf("%w: volume %q differs at %q", ErrVolumeIntegrity, v.Name, diff)
 			}
 			step("verify-volume", v.Name)
 		}
@@ -402,15 +418,15 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 	if err := s.Apply(ctx, req.ToHost, ApplyRequest{
 		Template: req.Template, Slug: req.Slug, Parameters: eff, Secrets: secrets, Domains: domains,
 	}, ApplyOptions{Replace: false}); err != nil {
-		return fmt.Errorf("apply on dest: %w", err)
+		return stoppedPaired, fmt.Errorf("apply on dest: %w", err)
 	}
 	step("apply-dest", req.ToHost)
 
 	if err := s.waitRunning(ctx, req.ToHost, req.Template, req.Slug); err != nil {
-		return fmt.Errorf("verify dest: %w", err)
+		return stoppedPaired, fmt.Errorf("verify dest: %w", err)
 	}
 	step("verify", req.ToHost)
-	return nil
+	return stoppedPaired, nil
 }
 
 // waitRunning polls the dest pod until Running, bounded by verifyTimeout and the

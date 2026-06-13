@@ -85,7 +85,7 @@ func (s *Service) planMove(ctx context.Context, m MigrateRequest) PlannedMove {
 	if err := render.Validate(tmpl.Meta, eff, spec.Secrets); err != nil {
 		pm.Issues = append(pm.Issues, PlanIssue{Code: codeInvalidParameters, Message: err.Error()})
 	}
-	errs, provisionable := s.preflightIssues(ctx, m, tmpl, eff)
+	errs, provisionable := s.preflightIssues(ctx, m, tmpl, eff, false)
 	for _, e := range errs {
 		pm.Issues = append(pm.Issues, classifyPlanIssue(e))
 	}
