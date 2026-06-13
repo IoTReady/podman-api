@@ -69,19 +69,20 @@ func (s *Service) waitReady(ctx context.Context, host, tmpl, slug string, timeou
 	defer ticker.Stop()
 	stable := 0
 	for {
-		p, err := s.client.PodInspect(ctx, host, podName(tmpl, slug))
+		name := podName(tmpl, slug)
+		p, err := s.client.PodInspect(ctx, host, name)
 		switch {
 		case err == nil && podReady(p):
 			stable++
-			log.Printf("pod %s ready (stable=%d/%d)", podName(tmpl, slug), stable, stableCount)
+			log.Printf("pod %s ready (stable=%d/%d)", name, stable, stableCount)
 			if stable >= stableCount {
 				return nil
 			}
 		case err == nil:
 			stable = 0
-			log.Printf("pod %s not ready (status=%q, stable reset to 0)", podName(tmpl, slug), p.Status)
+			log.Printf("pod %s not ready (status=%q, stable reset to 0)", name, p.Status)
 		default:
-			log.Printf("pod %s inspect error: %v (stable=%d/%d, not reset)", podName(tmpl, slug), err, stable, stableCount)
+			log.Printf("pod %s inspect error: %v (stable=%d/%d, not reset)", name, err, stable, stableCount)
 		}
 		if time.Now().After(deadline) {
 			return errReadyTimeout

@@ -150,9 +150,9 @@ func TestWaitReady_ErrorHandling(t *testing.T) {
 		// stableCount=3 with a pattern of success, error, success, error, success.
 		// Under old code, alternating errors resets counter to 0 every time → timeout.
 		// Under new code, errors don't reset; 3 successes → stable=3 → success.
-		p := &altErrorClient{Client: f, err: errors.New("ssh blip")}
+		wc := &altErrorClient{Client: f, err: errors.New("ssh blip")}
 		svc := readySvc(t, f)
-		svc.client = p
+		svc.client = wc
 		require.NoError(t, svc.waitReady(context.Background(), "h1", "web", "x", 200*time.Millisecond, 3))
 	})
 }
