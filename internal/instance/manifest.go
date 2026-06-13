@@ -8,6 +8,7 @@ import (
 	"io"
 	"path"
 	"sort"
+	"strings"
 )
 
 // fileInfo is the content fingerprint of one tar entry. It deliberately omits
@@ -80,12 +81,16 @@ func parseTar(r io.Reader, m Manifest) error {
 		case tar.TypeSymlink, tar.TypeLink:
 			fi.link = hdr.Linkname
 		}
+		cleaned := path.Clean(hdr.Name)
+		if excludePath(cleaned) {
+			continue
+		}
 		// path.Clean can collapse distinct names (e.g. "./foo" and "foo") to one
 		// key, last-writer-wins. That is safe here: the same cleaning is applied
 		// to both source and dest manifests, and podman's volume export is
 		// deterministic, so a collision cancels out on both sides rather than
 		// producing a false "equal".
-		m[path.Clean(hdr.Name)] = fi
+		m[cleaned] = fi
 	}
 }
 
@@ -116,4 +121,19 @@ func (m Manifest) firstDiff(other Manifest) (string, bool) {
 		}
 	}
 	return "", true
+}
+
+// excludePath returns true for paths that should be excluded from volume
+// integrity comparison. Litestream writes shadow WAL files into a
+// <name>-litestream/ directory during SQLite shutdown. This happens in the
+// brief window between pod stop and volume export, causing the source state
+// captured during the copy phase to differ from the state re-exported during
+// the verify phase. (#142)
+func excludePath(name string) bool {
+	for _, part := range strings.Split(name, "/") {
+		if strings.HasSuffix(part, "-litestream") {
+			return true
+		}
+	}
+	return false
 }

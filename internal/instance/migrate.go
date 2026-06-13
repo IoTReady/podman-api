@@ -18,7 +18,7 @@ import (
 
 // verify-poll knobs; vars (not consts) so same-package tests can shorten them.
 var (
-	verifyTimeout  = 60 * time.Second
+	verifyTimeout  = 180 * time.Second
 	verifyInterval = 2 * time.Second
 )
 
