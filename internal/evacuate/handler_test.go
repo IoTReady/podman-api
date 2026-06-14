@@ -265,6 +265,8 @@ func TestEvacuate_CancelChildFinishUsesDetachedCtx(t *testing.T) {
 	}
 }
 
+// —————— End of original tests ——————
+
 func TestEvacuateMovesArray_AllSucceed(t *testing.T) {
 	ctx := context.Background()
 	svc, mem := buildSvc(t, "acme", "globex")
@@ -297,4 +299,95 @@ func TestEvacuateMovesArray_AllSucceed(t *testing.T) {
 			t.Fatalf("child not succeeded migrate: %+v", c)
 		}
 	}
+}
+
+func TestEvacuateSharedSlugAcrossTemplates_MovesArray(t *testing.T) {
+	// Two instances share a slug across different templates on the same host.
+	// The Moves array (template, slug) form must express both without ambiguity.
+	// Regression guard: the handler must resolve both and create correctly
+	// parented child migrate jobs, one per (template, slug) pair.
+	ctx := context.Background()
+	svc, mem := buildSvc(t)
+	// Overwrite the "web"-only specs with two different templates sharing the
+	// same slug "dup" — this is legal in the moves-array form.
+	for _, s := range []store.Spec{
+		{Host: "hostA", Template: "postgres", Slug: "dup", Parameters: map[string]any{}, Secrets: map[string]string{}},
+		{Host: "hostA", Template: "redis", Slug: "dup", Parameters: map[string]any{}, Secrets: map[string]string{}},
+	} {
+		if err := mem.PutSpec(ctx, s); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	parent, _ := mem.Enqueue(ctx, "evacuate", mustArgsMoves(t, "hostA",
+		[]instance.Move{
+			{Template: "postgres", Slug: "dup", ToHost: "hostB"},
+			{Template: "redis", Slug: "dup", ToHost: "hostC"},
+		}), "")
+
+	var mu sync.Mutex
+	var seen []instance.MigrateRequest
+	h := &Handler{Svc: svc, Jobs: mem}
+	h.migrate = func(_ context.Context, req instance.MigrateRequest, step func(string, string)) error {
+		mu.Lock()
+		seen = append(seen, req)
+		mu.Unlock()
+		step("fake", req.Slug)
+		return nil
+	}
+
+	if err := h.Run(ctx, parent, jobs.NewJobContext(mem, parent.ID)); err != nil {
+		t.Fatalf("want success, got %v", err)
+	}
+
+	// Assert each migrate request was dispatched to the correct destination.
+	got := map[string]string{}
+	for _, req := range seen {
+		got[req.Template+"/"+req.Slug] = req.ToHost
+	}
+	if got["postgres/dup"] != "hostB" {
+		t.Fatalf("postgres/dup routed to %q, want hostB", got["postgres/dup"])
+	}
+	if got["redis/dup"] != "hostC" {
+		t.Fatalf("redis/dup routed to %q, want hostC", got["redis/dup"])
+	}
+
+	// Both children must exist and refer to the correct (template, slug).
+	children, _ := mem.ListJobs(ctx, store.JobFilter{ParentID: parent.ID})
+	if len(children) != 2 {
+		t.Fatalf("want 2 children, got %d", len(children))
+	}
+	tmplSlugs := map[string]bool{}
+	for _, c := range children {
+		if c.Kind != "migrate" || c.State != store.JobSucceeded {
+			t.Fatalf("child not succeeded migrate: %+v", c)
+		}
+		var req instance.MigrateRequest
+		if err := json.Unmarshal(c.Args, &req); err != nil {
+			t.Fatal(err)
+		}
+		key := req.Template + "/" + req.Slug
+		if tmplSlugs[key] {
+			t.Fatalf("duplicate child for %s", key)
+		}
+		tmplSlugs[key] = true
+	}
+	if !tmplSlugs["postgres/dup"] {
+		t.Fatal("missing child postgres/dup")
+	}
+	if !tmplSlugs["redis/dup"] {
+		t.Fatal("missing child redis/dup")
+	}
+}
+
+func TestEvacuate_ChildRollback_VerifyFailure(t *testing.T) {
+	// A child whose destination pod never becomes healthy must roll back the
+	// source and reap the partial dest, even when the volume copy succeeds.
+	//
+	// verifyInterval is 2s by default and is not exported — the evacuate
+	// package cannot shorten it via setVerifyKnobs (instance-internal). A full
+	// PollImmediate-style test would take 2s per poll × 3 stable checks, which
+	// is impractical for a unit test. The verify-failure rollback path itself
+	// is covered in the instance package's TestMigrate_Rollback/verify fails.
+	t.Skip("verifyInterval is unexported — this test needs setVerifyKnobs access")
 }

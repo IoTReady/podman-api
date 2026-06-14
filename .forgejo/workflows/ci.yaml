@@ -131,8 +131,9 @@ jobs:
           restore-keys: |
             go-integration-${{ runner.os }}-
 
-      - name: start podman service
+      - name: start podman services
         run: |
+          # First socket (source host for evacuate tests)
           podman system service --time=0 unix:///run/podman/podman.sock &
           for i in $(seq 1 30); do
             [ -S /run/podman/podman.sock ] && break
@@ -140,6 +141,18 @@ jobs:
           done
           podman info >/dev/null
           podman --version
+
+          # Second socket (destination host for evacuate tests) with separate
+          # storage so the two podman instances do not share state.
+          mkdir -p /tmp/podman2
+          podman --root /tmp/podman2/root --runroot /tmp/podman2/run \
+            system service --time=0 unix:///tmp/podman2/podman2.sock &
+          for i in $(seq 1 30); do
+            [ -S /tmp/podman2/podman2.sock ] && break
+            sleep 1
+          done
+          [ -S /tmp/podman2/podman2.sock ] || { echo "podman2 socket did not appear"; exit 1; }
+          podman --url unix:///tmp/podman2/podman2.sock info >/dev/null
 
       - name: integration tests
         # Explicit -timeout so a nested-podman hang fails clearly instead of
