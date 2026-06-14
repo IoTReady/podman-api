@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"sort"
 
 	"github.com/iotready/podman-api/internal/store"
 )
@@ -61,7 +60,7 @@ func (s *Service) ResolveEvacuation(ctx context.Context, req EvacuateRequest) ([
 
 	hostKeys := make(map[store.SpecKey]struct{}, len(keys))
 	for _, k := range keys {
-		hostKeys[store.SpecKey{Template: k.Template, Slug: k.Slug}] = struct{}{}
+		hostKeys[k] = struct{}{}
 	}
 
 	moves, err := resolveMoves(req, hostKeys)
@@ -92,11 +91,16 @@ func (s *Service) ResolveEvacuation(ctx context.Context, req EvacuateRequest) ([
 		}
 	}
 
+	var missing []string
 	for sk := range hostKeys {
 		if _, ok := seen[sk]; !ok {
-			return nil, fmt.Errorf("%w: no destination for %q/%q on %s",
-				ErrInvalidEvacuation, sk.Template, sk.Slug, req.FromHost)
+			missing = append(missing, fmt.Sprintf("%q/%q", sk.Template, sk.Slug))
 		}
+	}
+	if len(missing) > 0 {
+		slices.Sort(missing)
+		return nil, fmt.Errorf("%w: no destination for instance(s) %v on %s",
+			ErrInvalidEvacuation, missing, req.FromHost)
 	}
 
 	result := make([]MigrateRequest, 0, len(moves))
@@ -105,11 +109,20 @@ func (s *Service) ResolveEvacuation(ctx context.Context, req EvacuateRequest) ([
 			FromHost: req.FromHost, ToHost: m.ToHost, Template: m.Template, Slug: m.Slug,
 		})
 	}
-	sort.Slice(result, func(i, j int) bool {
-		if result[i].Template != result[j].Template {
-			return result[i].Template < result[j].Template
+	slices.SortFunc(result, func(a, b MigrateRequest) int {
+		if a.Template != b.Template {
+			if a.Template < b.Template {
+				return -1
+			}
+			return 1
 		}
-		return result[i].Slug < result[j].Slug
+		if a.Slug < b.Slug {
+			return -1
+		}
+		if a.Slug > b.Slug {
+			return 1
+		}
+		return 0
 	})
 	return result, nil
 }
@@ -127,8 +140,28 @@ func resolveMoves(req EvacuateRequest, hostKeys map[store.SpecKey]struct{}) ([]M
 	}
 
 	// Backward-compatible slug-keyed map path.
-	tmplBySlug := make(map[string]string, len(hostKeys))
+	// Sort host keys for deterministic template collision reporting.
+	skSorted := make([]store.SpecKey, 0, len(hostKeys))
 	for sk := range hostKeys {
+		skSorted = append(skSorted, sk)
+	}
+	slices.SortFunc(skSorted, func(a, b store.SpecKey) int {
+		if a.Template != b.Template {
+			if a.Template < b.Template {
+				return -1
+			}
+			return 1
+		}
+		if a.Slug < b.Slug {
+			return -1
+		}
+		if a.Slug > b.Slug {
+			return 1
+		}
+		return 0
+	})
+	tmplBySlug := make(map[string]string, len(hostKeys))
+	for _, sk := range skSorted {
 		if prev, dup := tmplBySlug[sk.Slug]; dup && prev != sk.Template {
 			return nil, fmt.Errorf("%w: slug %q exists under templates %q and %q on %s",
 				ErrInvalidEvacuation, sk.Slug, prev, sk.Template, req.FromHost)
@@ -141,7 +174,7 @@ func resolveMoves(req EvacuateRequest, hostKeys map[store.SpecKey]struct{}) ([]M
 	for slug := range tmplBySlug {
 		slugs = append(slugs, slug)
 	}
-	sort.Strings(slugs)
+	slices.Sort(slugs)
 	var missing []string
 	for _, slug := range slugs {
 		if _, ok := req.Map[slug]; !ok {
@@ -154,7 +187,6 @@ func resolveMoves(req EvacuateRequest, hostKeys map[store.SpecKey]struct{}) ([]M
 	}
 
 	moves := make([]Move, 0, len(req.Map))
-	// Sort map keys for deterministic output.
 	mapSlugs := make([]string, 0, len(req.Map))
 	for slug := range req.Map {
 		mapSlugs = append(mapSlugs, slug)

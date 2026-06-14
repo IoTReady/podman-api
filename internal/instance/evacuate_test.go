@@ -186,7 +186,7 @@ func TestResolveEvacuation(t *testing.T) {
 		assert.Empty(t, moves)
 	})
 
-	t.Run("empty host and moves is a no-op", func(t *testing.T) {
+	t.Run("empty host and moves is a no-op (falls through to map path)", func(t *testing.T) {
 		svc, _, _ := newMigrateSvc(t)
 
 		moves, err := svc.ResolveEvacuation(ctx, EvacuateRequest{
