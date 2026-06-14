@@ -1,10 +1,12 @@
 package instance
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 
 	"github.com/iotready/podman-api/internal/store"
 )
@@ -94,7 +96,7 @@ func (s *Service) ResolveEvacuation(ctx context.Context, req EvacuateRequest) ([
 	var missing []string
 	for sk := range hostKeys {
 		if _, ok := seen[sk]; !ok {
-			missing = append(missing, fmt.Sprintf("%q/%q", sk.Template, sk.Slug))
+			missing = append(missing, fmt.Sprintf("%s/%s", sk.Template, sk.Slug))
 		}
 	}
 	if len(missing) > 0 {
@@ -110,19 +112,7 @@ func (s *Service) ResolveEvacuation(ctx context.Context, req EvacuateRequest) ([
 		})
 	}
 	slices.SortFunc(result, func(a, b MigrateRequest) int {
-		if a.Template != b.Template {
-			if a.Template < b.Template {
-				return -1
-			}
-			return 1
-		}
-		if a.Slug < b.Slug {
-			return -1
-		}
-		if a.Slug > b.Slug {
-			return 1
-		}
-		return 0
+		return cmp.Or(strings.Compare(a.Template, b.Template), strings.Compare(a.Slug, b.Slug))
 	})
 	return result, nil
 }
@@ -146,19 +136,7 @@ func resolveMoves(req EvacuateRequest, hostKeys map[store.SpecKey]struct{}) ([]M
 		skSorted = append(skSorted, sk)
 	}
 	slices.SortFunc(skSorted, func(a, b store.SpecKey) int {
-		if a.Template != b.Template {
-			if a.Template < b.Template {
-				return -1
-			}
-			return 1
-		}
-		if a.Slug < b.Slug {
-			return -1
-		}
-		if a.Slug > b.Slug {
-			return 1
-		}
-		return 0
+		return cmp.Or(strings.Compare(a.Template, b.Template), strings.Compare(a.Slug, b.Slug))
 	})
 	tmplBySlug := make(map[string]string, len(hostKeys))
 	for _, sk := range skSorted {
