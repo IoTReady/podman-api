@@ -50,6 +50,15 @@ func mustArgsC(t *testing.T, from string, m map[string]string, concurrency int) 
 	return b
 }
 
+func mustArgsMoves(t *testing.T, from string, moves []instance.Move) json.RawMessage {
+	t.Helper()
+	b, err := json.Marshal(instance.EvacuateRequest{FromHost: from, Moves: moves})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
 func TestEvacuateAllSucceed(t *testing.T) {
 	ctx := context.Background()
 	svc, mem := buildSvc(t, "acme", "globex")
@@ -253,5 +262,39 @@ func TestEvacuate_CancelChildFinishUsesDetachedCtx(t *testing.T) {
 	}
 	if children[0].State != store.JobCanceled {
 		t.Fatalf("child state = %q, want canceled (terminal write must use a detached ctx)", children[0].State)
+	}
+}
+
+func TestEvacuateMovesArray_AllSucceed(t *testing.T) {
+	ctx := context.Background()
+	svc, mem := buildSvc(t, "acme", "globex")
+	parent, _ := mem.Enqueue(ctx, "evacuate", mustArgsMoves(t, "hostA",
+		[]instance.Move{
+			{Template: "web", Slug: "acme", ToHost: "hostB"},
+			{Template: "web", Slug: "globex", ToHost: "hostC"},
+		}), "")
+
+	var calls int32
+	h := &Handler{Svc: svc, Jobs: mem}
+	h.migrate = func(_ context.Context, req instance.MigrateRequest, step func(string, string)) error {
+		atomic.AddInt32(&calls, 1)
+		step("fake", req.Slug)
+		return nil
+	}
+
+	if err := h.Run(ctx, parent, jobs.NewJobContext(mem, parent.ID)); err != nil {
+		t.Fatalf("want success, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("want 2 migrate calls, got %d", calls)
+	}
+	children, _ := mem.ListJobs(ctx, store.JobFilter{ParentID: parent.ID})
+	if len(children) != 2 {
+		t.Fatalf("want 2 children, got %d", len(children))
+	}
+	for _, c := range children {
+		if c.Kind != "migrate" || c.State != store.JobSucceeded {
+			t.Fatalf("child not succeeded migrate: %+v", c)
+		}
 	}
 }

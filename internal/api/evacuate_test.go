@@ -308,3 +308,76 @@ func TestEvacuatePlan_API_ProvisionsSerialized(t *testing.T) {
 	assert.NotNil(t, out.Moves[0].Provisions, "provisions must serialize as [], not null")
 	assert.Empty(t, out.Moves[0].Provisions)
 }
+
+// --- Moves-array API tests ---
+
+func TestEvacuate_API_Success_Moves(t *testing.T) {
+	srv, tok, mem, _ := newEvacSrv(t)
+	ctx := context.Background()
+	seedEvac(t, mem, "db1")
+	seedEvac(t, mem, "db2")
+
+	resp := postEvacuate(t, srv, tok, instance.EvacuateRequest{
+		FromHost: "h1",
+		Moves: []instance.Move{
+			{Template: "postgres", Slug: "db1", ToHost: "h2"},
+			{Template: "postgres", Slug: "db2", ToHost: "h3"},
+		},
+	})
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	var acc struct {
+		JobID string `json:"job_id"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&acc))
+	require.NotEmpty(t, acc.JobID)
+	job, err := mem.GetJob(ctx, acc.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, "evacuate", job.Kind)
+}
+
+func TestEvacuate_API_SharedSlugAcrossTemplates_Moves(t *testing.T) {
+	srv, tok, mem, _ := newEvacSrv(t)
+	ctx := context.Background()
+	require.NoError(t, mem.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "postgres", Slug: "dup",
+		Parameters: map[string]any{}, Secrets: map[string]string{},
+	}))
+	require.NoError(t, mem.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "redis", Slug: "dup",
+		Parameters: map[string]any{}, Secrets: map[string]string{},
+	}))
+
+	resp := postEvacuate(t, srv, tok, instance.EvacuateRequest{
+		FromHost: "h1",
+		Moves: []instance.Move{
+			{Template: "postgres", Slug: "dup", ToHost: "h2"},
+			{Template: "redis", Slug: "dup", ToHost: "h3"},
+		},
+	})
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+}
+
+func TestEvacuatePlan_API_Success_Moves(t *testing.T) {
+	srv, tok, mem, _ := newEvacSrv(t)
+	seedEvacWithParams(t, mem, "db1")
+	seedEvacWithParams(t, mem, "db2")
+
+	resp := postEvacuatePlan(t, srv, tok, instance.EvacuateRequest{
+		FromHost: "h1",
+		Moves: []instance.Move{
+			{Template: "postgres", Slug: "db1", ToHost: "h2"},
+			{Template: "postgres", Slug: "db2", ToHost: "h3"},
+		},
+	})
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var out planResp
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+	assert.Equal(t, "h1", out.FromHost)
+	require.Len(t, out.Moves, 2)
+	assert.Equal(t, "db1", out.Moves[0].Slug)
+	assert.Equal(t, "db2", out.Moves[1].Slug)
+	for _, m := range out.Moves {
+		assert.True(t, m.OK)
+		assert.Empty(t, m.Issues)
+	}
+}
