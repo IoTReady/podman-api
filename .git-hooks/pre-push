@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# Pre-push hook for the OSS podman-api repo.
+#
+# Enforces the open-core review flow:
+#   1. main is PR-only on Forgejo (origin) — no direct pushes. Mirrors the
+#      server-side Forgejo branch protection rule.
+#   2. Nothing reaches GitHub (public OSS) until it is already on Forgejo main,
+#      i.e. reviewed and merged via a Forgejo PR. GitHub is a publication
+#      surface, never where review happens.
+#   3. Pushes to GitHub run `make test` first.
+#
+# Install: cp .git-hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+
+set -euo pipefail
+
+REMOTE="${1:-}"
+REMOTE_URL="${2:-}"
+
+is_github=false
+[[ "$REMOTE_URL" == *"github.com"* ]] && is_github=true
+
+# Forgejo main tip — used to verify GitHub pushes carry only merged code.
+# Best-effort: if origin is unreachable we skip the ancestry check (the
+# server-side protection rule + review process remain the real gate).
+ORIGIN_MAIN="$(git ls-remote origin refs/heads/main 2>/dev/null | awk '{print $1}')" || true
+
+# pre-push feeds one line per ref on stdin:
+#   <local_ref> <local_sha> <remote_ref> <remote_sha>
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+    # Skip deletions (local_sha is all zeros).
+    [[ "$local_sha" =~ ^0+$ ]] && continue
+
+    if [[ "$is_github" == true ]]; then
+        # Rule 2: only publish commits/tags already merged on Forgejo main.
+        if [[ -n "$ORIGIN_MAIN" ]] && ! git merge-base --is-ancestor "$local_sha" "$ORIGIN_MAIN"; then
+            echo "ERROR: refusing to push '${_local_ref}' to GitHub."
+            echo ""
+            echo "  ${local_sha} is not part of Forgejo 'main' yet, so it has not been"
+            echo "  reviewed and merged. GitHub only ever receives reviewed, merged code."
+            echo ""
+            echo "  Flow: open a PR on Forgejo -> review -> merge -> tag -> push to GitHub."
+            exit 1
+        fi
+    else
+        # Rule 1: main is PR-only on Forgejo.
+        if [[ "$remote_ref" == "refs/heads/main" ]]; then
+            echo "ERROR: direct push to 'main' is blocked — it is PR-only."
+            echo ""
+            echo "  Push a feature branch and open a PR instead:"
+            echo ""
+            echo "    git switch -c feat/my-change"
+            echo "    git push -u origin feat/my-change"
+            echo "    forgejo pr create tej/podman-api --head=feat/my-change --base=main ..."
+            echo ""
+            echo "  (The Forgejo branch protection rule enforces this server-side too.)"
+            exit 1
+        fi
+    fi
+done
+
+# Pushing to GitHub: run tests and remind about the release follow-ups.
+if [[ "$is_github" == true ]]; then
+    echo "→ Pushing to GitHub (public OSS). Running tests first..."
+    make test 2>&1 | tail -5
+
+    echo ""
+    echo "╔══════════════════════════════════════════════════════════════╗"
+    echo "║  Pushing to GitHub.                                          ║"
+    echo "║  If this includes a new tag:                                 ║"
+    echo "║    1. Tag on both remotes: git push github <tag>             ║"
+    echo "║    2. Bump podman-api in the commercial module go.mod        ║"
+    echo "║       go get github.com/iotready/podman-api@<tag>            ║"
+    echo "╚══════════════════════════════════════════════════════════════╝"
+    echo ""
+fi
+
+exit 0
