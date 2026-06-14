@@ -388,7 +388,7 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 	}
 
 	if s.sidecar != nil {
-		yaml, err = s.sidecar.InjectSidecars(ctx, yaml, tmpl.Meta, req.Parameters, req.Slug)
+		yaml, err = s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmpl.Meta), req.Parameters, req.Slug)
 		if err != nil {
 			return fmt.Errorf("sidecar inject: %w", err)
 		}

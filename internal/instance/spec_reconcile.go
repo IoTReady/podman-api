@@ -151,7 +151,7 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 	}
 
 	if s.sidecar != nil {
-		yaml, err = s.sidecar.InjectSidecars(ctx, yaml, tmplObj.Meta, params, slug)
+		yaml, err = s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmplObj.Meta), params, slug)
 		if err != nil {
 			return false, fmt.Errorf("sidecar inject: %w", err)
 		}
