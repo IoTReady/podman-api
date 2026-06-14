@@ -21,14 +21,16 @@ func newVolSvc(f *fake.Fake) *Service {
 
 func TestCopyVolume_HappyPath(t *testing.T) {
 	f := fake.New()
-	want := []byte("the-volume-tar")
+	want := tarBytes(t, map[string]string{"PG_VERSION": "16"})
 	f.SetVolumeData("a", "vol", want)
 	f.AddVolume("b", podman.Volume{Name: "vol"})
 
 	svc := newVolSvc(f)
-	require.NoError(t, svc.CopyVolume(context.Background(), "a", "b", "vol"))
+	manifest, err := svc.CopyVolume(context.Background(), "a", "b", "vol")
+	require.NoError(t, err)
 
 	assert.Equal(t, want, f.VolumeData("b", "vol"))
+	assert.NotEmpty(t, manifest, "expected non-empty source manifest from copy")
 }
 
 func TestCopyVolume_EmptyVolume(t *testing.T) {
@@ -37,7 +39,8 @@ func TestCopyVolume_EmptyVolume(t *testing.T) {
 	f.AddVolume("b", podman.Volume{Name: "vol"})
 
 	svc := newVolSvc(f)
-	require.NoError(t, svc.CopyVolume(context.Background(), "a", "b", "vol"))
+	_, err := svc.CopyVolume(context.Background(), "a", "b", "vol")
+	require.NoError(t, err)
 
 	// An empty volume copies cleanly: dest exists and is empty (not an error).
 	assert.Empty(t, f.VolumeData("b", "vol"))
@@ -45,15 +48,16 @@ func TestCopyVolume_EmptyVolume(t *testing.T) {
 
 func TestCopyVolume_ImportFails_SourceIntact(t *testing.T) {
 	f := fake.New()
-	want := []byte("the-volume-tar")
+	want := tarBytes(t, map[string]string{"PG_VERSION": "16"})
 	f.SetVolumeData("a", "vol", want)
 	f.AddVolume("b", podman.Volume{Name: "vol"})
 	boom := errors.New("dest rejected")
 	f.ImportErr = boom
 
 	svc := newVolSvc(f)
-	err := svc.CopyVolume(context.Background(), "a", "b", "vol")
+	_, err := svc.CopyVolume(context.Background(), "a", "b", "vol")
 	require.ErrorIs(t, err, boom)
+	assert.ErrorContains(t, err, "import volume")
 
 	// Source is read-only — unchanged. Dest never committed.
 	assert.Equal(t, want, f.VolumeData("a", "vol"))
@@ -65,12 +69,15 @@ func TestCopyVolume_ExportFailsMidStream_Aborts(t *testing.T) {
 	f := fake.New()
 	f.AddVolume("b", podman.Volume{Name: "vol"})
 	boom := errors.New("source stream broke")
+	// Valid tar that's truncated so buildManifest fails mid-stream.
+	srcTar := tarBytes(t, map[string]string{"PG_VERSION": "16"})
+	partialTar := srcTar[:len(srcTar)-1]
 	f.ExportReader = func(host, name string) io.ReadCloser {
-		return &midStreamReader{data: []byte("first-chunk"), err: boom}
+		return &midStreamReader{data: partialTar, err: boom}
 	}
 
 	svc := newVolSvc(f)
-	err := svc.CopyVolume(context.Background(), "a", "b", "vol")
+	_, err := svc.CopyVolume(context.Background(), "a", "b", "vol")
 	require.Error(t, err)
 	assert.ErrorContains(t, err, "source stream broke")
 	assert.Nil(t, f.VolumeData("b", "vol"))

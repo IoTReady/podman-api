@@ -988,40 +988,43 @@ func (s *Service) volumeManifest(ctx context.Context, host, name string) (Manife
 // an in-process pipe — the data crosses the daemon's network (two connections)
 // but never its disk. The destination volume must already exist. The source is
 // only ever read, so a failed copy leaves it untouched (migrate relies on this).
-func (s *Service) CopyVolume(ctx context.Context, fromHost, toHost, name string) error {
+//
+// CopyVolume builds and returns a Manifest from the source export stream so the
+// caller can verify the destination against the exact same snapshot, without
+// re-exporting the source (which would risk a false mismatch if the source is
+// still settling — see #153).
+func (s *Service) CopyVolume(ctx context.Context, fromHost, toHost, name string) (Manifest, error) {
 	rc, err := s.client.VolumeExport(ctx, fromHost, name)
 	if err != nil {
-		return fmt.Errorf("export volume %q from %s: %w", name, fromHost, err)
+		return nil, fmt.Errorf("export volume %q from %s: %w", name, fromHost, err)
 	}
 	defer rc.Close()
 
 	pr, pw := io.Pipe()
-	copyDone := make(chan struct{})
+	copyDone := make(chan error, 1)
+	var srcManifest Manifest
+
 	go func() {
-		_, cerr := io.Copy(pw, rc)
-		// nil cerr closes the pipe with EOF (clean); an error closes it so the
-		// importer's read fails too.
-		pw.CloseWithError(cerr)
-		close(copyDone)
+		tr := io.TeeReader(rc, pw)
+		m, err := buildManifest(tr)
+		if err == nil {
+			srcManifest = m
+		}
+		pw.CloseWithError(err)
+		copyDone <- err
 	}()
 
 	importErr := s.client.VolumeImport(ctx, toHost, name, pr)
-	// Unblock the copy goroutine if the importer stopped reading early, then
-	// wait for it so we never leak it. CloseWithError(nil) == Close, harmless
-	// after a fully-consumed stream.
 	pr.CloseWithError(importErr)
-	<-copyDone
 
-	// Note: a mid-stream source-read failure propagates through the pipe and
-	// surfaces here as importErr, so the message names the destination rather
-	// than the source. io.Pipe couples the two errors (a failed source read and
-	// a rejecting importer both yield the same pipe error), so cleanly
-	// distinguishing the locus needs a read-tracking wrapper — deferred to the
-	// migrate handler (#34), which is this primitive's first caller.
+	copyErr := <-copyDone
 	if importErr != nil {
-		return fmt.Errorf("import volume %q to %s: %w", name, toHost, importErr)
+		return nil, fmt.Errorf("import volume %q to %s: %w", name, toHost, importErr)
 	}
-	return nil
+	if copyErr != nil {
+		return nil, fmt.Errorf("copy volume %q: build manifest: %w", name, copyErr)
+	}
+	return srcManifest, nil
 }
 
 // Logs returns a channel of log lines from one container in an instance.
