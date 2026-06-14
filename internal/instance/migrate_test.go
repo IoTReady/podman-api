@@ -100,6 +100,15 @@ func TestPodReady(t *testing.T) {
 		{"healthcheck unhealthy", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "unhealthy"}}}, false},
 		{"healthcheck still starting", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "starting"}}}, false},
 		{"mixed declared and undeclared", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "healthy"}, {Status: "Running"}}}, true},
+		// Regression: podman API returns pod state capitalised but container
+		// state lowercased — #149. Both must be accepted.
+		{"lowercase container status", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "running"}}}, true},
+		{"lowercase everything", podman.Pod{Status: "running", Containers: []podman.Container{{Status: "running", Health: "healthy"}}}, true},
+		{"lowercase pod, capital container", podman.Pod{Status: "running", Containers: []podman.Container{{Status: "Running"}}}, true},
+		{"mixed-case health", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "Healthy"}}}, true},
+		{"capital unhealthy", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "Unhealthy"}}}, false},
+		{"capital starting", podman.Pod{Status: "Running", Containers: []podman.Container{{Status: "Running", Health: "Starting"}}}, false},
+		{"lowercase stopped pod", podman.Pod{Status: "stopped", Containers: []podman.Container{{Status: "running"}}}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
