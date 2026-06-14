@@ -28,16 +28,45 @@ git remote -v
 # github   git@github.com:IoTReady/podman-api.git              (public OSS mirror)
 ```
 
-**All development happens on Forgejo.** GitHub is a publication surface.
+**All development happens on Forgejo. GitHub is a publication surface only.**
 
-After merging to `main` on Forgejo, push to GitHub when the change is OSS-appropriate:
+### `main` is PR-only, and GitHub never receives unreviewed code
+
+1. **`main` is PR-only on Forgejo.** Direct commits/pushes to `main` are blocked —
+   both by a Forgejo branch protection rule (`enable_push: false`,
+   `apply_to_admins: true`, enforced server-side even for the repo owner) and by
+   the local `pre-push` hook. Work on a feature branch and open a PR.
+
+2. **Never push to GitHub until the change is reviewed and merged on Forgejo.**
+   GitHub is a publication surface, not a review surface. Nothing — no commit, no
+   release tag — goes to GitHub until it is already on Forgejo `main` via a merged
+   PR. The `pre-push` hook refuses to push anything to GitHub that is not yet an
+   ancestor of Forgejo `main`.
+
+The correct flow, end to end:
 
 ```sh
-git push github main      # push commits
-git push github <tag>     # push a release tag
+git switch -c feat/my-change
+git push -u origin feat/my-change
+forgejo pr create tej/podman-api --head=feat/my-change --base=main --body="..."
+# ... review happens on Forgejo, then:
+forgejo pr merge tej/podman-api <n> --method=squash
+# only now is it publishable:
+git switch main && git pull --ff-only origin main
+git push github main                 # publish reviewed, merged commits
+git tag vX.Y.Z && git push origin vX.Y.Z && git push github vX.Y.Z   # tag AFTER merge
 ```
 
-The pre-push hook runs `make test` automatically when pushing to GitHub.
+> **Never reuse a release tag.** Once pushed, a tag may be cached immutably in the
+> public Go module proxy (`proxy.golang.org`). If a tag was pushed in error,
+> delete it everywhere and bump to the **next** version — do not move it.
+
+The pre-push hook (`.git-hooks/pre-push`) enforces both rules and runs `make test`
+before any GitHub push. Install it once per clone:
+
+```sh
+cp .git-hooks/pre-push .git/hooks/pre-push && chmod +x .git/hooks/pre-push
+```
 
 Wiki changes go to both (`/tmp/podman-api-wiki` clone, push `main` to origin and `main:master` to github).
 
