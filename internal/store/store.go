@@ -44,6 +44,9 @@ type Spec struct {
 	// text/template are unaffected; callers must not type-assert .(int).
 	Parameters map[string]any
 	Secrets    map[string]string
+	// InjectorSecretNames tracks the short names of secrets declared by the
+	// SidecarInjector on the last Apply. The core prunes these on Delete.
+	InjectorSecretNames []string
 	// Domains are the public hostnames the ingress layer routes to this
 	// instance. Empty for non-web instances. Non-secret; stored in plaintext.
 	Domains []string

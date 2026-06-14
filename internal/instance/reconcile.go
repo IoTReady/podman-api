@@ -153,7 +153,11 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 				// deterministic from template+slug, so a future deploy of the same
 				// slug would otherwise silently remount stale data. Best-effort, like
 				// Delete's own prune — cannot reintroduce the source-proxy coupling.
-				s.pruneInstanceResources(mctx, req.FromHost, req.Template, req.Slug, true, true)
+				var injectorSecrets []string
+				if spec, specErr := s.store.GetSpec(mctx, req.FromHost, req.Template, req.Slug); specErr == nil {
+					injectorSecrets = spec.InjectorSecretNames
+				}
+				s.pruneInstanceResources(mctx, req.FromHost, req.Template, req.Slug, true, true, injectorSecrets)
 				// A store write is local and reliable; a failure is worth retrying so
 				// the orphan spec row is cleaned.
 				if derr := s.store.DeleteSpec(mctx, req.FromHost, req.Template, req.Slug); derr != nil && !errors.Is(derr, store.ErrNotFound) {

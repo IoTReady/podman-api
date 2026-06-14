@@ -17,24 +17,26 @@ import (
 // what it was handed and returns either a fixed replacement YAML or an error.
 type recordingInjector struct {
 	out       string // replacement YAML; "" means echo the input
-	err       error  // non-nil aborts injection
-	calls     int    // number of times InjectSidecars was called
+	secrets   []extension.InjectedSecret
+	err       error // non-nil aborts injection
+	calls     int   // number of times InjectSidecars was called
 	gotYAML   string
 	gotMeta   extension.TemplateMeta
 	gotParams map[string]any
 	gotSlug   string
 }
 
-func (r *recordingInjector) InjectSidecars(_ context.Context, yaml string, meta extension.TemplateMeta, params map[string]any, slug string) (string, error) {
+func (r *recordingInjector) InjectSidecars(_ context.Context, yaml string, meta extension.TemplateMeta, params map[string]any, slug string) (extension.SidecarInjection, error) {
 	r.calls++
 	r.gotYAML, r.gotMeta, r.gotParams, r.gotSlug = yaml, meta, params, slug
 	if r.err != nil {
-		return "", r.err
+		return extension.SidecarInjection{}, r.err
 	}
+	out := yaml
 	if r.out != "" {
-		return r.out, nil
+		out = r.out
 	}
-	return yaml, nil
+	return extension.SidecarInjection{YAML: out, Secrets: r.secrets}, nil
 }
 
 // injectedPod is a full pod manifest a sidecar injector might return — the
@@ -146,4 +148,36 @@ func TestReconcileOneSpec_InjectorError_Aborts(t *testing.T) {
 	svc.ReconcileSpecsOnHost(ctx, "h1")
 
 	assert.Empty(t, fc.PlayCalls, "PlayKube must not be called when injection fails")
+}
+
+// An injector that returns secrets creates podman secrets alongside
+// template-declared secrets, and the secrets are tracked for pruning.
+func TestService_Apply_InjectorSecrets_Created(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+	inj := &recordingInjector{
+		out: injectedPod,
+		secrets: []extension.InjectedSecret{
+			{Name: "litestream-s3-key", Key: "access-key-id", Value: "s3-secret-value"},
+		},
+	}
+	svc.SetSidecarInjector(inj)
+
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	// The injector secret was created as a podman secret.
+	_, secErr := f.SecretInspect(ctx, "h1", "postgres-demo-litestream-s3-key")
+	require.NoError(t, secErr, "injector secret must exist on the host")
+
+	// Template-declared secrets still work.
+	_, tmplSecErr := f.SecretInspect(ctx, "h1", "postgres-demo-password")
+	require.NoError(t, tmplSecErr, "template-declared secret must still exist")
+
+	// The spec tracks injector secret names for later pruning.
+	spec, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"litestream-s3-key"}, spec.InjectorSecretNames,
+		"injector secret names must be tracked in the spec")
+	assert.Equal(t, "s3-secret-value", spec.Secrets["litestream-s3-key"],
+		"injector secret value must be stored in spec.Secrets")
 }

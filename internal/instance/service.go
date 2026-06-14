@@ -387,11 +387,26 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 		return fmt.Errorf("render: %w", err)
 	}
 
+	var injectorSecretNames []string
 	if s.sidecar != nil {
-		yaml, err = s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmpl.Meta), req.Parameters, req.Slug)
+		inj, err := s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmpl.Meta), req.Parameters, req.Slug)
 		if err != nil {
 			return fmt.Errorf("sidecar inject: %w", err)
 		}
+		yaml = inj.YAML
+		// Collect injector-declared secrets so they are created alongside
+		// template-declared secrets below and tracked for pruning.
+		for _, sec := range inj.Secrets {
+			req.Secrets[sec.Name] = sec.Value
+			injectorSecretNames = append(injectorSecretNames, sec.Name)
+		}
+	}
+	// Reject injector-declared secrets on a key-less store BEFORE any host
+	// mutation. This mirrors the pre-injection check for template-declared
+	// secrets above — if the injector added secrets but the store cannot encrypt
+	// them, abort now so no orphan secrets or pods are left behind.
+	if len(injectorSecretNames) > 0 && !s.store.SecretsEnabled() {
+		return store.ErrSecretsNeedKey
 	}
 
 	// Pre-pull images BEFORE writing any secrets. A bad image ref then leaves
@@ -422,7 +437,7 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 				return fmt.Errorf("remove existing secret %q: %w", name, err)
 			}
 		}
-		if err := s.client.SecretCreate(ctx, host, name, wrapAsKubeSecret(name, []byte(v))); err != nil {
+		if err := s.client.SecretCreate(ctx, host, name, wrapAsKubeSecret(name, k, []byte(v))); err != nil {
 			return fmt.Errorf("create secret %q: %w", name, err)
 		}
 	}
@@ -447,12 +462,13 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 		return fmt.Errorf("play kube: %w", err)
 	}
 	sp := store.Spec{
-		Host:       host,
-		Template:   req.Template,
-		Slug:       req.Slug,
-		Parameters: paramsCopy,
-		Secrets:    secretsCopy,
-		Domains:    domainsCopy,
+		Host:                host,
+		Template:            req.Template,
+		Slug:                req.Slug,
+		Parameters:          paramsCopy,
+		Secrets:             secretsCopy,
+		InjectorSecretNames: injectorSecretNames,
+		Domains:             domainsCopy,
 	}
 	// Recheck the template still exists, then persist the spec — both under the
 	// template read lock so a concurrent DeleteTemplate (write lock) cannot slip
@@ -770,7 +786,7 @@ func (s *Service) InstanceSecretState(ctx context.Context, host, tmpl, slug stri
 // stale on-disk credentials. Errors are ignored — this is an idempotent
 // reconcile toward "gone"; callers that need durability handle the spec row
 // separately.
-func (s *Service) pruneInstanceResources(ctx context.Context, host, tmpl, slug string, secrets, volumes bool) {
+func (s *Service) pruneInstanceResources(ctx context.Context, host, tmpl, slug string, secrets, volumes bool, injectorSecrets []string) {
 	t, err := s.store.GetTemplate(ctx, tmpl)
 	if err != nil {
 		// Template gone from the catalog: nothing to derive resource names from.
@@ -779,6 +795,9 @@ func (s *Service) pruneInstanceResources(ctx context.Context, host, tmpl, slug s
 	}
 	if secrets {
 		for _, name := range t.Meta.Secrets.PerInstance {
+			_ = s.client.SecretRemove(ctx, host, instanceSecretName(tmpl, slug, name))
+		}
+		for _, name := range injectorSecrets {
 			_ = s.client.SecretRemove(ctx, host, instanceSecretName(tmpl, slug, name))
 		}
 	}
@@ -809,7 +828,11 @@ func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts Dele
 		podExisted = false
 	}
 
-	s.pruneInstanceResources(ctx, host, tmpl, slug, opts.PruneSecrets, opts.PruneVolumes)
+	var injectorSecretNames []string
+	if spec, err := s.store.GetSpec(ctx, host, tmpl, slug); err == nil {
+		injectorSecretNames = spec.InjectorSecretNames
+	}
+	s.pruneInstanceResources(ctx, host, tmpl, slug, opts.PruneSecrets, opts.PruneVolumes, injectorSecretNames)
 	// Reconcile away the desired-state row. This runs even when the pod was
 	// already gone (so a stale spec doesn't linger); ErrNotFound — never stored,
 	// or an idempotent double-delete — is not an error. Note this happens before
@@ -916,7 +939,7 @@ func (s *Service) PutHostSecret(ctx context.Context, host, name string, value []
 			return err
 		}
 	}
-	if err := s.client.SecretCreate(ctx, host, name, wrapAsKubeSecret(name, value)); err != nil {
+	if err := s.client.SecretCreate(ctx, host, name, wrapAsKubeSecret(name, name, value)); err != nil {
 		return err
 	}
 	if persist {
