@@ -445,7 +445,7 @@ func TestMigrate_VolumeReexportFails_RollsBack(t *testing.T) {
 	f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
 	srcTar := tarBytes(t, map[string]string{"PG_VERSION": "16"})
 	f.SetVolumeData("h1", "postgres-db1-data", srcTar)
-	// Source exports (copy + verify re-export) succeed; the dest re-export breaks.
+	// Copy of source succeeds; the dest re-export breaks.
 	f.ExportReader = func(host, _ string) io.ReadCloser {
 		if host == "h2" {
 			return &midStreamReader{err: errors.New("dest export broke")}
