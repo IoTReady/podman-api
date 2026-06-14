@@ -451,7 +451,7 @@ func (s *Service) waitRunning(ctx context.Context, host, tmpl, slug string) erro
 // Status comparisons use EqualFold because podman's API returns pod state
 // capitalised ("Running") but container state lowercased ("running") — #149.
 func podReady(p podman.Pod) bool {
-	if !strings.EqualFold(p.Status, "Running") {
+	if !strings.EqualFold(p.Status, "running") {
 		return false
 	}
 	for _, c := range p.Containers {
