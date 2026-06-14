@@ -19,14 +19,15 @@ import (
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS specs (
-  host       TEXT NOT NULL,
-  template   TEXT NOT NULL,
-  slug       TEXT NOT NULL,
-  parameters TEXT NOT NULL,
-  secrets    BLOB,
-  domains    TEXT NOT NULL DEFAULT '[]',
-  created    INTEGER NOT NULL,
-  updated    INTEGER NOT NULL,
+  host             TEXT NOT NULL,
+  template         TEXT NOT NULL,
+  slug             TEXT NOT NULL,
+  parameters       TEXT NOT NULL,
+  secrets          BLOB,
+  injector_secrets BLOB,
+  domains          TEXT NOT NULL DEFAULT '[]',
+  created          INTEGER NOT NULL,
+  updated          INTEGER NOT NULL,
   PRIMARY KEY (host, template, slug)
 );
 CREATE TABLE IF NOT EXISTS jobs (
@@ -315,6 +316,23 @@ func migrateSchema(db *sql.DB) error {
 		}
 		v = 7
 	}
+	if v < 8 {
+		// injector_secrets column — added by schemaSQL on a fresh DB but absent
+		// on a pre-v8 DB. Add it only when missing.
+		has, err := columnExists(db, "specs", "injector_secrets")
+		if err != nil {
+			return fmt.Errorf("migrateSchema: check injector_secrets column: %w", err)
+		}
+		if !has {
+			if _, err := db.Exec(`ALTER TABLE specs ADD COLUMN injector_secrets BLOB`); err != nil {
+				return fmt.Errorf("migrateSchema: add injector_secrets column: %w", err)
+			}
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 8`); err != nil {
+			return fmt.Errorf("migrateSchema v8: set user_version: %w", err)
+		}
+		v = 8
+	}
 	return nil
 }
 
@@ -350,6 +368,20 @@ func (s *SQLite) PutSpec(ctx context.Context, sp Spec) error {
 			return err
 		}
 	}
+	var injBlob []byte
+	if len(sp.InjectorSecrets) > 0 {
+		if s.keys == nil {
+			return ErrSecretsNeedKey
+		}
+		injJSON, err := json.Marshal(sp.InjectorSecrets)
+		if err != nil {
+			return err
+		}
+		injBlob, err = seal(s.keys.Load(), injJSON)
+		if err != nil {
+			return err
+		}
+	}
 	if sp.Domains == nil {
 		sp.Domains = []string{}
 	}
@@ -360,29 +392,31 @@ func (s *SQLite) PutSpec(ctx context.Context, sp Spec) error {
 	now := time.Now().Unix()
 	return s.write(ctx, func() error {
 		_, err := s.db.ExecContext(ctx, `
-INSERT INTO specs (host, template, slug, parameters, secrets, domains, created, updated)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO specs (host, template, slug, parameters, secrets, injector_secrets, domains, created, updated)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(host, template, slug) DO UPDATE SET
-  parameters = excluded.parameters,
-  secrets    = excluded.secrets,
-  domains    = excluded.domains,
-  updated    = excluded.updated`,
-			sp.Host, sp.Template, sp.Slug, string(params), blob, string(domJSON), now, now)
+  parameters        = excluded.parameters,
+  secrets           = excluded.secrets,
+  injector_secrets  = excluded.injector_secrets,
+  domains           = excluded.domains,
+  updated           = excluded.updated`,
+			sp.Host, sp.Template, sp.Slug, string(params), blob, injBlob, string(domJSON), now, now)
 		return err
 	})
 }
 
 func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT parameters, secrets, domains, created, updated FROM specs WHERE host=? AND template=? AND slug=?`,
+		`SELECT parameters, secrets, injector_secrets, domains, created, updated FROM specs WHERE host=? AND template=? AND slug=?`,
 		host, template, slug)
 	var (
 		paramsJSON       string
 		blob             []byte
+		injBlob          []byte
 		domainsJSON      string
 		created, updated int64
 	)
-	if err := row.Scan(&paramsJSON, &blob, &domainsJSON, &created, &updated); err != nil {
+	if err := row.Scan(&paramsJSON, &blob, &injBlob, &domainsJSON, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Spec{}, ErrNotFound
 		}
@@ -405,13 +439,26 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 			return Spec{}, fmt.Errorf("%w: secrets: %v", ErrSpecCorrupt, err)
 		}
 	}
+	var injectorSecrets []InjectorSecret
+	if len(injBlob) > 0 {
+		if s.keys == nil {
+			return Spec{}, ErrSecretsNeedKey
+		}
+		injJSON, err := open(s.keys.Load(), injBlob)
+		if err != nil {
+			return Spec{}, fmt.Errorf("%w: decrypt injector_secrets: %v", ErrSecretsUndecryptable, err)
+		}
+		if err := json.Unmarshal(injJSON, &injectorSecrets); err != nil {
+			return Spec{}, fmt.Errorf("%w: injector_secrets: %v", ErrSpecCorrupt, err)
+		}
+	}
 	var domains []string
 	if err := json.Unmarshal([]byte(domainsJSON), &domains); err != nil {
 		return Spec{}, fmt.Errorf("%w: domains: %v", ErrSpecCorrupt, err)
 	}
 	return Spec{
 		Host: host, Template: template, Slug: slug,
-		Parameters: params, Secrets: secrets, Domains: domains,
+		Parameters: params, Secrets: secrets, InjectorSecrets: injectorSecrets, Domains: domains,
 		Created: time.Unix(created, 0), Updated: time.Unix(updated, 0),
 	}, nil
 }

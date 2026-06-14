@@ -8,6 +8,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/iotready/podman-api/extension"
 	"github.com/iotready/podman-api/internal/podman"
@@ -17,24 +18,26 @@ import (
 // what it was handed and returns either a fixed replacement YAML or an error.
 type recordingInjector struct {
 	out       string // replacement YAML; "" means echo the input
-	err       error  // non-nil aborts injection
-	calls     int    // number of times InjectSidecars was called
+	secrets   []extension.InjectedSecret
+	err       error // non-nil aborts injection
+	calls     int   // number of times InjectSidecars was called
 	gotYAML   string
 	gotMeta   extension.TemplateMeta
 	gotParams map[string]any
 	gotSlug   string
 }
 
-func (r *recordingInjector) InjectSidecars(_ context.Context, yaml string, meta extension.TemplateMeta, params map[string]any, slug string) (string, error) {
+func (r *recordingInjector) InjectSidecars(_ context.Context, yaml string, meta extension.TemplateMeta, params map[string]any, slug string) (extension.SidecarInjection, error) {
 	r.calls++
 	r.gotYAML, r.gotMeta, r.gotParams, r.gotSlug = yaml, meta, params, slug
 	if r.err != nil {
-		return "", r.err
+		return extension.SidecarInjection{}, r.err
 	}
+	out := yaml
 	if r.out != "" {
-		return r.out, nil
+		out = r.out
 	}
-	return yaml, nil
+	return extension.SidecarInjection{YAML: out, Secrets: r.secrets}, nil
 }
 
 // injectedPod is a full pod manifest a sidecar injector might return — the
@@ -146,4 +149,87 @@ func TestReconcileOneSpec_InjectorError_Aborts(t *testing.T) {
 	svc.ReconcileSpecsOnHost(ctx, "h1")
 
 	assert.Empty(t, fc.PlayCalls, "PlayKube must not be called when injection fails")
+}
+
+// An injector that returns secrets creates podman secrets alongside
+// template-declared secrets, and the secrets are tracked for pruning.
+func TestService_Apply_InjectorSecrets_Created(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+	inj := &recordingInjector{
+		out: injectedPod,
+		secrets: []extension.InjectedSecret{
+			{Name: "litestream-s3-key", Key: "access-key-id", Value: "s3-secret-value"},
+		},
+	}
+	svc.SetSidecarInjector(inj)
+
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	// The injector secret was created as a podman secret.
+	_, secErr := f.SecretInspect(ctx, "h1", "postgres-demo-litestream-s3-key")
+	require.NoError(t, secErr, "injector secret must exist on the host")
+
+	// Template-declared secrets still work.
+	_, tmplSecErr := f.SecretInspect(ctx, "h1", "postgres-demo-password")
+	require.NoError(t, tmplSecErr, "template-declared secret must still exist")
+
+	// The spec tracks injector secrets with Name, Key, and Value preserved.
+	spec, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	require.Len(t, spec.InjectorSecrets, 1, "one injector secret must be tracked")
+	assert.Equal(t, "litestream-s3-key", spec.InjectorSecrets[0].Name)
+	assert.Equal(t, "access-key-id", spec.InjectorSecrets[0].Key)
+	assert.Equal(t, "s3-secret-value", spec.InjectorSecrets[0].Value)
+}
+
+// The wrapped K8s Secret body carries the correct data key for each secret:
+//   - template-declared secrets use the namespaced name as data key
+//   - injector-declared secrets use the declared Key as data key
+func TestService_Apply_SecretDataKeys(t *testing.T) {
+	svc, f, _ := newSvcMem(t)
+	ctx := context.Background()
+	inj := &recordingInjector{
+		out: injectedPod,
+		secrets: []extension.InjectedSecret{
+			{Name: "litestream-s3-key", Key: "access-key-id", Value: "s3-secret-value"},
+		},
+	}
+	svc.SetSidecarInjector(inj)
+
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	// Template secret's K8s data key is the namespaced name (backward compat).
+	tmplData := f.SecretData["h1"]["postgres-demo-password"]
+	require.NotNil(t, tmplData, "template secret body must be recorded")
+
+	var tmplSecret struct {
+		Metadata struct {
+			Name string `yaml:"name"`
+		} `yaml:"metadata"`
+		Data map[string]string `yaml:"data"`
+	}
+	require.NoError(t, yaml.Unmarshal(tmplData, &tmplSecret))
+	assert.Equal(t, "postgres-demo-password", tmplSecret.Metadata.Name)
+	// Must include key "postgres-demo-password" (namespaced name, not "password").
+	_, hasTmplKey := tmplSecret.Data["postgres-demo-password"]
+	assert.True(t, hasTmplKey, "template secret data key must be the namespaced name")
+
+	// Injector secret's K8s data key is the declared Key ("access-key-id").
+	injData := f.SecretData["h1"]["postgres-demo-litestream-s3-key"]
+	require.NotNil(t, injData, "injector secret body must be recorded")
+
+	var injSecret struct {
+		Metadata struct {
+			Name string `yaml:"name"`
+		} `yaml:"metadata"`
+		Data map[string]string `yaml:"data"`
+	}
+	require.NoError(t, yaml.Unmarshal(injData, &injSecret))
+	assert.Equal(t, "postgres-demo-litestream-s3-key", injSecret.Metadata.Name)
+	// Must include key "access-key-id" (declared Key), not the secret name.
+	_, hasInjKey := injSecret.Data["access-key-id"]
+	assert.True(t, hasInjKey, "injector secret data key must be the declared Key")
+	_, hasWrongKey := injSecret.Data["litestream-s3-key"]
+	assert.False(t, hasWrongKey, "injector secret data key must NOT be the secret name")
 }

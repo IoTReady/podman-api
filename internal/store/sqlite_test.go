@@ -250,3 +250,44 @@ func TestSQLite_GetSpec_CorruptSecretsJSON_IsErrSpecCorrupt(t *testing.T) {
 	_, err = s.GetSpec(ctx, "h1", "postgres", "demo")
 	require.ErrorIs(t, err, ErrSpecCorrupt)
 }
+
+func TestSQLite_InjectorSecrets_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	sp := sampleSpec()
+	sp.InjectorSecrets = []InjectorSecret{
+		{Name: "litestream-s3-key", Key: "access-key-id", Value: "s3-secret-value"},
+	}
+	require.NoError(t, s.PutSpec(ctx, sp))
+
+	got, err := s.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	require.Len(t, got.InjectorSecrets, 1)
+	require.Equal(t, "litestream-s3-key", got.InjectorSecrets[0].Name)
+	require.Equal(t, "access-key-id", got.InjectorSecrets[0].Key)
+	require.Equal(t, "s3-secret-value", got.InjectorSecrets[0].Value)
+}
+
+func TestSQLite_InjectorSecrets_EncryptedAtRest(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := filepath.Join(dir, "state.db")
+	s, err := OpenSQLite(db, NewKeyStore(testKey(0x11)))
+	require.NoError(t, err)
+	sp := sampleSpec()
+	sp.InjectorSecrets = []InjectorSecret{
+		{Name: "litestream-s3-key", Key: "access-key-id", Value: "s3-secret-value"},
+	}
+	require.NoError(t, s.PutSpec(ctx, sp))
+	require.NoError(t, s.Close())
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	for _, e := range entries {
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		require.NoError(t, err)
+		require.NotContains(t, string(raw), "s3-secret-value", "plaintext must not appear in the raw DB")
+		require.NotContains(t, string(raw), "access-key-id", "plaintext must not appear in the raw DB")
+		require.NotContains(t, string(raw), "litestream-s3-key", "plaintext must not appear in the raw DB")
+	}
+}

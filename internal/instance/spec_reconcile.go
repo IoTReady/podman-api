@@ -151,21 +151,37 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 	}
 
 	if s.sidecar != nil {
-		yaml, err = s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmplObj.Meta), params, slug)
+		inj, err := s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmplObj.Meta), params, slug)
 		if err != nil {
 			return false, fmt.Errorf("sidecar inject: %w", err)
 		}
+		yaml = inj.YAML
+		for _, sec := range inj.Secrets {
+			spec.InjectorSecrets = append(spec.InjectorSecrets, store.InjectorSecret{Name: sec.Name, Key: sec.Key, Value: sec.Value})
+		}
 	}
 
-	// Step 6: re-create per-instance secrets on the host.
+	// Step 6: re-create per-instance secrets on the host. Template-declared
+	// secrets use the namespaced name as the K8s data key (backward compat
+	// with every bundled template's secretKeyRef.key field).
 	for k, v := range spec.Secrets {
 		name := instanceSecretName(tmpl, slug, k)
-		// Remove before create (idempotent rotation — same as applyLocked).
 		if _, iErr := s.client.SecretInspect(ctx, hostID, name); iErr == nil {
 			_ = s.client.SecretRemove(ctx, hostID, name)
 		}
-		if err := s.client.SecretCreate(ctx, hostID, name, wrapAsKubeSecret(name, []byte(v))); err != nil {
+		if err := s.client.SecretCreate(ctx, hostID, name, wrapAsKubeSecret(name, name, []byte(v))); err != nil {
 			return false, fmt.Errorf("create secret %q: %w", name, err)
+		}
+	}
+	// Re-create injector-declared secrets. The K8s data key is the declared Key,
+	// so the injected sidecar's secretKeyRef.key resolves correctly.
+	for _, sec := range spec.InjectorSecrets {
+		name := instanceSecretName(tmpl, slug, sec.Name)
+		if _, iErr := s.client.SecretInspect(ctx, hostID, name); iErr == nil {
+			_ = s.client.SecretRemove(ctx, hostID, name)
+		}
+		if err := s.client.SecretCreate(ctx, hostID, name, wrapAsKubeSecret(name, sec.Key, []byte(sec.Value))); err != nil {
+			return false, fmt.Errorf("create injector secret %q: %w", name, err)
 		}
 	}
 
@@ -193,12 +209,13 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 	// Defensive clones: spec.Parameters and spec.Secrets came from GetSpec
 	// and may share backing arrays with the store depending on the implementation.
 	sp := store.Spec{
-		Host:       hostID,
-		Template:   tmpl,
-		Slug:       slug,
-		Parameters: maps.Clone(spec.Parameters),
-		Secrets:    maps.Clone(spec.Secrets),
-		Domains:    slices.Clone(spec.Domains),
+		Host:            hostID,
+		Template:        tmpl,
+		Slug:            slug,
+		Parameters:      maps.Clone(spec.Parameters),
+		Secrets:         maps.Clone(spec.Secrets),
+		InjectorSecrets: slices.Clone(spec.InjectorSecrets),
+		Domains:         slices.Clone(spec.Domains),
 	}
 	if err := s.store.PutSpec(ctx, sp); err != nil {
 		// Spec persist failed but the pod is already running. Log the error

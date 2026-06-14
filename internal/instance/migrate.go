@@ -346,7 +346,7 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 		if err != nil {
 			return nil, fmt.Errorf("load host secret %q: %w", name, err)
 		}
-		if err := s.client.SecretCreate(ctx, req.ToHost, name, wrapAsKubeSecret(name, val)); err != nil {
+		if err := s.client.SecretCreate(ctx, req.ToHost, name, wrapAsKubeSecret(name, name, val)); err != nil {
 			// A concurrent move may have created it between inspect and create;
 			// tolerate that, fail on anything else.
 			if _, ie := s.client.SecretInspect(ctx, req.ToHost, name); ie == nil {
