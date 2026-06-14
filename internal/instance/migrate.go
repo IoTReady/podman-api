@@ -448,15 +448,17 @@ func (s *Service) waitRunning(ctx context.Context, host, tmpl, slug string) erro
 // "healthy". Containers with no declared healthcheck (Health == "") are gated on
 // liveness alone, so an instance without healthchecks behaves exactly as before.
 // "starting" (still inside the healthcheck start_period) counts as not ready.
+// Status comparisons use EqualFold because podman's API returns pod state
+// capitalised ("Running") but container state lowercased ("running") — #149.
 func podReady(p podman.Pod) bool {
-	if p.Status != "Running" {
+	if !strings.EqualFold(p.Status, "Running") {
 		return false
 	}
 	for _, c := range p.Containers {
-		if c.Status != "Running" {
+		if !strings.EqualFold(c.Status, "running") {
 			return false
 		}
-		if c.Health != "" && c.Health != "healthy" {
+		if c.Health != "" && !strings.EqualFold(c.Health, "healthy") {
 			return false
 		}
 	}

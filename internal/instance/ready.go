@@ -81,6 +81,9 @@ func (s *Service) waitReady(ctx context.Context, host, tmpl, slug string, timeou
 		case err == nil:
 			stable = 0
 			log.Printf("pod %s not ready (status=%q, stable reset to 0)", name, p.Status)
+			for _, c := range p.Containers {
+				log.Printf("  container %s: status=%q health=%q", c.Name, c.Status, c.Health)
+			}
 		default:
 			log.Printf("pod %s inspect error: %v (stable=%d/%d, not reset)", name, err, stable, stableCount)
 		}
