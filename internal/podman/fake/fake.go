@@ -25,6 +25,11 @@ type Fake struct {
 	volumes map[string]map[string]podman.Volume // hostID -> name -> Volume
 	volData map[string]map[string][]byte        // hostID -> name -> tar bytes
 
+	// SecretData stores the raw bytes passed to SecretCreate, keyed by
+	// (hostID, name). Tests can decode them to assert the wrapped K8s Secret
+	// structure (metadata.name, data keys).
+	SecretData map[string]map[string][]byte // hostID -> name -> raw value bytes
+
 	// Optional hooks for tests that want to inject errors.
 	PlayKubeErr error
 	// PlayKubePodStatus overrides the status assigned to pods created by
@@ -341,13 +346,20 @@ func (f *Fake) PodRemove(_ context.Context, h, name string, _ bool) error {
 	return nil
 }
 
-func (f *Fake) SecretCreate(_ context.Context, h, name string, _ []byte) error {
+func (f *Fake) SecretCreate(_ context.Context, h, name string, value []byte) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.SecretCreateErr != nil {
 		return f.SecretCreateErr
 	}
 	f.hostSecrets(h)[name] = podman.Secret{Name: name, CreatedAt: time.Now()}
+	if f.SecretData == nil {
+		f.SecretData = map[string]map[string][]byte{}
+	}
+	if f.SecretData[h] == nil {
+		f.SecretData[h] = map[string][]byte{}
+	}
+	f.SecretData[h][name] = value
 	return nil
 }
 func (f *Fake) SecretList(_ context.Context, h string) ([]podman.Secret, error) {

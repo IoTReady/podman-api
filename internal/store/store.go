@@ -33,6 +33,14 @@ var ErrSpecCorrupt = errors.New("store: spec row corrupt (malformed)")
 // so callers (boot reconciliation) keep retrying rather than failing terminally.
 var ErrSecretsUndecryptable = errors.New("store: secrets undecryptable (wrong or missing -spec-key-file)")
 
+// InjectorSecret is one secret declared by a SidecarInjector. It carries the
+// data key needed to reconstruct the podman/K8s secret on boot converge.
+type InjectorSecret struct {
+	Name  string // short name; instanceSecretName(tmpl, slug, Name) is the podman secret name
+	Key   string // data key within the K8s Secret YAML (secretKeyRef.key)
+	Value string // plaintext value
+}
+
 // Spec is the desired state of one instance.
 type Spec struct {
 	Host     string
@@ -44,9 +52,10 @@ type Spec struct {
 	// text/template are unaffected; callers must not type-assert .(int).
 	Parameters map[string]any
 	Secrets    map[string]string
-	// InjectorSecretNames tracks the short names of secrets declared by the
-	// SidecarInjector on the last Apply. The core prunes these on Delete.
-	InjectorSecretNames []string
+	// InjectorSecrets tracks secrets declared by the SidecarInjector on the
+	// last Apply. Each entry preserves the (Name, Key, Value) triple so boot
+	// converge re-creates them with the correct K8s data key. Pruned on Delete.
+	InjectorSecrets []InjectorSecret
 	// Domains are the public hostnames the ingress layer routes to this
 	// instance. Empty for non-web instances. Non-secret; stored in plaintext.
 	Domains []string
