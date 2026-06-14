@@ -267,6 +267,40 @@ func TestEvacuate_CancelChildFinishUsesDetachedCtx(t *testing.T) {
 
 // —————— End of original tests ——————
 
+func TestEvacuateMovesArray_AllSucceed(t *testing.T) {
+	ctx := context.Background()
+	svc, mem := buildSvc(t, "acme", "globex")
+	parent, _ := mem.Enqueue(ctx, "evacuate", mustArgsMoves(t, "hostA",
+		[]instance.Move{
+			{Template: "web", Slug: "acme", ToHost: "hostB"},
+			{Template: "web", Slug: "globex", ToHost: "hostC"},
+		}), "")
+
+	var calls int32
+	h := &Handler{Svc: svc, Jobs: mem}
+	h.migrate = func(_ context.Context, req instance.MigrateRequest, step func(string, string)) error {
+		atomic.AddInt32(&calls, 1)
+		step("fake", req.Slug)
+		return nil
+	}
+
+	if err := h.Run(ctx, parent, jobs.NewJobContext(mem, parent.ID)); err != nil {
+		t.Fatalf("want success, got %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("want 2 migrate calls, got %d", calls)
+	}
+	children, _ := mem.ListJobs(ctx, store.JobFilter{ParentID: parent.ID})
+	if len(children) != 2 {
+		t.Fatalf("want 2 children, got %d", len(children))
+	}
+	for _, c := range children {
+		if c.Kind != "migrate" || c.State != store.JobSucceeded {
+			t.Fatalf("child not succeeded migrate: %+v", c)
+		}
+	}
+}
+
 func TestEvacuateSharedSlugAcrossTemplates_MovesArray(t *testing.T) {
 	// Two instances share a slug across different templates on the same host.
 	// The Moves array (template, slug) form must express both without ambiguity.
@@ -306,6 +340,18 @@ func TestEvacuateSharedSlugAcrossTemplates_MovesArray(t *testing.T) {
 		t.Fatalf("want success, got %v", err)
 	}
 
+	// Assert each migrate request was dispatched to the correct destination.
+	got := map[string]string{}
+	for _, req := range seen {
+		got[req.Template+"/"+req.Slug] = req.ToHost
+	}
+	if got["postgres/dup"] != "hostB" {
+		t.Fatalf("postgres/dup routed to %q, want hostB", got["postgres/dup"])
+	}
+	if got["redis/dup"] != "hostC" {
+		t.Fatalf("redis/dup routed to %q, want hostC", got["redis/dup"])
+	}
+
 	// Both children must exist and refer to the correct (template, slug).
 	children, _ := mem.ListJobs(ctx, store.JobFilter{ParentID: parent.ID})
 	if len(children) != 2 {
@@ -341,9 +387,7 @@ func TestEvacuate_ChildRollback_VerifyFailure(t *testing.T) {
 	// verifyInterval is 2s by default and is not exported — the evacuate
 	// package cannot shorten it via setVerifyKnobs (instance-internal). A full
 	// PollImmediate-style test would take 2s per poll × 3 stable checks, which
-	// is impractical for a unit test. Instead we exercise the same rollback
-	// machinery in TestEvacuate_ChildPreflightFailure_SiblingCompletes via the real Svc.Migrate path; the
-	// verify-failure rollback path itself is covered in the instance package's
-	// TestMigrate_Rollback/verify fails.
+	// is impractical for a unit test. The verify-failure rollback path itself
+	// is covered in the instance package's TestMigrate_Rollback/verify fails.
 	t.Skip("verifyInterval is unexported — this test needs setVerifyKnobs access")
 }

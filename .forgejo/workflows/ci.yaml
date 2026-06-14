@@ -151,7 +151,8 @@ jobs:
             [ -S /tmp/podman2/podman2.sock ] && break
             sleep 1
           done
-          podman --root /tmp/podman2/root --runroot /tmp/podman2/run info >/dev/null
+          [ -S /tmp/podman2/podman2.sock ] || { echo "podman2 socket did not appear"; exit 1; }
+          podman --url unix:///tmp/podman2/podman2.sock info >/dev/null
 
       - name: integration tests
         # Explicit -timeout so a nested-podman hang fails clearly instead of

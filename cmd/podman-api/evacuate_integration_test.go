@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -167,7 +168,7 @@ func TestEvacuate_TwoSockets_LocalOnly(t *testing.T) {
 
 	tok := "evactoken"
 	hash, _ := config.HashToken(tok)
-	keys := []config.APIKey{{ID: "evac", SecretHash: hash, Scopes: []string{"instances:*", "hosts:read"}}}
+	keys := []config.APIKey{{ID: "evac", SecretHash: hash, Scopes: []string{"instances:*", "hosts:read", "jobs:read"}}}
 	r := api.NewRouter(svc, db, auth.NewKeyStore(keys), nil, nil, runner)
 	srv := httptest.NewServer(r)
 	defer srv.Close()
@@ -216,12 +217,14 @@ func TestEvacuate_TwoSockets_LocalOnly(t *testing.T) {
 		for {
 			resp, err := do("GET", "/jobs/"+id, "")
 			require.NoError(t, err)
+			body, err := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			require.NoError(t, err)
 			var jv struct {
 				State string `json:"state"`
 				Error string `json:"error"`
 			}
-			require.NoError(t, json.NewDecoder(resp.Body).Decode(&jv))
-			resp.Body.Close()
+			require.NoError(t, json.Unmarshal(body, &jv))
 			switch jv.State {
 			case "succeeded":
 				return
@@ -286,23 +289,24 @@ func TestEvacuate_TwoSockets_LocalOnly(t *testing.T) {
 	resp, err = do("GET", "/jobs?parent_id="+ev.JobID, "")
 	require.NoError(t, err)
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-	var jl struct {
-		Jobs []struct {
-			Kind  string `json:"kind"`
-			State string `json:"state"`
-		} `json:"jobs"`
+	var jl []struct {
+		Kind  string `json:"kind"`
+		State string `json:"state"`
+		ID    string `json:"id"`
 	}
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&jl))
 	resp.Body.Close()
-	require.Len(t, jl.Jobs, 2)
+	require.Len(t, jl, 2)
 	ok, bad := 0, 0
-	for _, j := range jl.Jobs {
+	for _, j := range jl {
 		assert.Equal(t, "migrate", j.Kind)
 		switch j.State {
 		case "succeeded":
 			ok++
-		case "failed":
+		case "failed", "canceled":
 			bad++
+		default:
+			t.Fatalf("unexpected child job %s state %q", j.ID, j.State)
 		}
 	}
 	assert.Equal(t, 2, ok, "both child migrate jobs should succeed")
