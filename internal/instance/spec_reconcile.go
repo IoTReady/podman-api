@@ -150,6 +150,13 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 		return false, fmt.Errorf("render: %w", err)
 	}
 
+	if s.sidecar != nil {
+		yaml, err = s.sidecar.InjectSidecars(ctx, yaml, tmplObj.Meta, params, slug)
+		if err != nil {
+			return false, fmt.Errorf("sidecar inject: %w", err)
+		}
+	}
+
 	// Step 6: re-create per-instance secrets on the host.
 	for k, v := range spec.Secrets {
 		name := instanceSecretName(tmpl, slug, k)
