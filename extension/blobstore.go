@@ -1,8 +1,10 @@
 // Package extension provides public interfaces that a private commercial module
 // can implement to extend podman-api without modifying OSS internals.
 //
-// The BlobStore seam is the first extension point. Future releases will add
-// extension points for RBAC auth and custom ingress controllers.
+// Current extension points: BlobStore (backup artifact storage) and
+// SidecarInjector (inject sidecar containers into rendered pod YAML). Future
+// releases will add extension points for RBAC auth and custom ingress
+// controllers.
 package extension
 
 import (

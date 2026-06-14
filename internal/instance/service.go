@@ -84,6 +84,7 @@ type Service struct {
 	ingress    ingress.Controller                     // never nil; ingress.Disabled{} when off
 	ingressNet string                                 // shared ingress network; "" when ingress disabled
 	blobs      BlobStore                              // backup artifact store; set via SetBlobStore (nil → backups disabled)
+	sidecar    SidecarInjector                        // sidecar injector; set via SetSidecarInjector (nil → no injection)
 
 	verifyVolumes bool // verify each migrated volume's content before reaping the source
 
@@ -129,6 +130,10 @@ func (s *Service) SetStore(st Store) { s.store = st }
 // SetBlobStore wires the backup artifact store. Backups/restores are refused
 // (ErrBackupsDisabled) until this is set; main always sets it.
 func (s *Service) SetBlobStore(bs BlobStore) { s.blobs = bs }
+
+// SetSidecarInjector wires a sidecar injector that is called after template
+// rendering but before the pod YAML is applied.
+func (s *Service) SetSidecarInjector(si SidecarInjector) { s.sidecar = si }
 
 // SetIngress enables ingress reconciliation. network is the shared podman
 // network app pods join; passing a real controller marks ingress enabled so
@@ -380,6 +385,13 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 	yaml, err := render.RenderBody(tmpl.Body, req.Parameters)
 	if err != nil {
 		return fmt.Errorf("render: %w", err)
+	}
+
+	if s.sidecar != nil {
+		yaml, err = s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmpl.Meta), req.Parameters, req.Slug)
+		if err != nil {
+			return fmt.Errorf("sidecar inject: %w", err)
+		}
 	}
 
 	// Pre-pull images BEFORE writing any secrets. A bad image ref then leaves

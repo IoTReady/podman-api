@@ -38,7 +38,8 @@ import (
 )
 
 type cfg struct {
-	blobStore extension.BlobStore
+	blobStore       extension.BlobStore
+	sidecarInjector extension.SidecarInjector
 }
 
 type Option func(*cfg)
@@ -169,6 +170,11 @@ func RunWithFlags(opts ...Option) error {
 		}
 		svc.SetBlobStore(blobs)
 		log.Printf("backups enabled: %s", bdir)
+	}
+
+	if c.sidecarInjector != nil {
+		svc.SetSidecarInjector(c.sidecarInjector)
+		log.Printf("sidecar injector enabled")
 	}
 
 	runnerCtx, cancelRunner := context.WithCancel(context.Background())
