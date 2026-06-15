@@ -46,6 +46,95 @@ func (u *UI) instanceDetail(w http.ResponseWriter, r *http.Request) {
 	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(r.Context(), host, obs)))
 }
 
+// renameForm renders the rename form. The Get call acts as an existence check
+// — it renders an error if the instance doesn't exist before showing the form.
+func (u *UI) renameForm(w http.ResponseWriter, r *http.Request) {
+	host, tmplID, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
+	if _, err := u.cfg.Svc.Get(r.Context(), host, tmplID, slug); err != nil {
+		u.renderError(w, r, err)
+		return
+	}
+	domains := ""
+	spec, err := u.cfg.Svc.StoredSpec(r.Context(), host, tmplID, slug)
+	if err == nil {
+		domains = strings.Join(spec.Domains, ", ")
+	}
+	u.render(w, r, http.StatusOK, "rename-form", u.pageData(map[string]any{
+		"Host":       host,
+		"ActiveHost": host,
+		"Template":   tmplID,
+		"Slug":       slug,
+		"Domains":    domains,
+	}))
+}
+
+// renameApply handles the rename form submission.
+func (u *UI) renameApply(w http.ResponseWriter, r *http.Request) {
+	host, tmplID, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
+	newSlug := strings.TrimSpace(r.FormValue("new_slug"))
+	domainsRaw := strings.TrimSpace(r.FormValue("domains"))
+	keepOld := r.FormValue("keep_old_standby") == "true"
+
+	if newSlug == "" {
+		u.render(w, r, http.StatusBadRequest, "rename-form", u.pageData(map[string]any{
+			"Host": host, "ActiveHost": host, "Template": tmplID, "Slug": slug,
+			"Error": "new slug is required",
+		}))
+		return
+	}
+
+	var domains []string
+	if domainsRaw != "" {
+		for _, d := range strings.Split(domainsRaw, ",") {
+			d = strings.TrimSpace(d)
+			if d != "" {
+				domains = append(domains, d)
+			}
+		}
+	}
+
+	req := instance.RenameRequest{
+		NewSlug:        newSlug,
+		Domains:        domains,
+		KeepOldStandby: keepOld,
+	}
+
+	if err := u.cfg.Svc.CheckRenameable(r.Context(), host, tmplID, slug, req); err != nil {
+		spec, _ := u.cfg.Svc.StoredSpec(r.Context(), host, tmplID, slug)
+		domainsStr := ""
+		if spec.Domains != nil {
+			domainsStr = strings.Join(spec.Domains, ", ")
+		}
+		u.render(w, r, errorStatus(err), "rename-form", u.pageData(map[string]any{
+			"Host": host, "ActiveHost": host, "Template": tmplID, "Slug": slug,
+			"Domains": domainsStr, "Error": err.Error(),
+		}))
+		return
+	}
+
+	if err := u.cfg.Svc.Rename(r.Context(), host, tmplID, slug, req, nil); err != nil {
+		spec, _ := u.cfg.Svc.StoredSpec(r.Context(), host, tmplID, slug)
+		domainsStr := ""
+		if spec.Domains != nil {
+			domainsStr = strings.Join(spec.Domains, ", ")
+		}
+		u.render(w, r, errorStatus(err), "rename-form", u.pageData(map[string]any{
+			"Host": host, "ActiveHost": host, "Template": tmplID, "Slug": slug,
+			"Domains": domainsStr, "Error": err.Error(),
+		}))
+		return
+	}
+
+	// Render the new instance's detail page. The form's hx-target="#main"
+	// and hx-push-url="true" on the form element will update the URL.
+	obs, err := u.cfg.Svc.Get(r.Context(), host, tmplID, newSlug)
+	if err != nil {
+		u.renderError(w, r, err)
+		return
+	}
+	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(r.Context(), host, obs)))
+}
+
 // lifecycle dispatches start/stop/restart/delete, then re-renders the instance
 // detail (or the host instance list, after a delete). Upgrade is NOT handled
 // here — it is a separate form flow.

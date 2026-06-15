@@ -72,6 +72,7 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 	mux.Handle("POST /hosts/{host}/instances/{template}/{slug}/stop", guard("instances:write", http.HandlerFunc(h.stopInstance)))
 	mux.Handle("POST /hosts/{host}/instances/{template}/{slug}/restart", guard("instances:write", http.HandlerFunc(h.restartInstance)))
 	mux.Handle("POST /hosts/{host}/instances/{template}/{slug}/upgrade", guard("instances:write", http.HandlerFunc(h.upgradeInstance)))
+	mux.Handle("POST /hosts/{host}/instances/{template}/{slug}/rename", guard("instances:write", http.HandlerFunc(h.renameInstance)))
 
 	// Bulk lifecycle operations against many instances on one host.
 	mux.Handle("POST /hosts/{host}/bulk", guard("instances:write", http.HandlerFunc(h.bulk)))
