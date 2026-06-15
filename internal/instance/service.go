@@ -769,6 +769,15 @@ func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug st
 	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
 }
 
+// StoredSpec returns the persisted spec (parameters, secrets, domains) for an
+// existing instance, so the UI edit form can pre-populate parameters and merge
+// secrets before re-applying. The caller must NOT render or log the returned
+// secrets — they are write-only merge inputs, intended to be overlaid with form
+// values and re-persisted via ApplyAndObserve(Replace: true).
+func (s *Service) StoredSpec(ctx context.Context, host, tmpl, slug string) (store.Spec, error) {
+	return s.store.GetSpec(ctx, host, tmpl, slug)
+}
+
 // InstanceSecretState reports, per stored per-instance secret name, that a value
 // is present — presence only, never the value (the secret model is write-only).
 // Names a template declares but the instance never set are simply absent from the

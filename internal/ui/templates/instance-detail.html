@@ -9,6 +9,7 @@
     <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/start"   hx-target="#main" hx-disabled-elt="this">Start</button>
     <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/stop"    hx-target="#main" hx-disabled-elt="this">Stop</button>
     <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/restart" hx-target="#main" hx-disabled-elt="this">Restart</button>
+    <a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/edit" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/edit" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Edit</a>
     {{if .CanUpgrade}}<a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Upgrade</a>{{end}}
     {{if .HasSecrets}}<a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/secrets" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/secrets" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Manage secrets</a>{{end}}
     <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/delete" hx-target="#main"

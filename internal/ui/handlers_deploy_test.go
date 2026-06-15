@@ -2,13 +2,16 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iotready/podman-api/internal/config"
+	"github.com/iotready/podman-api/internal/ingress"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/podman/fake"
@@ -449,5 +452,291 @@ func TestUpgradeApplyMissingImageRerendersForm(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), `name="image"`) {
 		t.Error("upgrade form should re-render with the image field on error")
+	}
+}
+
+// ---- Edit (re-apply) handler tests ----
+
+// uiWithEditInstance builds a UI whose service has a "demo" template with a
+// real pod body, a seeded "demo/main" pod, and a stored spec carrying
+// parameters, secrets, and domains — so the edit flow can load, re-render, and
+// re-apply.
+func uiWithEditInstance(t *testing.T) *UI {
+	t.Helper()
+	fc := fake.New()
+	fc.PlayKubeContainerHealth = "healthy"
+	hosts := []config.Host{{ID: "edge-1"}}
+	fc.AddPod("edge-1", podman.Pod{
+		Name:   "demo-main",
+		Status: "Running",
+		Containers: []podman.Container{
+			{Name: "demo-main-app", Image: "demo:1", Status: "Running", Health: "healthy"},
+		},
+	})
+	mem := store.NewMemory()
+	_ = mem.PutTemplate(context.Background(), store.Template{
+		Meta: render.Meta{
+			ID: "demo",
+			Parameters: []render.ParamDef{
+				{Name: "version", Required: true},
+			},
+			Secrets: render.Secrets{PerInstance: []string{"password"}},
+		},
+		Body: `kind: Pod
+metadata:
+  name: demo-main
+spec:
+  containers:
+    - name: app
+      image: demo:{{.version}}
+`,
+		Origin: "seed",
+	})
+	_ = mem.PutSpec(context.Background(), store.Spec{
+		Host: "edge-1", Template: "demo", Slug: "main",
+		Parameters: map[string]any{"version": "1"},
+		Secrets:    map[string]string{"password": "hunter2"},
+	})
+	svc := instance.NewService(fc, hosts)
+	svc.SetStore(mem)
+	hash, _ := config.HashToken("pw")
+	u, err := New(Config{
+		Svc:  svc,
+		Jobs: mem,
+		Auth: NewOperatorAuthenticator(config.Operator{Username: "op", PasswordHash: hash}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+func TestEditFormRendersPrePopulatedParams(t *testing.T) {
+	u := uiWithEditInstance(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1/instances/demo/main/edit")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `value="1"`) {
+		t.Error("edit form should pre-populate the stored param 'version' value")
+	}
+	if !strings.Contains(body, `placeholder="unchanged"`) {
+		t.Error("edit form should show 'unchanged' placeholder for existing secrets")
+	}
+	// The actual secret value must never appear in the response.
+	if strings.Contains(body, "hunter2") {
+		t.Error("edit form must never contain the actual stored secret value")
+	}
+}
+
+func TestEditFormUnknownHostIs404(t *testing.T) {
+	u := uiWithEditInstance(t)
+	w := authedGet(t, u, "/ui/hosts/nope/instances/demo/main/edit")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for unknown host", w.Code)
+	}
+}
+
+func TestEditFormNonexistentInstanceIsNotFound(t *testing.T) {
+	u := uiWithEditInstance(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1/instances/demo/nope/edit")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 for nonexistent instance", w.Code)
+	}
+}
+
+func TestEditApplyPreservesUntouchedSecrets(t *testing.T) {
+	u := uiWithEditInstance(t)
+	instance.SetDeployVerifyTimeout(0)
+	defer instance.SetDeployVerifyTimeout(30 * time.Second)
+
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{
+		csrfField:       {csrfToken(tok)},
+		"param.version": {"2"},
+		// No secret.password submitted — must be preserved from stored spec.
+	}
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/instances/demo/main/edit", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (edit apply success)", w.Code)
+	}
+	// Verify the response is instance-detail (not the error form).
+	body := w.Body.String()
+	if strings.Contains(body, `placeholder="unchanged"`) {
+		t.Error("successful edit apply should render instance-detail, not the form")
+	}
+	// Verify the stored spec was updated with the new param and preserved secret.
+	spec, err := u.cfg.Svc.StoredSpec(context.Background(), "edge-1", "demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := spec.Parameters["version"]; !ok || fmt.Sprint(got) != "2" {
+		t.Errorf("stored version = %v, want 2", got)
+	}
+	if got := spec.Secrets["password"]; got != "hunter2" {
+		t.Errorf("stored password = %q, want hunter2 (preserved)", got)
+	}
+}
+
+func TestEditApplyAppliesChangedSecret(t *testing.T) {
+	u := uiWithEditInstance(t)
+	instance.SetDeployVerifyTimeout(0)
+	defer instance.SetDeployVerifyTimeout(30 * time.Second)
+
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{
+		csrfField:         {csrfToken(tok)},
+		"param.version":   {"3"},
+		"secret.password": {"newsecret"},
+	}
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/instances/demo/main/edit", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	spec, err := u.cfg.Svc.StoredSpec(context.Background(), "edge-1", "demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := spec.Secrets["password"]; got != "newsecret" {
+		t.Errorf("stored password = %q, want newsecret", got)
+	}
+}
+
+func TestEditApplyErrorRerenderDoesNotLeakSecrets(t *testing.T) {
+	u := uiWithEditInstance(t)
+	instance.SetDeployVerifyTimeout(0)
+	defer instance.SetDeployVerifyTimeout(30 * time.Second)
+
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{
+		csrfField: {csrfToken(tok)},
+		// no param.version — validation fails
+		"secret.password": {"changed"},
+	}
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/instances/demo/main/edit", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code == http.StatusOK {
+		t.Fatalf("expected non-200 status for failed edit, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "hunter2") {
+		t.Error("error re-render must not contain the stored secret value 'hunter2'")
+	}
+	if !strings.Contains(body, `value="changed"`) {
+		t.Error("error re-render should show the typed secret value that the operator submitted")
+	}
+	if !strings.Contains(body, "demo") || !strings.Contains(body, "main") {
+		t.Error("error re-render should show the instance template/slug in the heading")
+	}
+}
+
+func TestEditApplyRequiresCSRF(t *testing.T) {
+	u := uiWithEditInstance(t)
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{
+		"param.version": {"1"},
+		// no csrf_token
+	}
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/instances/demo/main/edit", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 for missing CSRF", w.Code)
+	}
+}
+
+// uiWithEditInstanceIngress is like uiWithEditInstance but with ingress enabled
+// and domains seeded, so the domain carry-over path can be tested.
+func uiWithEditInstanceIngress(t *testing.T) *UI {
+	t.Helper()
+	fc := fake.New()
+	fc.PlayKubeContainerHealth = "healthy"
+	hosts := []config.Host{{ID: "edge-1"}}
+	fc.AddPod("edge-1", podman.Pod{
+		Name:   "demo-main",
+		Status: "Running",
+		Containers: []podman.Container{
+			{Name: "demo-main-app", Image: "demo:1", Status: "Running", Health: "healthy"},
+		},
+	})
+	mem := store.NewMemory()
+	_ = mem.PutTemplate(context.Background(), store.Template{
+		Meta: render.Meta{
+			ID: "demo",
+			Parameters: []render.ParamDef{
+				{Name: "version", Required: true},
+			},
+			Secrets: render.Secrets{PerInstance: []string{"password"}},
+			Ingress: &render.Ingress{Container: "app", Port: 8080},
+		},
+		Body: `kind: Pod
+metadata:
+  name: demo-main
+spec:
+  containers:
+    - name: app
+      image: demo:{{.version}}
+`,
+		Origin: "seed",
+	})
+	_ = mem.PutSpec(context.Background(), store.Spec{
+		Host: "edge-1", Template: "demo", Slug: "main",
+		Parameters: map[string]any{"version": "1"},
+		Secrets:    map[string]string{"password": "hunter2"},
+		Domains:    []string{"app.example.com"},
+	})
+	svc := instance.NewService(fc, hosts)
+	svc.SetIngress(ingress.Disabled{}, "test-net")
+	svc.SetStore(mem)
+	hash, _ := config.HashToken("pw")
+	u, err := New(Config{
+		Svc:  svc,
+		Jobs: mem,
+		Auth: NewOperatorAuthenticator(config.Operator{Username: "op", PasswordHash: hash}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+func TestEditApplyCarriesDomains(t *testing.T) {
+	u := uiWithEditInstanceIngress(t)
+	instance.SetDeployVerifyTimeout(0)
+	defer instance.SetDeployVerifyTimeout(30 * time.Second)
+
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{
+		csrfField:       {csrfToken(tok)},
+		"param.version": {"4"},
+	}
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/instances/demo/main/edit", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	spec, err := u.cfg.Svc.StoredSpec(context.Background(), "edge-1", "demo", "main")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spec.Domains) != 1 || spec.Domains[0] != "app.example.com" {
+		t.Errorf("domains = %v, want [app.example.com]", spec.Domains)
 	}
 }

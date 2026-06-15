@@ -1,15 +1,29 @@
 {{define "deploy-form"}}
+{{if .EditMode}}
+<h2>Edit {{.Inst.Template}} / {{.Inst.Slug}} on {{.Host}}</h2>
+<p class="detail">Re-applies the instance with updated parameters (pod is recreated).</p>
+{{else}}
 <h2>Deploy on {{.Host}}</h2>
+{{end}}
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-<form hx-post="/ui/hosts/{{.Host}}/deploy" hx-target="#main" class="pure-form pure-form-stacked">
+<form hx-post="{{if .EditMode}}/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/edit{{else}}/ui/hosts/{{.Host}}/deploy{{end}}" hx-target="#main" class="pure-form pure-form-stacked">
   <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  {{if .EditMode}}
+  <label>Template
+    <select name="template" disabled>
+      <option value="{{.Inst.Template}}" selected>{{.Inst.Template}}</option>
+    </select>
+  </label>
+  <label>Slug <input name="slug" value="{{.Inst.Slug}}" required readonly></label>
+  {{else}}
   <label>Template
     <select name="template" hx-post="/ui/hosts/{{.Host}}/deploy/form" hx-target="#main" hx-trigger="change" hx-include="closest form">
       {{range .Templates}}<option value="{{.Meta.ID}}"{{if eq .Meta.ID $.Selected}} selected{{end}}>{{.Meta.ID}}</option>{{end}}
     </select>
   </label>
   <label>Slug <input name="slug" value="{{.Slug}}" required></label>
+  {{end}}
   {{template "instance-fields" .}}
-  <button type="submit" class="pure-button pure-button-primary" hx-disabled-elt="this">Deploy</button>
+  <button type="submit" class="pure-button pure-button-primary" hx-disabled-elt="this">{{if .EditMode}}Apply changes{{else}}Deploy{{end}}</button>
 </form>
 {{end}}
