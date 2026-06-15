@@ -233,3 +233,11 @@ func TestService_Apply_SecretDataKeys(t *testing.T) {
 	_, hasWrongKey := injSecret.Data["litestream-s3-key"]
 	assert.False(t, hasWrongKey, "injector secret data key must NOT be the secret name")
 }
+
+// instanceSecretName delegates to extension.InstanceSecretName so there is a
+// single source of truth for the per-instance secret namespacing convention.
+func TestInstanceSecretName_Delegates(t *testing.T) {
+	want := extension.InstanceSecretName("web", "x", "password")
+	got := instanceSecretName("web", "x", "password")
+	assert.Equal(t, want, got, "internal delegate must match the exported helper")
+}

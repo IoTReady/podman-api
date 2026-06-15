@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/iotready/podman-api/extension"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/ingress"
 	"github.com/iotready/podman-api/internal/podman"
@@ -261,7 +262,7 @@ func (s *Service) lookup(ctx context.Context, host, tmpl string) (store.Template
 func podName(tmpl, slug string) string { return tmpl + "-" + slug }
 
 func instanceSecretName(tmpl, slug, name string) string {
-	return tmpl + "-" + slug + "-" + name
+	return extension.InstanceSecretName(tmpl, slug, name)
 }
 
 // Apply creates or replaces an instance. If opts.Replace is false and the pod
