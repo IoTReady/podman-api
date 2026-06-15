@@ -145,7 +145,7 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 	}
 
 	// Step 5: re-render the YAML from stored parameters.
-	yaml, err := render.RenderBody(tmplObj.Body, params)
+	yaml, err := render.RenderAndValidate(tmplObj.Body, params)
 	if err != nil {
 		return false, fmt.Errorf("render: %w", err)
 	}

@@ -383,7 +383,7 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 		return ErrInstanceExists
 	}
 
-	yaml, err := render.RenderBody(tmpl.Body, req.Parameters)
+	yaml, err := render.RenderAndValidate(tmpl.Body, req.Parameters)
 	if err != nil {
 		return fmt.Errorf("render: %w", err)
 	}

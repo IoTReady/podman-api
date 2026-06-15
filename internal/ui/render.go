@@ -116,6 +116,7 @@ func errorStatus(err error) int {
 	case errors.Is(err, instance.ErrStoreDisabled):
 		return http.StatusNotImplemented
 	case errors.Is(err, render.ErrInvalidParameters),
+		errors.Is(err, render.ErrRenderInvalid),
 		errors.Is(err, instance.ErrSameHost),
 		errors.Is(err, store.ErrSecretsNeedKey):
 		return http.StatusBadRequest

@@ -75,7 +75,8 @@ func classify(err error) (code string, status int, msg string) {
 		return "backup_busy", http.StatusConflict, err.Error()
 	case errors.Is(err, instance.ErrBackupsDisabled):
 		return "not_implemented", http.StatusNotImplemented, err.Error()
-	case errors.Is(err, render.ErrInvalidParameters):
+	case errors.Is(err, render.ErrInvalidParameters),
+		errors.Is(err, render.ErrRenderInvalid):
 		return "invalid_parameters", http.StatusBadRequest, err.Error()
 	case errors.Is(err, errJobsDisabled):
 		return "not_implemented", http.StatusNotImplemented, err.Error()
