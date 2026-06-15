@@ -11,6 +11,9 @@
   {{- $ph := index $.Placeholders .Name}}
   <label>{{$label}}{{if .Required}} (required){{end}}
     <input name="param.{{.Name}}"{{if .Required}} required{{end}}{{if $ph}} placeholder="{{$ph}}"{{end}} value="{{index $.Values (printf "param.%s" .Name)}}">
+    {{- if and (not $.EditMode) (eq .Name "port") (gt $.PortSuggestion 0)}}
+      <small class="hint">Suggested: <strong>{{$.PortSuggestion}}</strong>{{if $.PortsInUse}} · In use: {{$.PortsInUse}}{{end}}</small>
+    {{- end}}
   </label>
 {{end}}
 {{if .Tmpl.Meta.Secrets.PerInstance}}

@@ -2,12 +2,16 @@ package ui
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/store"
 )
 
@@ -165,6 +169,94 @@ func paramPlaceholders(tmpl store.Template) map[string]string {
 	return ph
 }
 
+// portParamFloor is the minimum host port the suggestion algorithm starts from.
+const portParamFloor = 30000
+
+// hasPortParam reports whether the template declares a parameter named "port"
+// with type "int", which the deploy form treats as a publishable host port.
+func hasPortParam(tmpl store.Template) bool {
+	for _, p := range tmpl.Meta.Parameters {
+		if p.Name == "port" && p.Type == "int" {
+			return true
+		}
+	}
+	return false
+}
+
+// suggestPortFrom returns the first free port at or above the max in-use port
+// (with a floor of portParamFloor), scanning upward by up to scanLimit ports.
+// Returns 0 when no free port is found in the scan window.
+func suggestPortFrom(ports []podman.PortMapping) int {
+	busy := map[int]bool{}
+	maxPort := 0
+	for _, p := range ports {
+		busy[p.HostPort] = true
+		if p.HostPort > maxPort {
+			maxPort = p.HostPort
+		}
+	}
+	start := maxPort + 1
+	if start < portParamFloor {
+		start = portParamFloor
+	}
+	const scanLimit = 1000
+	for port := start; port < start+scanLimit; port++ {
+		if !busy[port] {
+			return port
+		}
+	}
+	log.Printf("port scan exhausted: no free port in [%d, %d)", start, start+scanLimit)
+	return 0
+}
+
+// portsInUseStr builds a compact display string for a slice of port mappings,
+// e.g. "31000, 31002". Returns "" when the slice is empty.
+func portsInUseStr(ports []podman.PortMapping) string {
+	if len(ports) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(ports))
+	for _, p := range ports {
+		parts = append(parts, strconv.Itoa(p.HostPort))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// checkPortConflict returns a user-facing error when port is already in use on
+// host, or nil when the port is free. The message includes a suggestion when
+// one is available.
+func (u *UI) checkPortConflict(ctx context.Context, host string, port int) error {
+	ports, err := u.cfg.Svc.PortsInUse(ctx, host)
+	if err != nil {
+		return nil // degraded: let the downstream apply surface the error
+	}
+	for _, p := range ports {
+		if p.HostPort == port {
+			msg := fmt.Sprintf("port %d is already in use by %s/%s", port, p.Pod, p.Container)
+			if sug := suggestPortFrom(ports); sug > 0 {
+				msg += fmt.Sprintf("; suggested free port: %d", sug)
+			}
+			return errors.New(msg)
+		}
+	}
+	return nil
+}
+
+// resolveTemplate looks up a template by id. Returns the zero value when
+// not found; the caller should check tmpl.Meta.ID.
+func resolveTemplate(ctx context.Context, svc *instance.Service, id string) store.Template {
+	tmpls, err := svc.Templates(ctx)
+	if err != nil {
+		return store.Template{}
+	}
+	for _, tmpl := range tmpls {
+		if tmpl.Meta.ID == id {
+			return tmpl
+		}
+	}
+	return store.Template{}
+}
+
 // deployFormData assembles the data map the "deploy-form" template needs. vals
 // are the raw typed param.*/secret.* values to re-populate; mergeParamDefaults
 // is applied here so every caller shares one defaults policy. A store error
@@ -194,16 +286,26 @@ func (u *UI) deployFormData(r *http.Request, host, selected, slug string, vals m
 	}
 	refs := u.hostSecretRefs(r, host, tmpl)
 	mergeParamDefaults(vals, tmpl)
+	var sug int
+	var busy string
+	if hasPortParam(tmpl) {
+		if ports, err := u.cfg.Svc.PortsInUse(r.Context(), host); err == nil {
+			sug = suggestPortFrom(ports)
+			busy = portsInUseStr(ports)
+		}
+	}
 	return map[string]any{
-		"Host":         host,
-		"ActiveHost":   host,
-		"Templates":    tmpls,
-		"Selected":     selected,
-		"Tmpl":         tmpl,
-		"HostRefs":     refs,
-		"Slug":         slug,
-		"Values":       vals,
-		"Placeholders": paramPlaceholders(tmpl),
+		"Host":           host,
+		"ActiveHost":     host,
+		"Templates":      tmpls,
+		"Selected":       selected,
+		"Tmpl":           tmpl,
+		"HostRefs":       refs,
+		"Slug":           slug,
+		"Values":         vals,
+		"Placeholders":   paramPlaceholders(tmpl),
+		"PortSuggestion": sug,
+		"PortsInUse":     busy,
 	}, nil
 }
 
@@ -252,6 +354,28 @@ func (u *UI) deployCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	params, secrets := formValues(r.PostForm)
+	tmpl := resolveTemplate(r.Context(), u.cfg.Svc, r.FormValue("template"))
+
+	// Port conflict pre-check: if the template has a port param and the
+	// operator submitted one, verify it isn't already bound on the host.
+	if hasPortParam(tmpl) {
+		if portStr, ok := params["port"]; ok {
+			port, atoiErr := strconv.Atoi(fmt.Sprint(portStr))
+			if atoiErr == nil {
+				if conflictErr := u.checkPortConflict(r.Context(), host, port); conflictErr != nil {
+					data, derr := u.deployFormData(r, host, tmpl.Meta.ID, r.FormValue("slug"), typedValues(r.PostForm), false)
+					if derr != nil {
+						u.renderError(w, r, derr)
+						return
+					}
+					data["Error"] = conflictErr.Error()
+					u.render(w, r, http.StatusConflict, "deploy-form", u.pageData(data))
+					return
+				}
+			}
+		}
+	}
+
 	req := instance.ApplyRequest{
 		Template:   r.FormValue("template"),
 		Slug:       r.FormValue("slug"),
