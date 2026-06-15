@@ -22,6 +22,7 @@ import (
 	"github.com/iotready/podman-api/internal/api"
 	"github.com/iotready/podman-api/internal/auth"
 	backuppkg "github.com/iotready/podman-api/internal/backup"
+	"github.com/iotready/podman-api/internal/backupctl"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/evacuate"
 	"github.com/iotready/podman-api/internal/ingress"
@@ -40,6 +41,7 @@ import (
 type cfg struct {
 	blobStore       extension.BlobStore
 	sidecarInjector extension.SidecarInjector
+	backupScheduler extension.BackupScheduler
 }
 
 type Option func(*cfg)
@@ -230,6 +232,12 @@ func RunWithFlags(opts ...Option) error {
 			return policies
 		})
 		log.Printf("prune scheduler enabled (interval %s, disk threshold %d%%, scopes %v)", *pruneInterval, *pruneThreshold, def.Scope)
+	}
+
+	if c.backupScheduler != nil {
+		ctrl := &backupctl.Controller{Svc: svc, Jobs: db}
+		runBackupScheduler(runnerCtx, c.backupScheduler, ctrl)
+		log.Printf("backup scheduler enabled (commercial)")
 	}
 
 	go func() {
