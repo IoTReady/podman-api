@@ -15,7 +15,14 @@
 {{end}}
 {{if .Tmpl.Meta.Secrets.PerInstance}}
 <div class="label">SECRETS</div>
-{{range .Tmpl.Meta.Secrets.PerInstance}}<label>{{.}} <input type="password" name="secret.{{.}}" value="{{index $.Values (printf "secret.%s" .)}}"></label>{{end}}
+{{range .Tmpl.Meta.Secrets.PerInstance}}
+  {{- $val := index $.Values (printf "secret.%s" .)}}
+  {{- $ph := ""}}
+  {{- if and $.EditMode (not $val)}}
+    {{- $ph = "unchanged"}}
+  {{- end}}
+  <label>{{.}} <input type="password" name="secret.{{.}}"{{if $ph}} placeholder="{{$ph}}"{{end}}{{if $val}} value="{{$val}}"{{end}}></label>
+{{end}}
 {{end}}
 {{if .HostRefs}}
 <div class="label">REQUIRED HOST SECRETS</div>

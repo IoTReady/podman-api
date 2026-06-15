@@ -325,6 +325,119 @@ func (u *UI) upgradeApply(w http.ResponseWriter, r *http.Request) {
 	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(r.Context(), host, obs)))
 }
 
+// editForm renders the deploy form pre-populated with the instance's stored
+// parameters, for editing and re-applying an existing instance. Secrets are
+// shown as placeholders ("unchanged") — the actual values are never sent to the
+// client. The template selector is disabled since the template is fixed.
+func (u *UI) editForm(w http.ResponseWriter, r *http.Request) {
+	host, tmplID, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
+	if !u.hostExists(host) {
+		u.renderError(w, r, instance.ErrUnknownHost)
+		return
+	}
+	// Verify the instance exists and load its stored spec.
+	obs, err := u.cfg.Svc.Get(r.Context(), host, tmplID, slug)
+	if err != nil {
+		u.renderError(w, r, err)
+		return
+	}
+	spec, err := u.cfg.Svc.StoredSpec(r.Context(), host, tmplID, slug)
+	if err != nil {
+		u.renderError(w, r, err)
+		return
+	}
+	// Build typed values from stored params. Secrets are set to empty so the
+	// template shows "unchanged" placeholders (see instance-fields.html).
+	vals := map[string]string{}
+	for k, v := range spec.Parameters {
+		vals["param."+k] = fmt.Sprint(v)
+	}
+	for name := range spec.Secrets {
+		vals["secret."+name] = ""
+	}
+	data, err := u.deployFormData(r, host, tmplID, slug, vals, false)
+	if err != nil {
+		u.renderError(w, r, err)
+		return
+	}
+	data["EditMode"] = true
+	// Pass the observed instance so the edit form can show current state.
+	data["Inst"] = obs
+	u.render(w, r, http.StatusOK, "deploy-form", u.pageData(data))
+}
+
+// editApply re-applies an existing instance with updated parameters (Replace:
+// true). Secrets not touched by the operator carry over from the stored spec.
+func (u *UI) editApply(w http.ResponseWriter, r *http.Request) {
+	host, tmplID, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
+	if !u.hostExists(host) {
+		u.renderError(w, r, instance.ErrUnknownHost)
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	// Load the existing spec so we can preserve secrets the form didn't touch.
+	spec, err := u.cfg.Svc.StoredSpec(r.Context(), host, tmplID, slug)
+	if err != nil {
+		u.renderError(w, r, err)
+		return
+	}
+	params, secrets := formValues(r.PostForm)
+	// Strip the "unchanged" sentinel — these are fields the operator did not
+	// touch, not real values to apply.
+	for k, v := range secrets {
+		if v == "unchanged" {
+			delete(secrets, k)
+		}
+	}
+	// Preserve existing secrets that the form did not override.
+	if spec.Secrets != nil {
+		for k, v := range spec.Secrets {
+			if _, touched := secrets[k]; !touched {
+				secrets[k] = v
+			}
+		}
+	}
+	req := instance.ApplyRequest{
+		Template:   tmplID,
+		Slug:       slug,
+		Parameters: params,
+		Secrets:    secrets,
+		Domains:    spec.Domains,
+	}
+	obs, applyErr := u.cfg.Svc.ApplyAndObserve(r.Context(), host, req, instance.ApplyOptions{Replace: true})
+	if applyErr != nil {
+		// Rebuild the form data for the error re-render.
+		vals := map[string]string{}
+		for k, v := range params {
+			vals["param."+k] = fmt.Sprint(v)
+		}
+		for k := range secrets {
+			if _, fromForm := r.PostForm["secret."+k]; fromForm && r.PostFormValue("secret."+k) != "unchanged" {
+				vals["secret."+k] = r.PostFormValue("secret." + k)
+			} else {
+				vals["secret."+k] = ""
+			}
+		}
+		edata, derr := u.deployFormData(r, host, tmplID, slug, vals, false)
+		if derr != nil {
+			u.renderError(w, r, derr)
+			return
+		}
+		edata["EditMode"] = true
+		edata["Error"] = applyErr.Error()
+		u.render(w, r, errorStatus(applyErr), "deploy-form", u.pageData(edata))
+		return
+	}
+	data := u.instanceView(r.Context(), host, obs)
+	if len(obs.Warnings) > 0 {
+		data["Notice"] = strings.Join(obs.Warnings, "; ")
+	}
+	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(data))
+}
+
 // firstContainerImage returns the first container's image, for prefilling the
 // upgrade form; "" when the instance has no observed containers.
 func firstContainerImage(obs instance.Observed) string {
