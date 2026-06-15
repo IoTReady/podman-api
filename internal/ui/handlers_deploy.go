@@ -4,13 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"slices"
 	"strconv"
 	"strings"
 
 	"github.com/iotready/podman-api/internal/instance"
-	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/store"
 )
 
@@ -182,18 +183,10 @@ func hasPortParam(tmpl store.Template) bool {
 	return false
 }
 
-// suggestPort computes a free host port for tmpl on host by finding the first
-// unoccupied port at or above portParamFloor. Returns 0 when the template has
-// no port parameter or the port set cannot be read (caller is expected to
-// degrade gracefully).
-func (u *UI) suggestPort(ctx context.Context, host string, tmpl store.Template) int {
-	if !hasPortParam(tmpl) {
-		return 0
-	}
-	ports, err := u.cfg.Svc.PortsInUse(ctx, host)
-	if err != nil {
-		return 0
-	}
+// suggestPortFrom returns the first free port at or above the max in-use port
+// (with a floor of portParamFloor), scanning upward by up to scanLimit ports.
+// Returns 0 when no free port is found in the scan window.
+func suggestPortFrom(ports []podman.PortMapping) int {
 	busy := map[int]bool{}
 	maxPort := 0
 	for _, p := range ports {
@@ -212,18 +205,14 @@ func (u *UI) suggestPort(ctx context.Context, host string, tmpl store.Template) 
 			return port
 		}
 	}
+	log.Printf("port scan exhausted: no free port in [%d, %d)", start, start+scanLimit)
 	return 0
 }
 
-// computePortsInUseStr builds a compact display string for the in-use ports
-// on host, e.g. "31000, 31002". Returns "" when there are no ports or the
-// template has no port parameter.
-func (u *UI) computePortsInUseStr(ctx context.Context, host string, tmpl store.Template) string {
-	if !hasPortParam(tmpl) {
-		return ""
-	}
-	ports, err := u.cfg.Svc.PortsInUse(ctx, host)
-	if err != nil || len(ports) == 0 {
+// portsInUseStr builds a compact display string for a slice of port mappings,
+// e.g. "31000, 31002". Returns "" when the slice is empty.
+func portsInUseStr(ports []podman.PortMapping) string {
+	if len(ports) == 0 {
 		return ""
 	}
 	parts := make([]string, 0, len(ports))
@@ -233,9 +222,9 @@ func (u *UI) computePortsInUseStr(ctx context.Context, host string, tmpl store.T
 	return strings.Join(parts, ", ")
 }
 
-// portConflictMessage returns a user-facing error when port is already in use
-// on host, or nil when the port is free. The message includes the suggestion
-// when one is available.
+// checkPortConflict returns a user-facing error when port is already in use on
+// host, or nil when the port is free. The message includes a suggestion when
+// one is available.
 func (u *UI) checkPortConflict(ctx context.Context, host string, port int) error {
 	ports, err := u.cfg.Svc.PortsInUse(ctx, host)
 	if err != nil {
@@ -244,7 +233,7 @@ func (u *UI) checkPortConflict(ctx context.Context, host string, port int) error
 	for _, p := range ports {
 		if p.HostPort == port {
 			msg := fmt.Sprintf("port %d is already in use by %s/%s", port, p.Pod, p.Container)
-			if sug := u.suggestPort(ctx, host, store.Template{Meta: render.Meta{Parameters: []render.ParamDef{{Name: "port", Type: "int"}}}}); sug > 0 {
+			if sug := suggestPortFrom(ports); sug > 0 {
 				msg += fmt.Sprintf("; suggested free port: %d", sug)
 			}
 			return errors.New(msg)
@@ -297,8 +286,14 @@ func (u *UI) deployFormData(r *http.Request, host, selected, slug string, vals m
 	}
 	refs := u.hostSecretRefs(r, host, tmpl)
 	mergeParamDefaults(vals, tmpl)
-	sug := u.suggestPort(r.Context(), host, tmpl)
-	busy := u.computePortsInUseStr(r.Context(), host, tmpl)
+	var sug int
+	var busy string
+	if hasPortParam(tmpl) {
+		if ports, err := u.cfg.Svc.PortsInUse(r.Context(), host); err == nil {
+			sug = suggestPortFrom(ports)
+			busy = portsInUseStr(ports)
+		}
+	}
 	return map[string]any{
 		"Host":           host,
 		"ActiveHost":     host,
