@@ -49,6 +49,13 @@ type SidecarInjection struct {
 	Secrets []InjectedSecret
 }
 
+// InstanceSecretName returns the per-instance podman secret name the core
+// creates for an InjectedSecret (and template-declared secret). Injectors
+// must use this to build the secretKeyRef.name in the pod YAML they return.
+func InstanceSecretName(template, slug, name string) string {
+	return template + "-" + slug + "-" + name
+}
+
 // SidecarInjector is a commercial extension point that injects sidecar
 // containers into an instance's pod YAML after the template body has been
 // rendered but before it is applied.

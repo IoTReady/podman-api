@@ -233,3 +233,20 @@ func TestService_Apply_SecretDataKeys(t *testing.T) {
 	_, hasWrongKey := injSecret.Data["litestream-s3-key"]
 	assert.False(t, hasWrongKey, "injector secret data key must NOT be the secret name")
 }
+
+// instanceSecretName delegates to extension.InstanceSecretName so there is a
+// single source of truth for the per-instance secret namespacing convention.
+func TestInstanceSecretName_Delegates(t *testing.T) {
+	want := extension.InstanceSecretName("web", "x", "password")
+	got := instanceSecretName("web", "x", "password")
+	assert.Equal(t, want, got, "internal delegate must match the exported helper")
+
+	// Pin the wire format itself. This string crosses the module boundary at a
+	// tagged version: a commercial injector compiled against tag vX builds
+	// secretKeyRef.name values that must match what a core at vY creates. If the
+	// format ever changed, both sides of the delegation check above would change
+	// together and still pass, yet already-shipped injectors would produce
+	// dangling secret refs. Asserting the literal turns that into a deliberate,
+	// reviewable break.
+	assert.Equal(t, "web-x-password", extension.InstanceSecretName("web", "x", "password"))
+}
