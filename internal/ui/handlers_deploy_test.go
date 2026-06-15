@@ -740,3 +740,137 @@ func TestEditApplyCarriesDomains(t *testing.T) {
 		t.Errorf("domains = %v, want [app.example.com]", spec.Domains)
 	}
 }
+
+// ---- Port suggestion and validation tests ----
+
+// portTemplateUI builds a UI whose "demo" template has a required "port" (int)
+// parameter, and optionally seeds the fake with pods occupying the given host
+// ports so the ports-in-use endpoint returns them.
+func portTemplateUI(t *testing.T, occupiedPorts ...int) *UI {
+	t.Helper()
+	fc := fake.New()
+	for _, p := range occupiedPorts {
+		fc.AddPod("edge-1", podman.Pod{
+			Name:   fmt.Sprintf("occupied-%d", p),
+			Status: "Running",
+			Containers: []podman.Container{
+				{
+					Name:   fmt.Sprintf("app-%d", p),
+					Image:  "demo:1",
+					Status: "Running",
+					Ports: []podman.PortMapping{
+						{HostPort: p, HostIP: "127.0.0.1", ContainerPort: 8080, Protocol: "tcp", Pod: fmt.Sprintf("occupied-%d", p), Container: fmt.Sprintf("app-%d", p)},
+					},
+				},
+			},
+		})
+	}
+	hosts := []config.Host{{ID: "edge-1"}}
+	mem := store.NewMemory()
+	_ = mem.PutTemplate(context.Background(), store.Template{
+		Meta: render.Meta{
+			ID: "demo",
+			Parameters: []render.ParamDef{
+				{Name: "slug", Type: "string", Required: true},
+				{Name: "port", Type: "int", Required: true},
+			},
+		},
+		Body: `kind: Pod
+metadata:
+  name: demo-{{.slug}}
+spec:
+  containers:
+    - name: app
+      image: demo:1
+`,
+	})
+	svc := instance.NewService(fc, hosts)
+	svc.SetStore(mem)
+	hash, _ := config.HashToken("pw")
+	u, err := New(Config{
+		Svc:  svc,
+		Auth: NewOperatorAuthenticator(config.Operator{Username: "op", PasswordHash: hash}),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
+}
+
+func TestDeployFormSuggestsPortWhenEmpty(t *testing.T) {
+	u := portTemplateUI(t)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo").Body.String()
+	if !strings.Contains(body, "Suggested:") {
+		t.Error("deploy form should show a port suggestion when the template has a port param")
+	}
+	if !strings.Contains(body, "30000") {
+		t.Error("deploy form should suggest port 30000 when no ports are in use")
+	}
+}
+
+func TestDeployFormSuggestsPortAboveOccupied(t *testing.T) {
+	u := portTemplateUI(t, 31000)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo").Body.String()
+	if !strings.Contains(body, "31001") {
+		t.Error("deploy form should suggest port above the max occupied port (31000 -> 31001)")
+	}
+}
+
+func TestDeployFormShowsPortsInUseList(t *testing.T) {
+	u := portTemplateUI(t, 31000, 31005)
+	body := authedGet(t, u, "/ui/hosts/edge-1/deploy?template=demo").Body.String()
+	if !strings.Contains(body, "31000") || !strings.Contains(body, "31005") {
+		t.Error("deploy form should list occupied ports when they exist")
+	}
+}
+
+func TestDeployCreateRejectsConflictingPort(t *testing.T) {
+	u := portTemplateUI(t, 31000)
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{
+		csrfField:    {csrfToken(tok)},
+		"template":   {"demo"},
+		"slug":       {"test"},
+		"param.slug": {"test"},
+		"param.port": {"31000"},
+	}
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/deploy", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 for port conflict", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "already in use") {
+		t.Error("conflict error should mention that the port is already in use")
+	}
+	if !strings.Contains(body, "31001") {
+		t.Error("conflict error should suggest an alternative free port")
+	}
+}
+
+func TestDeployCreateAcceptsFreePort(t *testing.T) {
+	u := portTemplateUI(t, 31000)
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	form := url.Values{
+		csrfField:    {csrfToken(tok)},
+		"template":   {"demo"},
+		"slug":       {"test"},
+		"param.slug": {"test"},
+		"param.port": {"31001"}, // free port above 31000
+	}
+	r := httptest.NewRequest("POST", "/ui/hosts/edge-1/deploy", strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+	// A free port must not be rejected as a port conflict.
+	if strings.Contains(w.Body.String(), "already in use") {
+		t.Error("a free port must not be rejected as a port conflict")
+	}
+	if w.Code == http.StatusConflict {
+		t.Error("free port should not result in a 409 conflict")
+	}
+}
