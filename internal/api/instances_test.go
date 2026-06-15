@@ -242,3 +242,29 @@ func TestRenameInstanceRejectsExistingSlug(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
 	assert.Equal(t, "instance_already_exists", got["code"])
 }
+
+func TestRenameInstanceRejectsInvalidNewSlug(t *testing.T) {
+	srv, tok, _ := newSrvFull(t)
+	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/hello", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	for _, bad := range []string{"", "UPPERCASE", "has space", "-leading-hyphen", "trailing-hyphen-", "x"} {
+		req, _ = http.NewRequest("POST", srv.URL+"/hosts/h1/instances/app/hello/rename", bytes.NewBufferString(`{"new_slug":"`+bad+`"}`))
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err = http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		resp.Body.Close()
+		if bad == "" {
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "empty new_slug should be rejected")
+		} else {
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "new_slug %q should be rejected", bad)
+		}
+	}
+}

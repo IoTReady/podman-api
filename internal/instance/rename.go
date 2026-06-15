@@ -7,9 +7,9 @@ import (
 	"io"
 	"log"
 	"maps"
-	"time"
 
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
 )
 
@@ -35,6 +35,9 @@ func (s *Service) CheckRenameable(ctx context.Context, host, tmpl, slug string, 
 	if req.NewSlug == slug {
 		return ErrNewSlugSameAsOld
 	}
+	if !render.ValidName(req.NewSlug) {
+		return fmt.Errorf("new_slug %q is invalid: must match %s", req.NewSlug, render.NameRe.String())
+	}
 	if _, err := s.lookup(ctx, host, tmpl); err != nil {
 		return err
 	}
@@ -58,8 +61,21 @@ func (s *Service) CheckRenameable(ctx context.Context, host, tmpl, slug string, 
 }
 
 // Rename renames an instance to a new slug on the same host: stop, copy
-// volumes and secrets, deploy under the new slug, verify health, then reap
-// or keep the old instance. step is a best-effort progress callback (may be nil).
+// volumes, deploy under the new slug, verify health, then reap or keep the
+// old instance. step is a best-effort progress callback (may be nil).
+//
+// Locking: the migrateLock on (tmpl, slug) serialises concurrent renames of
+// the same source instance, but does NOT serialise against operations
+// targeting the new slug — a concurrent Apply to the new slug is assumed not
+// to happen (single-operator system). The rollback Delete(newSlug, ...) would
+// nuke that racing Apply's data.
+//
+// Post-commit window: once Apply succeeds and waitRunning passes, the commit
+// steps (spec migration, ingress reconcile, old-instance reap) are all
+// best-effort. A failure here returns an error but does not roll back — the
+// new pod is healthy and serving, and the state is convergent (stale old
+// spec row, possibly repeated ingress reconcile, etc.). This mirrors the
+// post-commit window in applyLocked.
 func (s *Service) Rename(ctx context.Context, host, tmpl, slug string, req RenameRequest, step func(step, detail string)) error {
 	if step == nil {
 		step = func(string, string) {}
@@ -121,26 +137,13 @@ func (s *Service) Rename(ctx context.Context, host, tmpl, slug string, req Renam
 	}
 	step("volumes", host)
 
-	for k, v := range spec.Secrets {
-		newName := instanceSecretName(tmpl, req.NewSlug, k)
-		_ = s.client.SecretRemove(ctx, host, newName)
-		if err := s.client.SecretCreate(ctx, host, newName, wrapAsKubeSecret(newName, newName, []byte(v))); err != nil {
-			return fmt.Errorf("create secret %q: %w", newName, err)
-		}
-		step("copy-secret", k)
-	}
-	for _, sec := range spec.InjectorSecrets {
-		newName := instanceSecretName(tmpl, req.NewSlug, sec.Name)
-		_ = s.client.SecretRemove(ctx, host, newName)
-		if err := s.client.SecretCreate(ctx, host, newName, wrapAsKubeSecret(newName, sec.Key, []byte(sec.Value))); err != nil {
-			return fmt.Errorf("create injector secret %q: %w", newName, err)
-		}
-	}
-	step("secrets", host)
-
 	params := maps.Clone(spec.Parameters)
 	params["slug"] = req.NewSlug
 
+	// Apply under the new slug. Apply handles both template-declared secrets
+	// (passed via ApplyRequest.Secrets) and injector secrets (regenerated
+	// fresh by the SidecarInjector), so no pre-creation of secret names is
+	// needed here.
 	step("apply", host)
 	if err := s.Apply(ctx, host, ApplyRequest{
 		Template:   tmpl,
@@ -172,15 +175,20 @@ func (s *Service) Rename(ctx context.Context, host, tmpl, slug string, req Renam
 	}
 	step("verify", req.NewSlug)
 
+	// Load the spec that Apply just persisted — it carries fresh
+	// InjectorSecrets from the sidecar injector. We preserve the original
+	// Created timestamp so the spec reflects the instance's true birth time.
 	if err := s.store.DeleteSpec(ctx, host, tmpl, slug); err != nil && !errors.Is(err, store.ErrNotFound) {
 		return fmt.Errorf("delete old spec: %w", err)
 	}
-	newSpec := spec
-	newSpec.Slug = req.NewSlug
-	newSpec.Domains = domains
-	newSpec.Parameters = params
-	newSpec.Updated = time.Now()
-	if err := s.store.PutSpec(ctx, newSpec); err != nil {
+	applied, err := s.store.GetSpec(ctx, host, tmpl, req.NewSlug)
+	if err != nil {
+		return fmt.Errorf("reload new spec: %w", err)
+	}
+	// Domains may differ from what Apply persisted (rename might change them).
+	applied.Domains = domains
+	applied.Created = spec.Created // preserve original birth time
+	if err := s.store.PutSpec(ctx, applied); err != nil {
 		return fmt.Errorf("persist new spec: %w", err)
 	}
 	step("spec", host+"/"+tmpl+"/"+req.NewSlug)

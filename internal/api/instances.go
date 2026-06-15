@@ -251,6 +251,10 @@ func (h *handlers) renameInstance(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "new_slug is required"})
 		return
 	}
+	if !validName(req.NewSlug) {
+		writeInvalidName(w, "new_slug", req.NewSlug)
+		return
+	}
 	if err := h.svc.CheckRenameable(r.Context(), host, tmpl, slug, req); err != nil {
 		WriteError(w, err)
 		return

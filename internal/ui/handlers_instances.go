@@ -46,11 +46,11 @@ func (u *UI) instanceDetail(w http.ResponseWriter, r *http.Request) {
 	u.render(w, r, http.StatusOK, "instance-detail", u.pageData(u.instanceView(r.Context(), host, obs)))
 }
 
-// renameForm renders the rename form.
+// renameForm renders the rename form. The Get call acts as an existence check
+// — it renders an error if the instance doesn't exist before showing the form.
 func (u *UI) renameForm(w http.ResponseWriter, r *http.Request) {
 	host, tmplID, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
-	obs, err := u.cfg.Svc.Get(r.Context(), host, tmplID, slug)
-	if err != nil {
+	if _, err := u.cfg.Svc.Get(r.Context(), host, tmplID, slug); err != nil {
 		u.renderError(w, r, err)
 		return
 	}
@@ -66,7 +66,6 @@ func (u *UI) renameForm(w http.ResponseWriter, r *http.Request) {
 		"Slug":       slug,
 		"Domains":    domains,
 	}))
-	_ = obs // keep for consistency with other form handlers
 }
 
 // renameApply handles the rename form submission.
@@ -126,7 +125,8 @@ func (u *UI) renameApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Redirect to the new instance's detail page.
+	// Render the new instance's detail page. The form's hx-target="#main"
+	// and hx-push-url="true" on the form element will update the URL.
 	obs, err := u.cfg.Svc.Get(r.Context(), host, tmplID, newSlug)
 	if err != nil {
 		u.renderError(w, r, err)
