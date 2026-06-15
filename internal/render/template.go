@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"text/template"
 )
@@ -55,7 +56,7 @@ func RenderAndValidate(body string, params map[string]any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := validateRendered(body, params, rendered); err != nil {
+	if err := validateRendered(body, params); err != nil {
 		return "", err
 	}
 	return rendered, nil
@@ -74,22 +75,41 @@ func leadingWhitespace(s string) int {
 	return n
 }
 
+// paramRefPattern is a compiled regex matching Go template parameter references
+// like {{.name}} with any amount of inner whitespace (e.g. {{ .name }},
+// {{.name }}, {{ .name}}).
+var paramRefPattern = regexp.MustCompile(`\{\{-?\s*\.(\w+)\s*-?\}\}`)
+
 // paramRefIndent returns the leading whitespace before the first occurrence of
-// a template parameter reference {{.name}} in body, or -1 if not found.
+// a template parameter reference to name in body, or -1 if not found. Handles
+// standard delimiters with any inner spacing: {{.name}}, {{ .name }}, etc.
 func paramRefIndent(body, name string) int {
-	ref := "{{." + name + "}}"
-	idx := strings.Index(body, ref)
-	if idx == -1 {
+	matches := paramRefPattern.FindAllStringSubmatchIndex(body, -1)
+	if matches == nil {
 		return -1
 	}
-	indent := 0
-	for i := idx - 1; i >= 0 && body[i] != '\n'; i-- {
-		indent++
+	best := -1
+	for _, m := range matches {
+		if len(m) < 4 {
+			continue
+		}
+		matchedName := body[m[2]:m[3]]
+		if matchedName != name {
+			continue
+		}
+		idx := m[0]
+		indent := 0
+		for i := idx - 1; i >= 0 && body[i] != '\n'; i-- {
+			indent++
+		}
+		if best < 0 || indent < best {
+			best = indent
+		}
 	}
-	return indent
+	return best
 }
 
-// validateRendered checks the rendered output for common issues with
+// validateRendered checks the template body and params for common issues with
 // multi-line string parameters. For each multi-line string param, it verifies
 // that continuation lines are indented enough to stay inside a YAML block
 // scalar — otherwise the config file rendered from that param would come out
@@ -100,7 +120,7 @@ func paramRefIndent(body, name string) int {
 // Since Go's text/template only prefixes the first line with the template's
 // leading whitespace, continuation lines must already have enough leading
 // whitespace in the param value to reach the same baseline.
-func validateRendered(body string, params map[string]any, rendered string) error {
+func validateRendered(body string, params map[string]any) error {
 	for name, val := range params {
 		s, ok := val.(string)
 		if !ok || !strings.Contains(s, "\n") {
@@ -121,8 +141,8 @@ func validateRendered(body string, params map[string]any, rendered string) error
 				continue
 			}
 			if ws := leadingWhitespace(line); ws < baseline {
-				return fmt.Errorf("%w: parameter %q line %d has indentation %d, need at least %d to produce valid YAML (each continuation line must be indented at least %d spaces; use the | indent %d template function to auto-indent)",
-					ErrRenderInvalid, name, i+2, ws, baseline, baseline, baseline)
+				return fmt.Errorf("%w: parameter %q line %d has indentation %d, need at least %d to produce valid YAML (indent the param value or use the | indent template function with the {{.name}} reference moved to column 0)",
+					ErrRenderInvalid, name, i+2, ws, baseline)
 			}
 		}
 	}

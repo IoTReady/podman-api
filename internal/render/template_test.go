@@ -154,3 +154,23 @@ func TestRenderAndValidate_IndentFunc(t *testing.T) {
 	assert.Contains(t, out, "  line1")
 	assert.Contains(t, out, "  line2")
 }
+
+func TestRenderAndValidate_SpacedDelimiter_Detected(t *testing.T) {
+	body := `data:
+  config: |
+    {{ .config }}
+`
+	_, err := RenderAndValidate(body, map[string]any{"config": "line1\nline2"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrRenderInvalid)
+}
+
+func TestRenderAndValidate_SpacedDelimiterCondensed_Detected(t *testing.T) {
+	body := `data:
+  config: |
+    {{.config }}
+`
+	_, err := RenderAndValidate(body, map[string]any{"config": "line1\nline2"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrRenderInvalid)
+}
