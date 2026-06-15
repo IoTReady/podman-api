@@ -183,7 +183,7 @@ func (h *handlers) renderTemplate(w http.ResponseWriter, r *http.Request) {
 	// deploy (which applies defaults) would render; otherwise missingkey=error
 	// fails the preview for a param the deploy would have supplied (#61).
 	params = render.ApplyDefaults(tmpl.Meta, params)
-	out, err := render.RenderBody(tmpl.Body, params)
+	out, err := render.RenderAndValidate(tmpl.Body, params)
 	if err != nil {
 		WriteError(w, err)
 		return

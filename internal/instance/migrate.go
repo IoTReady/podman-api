@@ -184,7 +184,7 @@ func (s *Service) preflightIssues(ctx context.Context, req MigrateRequest, tmpl 
 	}
 	// Render the template body once and reuse it for the port check and, when
 	// pullImages is true, the image-pull preflight.
-	rendered, rerr := render.RenderBody(tmpl.Body, eff)
+	rendered, rerr := render.RenderAndValidate(tmpl.Body, eff)
 	if rerr != nil {
 		return append(issues, fmt.Errorf("render: %w", rerr)), provisionable
 	}
