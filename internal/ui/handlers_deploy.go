@@ -385,14 +385,10 @@ func (u *UI) editApply(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	params, secrets := formValues(r.PostForm)
-	// Strip the "unchanged" sentinel — these are fields the operator did not
-	// touch, not real values to apply.
-	for k, v := range secrets {
-		if v == "unchanged" {
-			delete(secrets, k)
-		}
-	}
-	// Preserve existing secrets that the form did not override.
+	// Preserve existing secrets that the form did not override. An untouched
+	// secret field submits empty (the template renders no value attribute in
+	// edit mode), formValues drops it, and this loop carries the stored value
+	// over — no sentinel string needed.
 	if spec.Secrets != nil {
 		for k, v := range spec.Secrets {
 			if _, touched := secrets[k]; !touched {
@@ -409,25 +405,22 @@ func (u *UI) editApply(w http.ResponseWriter, r *http.Request) {
 	}
 	obs, applyErr := u.cfg.Svc.ApplyAndObserve(r.Context(), host, req, instance.ApplyOptions{Replace: true})
 	if applyErr != nil {
-		// Rebuild the form data for the error re-render.
-		vals := map[string]string{}
-		for k, v := range params {
-			vals["param."+k] = fmt.Sprint(v)
-		}
-		for k := range secrets {
-			if _, fromForm := r.PostForm["secret."+k]; fromForm && r.PostFormValue("secret."+k) != "unchanged" {
-				vals["secret."+k] = r.PostFormValue("secret." + k)
-			} else {
-				vals["secret."+k] = ""
-			}
-		}
-		edata, derr := u.deployFormData(r, host, tmplID, slug, vals, false)
+		// Re-render the form with the operator's submitted values (not the
+		// merged secrets), so stored secret values never reach the client.
+		// typedValues reads the raw POST body, preserving cleared params and
+		// untouched secrets as empty — the template shows "unchanged"
+		// placeholders for those.
+		edata, derr := u.deployFormData(r, host, tmplID, slug, typedValues(r.PostForm), false)
 		if derr != nil {
 			u.renderError(w, r, derr)
 			return
 		}
 		edata["EditMode"] = true
 		edata["Error"] = applyErr.Error()
+		// Load the current observed state for the edit-mode form header.
+		if obs, err := u.cfg.Svc.Get(r.Context(), host, tmplID, slug); err == nil {
+			edata["Inst"] = obs
+		}
 		u.render(w, r, errorStatus(applyErr), "deploy-form", u.pageData(edata))
 		return
 	}
