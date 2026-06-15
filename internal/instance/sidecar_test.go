@@ -240,4 +240,13 @@ func TestInstanceSecretName_Delegates(t *testing.T) {
 	want := extension.InstanceSecretName("web", "x", "password")
 	got := instanceSecretName("web", "x", "password")
 	assert.Equal(t, want, got, "internal delegate must match the exported helper")
+
+	// Pin the wire format itself. This string crosses the module boundary at a
+	// tagged version: a commercial injector compiled against tag vX builds
+	// secretKeyRef.name values that must match what a core at vY creates. If the
+	// format ever changed, both sides of the delegation check above would change
+	// together and still pass, yet already-shipped injectors would produce
+	// dangling secret refs. Asserting the literal turns that into a deliberate,
+	// reviewable break.
+	assert.Equal(t, "web-x-password", extension.InstanceSecretName("web", "x", "password"))
 }
