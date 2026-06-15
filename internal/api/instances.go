@@ -234,3 +234,35 @@ func (h *handlers) upgradeInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	WriteJSON(w, http.StatusOK, obs)
 }
+
+func (h *handlers) renameInstance(w http.ResponseWriter, r *http.Request) {
+	host := r.PathValue("host")
+	tmpl := r.PathValue("template")
+	slug := r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
+	var req instance.RenameRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+		return
+	}
+	if req.NewSlug == "" {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "new_slug is required"})
+		return
+	}
+	if err := h.svc.CheckRenameable(r.Context(), host, tmpl, slug, req); err != nil {
+		WriteError(w, err)
+		return
+	}
+	if err := h.svc.Rename(r.Context(), host, tmpl, slug, req, nil); err != nil {
+		WriteError(w, err)
+		return
+	}
+	obs, err := h.svc.Get(r.Context(), host, tmpl, req.NewSlug)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, obs)
+}

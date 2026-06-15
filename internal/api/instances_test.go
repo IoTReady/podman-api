@@ -148,3 +148,97 @@ func TestApplyInstanceRejectsBadDomain(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
 	require.Equal(t, "invalid_domains", got["code"])
 }
+
+func TestRenameInstance(t *testing.T) {
+	srv, tok, _ := newSrvFull(t)
+
+	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/hello", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	body = `{"new_slug":"world"}`
+	req, _ = http.NewRequest("POST", srv.URL+"/hosts/h1/instances/app/hello/rename", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, "world", got["slug"])
+
+	// Old slug should be gone; new slug should be found.
+	resp = authedReq(t, srv, tok, "GET", "/hosts/h1/instances/app/hello")
+	resp.Body.Close()
+	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	resp = authedReq(t, srv, tok, "GET", "/hosts/h1/instances/app/world")
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+func TestRenameInstanceRejectsSameSlug(t *testing.T) {
+	srv, tok, _ := newSrvFull(t)
+	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/hello", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	body = `{"new_slug":"hello"}`
+	req, _ = http.NewRequest("POST", srv.URL+"/hosts/h1/instances/app/hello/rename", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, "invalid_request", got["code"])
+}
+
+func TestRenameInstanceRejectsExistingSlug(t *testing.T) {
+	srv, tok, _ := newSrvFull(t)
+	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/hello", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	body = `{"template":"app","slug":"world","parameters":{"slug":"world","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	req, _ = http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/world", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	body = `{"new_slug":"world"}`
+	req, _ = http.NewRequest("POST", srv.URL+"/hosts/h1/instances/app/hello/rename", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err = http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusConflict, resp.StatusCode)
+
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, "instance_already_exists", got["code"])
+}
