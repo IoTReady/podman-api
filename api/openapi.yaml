@@ -338,6 +338,12 @@ components:
           type: object
           additionalProperties: {type: string}
 
+    UpgradeImageRequest:
+      type: object
+      required: [image]
+      properties:
+        image: {type: string}
+
     MigrateRequest:
       type: object
       required: [from_host, to_host, template, slug]
@@ -967,6 +973,34 @@ paths:
         '200':
           description: upgraded
           content: {application/json: {schema: {$ref: '#/components/schemas/Observed'}}}
+        '502': {$ref: '#/components/responses/UpstreamError'}
+      x-required-scope: instances:write
+
+  /hosts/{host}/instances/{template}/{slug}/upgrade-image:
+    post:
+      tags: [instances]
+      summary: image-only upgrade reusing the instance's stored spec and sealed secrets
+      description: >-
+        Reuses the instance's stored parameters and sealed per-instance secrets,
+        overriding only the image, then re-applies with replace. Unlike
+        /upgrade this requires no secrets in the request — the sealed secrets are
+        unrecoverable plaintext and never need to be re-supplied — so an
+        unattended bearer-auth loop can roll many instances to a new image
+        without an operator login. A per-instance secret the template added after
+        deploy does not block the upgrade (the missing secret was already
+        missing).
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateID'}
+        - {$ref: '#/components/parameters/Slug'}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/UpgradeImageRequest'}}}
+      responses:
+        '200':
+          description: upgraded
+          content: {application/json: {schema: {$ref: '#/components/schemas/Observed'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
         '502': {$ref: '#/components/responses/UpstreamError'}
       x-required-scope: instances:write
 

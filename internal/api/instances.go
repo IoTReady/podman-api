@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"github.com/iotready/podman-api/internal/ingress"
 	"github.com/iotready/podman-api/internal/instance"
@@ -224,6 +225,43 @@ func (h *handlers) upgradeInstance(w http.ResponseWriter, r *http.Request) {
 		Secrets:    body.Secrets,
 	}
 	if err := h.svc.Upgrade(r.Context(), host, req, body.Image); err != nil {
+		WriteError(w, err)
+		return
+	}
+	obs, err := h.svc.Get(r.Context(), host, tmpl, slug)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, obs)
+}
+
+// upgradeImageInstance is the bearer-auth mirror of the admin UI's image-only
+// upgrade: it reuses the instance's stored spec (parameters + sealed
+// per-instance secrets) and overrides only the image, applying with
+// Replace+AllowMissingSecrets via Service.UpgradeImage. Unlike upgradeInstance
+// (POST .../upgrade) it requires no secrets in the request, so a scripted
+// rollout can roll every instance to a new image with a plain bearer key — the
+// sealed secrets are unrecoverable plaintext and never need to be re-supplied.
+func (h *handlers) upgradeImageInstance(w http.ResponseWriter, r *http.Request) {
+	host := r.PathValue("host")
+	tmpl := r.PathValue("template")
+	slug := r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
+	var body struct {
+		Image string `json:"image"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+		return
+	}
+	if strings.TrimSpace(body.Image) == "" {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "image is required"})
+		return
+	}
+	if err := h.svc.UpgradeImage(r.Context(), host, tmpl, slug, body.Image); err != nil {
 		WriteError(w, err)
 		return
 	}
