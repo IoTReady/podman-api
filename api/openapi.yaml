@@ -978,7 +978,7 @@ paths:
 
   /hosts/{host}/instances/{template}/{slug}/upgrade-image:
     post:
-      tags: [instances]
+      tags: [lifecycle]
       summary: image-only upgrade reusing the instance's stored spec and sealed secrets
       description: >-
         Reuses the instance's stored parameters and sealed per-instance secrets,
@@ -1001,6 +1001,7 @@ paths:
           description: upgraded
           content: {application/json: {schema: {$ref: '#/components/schemas/Observed'}}}
         '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
         '502': {$ref: '#/components/responses/UpstreamError'}
       x-required-scope: instances:write
 
