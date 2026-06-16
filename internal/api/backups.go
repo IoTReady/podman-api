@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/iotready/podman-api/internal/instance"
@@ -117,6 +118,54 @@ func (h *handlers) postRestore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	job, err := h.jobs.Enqueue(r.Context(), "restore", args, "")
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusAccepted, map[string]string{"job_id": job.ID})
+}
+
+// postPITRRestore enqueues a point-in-time restore job for an instance. The body
+// carries the target timestamp (an opaque selector interpreted by the injector —
+// the Litestream injector uses RFC3339) and an optional subset of volumes to
+// restore; an empty timestamp is rejected. This is distinct from the
+// /backups/{id}/restore tarball restore: PITR rolls a live instance back to a
+// chosen instant via the injected restore initContainer.
+func (h *handlers) postPITRRestore(w http.ResponseWriter, r *http.Request) {
+	if h.jobs == nil {
+		WriteError(w, errJobsDisabled)
+		return
+	}
+	host, tmpl, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
+	var body struct {
+		Timestamp string   `json:"timestamp"`
+		Volumes   []string `json:"volumes,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+		return
+	}
+	if strings.TrimSpace(body.Timestamp) == "" {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_request", Message: "timestamp is required"})
+		return
+	}
+	// PITR restores from the Litestream S3 replica via the injected initContainer,
+	// not the tarball blob store — so the precondition is "instance exists", not
+	// CheckBackupable (which would 501 a Litestream-only deployment).
+	if err := h.svc.CheckInstanceExists(r.Context(), host, tmpl, slug); err != nil {
+		WriteError(w, err)
+		return
+	}
+	req := instance.PITRRestoreRequest{
+		Host: host, Template: tmpl, Slug: slug,
+		Timestamp: body.Timestamp, Volumes: body.Volumes,
+	}
+	args, err := json.Marshal(req)
+	if err != nil {
+		WriteJSON(w, http.StatusInternalServerError, ErrorBody{Code: "internal", Message: err.Error()})
+		return
+	}
+	job, err := h.jobs.Enqueue(r.Context(), "pitr-restore", args, "")
 	if err != nil {
 		WriteError(w, err)
 		return

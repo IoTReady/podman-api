@@ -50,6 +50,11 @@ type ApplyOptions struct {
 	// spec (e.g. a template that gained a secret after the instance was deployed).
 	// The "unknown secret" check still applies. Deploys never set this.
 	AllowMissingSecrets bool
+	// RestoreIntent, when non-nil, requests a one-shot point-in-time restore for
+	// this Apply: it is handed to the SidecarInjector but is NOT persisted into
+	// the stored spec, so the reconcile path never replays it. Only the
+	// point-in-time restore trigger sets this; ordinary deploys leave it nil.
+	RestoreIntent *extension.RestoreIntent
 }
 
 // ApplyRequest is the body of POST /instances and PUT /instances/{...}.
@@ -390,7 +395,7 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 
 	var injectorSecrets []store.InjectorSecret
 	if s.sidecar != nil {
-		inj, err := s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmpl.Meta), req.Parameters, req.Slug)
+		inj, err := s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmpl.Meta), req.Parameters, req.Slug, opts.RestoreIntent)
 		if err != nil {
 			return fmt.Errorf("sidecar inject: %w", err)
 		}

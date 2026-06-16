@@ -53,6 +53,7 @@ func TestOpenAPI_ServedAndParseable(t *testing.T) {
 		"/hosts/{host}/instances/{template}/{slug}/backup",
 		"/hosts/{host}/instances/{template}/{slug}/backups",
 		"/backups/{id}/restore",
+		"/hosts/{host}/instances/{template}/{slug}/restore",
 		"/backups/{id}",
 		"/jobs/{id}/cancel",
 		"/hosts/{host}/secrets/{name}",

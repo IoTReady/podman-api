@@ -98,6 +98,11 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 	mux.Handle("POST /backups/{id}/restore", guard("instances:write", http.HandlerFunc(h.postRestore)))
 	mux.Handle("DELETE /backups/{id}", guard("instances:write", http.HandlerFunc(h.deleteBackup)))
 
+	// Point-in-time restore: roll a live instance back to a chosen timestamp via
+	// the injected restore initContainer (commercial Litestream). Distinct from
+	// the per-backup tarball restore above (#25 seam).
+	mux.Handle("POST /hosts/{host}/instances/{template}/{slug}/restore", guard("instances:write", http.HandlerFunc(h.postPITRRestore)))
+
 	// Evacuate enqueues a parent job that fans out child migrate jobs; 501 when the store is disabled.
 	mux.Handle("POST /evacuate", guard("instances:write", http.HandlerFunc(h.evacuate)))
 

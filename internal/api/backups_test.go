@@ -234,6 +234,93 @@ func TestAPI_PostRestore_Missing404(t *testing.T) {
 	assert.Equal(t, "backup_not_found", body.Code)
 }
 
+// postPITRRestoreReq POSTs a JSON body to the point-in-time restore endpoint.
+func postPITRRestoreReq(t *testing.T, url, tok, body string) *http.Response {
+	t.Helper()
+	req, _ := http.NewRequest("POST", url, bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	return resp
+}
+
+func TestAPI_PostPITRRestore_EnqueuesJob(t *testing.T) {
+	srv, tok, _, mem, _ := newBackupSrv(t)
+	ctx := context.Background()
+
+	resp := postPITRRestoreReq(t, srv.URL+"/hosts/h1/instances/postgres/a/restore", tok,
+		`{"timestamp":"2026-06-14T09:30:00Z","volumes":["data"]}`)
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	var acc struct {
+		JobID string `json:"job_id"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&acc))
+	require.NotEmpty(t, acc.JobID)
+
+	job, err := mem.GetJob(ctx, acc.JobID)
+	require.NoError(t, err)
+	assert.Equal(t, "pitr-restore", job.Kind)
+
+	var args instance.PITRRestoreRequest
+	require.NoError(t, json.Unmarshal(job.Args, &args))
+	assert.Equal(t, instance.PITRRestoreRequest{
+		Host: "h1", Template: "postgres", Slug: "a",
+		Timestamp: "2026-06-14T09:30:00Z", Volumes: []string{"data"},
+	}, args)
+}
+
+// PITR restores from the Litestream S3 replica, not the tarball blob store, so
+// the endpoint must accept a request even when no blob store is wired — otherwise
+// a Litestream-only deployment would get a spurious 501.
+func TestAPI_PostPITRRestore_NoBlobStore(t *testing.T) {
+	tok := "t"
+	hash, err := config.HashToken(tok)
+	require.NoError(t, err)
+	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*"}}}
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+
+	f := fake.New()
+	mem := store.NewMemory()
+	require.NoError(t, mem.PutTemplate(context.Background(), backupTmpl()))
+	require.NoError(t, mem.PutSpec(context.Background(), store.Spec{
+		Host: "h1", Template: "postgres", Slug: "a",
+		Parameters: map[string]any{"slug": "a", "image": "pg:16"},
+	}))
+	svc := instance.NewService(f, hosts)
+	svc.SetStore(mem)
+	// Deliberately NO svc.SetBlobStore — PITR must not require the tarball store.
+
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
+	t.Cleanup(srv.Close)
+
+	resp := postPITRRestoreReq(t, srv.URL+"/hosts/h1/instances/postgres/a/restore", tok,
+		`{"timestamp":"2026-06-14T09:30:00Z"}`)
+	require.Equal(t, http.StatusAccepted, resp.StatusCode,
+		"PITR must not 501 just because the tarball blob store is absent")
+	var acc struct {
+		JobID string `json:"job_id"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&acc))
+	require.NotEmpty(t, acc.JobID)
+}
+
+func TestAPI_PostPITRRestore_EmptyTimestamp400(t *testing.T) {
+	srv, tok, _, _, _ := newBackupSrv(t)
+	resp := postPITRRestoreReq(t, srv.URL+"/hosts/h1/instances/postgres/a/restore", tok, `{"timestamp":""}`)
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var body ErrorBody
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	assert.Equal(t, "invalid_request", body.Code)
+}
+
+func TestAPI_PostPITRRestore_Missing404(t *testing.T) {
+	srv, tok, _, _, _ := newBackupSrv(t)
+	resp := postPITRRestoreReq(t, srv.URL+"/hosts/h1/instances/postgres/ghost/restore", tok,
+		`{"timestamp":"2026-06-14T09:30:00Z"}`)
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
 func TestAPI_DeleteBackup_RemovesRowAndBlobs(t *testing.T) {
 	srv, tok, _, mem, blob := newBackupSrv(t)
 	ctx := context.Background()

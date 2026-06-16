@@ -151,7 +151,9 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 	}
 
 	if s.sidecar != nil {
-		inj, err := s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmplObj.Meta), params, slug)
+		// Reconcile never carries a RestoreIntent: a point-in-time restore is a
+		// one-shot operation supplied on an explicit Apply, never replayed here.
+		inj, err := s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmplObj.Meta), params, slug, nil)
 		if err != nil {
 			return false, fmt.Errorf("sidecar inject: %w", err)
 		}

@@ -417,11 +417,12 @@ func RunWithFlags(opts ...Option) error {
 
 func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics) (jobs.Registry, jobs.Reconcilers) {
 	reg := jobs.Registry{
-		"migrate":  &migrate.Handler{Svc: svc, Metrics: jobMetrics},
-		"evacuate": &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: evacConc, Metrics: jobMetrics},
-		"prune":    &prune.Handler{Client: client, Jobs: db, Metrics: pruneMetrics},
-		"backup":   &backuppkg.Handler{Svc: svc},
-		"restore":  &backuppkg.RestoreHandler{Svc: svc},
+		"migrate":      &migrate.Handler{Svc: svc, Metrics: jobMetrics},
+		"evacuate":     &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: evacConc, Metrics: jobMetrics},
+		"prune":        &prune.Handler{Client: client, Jobs: db, Metrics: pruneMetrics},
+		"backup":       &backuppkg.Handler{Svc: svc},
+		"restore":      &backuppkg.RestoreHandler{Svc: svc},
+		"pitr-restore": &backuppkg.PITRRestoreHandler{Svc: svc},
 	}
 	recs := jobs.Reconcilers{
 		"migrate": &migrate.Reconciler{Svc: svc},

@@ -1237,6 +1237,65 @@ paths:
               schema: {$ref: '#/components/schemas/Error'}
       x-required-scope: instances:write
 
+  /hosts/{host}/instances/{template}/{slug}/restore:
+    post:
+      tags: [backups]
+      summary: enqueue a point-in-time restore of an instance to a chosen timestamp
+      description: >-
+        Enqueues a one-shot point-in-time restore that recreates the instance's
+        pod with a restore intent handed to the sidecar injector (commercial
+        Litestream): the injected initContainer rolls the backup-marked
+        database(s) back to the requested instant. Distinct from
+        /backups/{id}/restore (which restores a tarball backup of all volumes):
+        this rolls a live instance back to a timestamp via the replication
+        replica. The intent is one-shot and is never persisted into the stored
+        spec, so a later pod restart does not replay the rollback. The timestamp
+        is interpreted by the injector (Litestream uses RFC3339). Progress and
+        failures (e.g. a timestamp outside the configured replica retention)
+        surface via GET /jobs/{id}.
+      parameters:
+        - {name: host, in: path, required: true, schema: {type: string}}
+        - {name: template, in: path, required: true, schema: {type: string}}
+        - {name: slug, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [timestamp]
+              properties:
+                timestamp:
+                  type: string
+                  description: target point in time, interpreted by the injector (Litestream uses RFC3339)
+                  example: '2026-06-14T09:30:00Z'
+                volumes:
+                  type: array
+                  items: {type: string}
+                  description: optional subset of backup-marked volumes to restore; empty/omitted means all
+      responses:
+        '202':
+          description: point-in-time restore job accepted
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/JobAccepted'}
+        '400':
+          description: malformed body or missing timestamp (codes invalid_body, invalid_request)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '404':
+          description: no such instance, host, or template (codes instance_not_found, unknown_host, unknown_template)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+        '501':
+          description: job runner or state store unavailable (the job runner is required to enqueue the restore)
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
+      x-required-scope: instances:write
+
   /backups/{id}:
     delete:
       tags: [backups]

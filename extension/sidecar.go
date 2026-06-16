@@ -56,15 +56,34 @@ func InstanceSecretName(template, slug, name string) string {
 	return template + "-" + slug + "-" + name
 }
 
+// RestoreIntent expresses a one-shot point-in-time restore for an instance. It
+// is supplied on a single Apply (via ApplyOptions.RestoreIntent) and is NEVER
+// persisted into the stored spec — so the reconcile/boot-converge path always
+// passes nil and never replays the restore. That non-persistence is what makes a
+// point-in-time rollback fire exactly once instead of repeating on every pod
+// restart.
+//
+// The core ascribes no meaning to Timestamp: it projects the value verbatim to
+// the injector, which owns the interpretation (the Litestream injector uses
+// RFC3339). An empty Timestamp is rejected by the restore trigger, not here.
+type RestoreIntent struct {
+	// Timestamp is the opaque point-in-time selector, interpreted by the injector.
+	Timestamp string
+	// Volumes restricts the restore to these volume names; empty means all of the
+	// instance's backup-marked volumes.
+	Volumes []string
+}
+
 // SidecarInjector is a commercial extension point that injects sidecar
 // containers into an instance's pod YAML after the template body has been
 // rendered but before it is applied.
 //
 // The implementation receives the rendered pod YAML, the projected template
-// metadata, the resolved template parameters, and the instance slug. It returns
-// the (possibly modified) YAML plus any secrets the core must create before
-// PlayKube and prune on delete. Return SidecarInjection{YAML: renderedYAML}
-// to pass through without injection.
+// metadata, the resolved template parameters, the instance slug, and an optional
+// one-shot RestoreIntent (nil on a normal apply and on every reconcile; non-nil
+// only on an explicit point-in-time restore). It returns the (possibly modified)
+// YAML plus any secrets the core must create before PlayKube and prune on delete.
+// Return SidecarInjection{YAML: renderedYAML} to pass through without injection.
 type SidecarInjector interface {
-	InjectSidecars(ctx context.Context, renderedYAML string, meta TemplateMeta, params map[string]any, slug string) (SidecarInjection, error)
+	InjectSidecars(ctx context.Context, renderedYAML string, meta TemplateMeta, params map[string]any, slug string, restore *RestoreIntent) (SidecarInjection, error)
 }

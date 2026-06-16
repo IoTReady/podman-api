@@ -17,19 +17,21 @@ import (
 // recordingInjector is a test double for extension.SidecarInjector. It records
 // what it was handed and returns either a fixed replacement YAML or an error.
 type recordingInjector struct {
-	out       string // replacement YAML; "" means echo the input
-	secrets   []extension.InjectedSecret
-	err       error // non-nil aborts injection
-	calls     int   // number of times InjectSidecars was called
-	gotYAML   string
-	gotMeta   extension.TemplateMeta
-	gotParams map[string]any
-	gotSlug   string
+	out        string // replacement YAML; "" means echo the input
+	secrets    []extension.InjectedSecret
+	err        error // non-nil aborts injection
+	calls      int   // number of times InjectSidecars was called
+	gotYAML    string
+	gotMeta    extension.TemplateMeta
+	gotParams  map[string]any
+	gotSlug    string
+	gotRestore *extension.RestoreIntent // restore arg from the most recent call
 }
 
-func (r *recordingInjector) InjectSidecars(_ context.Context, yaml string, meta extension.TemplateMeta, params map[string]any, slug string) (extension.SidecarInjection, error) {
+func (r *recordingInjector) InjectSidecars(_ context.Context, yaml string, meta extension.TemplateMeta, params map[string]any, slug string, restore *extension.RestoreIntent) (extension.SidecarInjection, error) {
 	r.calls++
 	r.gotYAML, r.gotMeta, r.gotParams, r.gotSlug = yaml, meta, params, slug
+	r.gotRestore = restore
 	if r.err != nil {
 		return extension.SidecarInjection{}, r.err
 	}
@@ -232,6 +234,50 @@ func TestService_Apply_SecretDataKeys(t *testing.T) {
 	assert.True(t, hasInjKey, "injector secret data key must be the declared Key")
 	_, hasWrongKey := injSecret.Data["litestream-s3-key"]
 	assert.False(t, hasWrongKey, "injector secret data key must NOT be the secret name")
+}
+
+// A RestoreIntent set in ApplyOptions must reach the injector verbatim — this is
+// the one-shot point-in-time restore signal.
+func TestService_Apply_PassesRestoreIntent(t *testing.T) {
+	svc, _ := newSvc(t)
+	inj := &recordingInjector{out: injectedPod}
+	svc.SetSidecarInjector(inj)
+
+	intent := &extension.RestoreIntent{Timestamp: "2026-06-14T09:30:00Z", Volumes: []string{"data"}}
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("demo"),
+		ApplyOptions{Replace: true, RestoreIntent: intent}))
+
+	require.Equal(t, 1, inj.calls)
+	require.NotNil(t, inj.gotRestore, "injector must receive the RestoreIntent")
+	assert.Equal(t, "2026-06-14T09:30:00Z", inj.gotRestore.Timestamp)
+	assert.Equal(t, []string{"data"}, inj.gotRestore.Volumes)
+}
+
+// An ordinary Apply (no restore requested) hands the injector a nil intent.
+func TestService_Apply_NoRestoreIntent_Nil(t *testing.T) {
+	svc, _ := newSvc(t)
+	inj := &recordingInjector{out: injectedPod}
+	svc.SetSidecarInjector(inj)
+
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	require.Equal(t, 1, inj.calls)
+	assert.Nil(t, inj.gotRestore, "ordinary apply must not carry a RestoreIntent")
+}
+
+// Reconcile/boot-converge must NEVER carry a RestoreIntent: a point-in-time
+// restore is one-shot and must not be replayed on every pod restart.
+func TestReconcileOneSpec_RestoreIntentNil(t *testing.T) {
+	svc, _, st := specReconcileSvc(t)
+	ctx := context.Background()
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	inj := &recordingInjector{}
+	svc.SetSidecarInjector(inj)
+
+	svc.ReconcileSpecsOnHost(ctx, "h1")
+
+	require.Equal(t, 1, inj.calls)
+	assert.Nil(t, inj.gotRestore, "reconcile must never replay a restore intent")
 }
 
 // instanceSecretName delegates to extension.InstanceSecretName so there is a

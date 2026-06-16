@@ -44,8 +44,27 @@ func (h *RestoreHandler) Run(ctx context.Context, job store.Job, jc *jobs.JobCon
 	return h.Svc.Restore(ctx, req, jc.Step)
 }
 
-// Ensure both adapters satisfy the runner contract.
+// PITRRestoreHandler runs "pitr-restore" jobs by delegating to
+// instance.Service.PITRRestore — a one-shot point-in-time restore that recreates
+// the pod with a non-persisted RestoreIntent. Like restore it has no reconciler:
+// an interrupted PITR is resolved by the operator re-running it.
+type PITRRestoreHandler struct {
+	Svc *instance.Service
+}
+
+// Run unmarshals the job args into a PITRRestoreRequest and performs the
+// point-in-time restore, reporting progress through the job context.
+func (h *PITRRestoreHandler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) error {
+	var req instance.PITRRestoreRequest
+	if err := json.Unmarshal(job.Args, &req); err != nil {
+		return fmt.Errorf("decode pitr-restore args: %w", err)
+	}
+	return h.Svc.PITRRestore(ctx, req, jc.Step)
+}
+
+// Ensure all adapters satisfy the runner contract.
 var (
 	_ jobs.Handler = (*Handler)(nil)
 	_ jobs.Handler = (*RestoreHandler)(nil)
+	_ jobs.Handler = (*PITRRestoreHandler)(nil)
 )

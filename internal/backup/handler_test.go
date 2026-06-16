@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/iotready/podman-api/extension"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/jobs"
@@ -159,6 +160,43 @@ func TestRestoreHandler_RunRoundTrip(t *testing.T) {
 
 func TestRestoreHandler_BadArgsFails(t *testing.T) {
 	h := &RestoreHandler{}
+	err := h.Run(context.Background(), store.Job{Args: json.RawMessage(`{`)}, jobs.NewJobContext(store.NewMemory(), "j1"))
+	assert.Error(t, err)
+}
+
+// recordingSidecar captures the RestoreIntent handed to InjectSidecars so a job
+// test can assert the timestamp threaded all the way through.
+type recordingSidecar struct{ gotRestore *extension.RestoreIntent }
+
+func (r *recordingSidecar) InjectSidecars(_ context.Context, yaml string, _ extension.TemplateMeta, _ map[string]any, _ string, restore *extension.RestoreIntent) (extension.SidecarInjection, error) {
+	r.gotRestore = restore
+	return extension.SidecarInjection{YAML: yaml}, nil
+}
+
+func TestPITRRestoreHandler_RunThreadsTimestamp(t *testing.T) {
+	svc, _, mem, _ := seedSvc(t)
+	ctx := context.Background()
+	rec := &recordingSidecar{}
+	svc.SetSidecarInjector(rec)
+
+	args, err := json.Marshal(instance.PITRRestoreRequest{
+		Host: "h1", Template: "postgres", Slug: "a",
+		Timestamp: "2026-06-14T09:30:00Z", Volumes: []string{"data"},
+	})
+	require.NoError(t, err)
+	job, err := mem.Enqueue(ctx, "pitr-restore", args, "")
+	require.NoError(t, err)
+
+	h := &PITRRestoreHandler{Svc: svc}
+	require.NoError(t, h.Run(ctx, job, jobs.NewJobContext(mem, job.ID)))
+
+	require.NotNil(t, rec.gotRestore, "the pitr-restore job must hand the injector a RestoreIntent")
+	assert.Equal(t, "2026-06-14T09:30:00Z", rec.gotRestore.Timestamp)
+	assert.Equal(t, []string{"data"}, rec.gotRestore.Volumes)
+}
+
+func TestPITRRestoreHandler_BadArgsFails(t *testing.T) {
+	h := &PITRRestoreHandler{}
 	err := h.Run(context.Background(), store.Job{Args: json.RawMessage(`{`)}, jobs.NewJobContext(store.NewMemory(), "j1"))
 	assert.Error(t, err)
 }
