@@ -68,8 +68,14 @@ type Ingress struct {
 
 // PreBackup is a command run inside a named container immediately before the
 // backup job stops+exports the instance. A non-zero exit fails the backup, so a
-// failed dump never ships a stale/partial snapshot. Command is rendered with the
-// instance's parameters (text/template) before execution.
+// failed dump never ships a stale/partial snapshot.
+//
+// Command is rendered with the instance's parameters (text/template) and then
+// run as `/bin/sh -lc "<rendered command>"` in Container. The target container
+// must therefore provide /bin/sh and support a login profile — minimal or
+// distroless images will fail the exec (and thus the backup). Because rendering
+// happens before the shell, parameters are interpolated directly into the shell
+// line.
 type PreBackup struct {
 	Container string `yaml:"container" json:"container"`
 	Command   string `yaml:"command" json:"command"`

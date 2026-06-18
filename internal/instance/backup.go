@@ -503,7 +503,10 @@ func (s *Service) runPreBackup(ctx context.Context, req BackupRequest, step func
 	if err != nil {
 		return fmt.Errorf("pre-backup: render command: %w", err)
 	}
-	container := req.Template + "-" + req.Slug + "-" + t.Meta.PreBackup.Container
+	container := podName(req.Template, req.Slug) + "-" + t.Meta.PreBackup.Container
+	// Emit before the exec so a long-running command (e.g. a DB dump) shows the
+	// phase in progress rather than nothing until it returns.
+	step("pre-backup", t.Meta.PreBackup.Container)
 	res, err := s.client.ContainerExec(ctx, req.Host, container, []string{"/bin/sh", "-lc", cmdStr})
 	if err != nil {
 		return fmt.Errorf("pre-backup: exec in %s: %w", container, err)
@@ -511,7 +514,6 @@ func (s *Service) runPreBackup(ctx context.Context, req BackupRequest, step func
 	if res.ExitCode != 0 {
 		return fmt.Errorf("pre-backup: command exited %d in %s: %s", res.ExitCode, container, res.Output)
 	}
-	step("pre-backup", t.Meta.PreBackup.Container)
 	return nil
 }
 
