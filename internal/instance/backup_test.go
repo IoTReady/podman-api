@@ -493,6 +493,81 @@ func TestRestoreInFlight(t *testing.T) {
 	assert.False(t, in)
 }
 
+func TestBackup_RunsPreBackupBeforeStop(t *testing.T) {
+	svc, f, _, _ := newBackupSvc(t)
+	ctx := context.Background()
+	tmpl, err := svc.store.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.PreBackup = &render.PreBackup{Container: "db", Command: "echo dump {{.slug}}"}
+	require.NoError(t, svc.store.PutTemplate(ctx, tmpl))
+
+	var steps []string
+	require.NoError(t, svc.Backup(ctx, newBackupReq(), recordSteps(&steps)))
+
+	require.Len(t, f.ExecCalls, 1)
+	assert.Equal(t, "pg-a-db", f.ExecCalls[0].Container)
+	assert.Contains(t, strings.Join(f.ExecCalls[0].Cmd, " "), "echo dump a")
+	assert.Less(t, indexOf(steps, "pre-backup"), indexOf(steps, "stop"))
+}
+
+func TestBackup_PreBackupNonZeroExitFailsBeforeStop(t *testing.T) {
+	svc, f, _, _ := newBackupSvc(t)
+	ctx := context.Background()
+	tmpl, err := svc.store.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.PreBackup = &render.PreBackup{Container: "db", Command: "false"}
+	require.NoError(t, svc.store.PutTemplate(ctx, tmpl))
+	f.ExecFunc = func(host, container string, cmd []string) (podman.ExecResult, error) {
+		return podman.ExecResult{ExitCode: 1, Output: "dump failed"}, nil
+	}
+
+	req := newBackupReq()
+	var steps []string
+	err = svc.Backup(ctx, req, recordSteps(&steps))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "pre-backup")
+	assert.NotContains(t, steps, "stop")
+	assert.NotContains(t, steps, "export-volume")
+	p, _ := f.PodInspect(ctx, "h1", "pg-a")
+	assert.Equal(t, "Running", p.Status)
+	b, _ := svc.store.GetBackup(ctx, req.BackupID)
+	assert.Equal(t, store.BackupFailed, b.State)
+}
+
+func TestBackup_PreBackupTransportErrorFailsBeforeStop(t *testing.T) {
+	svc, f, _, _ := newBackupSvc(t)
+	ctx := context.Background()
+	tmpl, err := svc.store.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.PreBackup = &render.PreBackup{Container: "db", Command: "bench backup"}
+	require.NoError(t, svc.store.PutTemplate(ctx, tmpl))
+	f.ExecFunc = func(host, container string, cmd []string) (podman.ExecResult, error) {
+		return podman.ExecResult{}, errors.New("connection refused")
+	}
+
+	req := newBackupReq()
+	var steps []string
+	err = svc.Backup(ctx, req, recordSteps(&steps))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "pre-backup: exec in")
+	assert.NotContains(t, steps, "stop")
+	assert.NotContains(t, steps, "export-volume")
+	p, _ := f.PodInspect(ctx, "h1", "pg-a")
+	assert.Equal(t, "Running", p.Status)
+	b, _ := svc.store.GetBackup(ctx, req.BackupID)
+	assert.Equal(t, store.BackupFailed, b.State)
+}
+
+// indexOf returns the position of v in s, or len(s) if absent.
+func indexOf(s []string, v string) int {
+	for i, x := range s {
+		if x == v {
+			return i
+		}
+	}
+	return len(s)
+}
+
 func TestBackupInFlight(t *testing.T) {
 	ctx := context.Background()
 	mem := store.NewMemory()

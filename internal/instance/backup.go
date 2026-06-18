@@ -9,6 +9,7 @@ import (
 	"io/fs"
 
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
 )
 
@@ -111,6 +112,10 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 		} else {
 			step("restart", req.Host)
 		}
+	}
+
+	if err := s.runPreBackup(ctx, req, step); err != nil {
+		return fail(err) // instance not yet stopped; nothing to restart
 	}
 
 	if err := s.Stop(ctx, req.Host, req.Template, req.Slug); err != nil {
@@ -475,6 +480,41 @@ func (s *Service) ReconcileBackup(ctx context.Context, req BackupRequest, step f
 		step("reconcile-restart", req.Host)
 	}
 	return true, false, "backup interrupted by daemon restart; instance restarted", nil
+}
+
+// runPreBackup runs the template's pre_backup command inside the named container
+// before any stop/export. A transport error or non-zero exit aborts the backup
+// so a failed dump never yields a stale/partial snapshot. No-op when the
+// template declares no pre_backup. The "pre-backup" step is emitted only when a
+// command actually runs, so no-op templates don't report a phantom step.
+func (s *Service) runPreBackup(ctx context.Context, req BackupRequest, step func(step, detail string)) error {
+	t, err := s.store.GetTemplate(ctx, req.Template)
+	if err != nil {
+		return fmt.Errorf("pre-backup: get template: %w", err)
+	}
+	if t.Meta.PreBackup == nil || t.Meta.PreBackup.Command == "" {
+		return nil
+	}
+	spec, err := s.store.GetSpec(ctx, req.Host, req.Template, req.Slug)
+	if err != nil {
+		return fmt.Errorf("pre-backup: get spec: %w", err)
+	}
+	cmdStr, err := render.RenderBody(t.Meta.PreBackup.Command, spec.Parameters)
+	if err != nil {
+		return fmt.Errorf("pre-backup: render command: %w", err)
+	}
+	container := podName(req.Template, req.Slug) + "-" + t.Meta.PreBackup.Container
+	// Emit before the exec so a long-running command (e.g. a DB dump) shows the
+	// phase in progress rather than nothing until it returns.
+	step("pre-backup", t.Meta.PreBackup.Container)
+	res, err := s.client.ContainerExec(ctx, req.Host, container, []string{"/bin/sh", "-lc", cmdStr})
+	if err != nil {
+		return fmt.Errorf("pre-backup: exec in %s: %w", container, err)
+	}
+	if res.ExitCode != 0 {
+		return fmt.Errorf("pre-backup: command exited %d in %s: %s", res.ExitCode, container, res.Output)
+	}
+	return nil
 }
 
 // BackupDeletable checks whether a backup is safe to delete: returns nil if
