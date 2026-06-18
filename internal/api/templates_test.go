@@ -216,6 +216,27 @@ func TestDeleteTemplate_InUseThenForce(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
+func TestCreateTemplate_PreBackupRoundTrip(t *testing.T) {
+	srv, tok, _, _ := newSrvWithTmpl(t)
+	body := `{"id":"frappe","body":"kind: Pod\nname: frappe-{{.slug}}\n","parameters":[{"name":"slug","type":"string","required":true}],"pre_backup":{"container":"app","command":"bench --site {{.slug}} backup"}}`
+
+	resp := doReq(t, srv, tok, "POST", "/templates", body)
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	resp.Body.Close()
+
+	resp = authedReq(t, srv, tok, "GET", "/templates/frappe")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+
+	pb, ok := got["pre_backup"].(map[string]any)
+	require.True(t, ok, "pre_backup must be an object in GET response")
+	assert.Equal(t, "app", pb["container"])
+	assert.Equal(t, "bench --site {{.slug}} backup", pb["command"])
+}
+
 func TestTemplateWriteRejectsReadOnlyKey(t *testing.T) {
 	tok := "ro"
 	hash, _ := config.HashToken(tok)
