@@ -25,6 +25,7 @@ type Meta struct {
 	Secrets    Secrets    `yaml:"secrets" json:"secrets,omitempty"`
 	Volumes    []Volume   `yaml:"volumes" json:"volumes,omitempty"`
 	Ingress    *Ingress   `yaml:"ingress" json:"ingress,omitempty"`
+	PreBackup  *PreBackup `yaml:"pre_backup,omitempty" json:"pre_backup,omitempty"`
 }
 
 // Display holds human-readable presentation metadata for a template.
@@ -63,6 +64,15 @@ type Volume struct {
 type Ingress struct {
 	Container string `yaml:"container" json:"container"`
 	Port      int    `yaml:"port" json:"port"`
+}
+
+// PreBackup is a command run inside a named container immediately before the
+// backup job stops+exports the instance. A non-zero exit fails the backup, so a
+// failed dump never ships a stale/partial snapshot. Command is rendered with the
+// instance's parameters (text/template) before execution.
+type PreBackup struct {
+	Container string `yaml:"container" json:"container"`
+	Command   string `yaml:"command" json:"command"`
 }
 
 // ValidateIngress checks an ingress declaration: container non-empty and

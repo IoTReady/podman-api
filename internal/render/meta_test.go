@@ -171,3 +171,40 @@ kind: Pod
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "float")
 }
+
+func TestParseMeta_PreBackup(t *testing.T) {
+	src := `# template-meta:
+#   id: example
+#   parameters:
+#     - name: slug
+#       type: string
+#       required: true
+#   pre_backup:
+#     container: app
+#     command: "bench --site {{.slug}} backup"
+---
+apiVersion: v1
+kind: Pod
+`
+	meta, _, err := ParseMeta(src)
+	require.NoError(t, err)
+	require.NotNil(t, meta.PreBackup)
+	assert.Equal(t, "app", meta.PreBackup.Container)
+	assert.Equal(t, "bench --site {{.slug}} backup", meta.PreBackup.Command)
+}
+
+func TestParseMeta_NoPreBackup(t *testing.T) {
+	src := `# template-meta:
+#   id: example
+#   parameters:
+#     - name: slug
+#       type: string
+#       required: true
+---
+apiVersion: v1
+kind: Pod
+`
+	meta, _, err := ParseMeta(src)
+	require.NoError(t, err)
+	assert.Nil(t, meta.PreBackup)
+}
