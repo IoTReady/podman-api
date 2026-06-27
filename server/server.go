@@ -190,8 +190,14 @@ func RunWithFlags(opts ...Option) error {
 	if *ingressEnabled {
 		hostAdmins := make(map[string]string)
 		for _, h := range hosts {
-			if h.CaddyAdminAddr != "" {
+			switch {
+			case h.CaddyAdminAddr != "":
 				hostAdmins[h.ID] = h.CaddyAdminAddr
+			case h.Addr != "unix" && h.Addr != "":
+				// Derive from SSH addr "user@host" → "host:2019" so operators
+				// don't need to set caddy_admin_addr for standard deployments.
+				parts := strings.SplitN(h.Addr, "@", 2)
+				hostAdmins[h.ID] = parts[len(parts)-1] + ":2019"
 			}
 		}
 		ctl := ingress.NewCaddyController(client, db, ingress.Config{

@@ -29,7 +29,7 @@ const (
 // after the pod is ready (see Reconcile).
 func caddySeedCaddyfile(acmeEmail string) string {
 	if acmeEmail != "" {
-		return fmt.Sprintf("{\n\tadmin 0.0.0.0:%d\n\temail %s\n\tauto_https disable_redirects\n}\n", caddyAdminPort, acmeEmail)
+		return fmt.Sprintf("{\n\tadmin 0.0.0.0:%d\n\temail %s\n}\n", caddyAdminPort, acmeEmail)
 	}
 	return fmt.Sprintf("{\n\tadmin 0.0.0.0:%d\n}\n", caddyAdminPort)
 }
@@ -50,7 +50,7 @@ func caddyPodYAML(image, acmeEmail string) string {
 	// then run caddy. --resume picks up the autosaved JSON config from /data
 	// on subsequent starts; fallback to the Caddyfile only on first boot.
 	boot := fmt.Sprintf(
-		`[ -f %s ] || printf '%%s' "$CADDY_SEED" > %s; exec caddy run --resume 2>/dev/null || exec caddy run --config %s --adapter caddyfile`,
+		`[ -f %s ] || printf '%%s' "$CADDY_SEED" > %s; exec caddy run --resume --config %s --adapter caddyfile`,
 		cfgPath, cfgPath, cfgPath)
 	return fmt.Sprintf(`apiVersion: v1
 kind: Pod

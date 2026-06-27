@@ -35,26 +35,19 @@ func (c *CaddyController) Reconcile(ctx context.Context, host string) error {
 		return c.deleteServer(ctx, adminAddr)
 	}
 
-	created, err := c.ensureProxy(ctx, host)
-	if err != nil {
+	if _, err := c.ensureProxy(ctx, host); err != nil {
 		return err
 	}
-	if created {
-		// Fresh pod: wait for the admin API to become ready before pushing routes.
-		if err := c.waitForAdmin(ctx, adminAddr); err != nil {
-			return err
-		}
+	// Wait for the admin API — one GET round-trip for a running pod,
+	// polling (up to 20×300ms) for a fresh or rebooting pod.
+	if err := c.waitForAdmin(ctx, adminAddr); err != nil {
+		return err
 	}
-
 	return c.pushRoutes(ctx, adminAddr, routes)
 }
 
-// pushRoutes applies routes to the Caddy server via the admin API. It also
-// sets the ACME email in the TLS automation config if configured.
+// pushRoutes applies routes to the Caddy server via the admin API.
 func (c *CaddyController) pushRoutes(ctx context.Context, adminAddr string, routes []Route) error {
-	// Build and push the server config with all current routes. This is
-	// done first so tests that look for the first PUT call see the routes
-	// payload rather than the TLS email update.
 	srv := caddyServer{
 		Listen:         []string{":80", ":443"},
 		Routes:         routesToCaddyJSON(routes),
@@ -70,19 +63,6 @@ func (c *CaddyController) pushRoutes(ctx context.Context, adminAddr string, rout
 	}
 	if code >= 300 {
 		return fmt.Errorf("ingress: admin PUT server: status %d: %s", code, respBody)
-	}
-
-	// Set ACME email in global TLS automation if configured. This is
-	// idempotent — Caddy treats a PUT to an existing path as a replace.
-	if c.cfg.ACMEEmail != "" {
-		emailJSON, _ := json.Marshal(c.cfg.ACMEEmail)
-		code, body, err := c.adminDo(ctx, adminAddr, http.MethodPut, "/config/apps/tls/automation/email", emailJSON)
-		if err != nil {
-			return fmt.Errorf("ingress: admin set TLS email: %w", err)
-		}
-		if code >= 300 {
-			return fmt.Errorf("ingress: admin set TLS email: status %d: %s", code, body)
-		}
 	}
 	return nil
 }
