@@ -24,6 +24,11 @@ type Host struct {
 	// the global flag defaults". Pointer fields inside distinguish "unset"
 	// (inherit default) from an explicit zero value.
 	Prune *PruneConfig `yaml:"prune,omitempty"`
+	// CaddyAdminAddr is the Caddy admin API address (host:port) on this host,
+	// e.g. "100.64.1.2:2019". When set, the ingress controller targets this
+	// address instead of the global -ingress-caddy-admin-addr default. Empty
+	// means use the global default.
+	CaddyAdminAddr string `yaml:"caddy_admin_addr,omitempty"`
 }
 
 // PruneConfig is the raw per-host prune policy as parsed from hosts/*.yaml.

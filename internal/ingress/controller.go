@@ -38,6 +38,12 @@ type Config struct {
 	Network    string // shared ingress network name (e.g. "podman-api-ingress")
 	CaddyImage string // e.g. "docker.io/library/caddy:2"
 	ACMEEmail  string // ACME account email for the global Caddyfile block
+	// AdminAddr is the Caddy admin API address (host:port) used when no
+	// per-host override is set. Default "localhost:2019".
+	AdminAddr string
+	// HostAdmins maps hostID to a per-host Caddy admin API address. Takes
+	// precedence over AdminAddr when set for the host being reconciled.
+	HostAdmins map[string]string
 }
 
 // CaddyController is the production Controller. It drives a per-host Caddy pod
@@ -47,6 +53,10 @@ type CaddyController struct {
 	store  Store
 	cfg    Config
 
+	// adminDo dispatches HTTP requests to the Caddy admin API. Overridden in
+	// tests with a recording stub; production uses caddyAdminDo (net/http).
+	adminDo func(ctx context.Context, addr, method, path string, body []byte) (int, []byte, error)
+
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex // per-host serialization
 }
@@ -55,6 +65,9 @@ type CaddyController struct {
 // template lookups, so ingress declarations are always read fresh from the
 // store (no stale boot-time template snapshot).
 func NewCaddyController(client podman.Client, st Store, cfg Config) *CaddyController {
+	if cfg.AdminAddr == "" {
+		cfg.AdminAddr = "localhost:2019"
+	}
 	return &CaddyController{
 		client: client,
 		store:  st,
@@ -73,6 +86,17 @@ func (c *CaddyController) hostLock(host string) *sync.Mutex {
 		c.locks[host] = m
 	}
 	return m
+}
+
+// resolveAdminAddr returns the Caddy admin API addr for the given host: the
+// per-host override from cfg.HostAdmins if present, otherwise cfg.AdminAddr.
+func (c *CaddyController) resolveAdminAddr(hostID string) string {
+	if c.cfg.HostAdmins != nil {
+		if addr, ok := c.cfg.HostAdmins[hostID]; ok && addr != "" {
+			return addr
+		}
+	}
+	return c.cfg.AdminAddr
 }
 
 // Compile-time guarantees.
