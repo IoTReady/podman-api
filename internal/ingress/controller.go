@@ -11,9 +11,9 @@ import (
 // Controller reconciles a host's ingress (Caddy) state with the store.
 type Controller interface {
 	// Reconcile makes the host's Caddy proxy match the routes derived from the
-	// store: ensures the network + Caddy pod exist, renders the Caddyfile, and
-	// applies it (zero-downtime reload). Safe to call repeatedly; serialized
-	// per host.
+	// store: ensures the network + Caddy pod exist, derives routes, and
+	// pushes JSON routes via the Caddy admin API. Safe to call repeatedly;
+	// serialized per host.
 	Reconcile(ctx context.Context, host string) error
 }
 
@@ -37,7 +37,7 @@ type Store interface {
 type Config struct {
 	Network    string // shared ingress network name (e.g. "podman-api-ingress")
 	CaddyImage string // e.g. "docker.io/library/caddy:2"
-	ACMEEmail  string // ACME account email for the global Caddyfile block
+	ACMEEmail  string // ACMEEmail is set in the bootstrap Caddyfile seed and pushed to the live TLS automation config via the admin API.
 	// AdminAddr is the Caddy admin API address (host:port) used when no
 	// per-host override is set. Default "localhost:2019".
 	AdminAddr string

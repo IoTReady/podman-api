@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -213,4 +214,17 @@ func TestReconcileACMEEmailPushedToTLS(t *testing.T) {
 	}
 	require.NotNil(t, tlsCall)
 	require.Equal(t, `"ops@example.com"`, string(tlsCall.body))
+}
+
+func TestReconcileFailsWhenAdminNotReady(t *testing.T) {
+	f := fake.New()
+	c := NewCaddyController(f, webSpecStore(t),
+		Config{Network: "n", CaddyImage: "img"})
+	c.adminDo = func(_ context.Context, _, _, _ string, _ []byte) (int, []byte, error) {
+		return http.StatusServiceUnavailable, nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := c.Reconcile(ctx, "h1")
+	require.Error(t, err)
 }
