@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -196,8 +197,16 @@ func RunWithFlags(opts ...Option) error {
 			case h.Addr != "unix" && h.Addr != "":
 				// Derive from SSH addr "user@host" → "host:2019" so operators
 				// don't need to set caddy_admin_addr for standard deployments.
-				parts := strings.SplitN(h.Addr, "@", 2)
-				hostAdmins[h.ID] = parts[len(parts)-1] + ":2019"
+				// Strip "user@" prefix, then strip any SSH port, then append :2019.
+				raw := h.Addr
+				if at := strings.IndexByte(raw, '@'); at >= 0 {
+					raw = raw[at+1:]
+				}
+				hostname := raw
+				if parsed, _, err := net.SplitHostPort(raw); err == nil {
+					hostname = parsed // e.g. "host:2222" → "host"; "[::1]:22" → "::1"
+				}
+				hostAdmins[h.ID] = net.JoinHostPort(hostname, "2019")
 			}
 		}
 		ctl := ingress.NewCaddyController(client, db, ingress.Config{

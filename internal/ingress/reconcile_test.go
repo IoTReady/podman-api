@@ -195,6 +195,29 @@ func TestReconcileUsesPerHostAdminAddr(t *testing.T) {
 	require.Equal(t, "custom-host:2019", gotAddr)
 }
 
+func TestReconcileACMEEmailPushedToTLS(t *testing.T) {
+	f := fake.New()
+	stub, calls := adminRecorder(http.StatusOK)
+	c := NewCaddyController(f, webSpecStore(t),
+		Config{Network: "n", CaddyImage: "img", ACMEEmail: "ops@example.com"})
+	c.adminDo = stub
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+
+	// A PUT to /config/apps/tls/automation/policies must carry the email
+	// and specify the ACME module (global Caddyfile email is dropped by adapt).
+	var tlsCall *adminCall
+	for i := range *calls {
+		if (*calls)[i].method == http.MethodPut && (*calls)[i].path == "/config/apps/tls/automation/policies" {
+			tlsCall = &(*calls)[i]
+			break
+		}
+	}
+	require.NotNil(t, tlsCall, "expected PUT to /config/apps/tls/automation/policies")
+	require.Contains(t, string(tlsCall.body), "ops@example.com")
+	require.Contains(t, string(tlsCall.body), "acme")
+}
+
 func TestReconcileFailsWhenAdminNotReady(t *testing.T) {
 	f := fake.New()
 	c := NewCaddyController(f, webSpecStore(t),
