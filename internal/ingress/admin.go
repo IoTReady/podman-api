@@ -12,9 +12,9 @@ import (
 // Caddy JSON types for the admin API.
 
 type caddyRoute struct {
-	Match    []caddyMatch    `json:"match"`
-	Handle   []caddyHandler  `json:"handle"`
-	Terminal bool            `json:"terminal"`
+	Match    []caddyMatch   `json:"match"`
+	Handle   []caddyHandler `json:"handle"`
+	Terminal bool           `json:"terminal"`
 }
 
 type caddyMatch struct {
@@ -22,8 +22,8 @@ type caddyMatch struct {
 }
 
 type caddyHandler struct {
-	Handler   string           `json:"handler"`
-	Upstreams []caddyUpstream  `json:"upstreams"`
+	Handler   string          `json:"handler"`
+	Upstreams []caddyUpstream `json:"upstreams"`
 }
 
 type caddyUpstream struct {
@@ -33,9 +33,9 @@ type caddyUpstream struct {
 // caddyServer is the JSON shape of the podman_api HTTP server we PUT at
 // /config/apps/http/servers/podman_api.
 type caddyServer struct {
-	Listen        []string     `json:"listen"`
-	Routes        []caddyRoute `json:"routes"`
-	AutomaticHTTPS *struct{}   `json:"automatic_https"`
+	Listen         []string     `json:"listen"`
+	Routes         []caddyRoute `json:"routes"`
+	AutomaticHTTPS *struct{}    `json:"automatic_https"`
 }
 
 // routesToCaddyJSON converts ingress Routes to Caddy JSON route objects.
