@@ -128,8 +128,9 @@ func TestIngressEndToEnd(t *testing.T) {
 
 	require.NoError(t, ctl.Reconcile(ctx, host))
 
-	// Give the Caddy pod a moment to settle into Running after kube play.
-	time.Sleep(3 * time.Second)
+	// Reconcile already waited for the admin API to become ready (via
+	// waitForAdmin). Give the pod a brief moment to settle its health status.
+	time.Sleep(1 * time.Second)
 
 	// Deterministic assertion: the Caddy system pod exists and is running.
 	// We deliberately do NOT assert live HTTPS here — public ACME issuance

@@ -2,7 +2,6 @@ package ingress
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"testing"
@@ -214,11 +213,4 @@ func TestReconcileACMEEmailPushedToTLS(t *testing.T) {
 	}
 	require.NotNil(t, tlsCall)
 	require.Equal(t, `"ops@example.com"`, string(tlsCall.body))
-}
-
-// assertValidJSON is a test helper that asserts the body is valid JSON.
-func assertValidJSON(t *testing.T, body []byte) {
-	t.Helper()
-	var v interface{}
-	require.NoError(t, json.Unmarshal(body, &v))
 }
