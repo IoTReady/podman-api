@@ -29,7 +29,7 @@ const ingressITAdminAddr = "localhost:2019"
 const ingressITNetwork = "podman-api-ingress-it"
 
 // webPod is a minimal backend the Caddy proxy routes to.
-const webPod = ` + "`" + `apiVersion: v1
+const webPod = `apiVersion: v1
 kind: Pod
 metadata:
   name: web-it
@@ -37,7 +37,7 @@ spec:
   containers:
     - name: web
       image: docker.io/library/nginx:alpine
-` + "`" + `
+`
 
 func localSocket(t *testing.T) string {
 	t.Helper()

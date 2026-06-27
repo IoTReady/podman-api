@@ -205,8 +205,8 @@ func RunWithFlags(opts ...Option) error {
 			}
 		}
 		ctl := ingress.NewCaddyController(db, ingress.Config{
-			ACMEEmail: *ingressACME,
-			AdminAddr: *ingressAdminAddr,
+			ACMEEmail:  *ingressACME,
+			AdminAddr:  *ingressAdminAddr,
 			HostAdmins: hostAdmins,
 		})
 		svc.SetIngress(ctl, *ingressNetwork)

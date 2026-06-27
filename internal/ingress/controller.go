@@ -41,8 +41,8 @@ type Config struct {
 // CaddyController is the production Controller. It drives routes on an
 // operator-managed Caddy instance via the admin API.
 type CaddyController struct {
-	store  Store
-	cfg    Config
+	store Store
+	cfg   Config
 
 	// adminDo dispatches HTTP requests to the Caddy admin API. Overridden in
 	// tests with a recording stub; production uses caddyAdminDo (net/http).
