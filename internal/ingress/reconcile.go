@@ -3,12 +3,10 @@ package ingress
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
-
-	"github.com/iotready/podman-api/internal/podman"
 )
 
 // Reconcile makes host's Caddy proxy match the store-derived routes. It is
@@ -24,22 +22,18 @@ func (c *CaddyController) Reconcile(ctx context.Context, host string) error {
 	}
 	adminAddr := c.resolveAdminAddr(host)
 
-	// Nothing to serve and no proxy yet: don't stand up an idle pod.
-	// If a pod already exists, fall through so a drop-to-zero removes the server.
+	// No routes: best-effort cleanup of our server namespace in Caddy. If
+	// Caddy is unreachable (not yet started, restarting) that is not an error
+	// when there is nothing to serve.
 	if len(routes) == 0 {
-		if _, err := c.client.PodInspect(ctx, host, caddyPodName); errors.Is(err, podman.ErrNotFound) {
-			return nil
-		} else if err != nil {
-			return fmt.Errorf("ingress: inspect caddy pod: %w", err)
+		if err := c.deleteServer(ctx, adminAddr); err != nil {
+			log.Printf("ingress: best-effort cleanup on %s (admin %s): %v", host, adminAddr, err)
 		}
-		return c.deleteServer(ctx, adminAddr)
+		return nil
 	}
 
-	if _, err := c.ensureProxy(ctx, host); err != nil {
-		return err
-	}
-	// Wait for the admin API — one GET round-trip for a running pod,
-	// polling (up to 20×300ms) for a fresh or rebooting pod.
+	// Wait for the admin API — one round-trip for a running Caddy, polling
+	// (up to 20×300ms) while it restarts.
 	if err := c.waitForAdmin(ctx, adminAddr); err != nil {
 		return err
 	}
@@ -102,8 +96,7 @@ func (c *CaddyController) deleteServer(ctx context.Context, adminAddr string) er
 }
 
 // waitForAdmin polls the Caddy admin API's /config/ endpoint until it
-// responds with 200 or the context is cancelled. Used after creating a
-// fresh Caddy pod to ensure it's ready before we push routes.
+// responds with 200 or the context is cancelled.
 func (c *CaddyController) waitForAdmin(ctx context.Context, adminAddr string) error {
 	const (
 		maxAttempts  = 20
