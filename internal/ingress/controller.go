@@ -69,10 +69,11 @@ func NewCaddyController(client podman.Client, st Store, cfg Config) *CaddyContro
 		cfg.AdminAddr = "localhost:2019"
 	}
 	return &CaddyController{
-		client: client,
-		store:  st,
-		cfg:    cfg,
-		locks:  map[string]*sync.Mutex{},
+		client:  client,
+		store:   st,
+		cfg:     cfg,
+		adminDo: caddyAdminDo,
+		locks:   map[string]*sync.Mutex{},
 	}
 }
 
