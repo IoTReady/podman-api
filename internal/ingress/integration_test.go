@@ -4,6 +4,7 @@ package ingress_test
 
 import (
 	"context"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -19,15 +20,16 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 )
 
-// ingressITNetwork is the dedicated network the controller and the dummy web
-// pod share for this end-to-end test. It is isolated from the production
-// ingress network so a stray run cannot disturb a real deployment.
+// ingressITAdminAddr is the Caddy admin API the integration test expects to
+// find running. Override with INGRESS_IT_ADMIN env var.
+const ingressITAdminAddr = "localhost:2019"
+
+// ingressITNetwork is the dedicated network the dummy web pod joins for this
+// end-to-end test.
 const ingressITNetwork = "podman-api-ingress-it"
 
-// webPod is a minimal backend the Caddy proxy routes to. It is deployed onto
-// the ingress network under the container name "web" so it matches the stored
-// "web" template's ingress: declaration the controller derives the upstream from.
-const webPod = `apiVersion: v1
+// webPod is a minimal backend the Caddy proxy routes to.
+const webPod = ` + "`" + `apiVersion: v1
 kind: Pod
 metadata:
   name: web-it
@@ -35,13 +37,8 @@ spec:
   containers:
     - name: web
       image: docker.io/library/nginx:alpine
-`
+` + "`" + `
 
-// localSocket mirrors the helper in internal/podman's integration tests: the
-// suite drives a real, local podman over the user socket pointed at by
-// XDG_RUNTIME_DIR. It is replicated here because that helper is unexported and
-// this test lives in the external ingress_test package. Skips (rather than
-// fails) when no local socket is reachable so CI without a podman host is green.
 func localSocket(t *testing.T) string {
 	t.Helper()
 	rt := os.Getenv("XDG_RUNTIME_DIR")
@@ -55,20 +52,34 @@ func localSocket(t *testing.T) string {
 	return p
 }
 
-// TestIngressEndToEnd exercises the real Caddy controller against a real
-// podman host: it stores a web spec with a public domain, stands up a dummy
-// backend on the ingress network, reconciles, and asserts the Caddy system pod
-// comes up running.
+// TestIngressEndToEnd exercises the real Caddy controller against a running
+// operator-managed Caddy instance. It pushes a route and confirms it appears
+// in Caddy's config via the admin API.
 //
-// The host is the local podman socket (host id "local"), matching the rest of
-// the integration suite. INGRESS_IT_DOMAIN must name a domain whose A record
-// points at this host; absent it (or a podman socket), the test skips.
+// Prerequisites:
+//   - XDG_RUNTIME_DIR set (local podman socket reachable)
+//   - INGRESS_IT_DOMAIN set to a domain whose A record points at this host
+//   - Caddy running with admin API enabled at localhost:2019
+//     (set INGRESS_IT_ADMIN to override the address)
 func TestIngressEndToEnd(t *testing.T) {
 	sock := localSocket(t)
 
 	domain := os.Getenv("INGRESS_IT_DOMAIN")
 	if domain == "" {
 		t.Skip("INGRESS_IT_DOMAIN unset")
+	}
+
+	adminAddr := os.Getenv("INGRESS_IT_ADMIN")
+	if adminAddr == "" {
+		adminAddr = ingressITAdminAddr
+	}
+
+	// Skip if Caddy admin API is not reachable — operator must start Caddy first.
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer probeCancel()
+	probeReq, _ := http.NewRequestWithContext(probeCtx, http.MethodGet, "http://"+adminAddr+"/config/", nil)
+	if resp, err := http.DefaultClient.Do(probeReq); err != nil || resp.StatusCode != http.StatusOK {
+		t.Skipf("Caddy admin API not reachable at %s — start Caddy first", adminAddr)
 	}
 
 	const host = "local"
@@ -79,8 +90,6 @@ func TestIngressEndToEnd(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 
-	// Open an encrypted store backed by a temp file (the store always
-	// round-trips through SQLite; the controller reads specs from it).
 	var key [32]byte
 	for i := range key {
 		key[i] = byte(i)
@@ -90,8 +99,6 @@ func TestIngressEndToEnd(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = st.Close() })
 
-	// The controller resolves the backend port from the stored "web" template's
-	// ingress: declaration, so seed that template alongside the spec.
 	require.NoError(t, st.PutTemplate(ctx, store.Template{
 		Meta: render.Meta{
 			ID:      "web",
@@ -108,54 +115,39 @@ func TestIngressEndToEnd(t *testing.T) {
 	}))
 
 	ctl := ingress.NewCaddyController(
-		client,
 		st,
 		ingress.Config{
-			Network:    ingressITNetwork,
-			CaddyImage: "docker.io/library/caddy:2",
 			ACMEEmail:  "it@example.com",
+			AdminAddr:  adminAddr,
+			HostAdmins: map[string]string{host: adminAddr},
 		},
 	)
 
-	// Stand up the dummy backend on the ingress network so the Caddy upstream
-	// (web-it/web:80) resolves once reconciliation wires the route.
+	// Stand up the dummy backend on the ingress network.
+	require.NoError(t, client.NetworkEnsure(ctx, host, ingressITNetwork))
 	require.NoError(t, client.PlayKube(ctx, host, webPod, true, ingressITNetwork))
-
 	t.Cleanup(func() {
 		_ = client.PodRemove(context.Background(), host, "web-it", true)
-		_ = client.PodRemove(context.Background(), host, "podman-api-ingress-caddy", true)
 	})
 
 	require.NoError(t, ctl.Reconcile(ctx, host))
 
-	// Reconcile already waited for the admin API to become ready (via
-	// waitForAdmin). Give the pod a brief moment to settle its health status.
-	time.Sleep(1 * time.Second)
-
-	// Deterministic assertion: the Caddy system pod exists and is running.
-	// We deliberately do NOT assert live HTTPS here — public ACME issuance
-	// needs real DNS plus open :80/:443 and has nondeterministic timing
-	// (proven out in the spike), which would make CI flaky. The pod-running
-	// check passes on any correctly-reconciled host.
-	pod, err := client.PodInspect(ctx, host, "podman-api-ingress-caddy")
+	// Verify the route appears in Caddy's config.
+	verifyCtx, verifyCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer verifyCancel()
+	verifyReq, _ := http.NewRequestWithContext(verifyCtx, http.MethodGet,
+		"http://"+adminAddr+"/config/apps/http/servers/podman_api", nil)
+	resp, err := http.DefaultClient.Do(verifyReq)
 	require.NoError(t, err)
-	assert.Equal(t, "podman-api-ingress-caddy", pod.Name)
-	assert.Equal(t, "Running", pod.Status, "Caddy system pod should be Running after reconcile")
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode, "podman_api server should exist in Caddy config after reconcile")
 
-	// Manual HTTPS smoke test (run by hand when INGRESS_IT_DOMAIN resolves
-	// publicly and :80/:443 are reachable; left commented to keep CI
-	// deterministic):
-	//
-	//   c := &http.Client{Timeout: 30 * time.Second}
-	//   var resp *http.Response
-	//   for i := 0; i < 12; i++ { // wait up to ~60s for LE issuance
-	//   	resp, err = c.Get("https://" + domain + "/")
-	//   	if err == nil {
-	//   		break
-	//   	}
-	//   	time.Sleep(5 * time.Second)
-	//   }
-	//   require.NoError(t, err)
-	//   defer resp.Body.Close()
-	//   require.Equal(t, http.StatusOK, resp.StatusCode)
+	// Cleanup: remove our server namespace from Caddy.
+	t.Cleanup(func() {
+		cleanCtx, cleanCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanCancel()
+		cleanReq, _ := http.NewRequestWithContext(cleanCtx, http.MethodDelete,
+			"http://"+adminAddr+"/config/apps/http/servers/podman_api", nil)
+		_, _ = http.DefaultClient.Do(cleanReq)
+	})
 }
