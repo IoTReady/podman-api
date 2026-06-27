@@ -78,7 +78,7 @@ func TestReconcileSecondCallPushesAdminRoutes(t *testing.T) {
 	require.Contains(t, string(putCall.body), "blog.example.com")
 }
 
-func TestReconcileNoRoutesIsNoop(t *testing.T) {
+func TestReconcileNoRoutesSkipsPush(t *testing.T) {
 	stub, calls := adminRecorder(http.StatusOK)
 	c := NewCaddyController(store.NewMemory(),
 		Config{ACMEEmail: "ops@example.com"})

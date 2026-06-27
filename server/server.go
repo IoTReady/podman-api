@@ -85,7 +85,7 @@ func RunWithFlags(opts ...Option) error {
 
 		ingressEnabled   = fs.Bool("ingress-enabled", false, "enable per-host Caddy ingress + auto-TLS")
 		ingressNetwork   = fs.String("ingress-network", "podman-api-ingress", "shared podman network app pods join for ingress")
-		ingressACME      = fs.String("ingress-acme-email", "", "ACME account email for Let's Encrypt (required when -ingress-enabled)")
+		ingressACME      = fs.String("ingress-acme-email", "", "ACME account email for Let's Encrypt; optional — omit to skip automatic TLS via ACME")
 		ingressAdminAddr = fs.String("ingress-caddy-admin-addr", "localhost:2019", "default Caddy admin API address (host:port); per-host caddy_admin_addr in hosts/*.yaml overrides this. The admin API is unauthenticated, so keep :2019 on a trusted/private network or firewalled to the control plane")
 		ingressInterval  = fs.Duration("ingress-reconcile-interval", 5*time.Minute, "periodic ingress drift-correction interval per host; 0 disables the periodic loop")
 
