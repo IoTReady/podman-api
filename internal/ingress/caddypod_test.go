@@ -42,6 +42,24 @@ func TestEnsureProxyNoopWhenPresent(t *testing.T) {
 	require.Equal(t, plays, len(f.PlayCalls), "no second play")
 }
 
+func TestEnsureProxyRecreatesStalePod(t *testing.T) {
+	f := fake.New()
+	c := NewCaddyController(f, store.NewMemory(), Config{Network: "n", CaddyImage: "img"})
+	// Seed a pre-admin-API pod: same name, but without the schema label.
+	require.NoError(t, f.NetworkEnsure(context.Background(), "h1", "n"))
+	oldYAML := "apiVersion: v1\nkind: Pod\nmetadata:\n  name: " + caddyPodName +
+		"\nspec:\n  containers:\n    - name: caddy\n      image: old\n"
+	require.NoError(t, f.PlayKube(context.Background(), "h1", oldYAML, false, "n"))
+	plays := len(f.PlayCalls)
+
+	created, err := c.ensureProxy(context.Background(), "h1")
+	require.NoError(t, err)
+	require.True(t, created, "stale pod must be recreated")
+	require.Equal(t, plays+1, len(f.PlayCalls), "expected a replace play")
+	// The replacement carries the current schema label.
+	require.Contains(t, f.PlayCalls[len(f.PlayCalls)-1].YAML, caddySchemaLabel+": "+caddySchema)
+}
+
 func TestCaddyPodYAMLShape(t *testing.T) {
 	y := caddyPodYAML("docker.io/library/caddy:2", "ops@example.com")
 	require.Contains(t, y, "name: "+caddyPodName)
@@ -51,6 +69,8 @@ func TestCaddyPodYAMLShape(t *testing.T) {
 	require.Contains(t, y, "hostPort: 2019")
 	require.Contains(t, y, "containerPort: 2019")
 	require.Contains(t, y, "claimName: "+caddyDataVolume)
+	// Pod carries the schema label so ensureProxy can recreate stale pods.
+	require.Contains(t, y, caddySchemaLabel+": "+caddySchema)
 	require.True(t, strings.Contains(y, "kind: Pod"))
 	// Boot via seeding sh wrapper that writes seed only when absent.
 	require.Contains(t, y, `command: ["sh", "-c",`)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/iotready/podman-api/internal/podman"
 )
@@ -16,7 +17,19 @@ const (
 	caddyDataVolume = "podman-api-caddy-data"
 	// caddyAdminPort is the Caddy admin API port exposed as a hostPort so the
 	// controller can reach it from the control plane.
+	//
+	// SECURITY: the admin API is unauthenticated and can replace Caddy's entire
+	// running config. It is published on the host (see caddyPodYAML) so the
+	// controller can reach it at the host's address, which means :2019 must be
+	// kept on a trusted/private network (e.g. a tailnet) or firewalled to the
+	// control plane — anyone who can reach it controls the host's TLS.
 	caddyAdminPort = 2019
+	// caddySchemaLabel/caddySchema mark the manifest generation of the managed
+	// Caddy pod. ensureProxy recreates any pod missing the current value — e.g.
+	// one created by a pre-admin-API release, which neither publishes :2019 nor
+	// serves the admin API the controller now depends on.
+	caddySchemaLabel = "podman-api.ingress.schema"
+	caddySchema      = "admin-api"
 )
 
 // caddySeedCaddyfile renders the minimal global Caddyfile used to bootstrap a
@@ -58,6 +71,7 @@ metadata:
   name: %s
   labels:
     podman-api.ingress: caddy
+    %s: %s
 spec:
   containers:
     - name: caddy
@@ -80,16 +94,21 @@ spec:
     - name: data
       persistentVolumeClaim:
         claimName: %s
-`, caddyPodName, image, boot, seed, caddyAdminPort, caddyAdminPort, caddyDataVolume)
+`, caddyPodName, caddySchemaLabel, caddySchema, image, boot, seed, caddyAdminPort, caddyAdminPort, caddyDataVolume)
 }
 
-// ensureProxy makes the network + Caddy pod exist on host. When it creates
-// the pod it returns created=true; when the pod already exists it does
-// nothing and returns created=false. Reconcile uses created to decide
-// whether to wait for the admin API to become ready before pushing routes.
+// ensureProxy makes the network + Caddy pod exist (and current) on host. It
+// returns created=true when it (re)creates the pod and created=false when an
+// up-to-date pod is already present. A pod from a pre-admin-API release is
+// recreated with the current manifest — it lacks the published :2019 / admin
+// API the controller now depends on; the persistent /data volume (and its ACME
+// certs) survives the replace.
 func (c *CaddyController) ensureProxy(ctx context.Context, host string) (bool, error) {
-	if _, err := c.client.PodInspect(ctx, host, caddyPodName); err == nil {
-		return false, nil // already present
+	if pod, err := c.client.PodInspect(ctx, host, caddyPodName); err == nil {
+		if pod.Labels[caddySchemaLabel] == caddySchema {
+			return false, nil // present and current
+		}
+		log.Printf("ingress: recreating stale caddy pod on %s (missing %s=%s)", host, caddySchemaLabel, caddySchema)
 	} else if !errors.Is(err, podman.ErrNotFound) {
 		return false, fmt.Errorf("ingress: inspect caddy pod: %w", err)
 	}
@@ -99,7 +118,9 @@ func (c *CaddyController) ensureProxy(ctx context.Context, host string) (bool, e
 	if err := c.client.VolumeCreate(ctx, host, caddyDataVolume); err != nil {
 		return false, fmt.Errorf("ingress: create data volume: %w", err)
 	}
-	if err := c.client.PlayKube(ctx, host, caddyPodYAML(c.cfg.CaddyImage, c.cfg.ACMEEmail), false, c.cfg.Network); err != nil {
+	// replace=true so a stale pod is torn down and recreated; for a brand-new
+	// host there is nothing to replace.
+	if err := c.client.PlayKube(ctx, host, caddyPodYAML(c.cfg.CaddyImage, c.cfg.ACMEEmail), true, c.cfg.Network); err != nil {
 		return false, fmt.Errorf("ingress: play caddy pod: %w", err)
 	}
 	return true, nil

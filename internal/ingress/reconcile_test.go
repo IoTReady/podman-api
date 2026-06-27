@@ -38,6 +38,17 @@ type adminCall struct {
 	body               []byte
 }
 
+// findPut returns the first recorded PUT to path, or nil. Order-independent so
+// tests don't depend on whether the TLS or server PUT is sent first.
+func findPut(calls *[]adminCall, path string) *adminCall {
+	for i := range *calls {
+		if (*calls)[i].method == http.MethodPut && (*calls)[i].path == path {
+			return &(*calls)[i]
+		}
+	}
+	return nil
+}
+
 func TestReconcileFreshHostCreatesPodsAndPushesAdminRoutes(t *testing.T) {
 	f := fake.New()
 	stub, calls := adminRecorder(http.StatusOK)
@@ -53,16 +64,9 @@ func TestReconcileFreshHostCreatesPodsAndPushesAdminRoutes(t *testing.T) {
 	// Pod YAML must NOT carry route content — routes go via admin API only.
 	require.NotContains(t, caddyYAML, "blog.example.com")
 	require.NotContains(t, caddyYAML, "reverse_proxy")
-	// Admin API should have been called to push routes.
-	var putCall *adminCall
-	for i := range *calls {
-		if (*calls)[i].method == http.MethodPut {
-			putCall = &(*calls)[i]
-			break
-		}
-	}
-	require.NotNil(t, putCall, "expected a PUT call to admin API")
-	require.Contains(t, putCall.path, "podman_api")
+	// Admin API should have been called to push the routes (server) config.
+	putCall := findPut(calls, "/config/apps/http/servers/podman_api")
+	require.NotNil(t, putCall, "expected a PUT to the podman_api server")
 	require.Contains(t, string(putCall.body), "blog.example.com")
 	require.Contains(t, string(putCall.body), "web-blog:8080")
 	// No exec or file copy.
@@ -83,13 +87,7 @@ func TestReconcileExistingHostPushesAdminRoutes(t *testing.T) {
 
 	require.Empty(t, f.ExecCalls, "no exec on existing pod")
 	require.Empty(t, f.CopyCalls, "no file copy on existing pod")
-	var putCall *adminCall
-	for i := range *calls {
-		if (*calls)[i].method == http.MethodPut {
-			putCall = &(*calls)[i]
-			break
-		}
-	}
+	putCall := findPut(calls, "/config/apps/http/servers/podman_api")
 	require.NotNil(t, putCall)
 	require.Contains(t, string(putCall.body), "blog.example.com")
 }
