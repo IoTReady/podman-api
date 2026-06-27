@@ -9,7 +9,6 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/store"
 )
 
@@ -49,73 +48,63 @@ func findPut(calls *[]adminCall, path string) *adminCall {
 	return nil
 }
 
-func TestReconcileFreshHostCreatesPodsAndPushesAdminRoutes(t *testing.T) {
-	f := fake.New()
+func TestReconcilePushesAdminRoutes(t *testing.T) {
 	stub, calls := adminRecorder(http.StatusOK)
-	c := NewCaddyController(f, webSpecStore(t),
-		Config{Network: "podman-api-ingress", CaddyImage: "docker.io/library/caddy:2", ACMEEmail: "ops@example.com"})
+	c := NewCaddyController(webSpecStore(t),
+		Config{ACMEEmail: "ops@example.com"})
 	c.adminDo = stub
 
 	require.NoError(t, c.Reconcile(context.Background(), "h1"))
 
-	// Pod should be created (fresh host).
-	require.NotEmpty(t, f.PlayCalls)
-	caddyYAML := f.PlayCalls[len(f.PlayCalls)-1].YAML
-	// Pod YAML must NOT carry route content — routes go via admin API only.
-	require.NotContains(t, caddyYAML, "blog.example.com")
-	require.NotContains(t, caddyYAML, "reverse_proxy")
 	// Admin API should have been called to push the routes (server) config.
 	putCall := findPut(calls, "/config/apps/http/servers/podman_api")
 	require.NotNil(t, putCall, "expected a PUT to the podman_api server")
 	require.Contains(t, string(putCall.body), "blog.example.com")
 	require.Contains(t, string(putCall.body), "web-blog:8080")
-	// No exec or file copy.
-	require.Empty(t, f.ExecCalls)
-	require.Empty(t, f.CopyCalls)
 }
 
-func TestReconcileExistingHostPushesAdminRoutes(t *testing.T) {
-	f := fake.New()
+func TestReconcileSecondCallPushesAdminRoutes(t *testing.T) {
 	stub, calls := adminRecorder(http.StatusOK)
-	c := NewCaddyController(f, webSpecStore(t),
-		Config{Network: "n", CaddyImage: "img", ACMEEmail: "ops@example.com"})
+	c := NewCaddyController(webSpecStore(t),
+		Config{ACMEEmail: "ops@example.com"})
 	c.adminDo = stub
-	require.NoError(t, c.Reconcile(context.Background(), "h1")) // creates pod
-	*calls = nil                                                // reset; only care about the second reconcile
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	*calls = nil // reset; only care about the second reconcile
 
-	require.NoError(t, c.Reconcile(context.Background(), "h1")) // pod exists → admin API only
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
 
-	require.Empty(t, f.ExecCalls, "no exec on existing pod")
-	require.Empty(t, f.CopyCalls, "no file copy on existing pod")
 	putCall := findPut(calls, "/config/apps/http/servers/podman_api")
 	require.NotNil(t, putCall)
 	require.Contains(t, string(putCall.body), "blog.example.com")
 }
 
-func TestReconcileNoRoutesNoPodIsNoop(t *testing.T) {
-	f := fake.New()
+func TestReconcileNoRoutesIsNoop(t *testing.T) {
 	stub, calls := adminRecorder(http.StatusOK)
-	c := NewCaddyController(f, store.NewMemory(),
-		Config{Network: "n", CaddyImage: "img", ACMEEmail: "ops@example.com"})
+	c := NewCaddyController(store.NewMemory(),
+		Config{ACMEEmail: "ops@example.com"})
 	c.adminDo = stub
 
 	require.NoError(t, c.Reconcile(context.Background(), "h1"))
 
-	require.Empty(t, f.PlayCalls, "no Caddy pod should be created when there are no routes")
-	require.Empty(t, *calls, "no admin API calls when there are no routes and no pod")
+	// Zero routes: a best-effort DELETE is sent; no PUT to the server.
+	var putCall *adminCall
+	for i := range *calls {
+		if (*calls)[i].method == http.MethodPut {
+			putCall = &(*calls)[i]
+			break
+		}
+	}
+	require.Nil(t, putCall, "no PUT when there are no routes")
 }
 
-func TestReconcileNoRoutesExistingPodDeletesServer(t *testing.T) {
-	f := fake.New()
+func TestReconcileNoRoutesDeletesServer(t *testing.T) {
 	stub, calls := adminRecorder(http.StatusOK)
-	c := NewCaddyController(f, webSpecStore(t),
-		Config{Network: "n", CaddyImage: "img", ACMEEmail: "ops@example.com"})
+	c := NewCaddyController(webSpecStore(t), Config{})
 	c.adminDo = stub
-	require.NoError(t, c.Reconcile(context.Background(), "h1")) // creates pod + routes
+	require.NoError(t, c.Reconcile(context.Background(), "h1")) // push routes
 
 	// Now clear the store so zero routes remain.
-	emptyStore := store.NewMemory()
-	c.store = emptyStore
+	c.store = store.NewMemory()
 	*calls = nil
 
 	require.NoError(t, c.Reconcile(context.Background(), "h1"))
@@ -131,16 +120,20 @@ func TestReconcileNoRoutesExistingPodDeletesServer(t *testing.T) {
 	require.Contains(t, deleteCall.path, "podman_api")
 }
 
-func TestReconcileFailsWhenAdminAPIFails(t *testing.T) {
-	f := fake.New()
-	c := NewCaddyController(f, webSpecStore(t),
-		Config{Network: "n", CaddyImage: "img"})
-	// First reconcile: create pod with a working admin stub.
-	stub, _ := adminRecorder(http.StatusOK)
-	c.adminDo = stub
-	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+func TestReconcileNoRoutesAdminUnreachableIsNoop(t *testing.T) {
+	// When routes=0 and Caddy is not running, Reconcile should return nil
+	// (best-effort cleanup — Caddy not running means nothing to clean up).
+	c := NewCaddyController(store.NewMemory(), Config{})
+	c.adminDo = func(_ context.Context, _, _, _ string, _ []byte) (int, []byte, error) {
+		return 0, nil, fmt.Errorf("connection refused")
+	}
 
-	// Second reconcile: GET /config/ readiness probe succeeds but PUT returns 500.
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+}
+
+func TestReconcileFailsWhenAdminAPIFails(t *testing.T) {
+	c := NewCaddyController(webSpecStore(t), Config{})
+	// GET /config/ readiness probe succeeds but PUT returns 500.
 	c.adminDo = func(_ context.Context, _, method, _ string, _ []byte) (int, []byte, error) {
 		if method == http.MethodGet {
 			return http.StatusOK, nil, nil
@@ -153,19 +146,8 @@ func TestReconcileFailsWhenAdminAPIFails(t *testing.T) {
 }
 
 func TestReconcileFailsWhenAdminAPINetworkError(t *testing.T) {
-	f := fake.New()
-	c := NewCaddyController(f, webSpecStore(t),
-		Config{Network: "n", CaddyImage: "img"})
-	// First reconcile: create pod.
-	stub, _ := adminRecorder(http.StatusOK)
-	c.adminDo = stub
-	require.NoError(t, c.Reconcile(context.Background(), "h1"))
-
-	// Second reconcile: network error on PUT.
-	c.adminDo = func(_ context.Context, _, method, _ string, _ []byte) (int, []byte, error) {
-		if method == http.MethodGet {
-			return http.StatusOK, nil, nil
-		}
+	c := NewCaddyController(webSpecStore(t), Config{})
+	c.adminDo = func(_ context.Context, _, _, _ string, _ []byte) (int, []byte, error) {
 		return 0, nil, fmt.Errorf("connection refused")
 	}
 	err := c.Reconcile(context.Background(), "h1")
@@ -174,11 +156,8 @@ func TestReconcileFailsWhenAdminAPINetworkError(t *testing.T) {
 }
 
 func TestReconcileUsesPerHostAdminAddr(t *testing.T) {
-	f := fake.New()
 	var gotAddr string
-	c := NewCaddyController(f, webSpecStore(t), Config{
-		Network:    "n",
-		CaddyImage: "img",
+	c := NewCaddyController(webSpecStore(t), Config{
 		AdminAddr:  "default:2019",
 		HostAdmins: map[string]string{"h1": "custom-host:2019"},
 	})
@@ -194,16 +173,15 @@ func TestReconcileUsesPerHostAdminAddr(t *testing.T) {
 }
 
 func TestReconcileACMEEmailPushedToTLS(t *testing.T) {
-	f := fake.New()
 	stub, calls := adminRecorder(http.StatusOK)
-	c := NewCaddyController(f, webSpecStore(t),
-		Config{Network: "n", CaddyImage: "img", ACMEEmail: "ops@example.com"})
+	c := NewCaddyController(webSpecStore(t),
+		Config{ACMEEmail: "ops@example.com"})
 	c.adminDo = stub
 
 	require.NoError(t, c.Reconcile(context.Background(), "h1"))
 
 	// A PUT to /config/apps/tls/automation/policies must carry the email
-	// and specify the ACME module (global Caddyfile email is dropped by adapt).
+	// and specify the ACME module.
 	var tlsCall *adminCall
 	for i := range *calls {
 		if (*calls)[i].method == http.MethodPut && (*calls)[i].path == "/config/apps/tls/automation/policies" {
@@ -217,9 +195,7 @@ func TestReconcileACMEEmailPushedToTLS(t *testing.T) {
 }
 
 func TestReconcileFailsWhenAdminNotReady(t *testing.T) {
-	f := fake.New()
-	c := NewCaddyController(f, webSpecStore(t),
-		Config{Network: "n", CaddyImage: "img"})
+	c := NewCaddyController(webSpecStore(t), Config{})
 	c.adminDo = func(_ context.Context, _, _, _ string, _ []byte) (int, []byte, error) {
 		return http.StatusServiceUnavailable, nil, nil
 	}

@@ -102,16 +102,21 @@ func (c *CaddyController) waitForAdmin(ctx context.Context, adminAddr string) er
 		maxAttempts  = 20
 		pollInterval = 300 * time.Millisecond
 	)
+	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
 		code, _, err := c.adminDo(ctx, adminAddr, http.MethodGet, "/config/", nil)
 		if err == nil && code == http.StatusOK {
 			return nil
 		}
+		lastErr = err
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("ingress: admin API at %s not ready: %w", adminAddr, ctx.Err())
 		case <-time.After(pollInterval):
 		}
+	}
+	if lastErr != nil {
+		return fmt.Errorf("ingress: admin API at %s not ready: %w", adminAddr, lastErr)
 	}
 	return fmt.Errorf("ingress: admin API at %s not ready after %d attempts", adminAddr, maxAttempts)
 }
