@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -82,11 +83,12 @@ func RunWithFlags(opts ...Option) error {
 		pruneScope     = fs.String("prune-scope", "dangling", "default prune scopes, comma-separated: dangling,all-images,containers,build-cache,volumes")
 		pruneDryRun    = fs.Bool("prune-dry-run", false, "default dry-run: report reclaimable space without removing anything")
 
-		ingressEnabled  = fs.Bool("ingress-enabled", false, "enable per-host Caddy ingress + auto-TLS")
-		ingressNetwork  = fs.String("ingress-network", "podman-api-ingress", "shared podman network app pods join for ingress")
-		ingressImage    = fs.String("ingress-caddy-image", "docker.io/library/caddy:2", "Caddy image for the per-host ingress pod; must include /bin/sh (the pod seeds its config via a small shell wrapper), so a shell-less distroless/scratch variant won't work")
-		ingressACME     = fs.String("ingress-acme-email", "", "ACME account email for Let's Encrypt (required when -ingress-enabled)")
-		ingressInterval = fs.Duration("ingress-reconcile-interval", 5*time.Minute, "periodic ingress drift-correction interval per host; 0 disables the periodic loop")
+		ingressEnabled   = fs.Bool("ingress-enabled", false, "enable per-host Caddy ingress + auto-TLS")
+		ingressNetwork   = fs.String("ingress-network", "podman-api-ingress", "shared podman network app pods join for ingress")
+		ingressImage     = fs.String("ingress-caddy-image", "docker.io/library/caddy:2", "Caddy image for the per-host ingress pod; must include /bin/sh (the pod seeds its config via a small shell wrapper), so a shell-less distroless/scratch variant won't work")
+		ingressACME      = fs.String("ingress-acme-email", "", "ACME account email for Let's Encrypt (required when -ingress-enabled)")
+		ingressAdminAddr = fs.String("ingress-caddy-admin-addr", "localhost:2019", "default Caddy admin API address (host:port); per-host caddy_admin_addr in hosts/*.yaml overrides this. The admin API is unauthenticated, so keep :2019 on a trusted/private network or firewalled to the control plane")
+		ingressInterval  = fs.Duration("ingress-reconcile-interval", 5*time.Minute, "periodic ingress drift-correction interval per host; 0 disables the periodic loop")
 
 		operatorFile   = fs.String("operator-file", "", "if set, enable the admin UI and authenticate the single operator against this YAML file (username, password_hash)")
 		uiSecureCookie = fs.Bool("ui-secure-cookie", false, "set the Secure flag on the UI session cookie (enable when serving the UI over HTTPS / behind TLS)")
@@ -187,10 +189,32 @@ func RunWithFlags(opts ...Option) error {
 	var ingressCtl *ingress.CaddyController
 
 	if *ingressEnabled {
+		hostAdmins := make(map[string]string)
+		for _, h := range hosts {
+			switch {
+			case h.CaddyAdminAddr != "":
+				hostAdmins[h.ID] = h.CaddyAdminAddr
+			case h.Addr != "unix" && h.Addr != "":
+				// Derive from SSH addr "user@host" → "host:2019" so operators
+				// don't need to set caddy_admin_addr for standard deployments.
+				// Strip "user@" prefix, then strip any SSH port, then append :2019.
+				raw := h.Addr
+				if at := strings.IndexByte(raw, '@'); at >= 0 {
+					raw = raw[at+1:]
+				}
+				hostname := raw
+				if parsed, _, err := net.SplitHostPort(raw); err == nil {
+					hostname = parsed // e.g. "host:2222" → "host"; "[::1]:22" → "::1"
+				}
+				hostAdmins[h.ID] = net.JoinHostPort(hostname, "2019")
+			}
+		}
 		ctl := ingress.NewCaddyController(client, db, ingress.Config{
 			Network:    *ingressNetwork,
 			CaddyImage: *ingressImage,
 			ACMEEmail:  *ingressACME,
+			AdminAddr:  *ingressAdminAddr,
+			HostAdmins: hostAdmins,
 		})
 		svc.SetIngress(ctl, *ingressNetwork)
 		ingressCtl = ctl

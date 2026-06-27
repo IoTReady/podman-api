@@ -49,3 +49,20 @@ func TestLoadHosts_DuplicateID(t *testing.T) {
 func writeFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0644)
 }
+
+func TestLoadHostsCaddyAdminAddr(t *testing.T) {
+	dir := t.TempDir()
+	writeHost(t, dir, "h1.yaml", "id: h1\naddr: user@engine-1\nsocket: /run/user/1000/podman/podman.sock\ncaddy_admin_addr: \"100.64.1.2:2019\"\n")
+	hosts, err := LoadHosts(dir)
+	require.NoError(t, err)
+	require.Len(t, hosts, 1)
+	require.Equal(t, "100.64.1.2:2019", hosts[0].CaddyAdminAddr)
+}
+
+func TestLoadHostsCaddyAdminAddrAbsent(t *testing.T) {
+	dir := t.TempDir()
+	writeHost(t, dir, "h1.yaml", "id: h1\naddr: unix\nsocket: /run/user/1000/podman/podman.sock\n")
+	hosts, err := LoadHosts(dir)
+	require.NoError(t, err)
+	require.Equal(t, "", hosts[0].CaddyAdminAddr)
+}

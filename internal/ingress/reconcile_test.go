@@ -2,11 +2,13 @@ package ingress
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/store"
 )
@@ -20,71 +22,209 @@ func webSpecStore(t *testing.T) *store.Memory {
 	)
 }
 
-func TestReconcileFreshHostSeedsAndPlays(t *testing.T) {
+// adminRecorder returns an adminDo stub that records (method, path, body)
+// and returns statusCode for all calls. It also satisfies waitForAdmin's
+// GET /config/ probe.
+func adminRecorder(statusCode int) (func(context.Context, string, string, string, []byte) (int, []byte, error), *[]adminCall) {
+	calls := &[]adminCall{}
+	return func(_ context.Context, addr, method, path string, body []byte) (int, []byte, error) {
+		*calls = append(*calls, adminCall{addr: addr, method: method, path: path, body: body})
+		return statusCode, nil, nil
+	}, calls
+}
+
+type adminCall struct {
+	addr, method, path string
+	body               []byte
+}
+
+// findPut returns the first recorded PUT to path, or nil. Order-independent so
+// tests don't depend on whether the TLS or server PUT is sent first.
+func findPut(calls *[]adminCall, path string) *adminCall {
+	for i := range *calls {
+		if (*calls)[i].method == http.MethodPut && (*calls)[i].path == path {
+			return &(*calls)[i]
+		}
+	}
+	return nil
+}
+
+func TestReconcileFreshHostCreatesPodsAndPushesAdminRoutes(t *testing.T) {
 	f := fake.New()
+	stub, calls := adminRecorder(http.StatusOK)
 	c := NewCaddyController(f, webSpecStore(t),
 		Config{Network: "podman-api-ingress", CaddyImage: "docker.io/library/caddy:2", ACMEEmail: "ops@example.com"})
+	c.adminDo = stub
 
 	require.NoError(t, c.Reconcile(context.Background(), "h1"))
 
-	// The fresh Caddy pod is seeded with the rendered route via its boot env, so
-	// the route rides in the played manifest (not the volume-import API).
+	// Pod should be created (fresh host).
 	require.NotEmpty(t, f.PlayCalls)
 	caddyYAML := f.PlayCalls[len(f.PlayCalls)-1].YAML
-	require.Contains(t, caddyYAML, "blog.example.com")
-	require.Contains(t, caddyYAML, "reverse_proxy web-blog:8080")
-	require.Empty(t, f.ExecCalls, "fresh pod boots from the seeded config; no reload")
+	// Pod YAML must NOT carry route content — routes go via admin API only.
+	require.NotContains(t, caddyYAML, "blog.example.com")
+	require.NotContains(t, caddyYAML, "reverse_proxy")
+	// Admin API should have been called to push the routes (server) config.
+	putCall := findPut(calls, "/config/apps/http/servers/podman_api")
+	require.NotNil(t, putCall, "expected a PUT to the podman_api server")
+	require.Contains(t, string(putCall.body), "blog.example.com")
+	require.Contains(t, string(putCall.body), "web-blog:8080")
+	// No exec or file copy.
+	require.Empty(t, f.ExecCalls)
+	require.Empty(t, f.CopyCalls)
 }
 
-func TestReconcileExistingHostCopiesAndReloads(t *testing.T) {
+func TestReconcileExistingHostPushesAdminRoutes(t *testing.T) {
 	f := fake.New()
+	stub, calls := adminRecorder(http.StatusOK)
 	c := NewCaddyController(f, webSpecStore(t),
 		Config{Network: "n", CaddyImage: "img", ACMEEmail: "ops@example.com"})
-	require.NoError(t, c.Reconcile(context.Background(), "h1")) // creates the pod
+	c.adminDo = stub
+	require.NoError(t, c.Reconcile(context.Background(), "h1")) // creates pod
+	*calls = nil                                                // reset; only care about the second reconcile
 
-	require.NoError(t, c.Reconcile(context.Background(), "h1")) // pod exists -> cp + reload
+	require.NoError(t, c.Reconcile(context.Background(), "h1")) // pod exists → admin API only
 
-	require.NotEmpty(t, f.CopyCalls)
-	last := f.CopyCalls[len(f.CopyCalls)-1]
-	require.Equal(t, caddyConfigDir, last.DestDir)
-	require.Equal(t, caddyConfigFile, last.Name)
-	// cp + exec must target the container name `podman kube play` actually
-	// assigns ("<pod>-caddy"), not the bare spec name, or every steady-state
-	// reconcile would hit a non-existent container.
-	require.Equal(t, caddyContainer, last.Container)
-	require.Contains(t, string(last.Content), "reverse_proxy web-blog:8080")
-	require.GreaterOrEqual(t, len(f.ExecCalls), 2)
-	require.Equal(t, caddyContainer, f.ExecCalls[len(f.ExecCalls)-1].Container)
-	require.Contains(t, f.ExecCalls[len(f.ExecCalls)-2].Cmd, "validate")
-	require.Contains(t, f.ExecCalls[len(f.ExecCalls)-1].Cmd, "reload")
+	require.Empty(t, f.ExecCalls, "no exec on existing pod")
+	require.Empty(t, f.CopyCalls, "no file copy on existing pod")
+	putCall := findPut(calls, "/config/apps/http/servers/podman_api")
+	require.NotNil(t, putCall)
+	require.Contains(t, string(putCall.body), "blog.example.com")
 }
 
 func TestReconcileNoRoutesNoPodIsNoop(t *testing.T) {
 	f := fake.New()
-	// empty store -> zero routes; no Caddy pod exists yet
+	stub, calls := adminRecorder(http.StatusOK)
 	c := NewCaddyController(f, store.NewMemory(),
 		Config{Network: "n", CaddyImage: "img", ACMEEmail: "ops@example.com"})
+	c.adminDo = stub
 
 	require.NoError(t, c.Reconcile(context.Background(), "h1"))
 
 	require.Empty(t, f.PlayCalls, "no Caddy pod should be created when there are no routes")
-	require.Empty(t, f.NetworkEnsureCalls["h1"], "no network should be ensured when there are no routes")
+	require.Empty(t, *calls, "no admin API calls when there are no routes and no pod")
 }
 
-func TestReconcileFailsWhenValidateFails(t *testing.T) {
+func TestReconcileNoRoutesExistingPodDeletesServer(t *testing.T) {
 	f := fake.New()
-	f.ExecFunc = func(_, _ string, cmd []string) (podman.ExecResult, error) {
-		for _, a := range cmd {
-			if a == "validate" {
-				return podman.ExecResult{ExitCode: 1, Output: "adapt: bad config"}, nil
-			}
+	stub, calls := adminRecorder(http.StatusOK)
+	c := NewCaddyController(f, webSpecStore(t),
+		Config{Network: "n", CaddyImage: "img", ACMEEmail: "ops@example.com"})
+	c.adminDo = stub
+	require.NoError(t, c.Reconcile(context.Background(), "h1")) // creates pod + routes
+
+	// Now clear the store so zero routes remain.
+	emptyStore := store.NewMemory()
+	c.store = emptyStore
+	*calls = nil
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+
+	var deleteCall *adminCall
+	for i := range *calls {
+		if (*calls)[i].method == http.MethodDelete {
+			deleteCall = &(*calls)[i]
+			break
 		}
-		return podman.ExecResult{}, nil
 	}
+	require.NotNil(t, deleteCall, "expected DELETE when routes go to zero")
+	require.Contains(t, deleteCall.path, "podman_api")
+}
+
+func TestReconcileFailsWhenAdminAPIFails(t *testing.T) {
+	f := fake.New()
 	c := NewCaddyController(f, webSpecStore(t),
 		Config{Network: "n", CaddyImage: "img"})
-	require.NoError(t, c.Reconcile(context.Background(), "h1")) // create
-	err := c.Reconcile(context.Background(), "h1")              // cp + failing validate
+	// First reconcile: create pod with a working admin stub.
+	stub, _ := adminRecorder(http.StatusOK)
+	c.adminDo = stub
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+
+	// Second reconcile: GET /config/ readiness probe succeeds but PUT returns 500.
+	c.adminDo = func(_ context.Context, _, method, _ string, _ []byte) (int, []byte, error) {
+		if method == http.MethodGet {
+			return http.StatusOK, nil, nil
+		}
+		return http.StatusInternalServerError, []byte("internal error"), nil
+	}
+	err := c.Reconcile(context.Background(), "h1")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "validate")
+	require.Contains(t, err.Error(), "admin")
+}
+
+func TestReconcileFailsWhenAdminAPINetworkError(t *testing.T) {
+	f := fake.New()
+	c := NewCaddyController(f, webSpecStore(t),
+		Config{Network: "n", CaddyImage: "img"})
+	// First reconcile: create pod.
+	stub, _ := adminRecorder(http.StatusOK)
+	c.adminDo = stub
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+
+	// Second reconcile: network error on PUT.
+	c.adminDo = func(_ context.Context, _, method, _ string, _ []byte) (int, []byte, error) {
+		if method == http.MethodGet {
+			return http.StatusOK, nil, nil
+		}
+		return 0, nil, fmt.Errorf("connection refused")
+	}
+	err := c.Reconcile(context.Background(), "h1")
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "connection refused")
+}
+
+func TestReconcileUsesPerHostAdminAddr(t *testing.T) {
+	f := fake.New()
+	var gotAddr string
+	c := NewCaddyController(f, webSpecStore(t), Config{
+		Network:    "n",
+		CaddyImage: "img",
+		AdminAddr:  "default:2019",
+		HostAdmins: map[string]string{"h1": "custom-host:2019"},
+	})
+	c.adminDo = func(_ context.Context, addr, method, _ string, _ []byte) (int, []byte, error) {
+		if method == http.MethodPut {
+			gotAddr = addr
+		}
+		return http.StatusOK, nil, nil
+	}
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.Equal(t, "custom-host:2019", gotAddr)
+}
+
+func TestReconcileACMEEmailPushedToTLS(t *testing.T) {
+	f := fake.New()
+	stub, calls := adminRecorder(http.StatusOK)
+	c := NewCaddyController(f, webSpecStore(t),
+		Config{Network: "n", CaddyImage: "img", ACMEEmail: "ops@example.com"})
+	c.adminDo = stub
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+
+	// A PUT to /config/apps/tls/automation/policies must carry the email
+	// and specify the ACME module (global Caddyfile email is dropped by adapt).
+	var tlsCall *adminCall
+	for i := range *calls {
+		if (*calls)[i].method == http.MethodPut && (*calls)[i].path == "/config/apps/tls/automation/policies" {
+			tlsCall = &(*calls)[i]
+			break
+		}
+	}
+	require.NotNil(t, tlsCall, "expected PUT to /config/apps/tls/automation/policies")
+	require.Contains(t, string(tlsCall.body), "ops@example.com")
+	require.Contains(t, string(tlsCall.body), "acme")
+}
+
+func TestReconcileFailsWhenAdminNotReady(t *testing.T) {
+	f := fake.New()
+	c := NewCaddyController(f, webSpecStore(t),
+		Config{Network: "n", CaddyImage: "img"})
+	c.adminDo = func(_ context.Context, _, _, _ string, _ []byte) (int, []byte, error) {
+		return http.StatusServiceUnavailable, nil, nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := c.Reconcile(ctx, "h1")
+	require.Error(t, err)
 }

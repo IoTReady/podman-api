@@ -4,50 +4,66 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 
 	"github.com/iotready/podman-api/internal/podman"
 )
 
 const (
 	// caddyPodName is the globally-unique name of the per-host Caddy system pod.
-	// It cannot collide with app pods, which are "<template>-<slug>".
 	caddyPodName = "podman-api-ingress-caddy"
-	// caddyContainer is the container name `podman kube play` assigns: the repo
-	// convention (see instance.Service.Logs) is "<pod-name>-<container-name>",
-	// so the pod's `name: caddy` container is reachable for exec/cp as
-	// "podman-api-ingress-caddy-caddy", NOT the bare "caddy".
-	caddyContainer = caddyPodName + "-caddy"
-	// caddyConfigDir is where the Caddyfile lives inside the container.
-	caddyConfigDir = "/etc/caddy"
-	// caddyConfigFile is the Caddyfile name inside caddyConfigDir.
-	caddyConfigFile = "Caddyfile"
-	// caddyConfigVolume / caddyDataVolume are the named volumes backing the
-	// config dir and the ACME/cert data (data must persist across restarts).
-	caddyConfigVolume = "podman-api-caddy-config"
-	caddyDataVolume   = "podman-api-caddy-data"
+	// caddyDataVolume is the named volume backing ACME/cert data (must persist
+	// across restarts so Let's Encrypt certs survive pod recreations).
+	caddyDataVolume = "podman-api-caddy-data"
+	// caddyAdminPort is the Caddy admin API port exposed as a hostPort so the
+	// controller can reach it from the control plane.
+	//
+	// SECURITY: the admin API is unauthenticated and can replace Caddy's entire
+	// running config. It is published on the host (see caddyPodYAML) so the
+	// controller can reach it at the host's address, which means :2019 must be
+	// kept on a trusted/private network (e.g. a tailnet) or firewalled to the
+	// control plane — anyone who can reach it controls the host's TLS.
+	caddyAdminPort = 2019
+	// caddySchemaLabel/caddySchema mark the manifest generation of the managed
+	// Caddy pod. ensureProxy recreates any pod missing the current value — e.g.
+	// one created by a pre-admin-API release, which neither publishes :2019 nor
+	// serves the admin API the controller now depends on.
+	caddySchemaLabel = "podman-api.ingress.schema"
+	caddySchema      = "admin-api"
 )
 
-// caddyPodYAML renders the kube manifest for the Caddy system pod. PVC
-// claimNames map to podman named volumes. hostPort publishes :80/:443 to the
-// host (rootless: requires net.ipv4.ip_unprivileged_port_start <= 80).
+// caddySeedCaddyfile renders the minimal global Caddyfile used to bootstrap a
+// fresh managed Caddy pod. It enables the admin API on 0.0.0.0:2019 (so the
+// controller can reach it from outside the pod), sets the ACME email if
+// provided, and configures Caddy to auto-save runtime config to /data so
+// `caddy run --resume` picks it up on restart.
 //
-// The container seeds its own config on first boot: a small sh wrapper writes
-// caddyfile (passed through the CADDY_SEED env) to the config volume only when
-// the file is absent, then execs caddy. Writing only-when-absent means a live
-// `caddy reload` (which rewrites the file on the persistent volume) survives a
-// container restart instead of being clobbered by a now-stale seed.
-//
-// Caveat: if the pod is destroyed and recreated while the config volume persists
-// with an OLD Caddyfile, the wrapper keeps that file (it exists) and ignores the
-// fresh seed, so Caddy can boot stale routes until the next change-triggered
-// Reconcile runs the cp+reload path. This self-heals on the next deploy/delete.
-//
-// This avoids the volume-import REST API, which podman only serves at >= 5.6.0;
-// the env+wrapper works on any version (the image must ship /bin/sh).
-func caddyPodYAML(image, caddyfile string) string {
-	cfgPath := caddyConfigDir + "/" + caddyConfigFile
+// Routes are NOT seeded here; they are pushed via the admin API immediately
+// after the pod is ready (see Reconcile).
+func caddySeedCaddyfile(acmeEmail string) string {
+	if acmeEmail != "" {
+		return fmt.Sprintf("{\n\tadmin 0.0.0.0:%d\n\temail %s\n}\n", caddyAdminPort, acmeEmail)
+	}
+	return fmt.Sprintf("{\n\tadmin 0.0.0.0:%d\n}\n", caddyAdminPort)
+}
+
+// caddyPodYAML renders the kube manifest for the managed Caddy system pod.
+// The pod:
+//   - Seeds a minimal Caddyfile (admin-only, no routes) via CADDY_SEED env.
+//     The boot script writes it only when absent so a live autosave from the
+//     admin API survives container restarts (Caddy writes autosave to /data).
+//   - Exposes :2019 as hostPort so the controller can call the admin API from
+//     the control plane.
+//   - Exposes :80 and :443 for HTTP/HTTPS traffic.
+//   - Mounts a persistent /data volume for ACME cert storage.
+func caddyPodYAML(image, acmeEmail string) string {
+	seed := caddySeedCaddyfile(acmeEmail)
+	cfgPath := "/etc/caddy/Caddyfile"
+	// Boot: write seed only if no file exists (preserves admin-API autosave),
+	// then run caddy. --resume picks up the autosaved JSON config from /data
+	// on subsequent starts; fallback to the Caddyfile only on first boot.
 	boot := fmt.Sprintf(
-		`[ -f %s ] || printf '%%s' "$CADDY_SEED" > %s; exec caddy run --config %s --adapter caddyfile`,
+		`[ -f %s ] || printf '%%s' "$CADDY_SEED" > %s; exec caddy run --resume --config %s --adapter caddyfile`,
 		cfgPath, cfgPath, cfgPath)
 	return fmt.Sprintf(`apiVersion: v1
 kind: Pod
@@ -55,6 +71,7 @@ metadata:
   name: %s
   labels:
     podman-api.ingress: caddy
+    %s: %s
 spec:
   containers:
     - name: caddy
@@ -68,44 +85,42 @@ spec:
           hostPort: 80
         - containerPort: 443
           hostPort: 443
+        - containerPort: %d
+          hostPort: %d
       volumeMounts:
-        - name: config
-          mountPath: %s
         - name: data
           mountPath: /data
   volumes:
-    - name: config
-      persistentVolumeClaim:
-        claimName: %s
     - name: data
       persistentVolumeClaim:
         claimName: %s
-`, caddyPodName, image, boot, caddyfile, caddyConfigDir, caddyConfigVolume, caddyDataVolume)
+`, caddyPodName, caddySchemaLabel, caddySchema, image, boot, seed, caddyAdminPort, caddyAdminPort, caddyDataVolume)
 }
 
-// ensureProxy makes the network + Caddy pod exist on host. When it creates the
-// pod it passes initialCaddyfile as the boot seed (see caddyPodYAML) so Caddy
-// starts with a valid config, and returns created=true; when the pod already
-// exists it does nothing and returns created=false. Reconcile uses created to
-// decide whether a live cp+reload is needed.
-func (c *CaddyController) ensureProxy(ctx context.Context, host, initialCaddyfile string) (bool, error) {
-	if _, err := c.client.PodInspect(ctx, host, caddyPodName); err == nil {
-		return false, nil // already present
+// ensureProxy makes the network + Caddy pod exist (and current) on host. It
+// returns created=true when it (re)creates the pod and created=false when an
+// up-to-date pod is already present. A pod from a pre-admin-API release is
+// recreated with the current manifest — it lacks the published :2019 / admin
+// API the controller now depends on; the persistent /data volume (and its ACME
+// certs) survives the replace.
+func (c *CaddyController) ensureProxy(ctx context.Context, host string) (bool, error) {
+	if pod, err := c.client.PodInspect(ctx, host, caddyPodName); err == nil {
+		if pod.Labels[caddySchemaLabel] == caddySchema {
+			return false, nil // present and current
+		}
+		log.Printf("ingress: recreating stale caddy pod on %s (missing %s=%s)", host, caddySchemaLabel, caddySchema)
 	} else if !errors.Is(err, podman.ErrNotFound) {
 		return false, fmt.Errorf("ingress: inspect caddy pod: %w", err)
 	}
 	if err := c.client.NetworkEnsure(ctx, host, c.cfg.Network); err != nil {
 		return false, fmt.Errorf("ingress: ensure network: %w", err)
 	}
-	if err := c.client.VolumeCreate(ctx, host, caddyConfigVolume); err != nil {
-		return false, fmt.Errorf("ingress: create config volume: %w", err)
-	}
 	if err := c.client.VolumeCreate(ctx, host, caddyDataVolume); err != nil {
 		return false, fmt.Errorf("ingress: create data volume: %w", err)
 	}
-	// The Caddy pod seeds its own config from initialCaddyfile on first boot
-	// (see caddyPodYAML), so we don't need the volume-import API (podman >=5.6.0).
-	if err := c.client.PlayKube(ctx, host, caddyPodYAML(c.cfg.CaddyImage, initialCaddyfile), false, c.cfg.Network); err != nil {
+	// replace=true so a stale pod is torn down and recreated; for a brand-new
+	// host there is nothing to replace.
+	if err := c.client.PlayKube(ctx, host, caddyPodYAML(c.cfg.CaddyImage, c.cfg.ACMEEmail), true, c.cfg.Network); err != nil {
 		return false, fmt.Errorf("ingress: play caddy pod: %w", err)
 	}
 	return true, nil

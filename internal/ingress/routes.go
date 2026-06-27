@@ -1,3 +1,6 @@
+// Package ingress derives a host's ingress routes from the store and reconciles
+// a per-host Caddy pod to match them via the Caddy admin API. Nothing here other
+// than the controller talks to podman or the network.
 package ingress
 
 import (
@@ -10,6 +13,14 @@ import (
 
 	"github.com/iotready/podman-api/internal/store"
 )
+
+// Route maps a public domain to the backend address the host's Caddy
+// reverse-proxies to. Backend is resolved on the shared ingress network
+// (e.g. "web-app1:8080").
+type Route struct {
+	Domain  string
+	Backend string
+}
 
 // podName mirrors instance.podName: an instance's pod is "<template>-<slug>",
 // which is globally unique and the name aardvark resolves on the network. The
