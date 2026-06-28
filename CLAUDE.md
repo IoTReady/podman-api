@@ -8,15 +8,15 @@ This repo lives on a self-hosted **Forgejo** instance (`git.iotready.com`, SSH o
 port 2222). `gh` does **not** work here. Use the `forgejo` CLI for issues and PRs:
 
 ```sh
-forgejo issue create tej/podman-api --title="..." --body="..."
-forgejo issue view   tej/podman-api 42
-forgejo issue close  tej/podman-api 42
-forgejo pr create    tej/podman-api --title="..." --head=<branch> --base=main --body="..."
-forgejo pr merge     tej/podman-api 17 --method=squash
+forgejo issue create IoTReady/podman-api --title="..." --body="..."
+forgejo issue view   IoTReady/podman-api 42
+forgejo issue close  IoTReady/podman-api 42
+forgejo pr create    IoTReady/podman-api --title="..." --head=<branch> --base=main --body="..."
+forgejo pr merge     IoTReady/podman-api 17 --method=squash
 forgejo <resource> --help    # detailed help
 ```
 
-`OWNER/REPO` is always `tej/podman-api`. Add `--json` for machine-readable output.
+`OWNER/REPO` is always `IoTReady/podman-api`. Add `--json` for machine-readable output.
 
 ## Two remotes: Forgejo (private) + GitHub (public OSS)
 
@@ -24,7 +24,7 @@ This repo has two remotes:
 
 ```sh
 git remote -v
-# origin   ssh://git@git.iotready.com:2222/tej/podman-api.git  (private, source of truth)
+# origin   ssh://git@git.iotready.com:2222/IoTReady/podman-api.git  (private, source of truth)
 # github   git@github.com:IoTReady/podman-api.git              (public OSS mirror)
 ```
 
@@ -48,9 +48,9 @@ The correct flow, end to end:
 ```sh
 git switch -c feat/my-change
 git push -u origin feat/my-change
-forgejo pr create tej/podman-api --head=feat/my-change --base=main --body="..."
+forgejo pr create IoTReady/podman-api --head=feat/my-change --base=main --body="..."
 # ... review happens on Forgejo, then:
-forgejo pr merge tej/podman-api <n> --method=squash
+forgejo pr merge IoTReady/podman-api <n> --method=squash
 # only now is it publishable:
 git switch main && git pull --ff-only origin main
 git push github main                 # publish reviewed, merged commits
@@ -73,7 +73,7 @@ Wiki changes go to both (`/tmp/podman-api-wiki` clone, push `main` to origin and
 ## Open-core contract
 
 This repo is the **OSS core**. The commercial tier lives in a **separate private module**
-(`git.iotready.com/tej/podman-api-pro`) that imports this one as a Go dependency.
+(`git.iotready.com/IoTReady/podman-api-pro`) that imports this one as a Go dependency.
 
 ### Rules — read before touching either repo
 
@@ -97,7 +97,7 @@ This repo is the **OSS core**. The commercial tier lives in a **separate private
 ### Adding a new extension point
 
 ```
-1. File issue on tej/podman-api describing the seam interface
+1. File issue on IoTReady/podman-api describing the seam interface
 2. Implement in extension/<name>.go (public interface)
 3. Add server.With<Name>(impl extension.<Name>) Option
 4. OSS default wired in server.RunWithFlags (same behaviour as before)
@@ -127,7 +127,7 @@ Keep the tag list in `Makefile` and `.forgejo/workflows/ci.yaml` in sync.
 
 ## Documentation
 
-Operator docs live in both the Forgejo wiki (`git.iotready.com/tej/podman-api/wiki`)
+Operator docs live in both the Forgejo wiki (`git.iotready.com/IoTReady/podman-api/wiki`)
 and the GitHub wiki (`github.com/IoTReady/podman-api/wiki`) — they are the same content,
 kept in sync via `/tmp/podman-api-wiki` (a clone of the Forgejo wiki repo with `github`
 as a second remote). The README is the quick reference and links into the GitHub wiki.
