@@ -29,7 +29,6 @@ type Store interface {
 
 // Config holds the operator-set knobs for the Caddy controller.
 type Config struct {
-	ACMEEmail string // pushed to Caddy's TLS automation via the admin API; optional.
 	// AdminAddr is the Caddy admin API address (host:port) used when no
 	// per-host override is set. Default "localhost:2019".
 	AdminAddr string

@@ -117,7 +117,6 @@ func TestIngressEndToEnd(t *testing.T) {
 	ctl := ingress.NewCaddyController(
 		st,
 		ingress.Config{
-			ACMEEmail:  "it@example.com",
 			AdminAddr:  adminAddr,
 			HostAdmins: map[string]string{host: adminAddr},
 		},

@@ -40,30 +40,10 @@ func (c *CaddyController) Reconcile(ctx context.Context, host string) error {
 	return c.pushRoutes(ctx, adminAddr, routes)
 }
 
-// pushRoutes applies routes to the Caddy server via the admin API and sets
-// the ACME email in TLS automation when configured.
+// pushRoutes applies routes to the Caddy server via the admin API.
+// TLS automation (ACME email, issuers) is operator-managed via Caddyfile;
+// automatic_https on the server config is enough to trigger issuance.
 func (c *CaddyController) pushRoutes(ctx context.Context, adminAddr string, routes []Route) error {
-	// Set the ACME email in TLS automation BEFORE creating the server, so the
-	// account email is already in place when automatic_https starts
-	// provisioning certs for the server's routes. The seed Caddyfile's global
-	// `email` directive is dropped by `caddy adapt` when there are no site
-	// blocks, so it must be set via the admin API. Path verified against Caddy
-	// v2.11.4.
-	if c.cfg.ACMEEmail != "" {
-		policies := []caddyAutomationPolicy{{
-			Issuers: []caddyIssuer{{Module: "acme", Email: c.cfg.ACMEEmail}},
-		}}
-		policiesJSON, err := json.Marshal(policies)
-		if err != nil {
-			return fmt.Errorf("ingress: marshal TLS automation: %w", err)
-		}
-		if code, body, err := c.adminDo(ctx, adminAddr, http.MethodPut, "/config/apps/tls/automation/policies", policiesJSON); err != nil {
-			return fmt.Errorf("ingress: admin set TLS automation: %w", err)
-		} else if code >= 300 {
-			return fmt.Errorf("ingress: admin set TLS automation: status %d: %s", code, body)
-		}
-	}
-
 	srv := caddyServer{
 		Listen:         []string{":80", ":443"},
 		Routes:         routesToCaddyJSON(routes),

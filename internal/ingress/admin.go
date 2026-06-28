@@ -38,17 +38,6 @@ type caddyServer struct {
 	AutomaticHTTPS *struct{}    `json:"automatic_https"`
 }
 
-// caddyAutomationPolicy and caddyIssuer are the minimal Caddy JSON types for
-// setting ACME email via PUT /config/apps/tls/automation/policies.
-type caddyAutomationPolicy struct {
-	Issuers []caddyIssuer `json:"issuers,omitempty"`
-}
-
-type caddyIssuer struct {
-	Module string `json:"module"`
-	Email  string `json:"email,omitempty"`
-}
-
 // routesToCaddyJSON converts ingress Routes to Caddy JSON route objects.
 func routesToCaddyJSON(routes []Route) []caddyRoute {
 	if len(routes) == 0 {
