@@ -73,7 +73,7 @@ Wiki changes go to both (`/tmp/podman-api-wiki` clone, push `main` to origin and
 ## Open-core contract
 
 This repo is the **OSS core**. The commercial tier lives in a **separate private module**
-(`git.iotready.com/IoTReady/podman-api-pro`) that imports this one as a Go dependency.
+(`git.iotready.com/tej/podman-api-pro`) that imports this one as a Go dependency.
 
 ### Rules — read before touching either repo
 
