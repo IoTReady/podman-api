@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/store"
 )
@@ -36,7 +37,8 @@ type Config struct {
 	Auth       Authenticator
 	Sessions   SessionStore
 	SessionTTL time.Duration
-	Secure     bool // set Secure flag on the session cookie (true in production)
+	Secure     bool               // set Secure flag on the session cookie (true in production)
+	TokenMgr   *auth.TokenManager // optional; enables /ui/tokens if non-nil
 }
 
 // UI holds parsed templates and dependencies and produces the /ui sub-router.
@@ -79,6 +81,7 @@ func (u *UI) pageData(data map[string]any) map[string]any {
 	// Set for every authenticated page regardless of host count, so an operator
 	// with zero configured hosts still gets nav + sign-out.
 	data["Shell"] = true
+	data["TokensEnabled"] = u.cfg.TokenMgr != nil
 	// Svc is nil only in template-only construction (tests that never reach an
 	// authenticated handler); guard so pageData can't panic there.
 	if u.cfg.Svc != nil {
@@ -123,6 +126,12 @@ func (u *UI) Handler() http.Handler {
 	mux.Handle("POST /ui/logout", guardW(u.logout))
 	mux.Handle("GET /ui/jobs", guard(u.jobsList))
 	mux.Handle("GET /ui/jobs/{id}", guard(u.jobDetail))
+
+	if u.cfg.TokenMgr != nil {
+		mux.Handle("GET /ui/tokens", guard(u.tokensList))
+		mux.Handle("POST /ui/tokens", guardW(u.tokensCreate))
+		mux.Handle("POST /ui/tokens/{id}/revoke", guardW(u.tokensRevoke))
+	}
 
 	return mux
 }

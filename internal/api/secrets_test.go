@@ -23,7 +23,7 @@ func newSrvWithSecrets(t *testing.T) (*httptest.Server, string) {
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	svc := instance.NewService(fake.New(), hosts)
 	svc.SetStore(store.NewMemory())
-	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	t.Cleanup(srv.Close)
 	return srv, tok
 }

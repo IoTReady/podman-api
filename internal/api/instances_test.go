@@ -53,7 +53,7 @@ spec:
 	require.NoError(t, mem.PutTemplate(context.Background(), tmpl))
 	svc := instance.NewService(f, hosts)
 	svc.SetStore(mem)
-	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	t.Cleanup(srv.Close)
 	return srv, tok, f
 }

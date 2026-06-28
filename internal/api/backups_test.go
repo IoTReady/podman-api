@@ -99,7 +99,7 @@ func newBackupSrv(t *testing.T) (*httptest.Server, string, *fake.Fake, *store.Me
 	require.NoError(t, err)
 	svc.SetBlobStore(blob)
 
-	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	t.Cleanup(srv.Close)
 	return srv, tok, f, mem, blob
 }
@@ -291,7 +291,7 @@ func TestAPI_PostPITRRestore_NoBlobStore(t *testing.T) {
 	svc.SetStore(mem)
 	// Deliberately NO svc.SetBlobStore — PITR must not require the tarball store.
 
-	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	t.Cleanup(srv.Close)
 
 	resp := postPITRRestoreReq(t, srv.URL+"/hosts/h1/instances/postgres/a/restore", tok,
@@ -432,7 +432,7 @@ func TestAPI_Backup_ScopeEnforced(t *testing.T) {
 	svc.SetBlobStore(blob)
 
 	keys := []config.APIKey{{ID: "ro", SecretHash: hash, Scopes: []string{"instances:read"}}}
-	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	t.Cleanup(srv.Close)
 
 	resp := backupReq(t, "POST", srv.URL+"/hosts/h1/instances/postgres/a/backup", "t")

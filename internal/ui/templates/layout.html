@@ -51,6 +51,7 @@
     {{end}}
   </ul>
   <a href="/ui/jobs" hx-get="/ui/jobs" hx-target="#main" hx-push-url="true" hx-disabled-elt="this"{{if eq "jobs" $.ActivePage}} class="active"{{end}}>Jobs</a>
+  {{if .TokensEnabled}}<a href="/ui/tokens" hx-get="/ui/tokens" hx-target="#main" hx-push-url="true" hx-disabled-elt="this"{{if eq "tokens" $.ActivePage}} class="active"{{end}}>Tokens</a>{{end}}
   <form method="post" action="/ui/logout">
     <input type="hidden" name="csrf_token" value="{{.CSRF}}">
     <button type="submit">Sign out</button>

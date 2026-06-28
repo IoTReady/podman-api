@@ -35,7 +35,7 @@ func TestListHosts(t *testing.T) {
 	}
 	svc := instance.NewService(fake.New(), hosts)
 	svc.SetStore(store.NewMemory())
-	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	defer srv.Close()
 
 	resp := authedReq(t, srv, tok, "GET", "/hosts")
@@ -56,7 +56,7 @@ func TestHostHealthz(t *testing.T) {
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
 	svc := instance.NewService(fake.New(), hosts)
 	svc.SetStore(store.NewMemory())
-	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	defer srv.Close()
 
 	resp := authedReq(t, srv, tok, "GET", "/hosts/h1/healthz")

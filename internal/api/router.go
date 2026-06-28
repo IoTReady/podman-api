@@ -13,7 +13,8 @@ import (
 // audit is an optional middleware applied around auth-guarded handlers; pass nil for no-op.
 // metricsHandler is an optional handler mounted at GET /metrics; pass nil to omit the endpoint.
 // canceller is an optional JobCanceller for the POST /jobs/{id}/cancel route; pass nil when the job runner is not wired.
-func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, audit func(http.Handler) http.Handler, metricsHandler http.Handler, canceller JobCanceller) http.Handler {
+// version is the server's release string (e.g. "v1.0.16", "dev"); included in the /mcp discovery document.
+func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, audit func(http.Handler) http.Handler, metricsHandler http.Handler, canceller JobCanceller, version string) http.Handler {
 	mux := http.NewServeMux()
 	h := &handlers{svc: svc, jobs: jobs, canceller: canceller}
 
@@ -31,6 +32,8 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(apispec.Spec)
 	})
+	mux.HandleFunc("GET /mcp", mcpDiscoveryHandler(version))
+	mux.HandleFunc("GET /agent-docs", agentDocsHandler)
 
 	if metricsHandler != nil {
 		mux.Handle("GET /metrics", metricsHandler)

@@ -47,7 +47,7 @@ func newSrvWithTmpl(t *testing.T) (*httptest.Server, string, *store.Memory, *fak
 	f := fake.New()
 	svc := instance.NewService(f, hosts)
 	svc.SetStore(mem)
-	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	t.Cleanup(srv.Close)
 	return srv, tok, mem, f
 }
@@ -246,7 +246,7 @@ func TestTemplateWriteRejectsReadOnlyKey(t *testing.T) {
 	require.NoError(t, mem.PutTemplate(context.Background(), catalogTmpl()))
 	svc := instance.NewService(fake.New(), hosts)
 	svc.SetStore(mem)
-	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	t.Cleanup(srv.Close)
 
 	// Read is allowed.

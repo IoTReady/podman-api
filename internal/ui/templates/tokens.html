@@ -1,0 +1,66 @@
+{{define "tokens"}}
+<div class="page-header">
+  <h2>API Tokens</h2>
+</div>
+
+{{if .CreatedSecret}}
+<div class="notice notice-success" style="margin-bottom:1.5rem;padding:1rem;border-left:4px solid #2ecc71;background:#f0fff4">
+  <strong>Copy your token — it will not be shown again:</strong><br>
+  <code style="word-break:break-all;font-size:0.9em">{{.CreatedSecret}}</code>
+</div>
+{{end}}
+
+{{if .Error}}
+<div class="notice notice-error" style="margin-bottom:1rem;padding:0.75rem;border-left:4px solid #e74c3c;background:#fff0f0">{{.Error}}</div>
+{{end}}
+
+<table class="pure-table pure-table-bordered" style="width:100%;margin-bottom:2rem">
+  <thead>
+    <tr><th>ID</th><th>Description</th><th>Scopes</th><th></th></tr>
+  </thead>
+  <tbody>
+    {{range .Keys}}
+    <tr>
+      <td><code>{{.ID}}</code></td>
+      <td>{{.Description}}</td>
+      <td><small>{{range .Scopes}}<span style="margin-right:0.25em">{{.}}</span>{{end}}</small></td>
+      <td>
+        <form method="post" action="/ui/tokens/{{.ID}}/revoke" onsubmit="return confirm('Revoke token {{.ID}}?')">
+          <input type="hidden" name="csrf_token" value="{{$.CSRF}}">
+          <button type="submit" class="pure-button pure-button-danger" style="font-size:0.8em">Revoke</button>
+        </form>
+      </td>
+    </tr>
+    {{else}}
+    <tr><td colspan="4" style="text-align:center;color:#888">No tokens yet.</td></tr>
+    {{end}}
+  </tbody>
+</table>
+
+<h3>Generate new token</h3>
+<form class="pure-form pure-form-stacked" method="post" action="/ui/tokens">
+  <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+  <fieldset>
+    <div class="pure-control-group">
+      <label for="token-id">ID</label>
+      <input id="token-id" name="id" type="text" required
+             pattern="[a-zA-Z0-9_-]+"
+             title="Letters, digits, hyphens, and underscores only"
+             placeholder="e.g. ci-deploy" style="width:100%;max-width:320px">
+    </div>
+    <div class="pure-control-group">
+      <label for="token-desc">Description</label>
+      <input id="token-desc" name="description" type="text" placeholder="optional" style="width:100%;max-width:320px">
+    </div>
+    <div class="pure-control-group">
+      <label>Scopes</label>
+      {{range $s := .AllScopes}}
+      <label class="pure-checkbox">
+        <input type="checkbox" name="scopes" value="{{$s}}"> {{$s}}
+      </label>
+      {{end}}
+    </div>
+    <button type="submit" class="pure-button pure-button-primary">Generate token</button>
+  </fieldset>
+</form>
+{{end}}

@@ -39,6 +39,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// Version is the server's release string, set via -ldflags "-X server.Version=v1.x.y" at build time.
+var Version = "dev"
+
 type cfg struct {
 	blobStore       extension.BlobStore
 	sidecarInjector extension.SidecarInjector
@@ -290,10 +293,11 @@ func RunWithFlags(opts ...Option) error {
 		return metrics.Middleware()(audit(h))
 	}
 
-	router := api.NewRouter(svc, jobStore, keyStore, combined, nil, canceller)
+	router := api.NewRouter(svc, jobStore, keyStore, combined, nil, canceller, Version)
 
 	var opHolder atomic.Pointer[config.Operator]
 	var uiApp *ui.UI
+	var tokenMgr *auth.TokenManager
 	if *operatorFile != "" {
 		op, fp, err := loadOperator(*operatorFile)
 		if err != nil {
@@ -303,7 +307,8 @@ func RunWithFlags(opts ...Option) error {
 		authr := ui.AuthenticatorFunc(func(user, pass string) (ui.Identity, error) {
 			return ui.NewOperatorAuthenticator(*opHolder.Load()).Authenticate(user, pass)
 		})
-		uiApp, err = ui.New(ui.Config{Svc: svc, Jobs: jobStore, Auth: authr, Secure: *uiSecureCookie})
+		tokenMgr = auth.NewTokenManager(*keysFile, keyStore)
+		uiApp, err = ui.New(ui.Config{Svc: svc, Jobs: jobStore, Auth: authr, Secure: *uiSecureCookie, TokenMgr: tokenMgr})
 		if err != nil {
 			return fmt.Errorf("ui: %w", err)
 		}
@@ -334,13 +339,21 @@ func RunWithFlags(opts ...Option) error {
 	signal.Notify(hup, syscall.SIGHUP)
 	go func() {
 		for range hup {
-			if newKeys, fp, err := loadKeys(*keysFile); err != nil {
-				log.Printf("keys reload FAILED, keeping previous set: %v", err)
-			} else if len(newKeys) == 0 {
-				log.Printf("keys reload SKIPPED, file parsed but contained zero keys (path=%s, fp=%s)", *keysFile, fp)
+			if tokenMgr != nil {
+				if err := tokenMgr.Reload(); err != nil {
+					log.Printf("keys reload FAILED: %v", err)
+				} else {
+					log.Printf("keys reloaded via TokenManager (%d entries)", len(keyStore.Load()))
+				}
 			} else {
-				keyStore.Store(newKeys)
-				log.Printf("keys reloaded: %d entries, fingerprint=%s", len(newKeys), fp)
+				if newKeys, fp, err := loadKeys(*keysFile); err != nil {
+					log.Printf("keys reload FAILED, keeping previous set: %v", err)
+				} else if len(newKeys) == 0 {
+					log.Printf("keys reload SKIPPED, file parsed but contained zero keys (path=%s, fp=%s)", *keysFile, fp)
+				} else {
+					keyStore.Store(newKeys)
+					log.Printf("keys reloaded: %d entries, fingerprint=%s", len(newKeys), fp)
+				}
 			}
 
 			if newHosts, err := config.LoadHosts(*hostsDir); err != nil {

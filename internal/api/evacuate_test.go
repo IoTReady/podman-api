@@ -35,7 +35,7 @@ func newEvacSrv(t *testing.T) (*httptest.Server, string, *store.Memory, *fake.Fa
 	f := fake.New()
 	svc := instance.NewService(f, hosts)
 	svc.SetStore(mem)
-	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	t.Cleanup(srv.Close)
 	return srv, tok, mem, f
 }
@@ -126,7 +126,7 @@ func TestEvacuate_API_StoreDisabled_501(t *testing.T) {
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*", "jobs:*"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}, {ID: "h2", Addr: "unix", Socket: "/y"}}
 	svc := instance.NewService(fake.New(), hosts)
-	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	t.Cleanup(srv.Close)
 
 	resp := postEvacuate(t, srv, tok, instance.EvacuateRequest{FromHost: "h1", Map: map[string]string{}})
@@ -269,7 +269,7 @@ func TestEvacuatePlan_API_StoreDisabled_501(t *testing.T) {
 	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*", "jobs:*"}}}
 	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}, {ID: "h2", Addr: "unix", Socket: "/y"}}
 	svc := instance.NewService(fake.New(), hosts)
-	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	t.Cleanup(srv.Close)
 
 	resp := postEvacuatePlan(t, srv, tok, instance.EvacuateRequest{FromHost: "h1", Map: map[string]string{}})
@@ -287,7 +287,7 @@ func TestEvacuatePlan_API_RequiresReadScope(t *testing.T) {
 	svc.SetStore(mem)
 
 	keys := []config.APIKey{{ID: "noscope", SecretHash: hash, Scopes: []string{"hosts:read"}}}
-	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil))
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	t.Cleanup(srv.Close)
 
 	resp := postEvacuatePlan(t, srv, "t", instance.EvacuateRequest{FromHost: "h1", Map: map[string]string{}})
