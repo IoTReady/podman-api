@@ -85,8 +85,6 @@ func RunWithFlags(opts ...Option) error {
 
 		ingressEnabled   = fs.Bool("ingress-enabled", false, "enable per-host Caddy ingress + auto-TLS")
 		ingressNetwork   = fs.String("ingress-network", "podman-api-ingress", "shared podman network app pods join for ingress")
-		ingressImage     = fs.String("ingress-caddy-image", "docker.io/library/caddy:2", "Caddy image for the per-host ingress pod; must include /bin/sh (the pod seeds its config via a small shell wrapper), so a shell-less distroless/scratch variant won't work")
-		ingressACME      = fs.String("ingress-acme-email", "", "ACME account email for Let's Encrypt (required when -ingress-enabled)")
 		ingressAdminAddr = fs.String("ingress-caddy-admin-addr", "localhost:2019", "default Caddy admin API address (host:port); per-host caddy_admin_addr in hosts/*.yaml overrides this. The admin API is unauthenticated, so keep :2019 on a trusted/private network or firewalled to the control plane")
 		ingressInterval  = fs.Duration("ingress-reconcile-interval", 5*time.Minute, "periodic ingress drift-correction interval per host; 0 disables the periodic loop")
 
@@ -107,10 +105,6 @@ func RunWithFlags(opts ...Option) error {
 		}
 		fmt.Println(h)
 		return nil
-	}
-
-	if *ingressEnabled && *ingressACME == "" {
-		return fmt.Errorf("ingress: -ingress-enabled requires -ingress-acme-email")
 	}
 
 	hosts, err := config.LoadHosts(*hostsDir)
@@ -209,16 +203,13 @@ func RunWithFlags(opts ...Option) error {
 				hostAdmins[h.ID] = net.JoinHostPort(hostname, "2019")
 			}
 		}
-		ctl := ingress.NewCaddyController(client, db, ingress.Config{
-			Network:    *ingressNetwork,
-			CaddyImage: *ingressImage,
-			ACMEEmail:  *ingressACME,
+		ctl := ingress.NewCaddyController(db, ingress.Config{
 			AdminAddr:  *ingressAdminAddr,
 			HostAdmins: hostAdmins,
 		})
 		svc.SetIngress(ctl, *ingressNetwork)
 		ingressCtl = ctl
-		log.Printf("ingress enabled (network %s, image %s, reconcile interval %s)", *ingressNetwork, *ingressImage, *ingressInterval)
+		log.Printf("ingress enabled (network %s, caddy admin %s, reconcile interval %s)", *ingressNetwork, *ingressAdminAddr, *ingressInterval)
 	}
 	jobStore = db
 	pruneMetrics := obs.NewPruneMetrics(prometheus.DefaultRegisterer)

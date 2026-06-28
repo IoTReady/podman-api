@@ -48,7 +48,7 @@ func newMemStore(t *testing.T, specs []store.Spec, tmpls ...store.Template) *sto
 
 func newCtl(t *testing.T, specs []store.Spec, tmpls ...store.Template) *CaddyController {
 	t.Helper()
-	return NewCaddyController(nil, newMemStore(t, specs, tmpls...), Config{})
+	return NewCaddyController(newMemStore(t, specs, tmpls...), Config{})
 }
 
 func TestDeriveRoutesHappyPath(t *testing.T) {
@@ -71,7 +71,7 @@ func TestDeriveRoutesPicksUpTemplateAddedAfterConstruction(t *testing.T) {
 	require.NoError(t, st.PutSpec(ctx, store.Spec{
 		Host: "h1", Template: "late", Slug: "site", Domains: []string{"site.example.com"},
 	}))
-	c := NewCaddyController(nil, st, Config{})
+	c := NewCaddyController(st, Config{})
 
 	// Template "late" does not exist yet: its spec references a missing template,
 	// so the route is skipped (not an error).

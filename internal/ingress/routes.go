@@ -1,6 +1,6 @@
-// Package ingress derives a host's ingress routes from the store and reconciles
-// a per-host Caddy pod to match them via the Caddy admin API. Nothing here other
-// than the controller talks to podman or the network.
+// Package ingress derives a host's ingress routes from the store and pushes
+// them to an operator-managed Caddy instance via the admin API. Nothing in
+// this package talks to podman directly.
 package ingress
 
 import (

@@ -3,12 +3,10 @@ package ingress
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"time"
-
-	"github.com/iotready/podman-api/internal/podman"
 )
 
 // Reconcile makes host's Caddy proxy match the store-derived routes. It is
@@ -24,52 +22,28 @@ func (c *CaddyController) Reconcile(ctx context.Context, host string) error {
 	}
 	adminAddr := c.resolveAdminAddr(host)
 
-	// Nothing to serve and no proxy yet: don't stand up an idle pod.
-	// If a pod already exists, fall through so a drop-to-zero removes the server.
+	// No routes: best-effort cleanup of our server namespace in Caddy. If
+	// Caddy is unreachable (not yet started, restarting) that is not an error
+	// when there is nothing to serve.
 	if len(routes) == 0 {
-		if _, err := c.client.PodInspect(ctx, host, caddyPodName); errors.Is(err, podman.ErrNotFound) {
-			return nil
-		} else if err != nil {
-			return fmt.Errorf("ingress: inspect caddy pod: %w", err)
+		if err := c.deleteServer(ctx, adminAddr); err != nil {
+			log.Printf("ingress: best-effort cleanup on %s (admin %s): %v", host, adminAddr, err)
 		}
-		return c.deleteServer(ctx, adminAddr)
+		return nil
 	}
 
-	if _, err := c.ensureProxy(ctx, host); err != nil {
-		return err
-	}
-	// Wait for the admin API — one GET round-trip for a running pod,
-	// polling (up to 20×300ms) for a fresh or rebooting pod.
+	// Wait for the admin API — one round-trip for a running Caddy, polling
+	// (up to 20×300ms) while it restarts.
 	if err := c.waitForAdmin(ctx, adminAddr); err != nil {
 		return err
 	}
 	return c.pushRoutes(ctx, adminAddr, routes)
 }
 
-// pushRoutes applies routes to the Caddy server via the admin API and sets
-// the ACME email in TLS automation when configured.
+// pushRoutes applies routes to the Caddy server via the admin API.
+// TLS automation (ACME email, issuers) is operator-managed via Caddyfile;
+// automatic_https on the server config is enough to trigger issuance.
 func (c *CaddyController) pushRoutes(ctx context.Context, adminAddr string, routes []Route) error {
-	// Set the ACME email in TLS automation BEFORE creating the server, so the
-	// account email is already in place when automatic_https starts
-	// provisioning certs for the server's routes. The seed Caddyfile's global
-	// `email` directive is dropped by `caddy adapt` when there are no site
-	// blocks, so it must be set via the admin API. Path verified against Caddy
-	// v2.11.4.
-	if c.cfg.ACMEEmail != "" {
-		policies := []caddyAutomationPolicy{{
-			Issuers: []caddyIssuer{{Module: "acme", Email: c.cfg.ACMEEmail}},
-		}}
-		policiesJSON, err := json.Marshal(policies)
-		if err != nil {
-			return fmt.Errorf("ingress: marshal TLS automation: %w", err)
-		}
-		if code, body, err := c.adminDo(ctx, adminAddr, http.MethodPut, "/config/apps/tls/automation/policies", policiesJSON); err != nil {
-			return fmt.Errorf("ingress: admin set TLS automation: %w", err)
-		} else if code >= 300 {
-			return fmt.Errorf("ingress: admin set TLS automation: status %d: %s", code, body)
-		}
-	}
-
 	srv := caddyServer{
 		Listen:         []string{":80", ":443"},
 		Routes:         routesToCaddyJSON(routes),
@@ -102,23 +76,27 @@ func (c *CaddyController) deleteServer(ctx context.Context, adminAddr string) er
 }
 
 // waitForAdmin polls the Caddy admin API's /config/ endpoint until it
-// responds with 200 or the context is cancelled. Used after creating a
-// fresh Caddy pod to ensure it's ready before we push routes.
+// responds with 200 or the context is cancelled.
 func (c *CaddyController) waitForAdmin(ctx context.Context, adminAddr string) error {
 	const (
 		maxAttempts  = 20
 		pollInterval = 300 * time.Millisecond
 	)
+	var lastErr error
 	for i := 0; i < maxAttempts; i++ {
 		code, _, err := c.adminDo(ctx, adminAddr, http.MethodGet, "/config/", nil)
 		if err == nil && code == http.StatusOK {
 			return nil
 		}
+		lastErr = err
 		select {
 		case <-ctx.Done():
 			return fmt.Errorf("ingress: admin API at %s not ready: %w", adminAddr, ctx.Err())
 		case <-time.After(pollInterval):
 		}
+	}
+	if lastErr != nil {
+		return fmt.Errorf("ingress: admin API at %s not ready: %w", adminAddr, lastErr)
 	}
 	return fmt.Errorf("ingress: admin API at %s not ready after %d attempts", adminAddr, maxAttempts)
 }
