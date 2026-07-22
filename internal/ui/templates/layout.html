@@ -7,7 +7,6 @@
   <!-- Swap 4xx/5xx responses too (htmx ignores them by default), so inline
        validation errors and renderError fragments land in their target. -->
   <meta name="htmx-config" content='{"responseHandling":[{"code":"204","swap":false},{"code":"[1-5]..","swap":true}]}'>
-  <link rel="stylesheet" href="/ui/static/pure-min.css?v={{.Version}}">
   <link rel="stylesheet" href="/ui/static/app.css?v={{.Version}}">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2280%22>🐳</text></svg>">
   <script src="/ui/static/htmx.min.js?v={{.Version}}" defer></script>
