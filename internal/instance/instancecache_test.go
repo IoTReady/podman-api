@@ -107,6 +107,46 @@ func TestInstanceCache_CollapsesConcurrentFetches(t *testing.T) {
 	}
 }
 
+// TestInstanceCache_InvalidateDuringInFlightFetchIsNotOverwritten drives the
+// race directly: a get() is in the middle of fetch() (started, not yet
+// returned) when invalidate() runs concurrently. The fetch's result — which
+// is stale relative to the invalidate — must NOT be stored: a subsequent
+// get() must trigger a fresh fetch rather than serving the stale value.
+func TestInstanceCache_InvalidateDuringInFlightFetchIsNotOverwritten(t *testing.T) {
+	c := newInstanceCache(time.Minute)
+	var calls int32
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fetch := func() ([]Observed, error) {
+		n := atomic.AddInt32(&calls, 1)
+		if n == 1 {
+			close(started)
+			<-release
+		}
+		return []Observed{{Slug: "stale"}}, nil
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = c.get("h1", fetch)
+	}()
+
+	<-started               // fetch #1 is in flight
+	c.invalidate("h1")      // invalidate races the in-flight fetch
+	close(release)          // let fetch #1 finish and attempt to store
+	<-done
+
+	// The stale result from fetch #1 must not have been cached: a subsequent
+	// get() must re-fetch rather than returning the stale "stale" value.
+	if _, err := c.get("h1", fetch); err != nil {
+		t.Fatal(err)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("fetch called %d times, want 2 (invalidate-during-fetch must not poison the cache)", got)
+	}
+}
+
 // TestListAllInstances_CachesAcrossCalls drives ListAllInstances through the
 // real per-host cache using the package's existing podman fake (newSvc, see
 // service_test.go): a second call within the TTL must not re-sweep PodList,

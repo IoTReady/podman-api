@@ -17,6 +17,7 @@ type instanceCache struct {
 	mu       sync.Mutex
 	data     map[string]instEntry
 	inflight map[string]*instCall
+	gen      map[string]uint64
 }
 
 type instEntry struct {
@@ -36,6 +37,7 @@ func newInstanceCache(ttl time.Duration) *instanceCache {
 		now:      time.Now,
 		data:     make(map[string]instEntry),
 		inflight: make(map[string]*instCall),
+		gen:      make(map[string]uint64),
 	}
 }
 
@@ -54,17 +56,21 @@ func (c *instanceCache) get(host string, fetch func() ([]Observed, error)) ([]Ob
 		call.wg.Wait()
 		return call.obs, call.err
 	}
-	// Become the fetcher.
+	// Become the fetcher. Capture the current generation for host before
+	// releasing the lock: if invalidate(host) runs while fetch() is in
+	// flight, it bumps the generation, and the store below (which re-checks
+	// the generation under the lock) will skip writing our now-stale result.
 	call := &instCall{}
 	call.wg.Add(1)
 	c.inflight[host] = call
+	gen := c.gen[host]
 	c.mu.Unlock()
 
 	call.obs, call.err = fetch()
 
 	c.mu.Lock()
 	delete(c.inflight, host)
-	if call.err == nil && c.ttl > 0 {
+	if call.err == nil && c.ttl > 0 && c.gen[host] == gen {
 		c.data[host] = instEntry{obs: call.obs, fetchedAt: c.now()}
 	}
 	c.mu.Unlock()
@@ -75,5 +81,6 @@ func (c *instanceCache) get(host string, fetch func() ([]Observed, error)) ([]Ob
 func (c *instanceCache) invalidate(host string) {
 	c.mu.Lock()
 	delete(c.data, host)
+	c.gen[host]++
 	c.mu.Unlock()
 }
