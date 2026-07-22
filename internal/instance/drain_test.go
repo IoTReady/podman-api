@@ -73,10 +73,6 @@ func TestService_Drain_AllowsLifecycleAndDelete(t *testing.T) {
 
 func TestService_InstanceCount(t *testing.T) {
 	svc, _, _ := newSvcDrainable(t)
-	// InstanceCount reads through the ListAllInstances cache (default 3s TTL);
-	// this test asserts an immediate live count right after Apply, so disable
-	// caching to avoid observing a stale pre-Apply sweep.
-	svc.SetInstanceCacheTTL(0)
 	ctx := context.Background()
 
 	n, err := svc.InstanceCount(ctx, "h1")

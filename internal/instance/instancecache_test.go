@@ -195,6 +195,61 @@ func TestListAllInstances_ParallelSweepMatchesSerial(t *testing.T) {
 	}
 }
 
+// TestApply_InvalidatesInstanceCache proves the applyLocked funnel drops the
+// per-host cache entry so the next ListAllInstances re-sweeps instead of
+// serving a stale (pre-Apply) result.
+func TestApply_InvalidatesInstanceCache(t *testing.T) {
+	svc, f := newSvc(t)
+	svc.SetInstanceCacheTTL(time.Minute)
+	ctx := context.Background()
+
+	// Prime the cache.
+	if _, err := svc.ListAllInstances(ctx, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	before := f.PodListCallCount()
+
+	// A mutation via Apply must invalidate, so the next list re-sweeps.
+	if err := svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if _, err := svc.ListAllInstances(ctx, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	if f.PodListCallCount() == before {
+		t.Error("ListAllInstances hit stale cache after Apply; expected invalidation + refetch")
+	}
+}
+
+// TestDelete_InvalidatesInstanceCache proves the Delete funnel drops the
+// per-host cache entry so the next ListAllInstances re-sweeps instead of
+// serving a stale (pre-Delete) result.
+func TestDelete_InvalidatesInstanceCache(t *testing.T) {
+	svc, f := newSvc(t)
+	svc.SetInstanceCacheTTL(time.Minute)
+	ctx := context.Background()
+
+	if err := svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	// Prime the cache post-Apply (Apply itself already invalidates).
+	if _, err := svc.ListAllInstances(ctx, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	before := f.PodListCallCount()
+
+	if err := svc.Delete(ctx, "h1", "postgres", "demo", DeleteOptions{}); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := svc.ListAllInstances(ctx, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	if f.PodListCallCount() == before {
+		t.Error("ListAllInstances hit stale cache after Delete; expected invalidation + refetch")
+	}
+}
+
 func TestListAllInstances_PropagatesTemplateError(t *testing.T) {
 	svc, f := newTestServiceWithFakeTemplates(t, 3)
 	svc.SetInstanceCacheTTL(0)

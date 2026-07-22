@@ -345,6 +345,12 @@ func (s *Service) ApplyAndObserve(ctx context.Context, host string, req ApplyReq
 // UpgradeImage) hold a single lock across GetSpec + re-apply without re-entering
 // Apply's non-reentrant lock. Apply is the public, lock-acquiring entry point.
 func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest, opts ApplyOptions) error {
+	// Any create/replace changes this host's instance list; drop the cache on
+	// return (after the mutation completes) so the next read is fresh. Deferred
+	// so all success and error exits invalidate — an extra sweep on failure is
+	// harmless, a stale hit after success is not.
+	defer s.invalidateInstances(host)
+
 	tmpl, err := s.lookup(ctx, host, req.Template)
 	if err != nil {
 		return err
@@ -885,6 +891,8 @@ func (s *Service) pruneInstanceResources(ctx context.Context, host, tmpl, slug s
 
 // Delete removes the pod and optionally its volumes and per-instance secrets.
 func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts DeleteOptions) error {
+	defer s.invalidateInstances(host)
+
 	if _, err := s.lookup(ctx, host, tmpl); err != nil {
 		return err
 	}
