@@ -111,6 +111,12 @@ h1,h2,h3{margin:0;font-weight:600;letter-spacing:-.02em}
 .badge.muted .dot{background:var(--faint)}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
 
+/* inline status messages (post-action feedback) */
+.notice{background:var(--ok-weak);border:1px solid color-mix(in srgb,var(--ok) 30%,var(--border));
+  color:var(--ok);border-radius:var(--r-sm);padding:10px 13px;margin-bottom:16px;font-size:13px}
+.error{background:var(--bad-weak);border:1px solid color-mix(in srgb,var(--bad) 30%,var(--border));
+  color:var(--bad);border-radius:var(--r-sm);padding:10px 13px;margin-bottom:16px;font-size:13px}
+
 /* ============================================================= BUTTONS */
 .btn{display:inline-flex;align-items:center;gap:7px;font:600 13px/1 var(--font-sans);
   padding:8px 13px;border-radius:var(--r-sm);border:1px solid var(--border-strong);background:var(--surface);
@@ -184,6 +190,10 @@ button:disabled {
 
 /* form */
 .form{max-width:520px}
+.subtitle,.detail{color:var(--muted);font-size:12.5px;margin:0 0 14px}
+.label{font:600 10.5px/1 var(--font-sans);letter-spacing:.11em;text-transform:uppercase;color:var(--faint);
+  margin:18px 0 10px}
+.label:first-child{margin-top:0}
 .field{margin-bottom:15px}
 .field label{display:block;font-weight:600;font-size:12.5px;margin-bottom:6px}
 .field .hint{color:var(--muted);font-weight:400;font-size:12px}
