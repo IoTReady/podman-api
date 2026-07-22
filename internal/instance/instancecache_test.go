@@ -3,10 +3,17 @@ package instance
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/iotready/podman-api/internal/config"
+	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/podman/fake"
+	"github.com/iotready/podman-api/internal/render"
+	"github.com/iotready/podman-api/internal/store"
 )
 
 func TestInstanceCache_HitWithinTTL(t *testing.T) {
@@ -126,5 +133,73 @@ func TestListAllInstances_CachesAcrossCalls(t *testing.T) {
 	}
 	if after := f.PodListCallCount(); after == before {
 		t.Errorf("PodList not called after invalidate; expected a refetch")
+	}
+}
+
+// newTestServiceWithFakeTemplates builds a Service backed by the package's
+// podman fake, seeded with n distinct templates ("tmpl-0".."tmpl-(n-1)"),
+// each with exactly one pod on host h1 carrying a distinct slug. Used by the
+// parallel-sweep tests below.
+func newTestServiceWithFakeTemplates(t *testing.T, n int) (*Service, *fake.Fake) {
+	t.Helper()
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	f := fake.New()
+	tmpls := make([]store.Template, 0, n)
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("tmpl-%d", i)
+		tmpls = append(tmpls, store.Template{
+			Meta: render.Meta{ID: id},
+			Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: ` + id + `
+`,
+			Origin: "seed",
+		})
+	}
+	svc, _ := newSvcWith(t, f, hosts, tmpls...)
+	for i, tm := range tmpls {
+		slug := fmt.Sprintf("slug-%d", i)
+		f.AddPod("h1", podman.Pod{
+			ID:   tm.Meta.ID + "-" + slug,
+			Name: tm.Meta.ID + "-" + slug,
+			Labels: map[string]string{
+				"podman-api/template": tm.Meta.ID,
+				"podman-api/slug":     slug,
+			},
+			Status: "Running",
+		})
+	}
+	return svc, f
+}
+
+func TestListAllInstances_ParallelSweepMatchesSerial(t *testing.T) {
+	// A fake with N templates, each returning a distinct pod. Result set must be
+	// complete and independent of ordering.
+	svc, _ := newTestServiceWithFakeTemplates(t, 5) // 5 templates, 1 pod each
+	svc.SetInstanceCacheTTL(0)                      // force a live sweep
+
+	obs, err := svc.ListAllInstances(context.Background(), "h1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(obs) != 5 {
+		t.Fatalf("got %d observed, want 5", len(obs))
+	}
+	slugs := map[string]bool{}
+	for _, o := range obs {
+		slugs[o.Slug] = true
+	}
+	if len(slugs) != 5 {
+		t.Errorf("expected 5 distinct slugs, got %d (%v)", len(slugs), slugs)
+	}
+}
+
+func TestListAllInstances_PropagatesTemplateError(t *testing.T) {
+	svc, f := newTestServiceWithFakeTemplates(t, 3)
+	svc.SetInstanceCacheTTL(0)
+	f.FailPodListFor("tmpl-2", errors.New("podlist boom"))
+	if _, err := svc.ListAllInstances(context.Background(), "h1"); err == nil {
+		t.Fatal("expected error from failing template, got nil")
 	}
 }

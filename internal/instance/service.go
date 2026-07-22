@@ -601,18 +601,44 @@ func (s *Service) listAllInstancesLive(ctx context.Context, host string) ([]Obse
 	if err != nil {
 		return nil, fmt.Errorf("list templates: %w", err)
 	}
+
+	type result struct {
+		obs []Observed
+		err error
+	}
+	const maxWorkers = 8
+	sem := make(chan struct{}, maxWorkers)
+	results := make([]result, len(tmpls))
+	var wg sync.WaitGroup
+	for i, t := range tmpls {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, t store.Template) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			tmplID := t.Meta.ID
+			pods, err := s.client.PodList(ctx, host, map[string]string{"podman-api/template": tmplID})
+			if err != nil {
+				results[i] = result{err: fmt.Errorf("list %s: %w", tmplID, err)}
+				return
+			}
+			secretEnvs := secretEnvNames(t.Body)
+			var part []Observed
+			for _, p := range pods {
+				slug := p.Labels["podman-api/slug"]
+				part = append(part, Normalize(p, tmplID, slug, nil, secretEnvs))
+			}
+			results[i] = result{obs: part}
+		}(i, t)
+	}
+	wg.Wait()
+
 	var out []Observed
-	for _, t := range tmpls {
-		tmplID := t.Meta.ID
-		pods, err := s.client.PodList(ctx, host, map[string]string{"podman-api/template": tmplID})
-		if err != nil {
-			return nil, fmt.Errorf("list %s: %w", tmplID, err)
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err // first error in template order, matching prior serial semantics
 		}
-		secretEnvs := secretEnvNames(t.Body)
-		for _, p := range pods {
-			slug := p.Labels["podman-api/slug"]
-			out = append(out, Normalize(p, tmplID, slug, nil, secretEnvs))
-		}
+		out = append(out, r.obs...)
 	}
 	return out, nil
 }
