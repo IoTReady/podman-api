@@ -1,17 +1,28 @@
 {{define "dashboard"}}
-<h1>Dashboard</h1>
+<div class="phead"><div><h1>Fleet</h1>{{if .HostSummaries}}<div class="sub">{{.TotalInstances}} instance(s) across {{.HostCount}} host(s).</div>{{end}}</div></div>
 {{if .HostSummaries}}
-<p>{{.TotalInstances}} instance(s) across {{.HostCount}} host(s).</p>
-<table class="pure-table">
-  <thead><tr><th>Host</th><th>Instances</th></tr></thead>
-  <tbody>
-  {{range .HostSummaries}}
-  <tr class="clickable" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true">
-    <td data-label="Host">{{.ID}}</td><td data-label="Instances">{{.Instances}}</td>
-  </tr>
-  {{end}}
-  </tbody>
-</table>
+<div class="stats">
+  <div class="stat"><div class="k">Hosts</div><div class="v">{{.HostCount}}</div></div>
+  <div class="stat"><div class="k">Instances</div><div class="v">{{.TotalInstances}}</div></div>
+</div>
+<div class="card">
+  <div class="card-h"><span class="t">Hosts</span></div>
+  <table class="tbl">
+    <thead><tr><th>Host</th><th>Instances</th><th>Status</th></tr></thead>
+    <tbody>
+    {{range .HostSummaries}}
+    <tr hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true" preload="mouseover">
+      <td class="idcell slug" data-label="Host">{{.ID}}</td>
+      <td class="sub-td mono" data-label="Instances">{{.Instances}}</td>
+      <td data-label="Status">
+        {{if gt .Instances 0}}<span class="badge ok"><span class="dot"></span>{{.Instances}} running</span>{{else}}<span class="badge muted"><span class="dot"></span>none deployed</span>{{end}}
+        <span class="go">→</span>
+      </td>
+    </tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
 {{else if .Hosts}}
 <p>No instances deployed yet. Select a host from the sidebar to deploy one.</p>
 {{else}}

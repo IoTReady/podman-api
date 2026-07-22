@@ -1,21 +1,28 @@
 {{define "host-instances"}}
-<div class="host-head">
-  <strong>{{.Host}}</strong> · {{len .Instances}} instances
-  <a class="pure-button" href="/ui/hosts/{{.Host}}/deploy" hx-get="/ui/hosts/{{.Host}}/deploy" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">+ Deploy</a>
+<div class="phead"><div><h1>{{.Host}}</h1><div class="sub">{{len .Instances}} instance(s)</div></div></div>
+<div class="card">
+  <div class="card-h">
+    <span class="t">{{.Host}} · instances</span>
+    <span class="sp"></span>
+    <a class="btn primary sm" href="/ui/hosts/{{.Host}}/deploy" hx-get="/ui/hosts/{{.Host}}/deploy" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">+ Deploy</a>
+  </div>
+  <table class="tbl">
+    <thead><tr><th>Template / Slug</th><th>Status</th></tr></thead>
+    <tbody>
+    {{range .Instances}}
+      <tr hx-get="/ui/hosts/{{$.Host}}/instances/{{.Template}}/{{.Slug}}" hx-target="#main" hx-push-url="true" preload="mouseover">
+        <td class="idcell" data-label="Template/Slug"><span class="tmpl">{{.Template}}</span> <span class="mut">/</span> <span class="slug">{{.Slug}}</span></td>
+        <td data-label="Status">
+          {{if eq .Pod.Status "Running"}}
+            {{if .Ready}}<span class="badge ok"><span class="dot"></span>{{.Pod.Status}}</span>{{else}}<span class="badge warn"><span class="dot"></span>{{.Pod.Status}}</span>{{end}}
+          {{else}}
+            <span class="badge muted"><span class="dot"></span>{{.Pod.Status}}</span>
+          {{end}}
+          <span class="go">→</span>
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
 </div>
-<table class="pure-table">
-  <tbody>
-  {{range .Instances}}
-    <tr class="clickable" hx-get="/ui/hosts/{{$.Host}}/instances/{{.Template}}/{{.Slug}}" hx-target="#main" hx-push-url="true">
-      <td data-label="Template/Slug">{{.Template}} / {{.Slug}}</td>
-      <td data-label="Status">
-        {{.Pod.Status}}
-        {{if eq .Pod.Status "Running"}}
-          {{if .Ready}}<span class="health-dot healthy" title="healthy">●</span>{{else}}<span class="health-dot starting" title="not yet healthy">●</span>{{end}}
-        {{end}}
-      </td>
-    </tr>
-  {{end}}
-  </tbody>
-</table>
 {{end}}
