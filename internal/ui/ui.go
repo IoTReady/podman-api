@@ -1,9 +1,14 @@
 package ui
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"html/template"
+	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/iotready/podman-api/internal/auth"
@@ -63,9 +68,36 @@ func New(cfg Config) (*UI, error) {
 	return &UI{cfg: cfg, tmpl: t}, nil
 }
 
-// staticHandler serves the embedded /ui/static/* assets.
+// staticHandler serves the embedded /ui/static/* assets with long-lived,
+// immutable browser caching. Assets are embedded in the binary, so they are
+// immutable for a given build; URLs are cache-busted by ?v=<version> (see the
+// layout), and an ETag lets any un-versioned request revalidate cheaply (304).
 func (u *UI) staticHandler() http.Handler {
-	return http.StripPrefix("/ui/", http.FileServer(http.FS(staticFS)))
+	return http.StripPrefix("/ui/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/")
+		f, err := staticFS.Open(name)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer f.Close()
+		data, err := io.ReadAll(f)
+		if err != nil {
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+		sum := sha256.Sum256(data)
+		etag := `"` + hex.EncodeToString(sum[:8]) + `"`
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		w.Header().Set("ETag", etag)
+		if match := r.Header.Get("If-None-Match"); match == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		// http.ServeContent sets Content-Type (by extension) and handles Range.
+		// Zero time disables Last-Modified; ETag drives revalidation.
+		http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(data))
+	}))
 }
 
 // pageData builds the render data for an authenticated page, injecting the host
