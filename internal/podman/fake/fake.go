@@ -77,6 +77,15 @@ type Fake struct {
 	PlayCalls []PlayCall
 	// PodListErr, if non-nil, makes PodList return this error.
 	PodListErr error
+	// podListErrFor maps a "podman-api/template" filter value to an error
+	// PodList should return when called with that template filter. Guarded by
+	// mu. Set via FailPodListFor. Lets tests exercise a single failing template
+	// in a multi-template sweep (e.g. the parallel ListAllInstances fan-out)
+	// without failing every PodList call.
+	podListErrFor map[string]error
+	// podListCalls counts PodList invocations (guarded by mu); read via
+	// PodListCallCount. Lets cache tests assert a live sweep did/didn't happen.
+	podListCalls int
 	// LogLines, if set, are emitted in order by ContainerLogs before the
 	// channel closes. Lets tests exercise the streaming response paths.
 	LogLines []podman.LogLine
@@ -287,11 +296,35 @@ func (f *Fake) PodInspect(_ context.Context, h, name string) (podman.Pod, error)
 	return p, nil
 }
 
+// PodListCallCount returns the number of PodList invocations so far.
+func (f *Fake) PodListCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.podListCalls
+}
+
+// FailPodListFor makes PodList return err whenever it is called with a
+// "podman-api/template" filter equal to tmplID. Test-only.
+func (f *Fake) FailPodListFor(tmplID string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.podListErrFor == nil {
+		f.podListErrFor = map[string]error{}
+	}
+	f.podListErrFor[tmplID] = err
+}
+
 func (f *Fake) PodList(_ context.Context, h string, filters map[string]string) ([]podman.Pod, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.podListCalls++
 	if f.PodListErr != nil {
 		return nil, f.PodListErr
+	}
+	if tmplID, ok := filters["podman-api/template"]; ok {
+		if err, ok := f.podListErrFor[tmplID]; ok {
+			return nil, err
+		}
 	}
 	var out []podman.Pod
 	for _, p := range f.hostPods(h) {

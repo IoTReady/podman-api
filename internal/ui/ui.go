@@ -1,9 +1,14 @@
 package ui
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"html/template"
+	"io/fs"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/iotready/podman-api/internal/auth"
@@ -39,12 +44,14 @@ type Config struct {
 	SessionTTL time.Duration
 	Secure     bool               // set Secure flag on the session cookie (true in production)
 	TokenMgr   *auth.TokenManager // optional; enables /ui/tokens if non-nil
+	Version    string             // build version; used to cache-bust static asset URLs (?v=)
 }
 
 // UI holds parsed templates and dependencies and produces the /ui sub-router.
 type UI struct {
-	cfg  Config
-	tmpl *template.Template
+	cfg         Config
+	tmpl        *template.Template
+	staticETags map[string]string // fs path (e.g. "static/app.css") -> ETag, precomputed at New()
 }
 
 func New(cfg Config) (*UI, error) {
@@ -59,12 +66,67 @@ func New(cfg Config) (*UI, error) {
 	if cfg.Sessions == nil {
 		cfg.Sessions = NewMemorySessionStore(cfg.SessionTTL)
 	}
-	return &UI{cfg: cfg, tmpl: t}, nil
+	etags, err := computeStaticETags()
+	if err != nil {
+		return nil, err
+	}
+	return &UI{cfg: cfg, tmpl: t, staticETags: etags}, nil
 }
 
-// staticHandler serves the embedded /ui/static/* assets.
+// computeStaticETags hashes every embedded static asset once, so the request
+// path never re-reads or re-hashes them. Assets are immutable for a given
+// build, so the ETag is stable for the process lifetime.
+func computeStaticETags() (map[string]string, error) {
+	etags := map[string]string{}
+	err := fs.WalkDir(staticFS, "static", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		data, err := staticFS.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(data)
+		etags[p] = `"` + hex.EncodeToString(sum[:8]) + `"`
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return etags, nil
+}
+
+// staticHandler serves the embedded /ui/static/* assets with long-lived,
+// immutable browser caching. Assets are embedded in the binary, so they are
+// immutable for a given build; URLs are cache-busted by ?v=<version> (see the
+// layout), and an ETag (precomputed in New) lets any un-versioned request
+// revalidate cheaply (304) without re-hashing.
 func (u *UI) staticHandler() http.Handler {
-	return http.StripPrefix("/ui/", http.FileServer(http.FS(staticFS)))
+	return http.StripPrefix("/ui/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		name := strings.TrimPrefix(r.URL.Path, "/")
+		etag, ok := u.staticETags[name]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		w.Header().Set("ETag", etag)
+		if match := r.Header.Get("If-None-Match"); match == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		data, err := staticFS.ReadFile(name)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		// http.ServeContent sets Content-Type (by extension) and handles Range.
+		// Zero time disables Last-Modified; ETag drives revalidation.
+		http.ServeContent(w, r, name, time.Time{}, bytes.NewReader(data))
+	}))
 }
 
 // pageData builds the render data for an authenticated page, injecting the host

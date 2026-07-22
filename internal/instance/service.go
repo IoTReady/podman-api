@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/iotready/podman-api/extension"
 	"github.com/iotready/podman-api/internal/config"
@@ -91,6 +92,7 @@ type Service struct {
 	ingressNet string                                 // shared ingress network; "" when ingress disabled
 	blobs      BlobStore                              // backup artifact store; set via SetBlobStore (nil → backups disabled)
 	sidecar    SidecarInjector                        // sidecar injector; set via SetSidecarInjector (nil → no injection)
+	instCache  *instanceCache                         // per-host read cache over ListAllInstances (default 3s TTL)
 
 	verifyVolumes bool // verify each migrated volume's content before reaping the source
 
@@ -114,6 +116,7 @@ func NewService(client podman.Client, hosts []config.Host) *Service {
 	}
 	s.ingress = ingress.Disabled{}
 	s.SetHosts(hosts)
+	s.instCache = newInstanceCache(3 * time.Second)
 	return s
 }
 
@@ -140,6 +143,19 @@ func (s *Service) SetBlobStore(bs BlobStore) { s.blobs = bs }
 // SetSidecarInjector wires a sidecar injector that is called after template
 // rendering but before the pod YAML is applied.
 func (s *Service) SetSidecarInjector(si SidecarInjector) { s.sidecar = si }
+
+// SetInstanceCacheTTL replaces the per-host ListAllInstances cache with one of
+// the given TTL. ttl == 0 disables caching (live passthrough). Wire from the
+// server if the operator wants a non-default window; the default is 3s.
+func (s *Service) SetInstanceCacheTTL(ttl time.Duration) {
+	s.instCache = newInstanceCache(ttl)
+}
+
+// invalidateInstances drops the cached instance list for a host so the next
+// ListAllInstances re-sweeps. Called by mutating methods.
+func (s *Service) invalidateInstances(host string) {
+	s.instCache.invalidate(host)
+}
 
 // SetIngress enables ingress reconciliation. network is the shared podman
 // network app pods join; passing a real controller marks ingress enabled so
@@ -329,6 +345,12 @@ func (s *Service) ApplyAndObserve(ctx context.Context, host string, req ApplyReq
 // UpgradeImage) hold a single lock across GetSpec + re-apply without re-entering
 // Apply's non-reentrant lock. Apply is the public, lock-acquiring entry point.
 func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest, opts ApplyOptions) error {
+	// Any create/replace changes this host's instance list; drop the cache on
+	// return (after the mutation completes) so the next read is fresh. Deferred
+	// so all success and error exits invalidate — an extra sweep on failure is
+	// harmless, a stale hit after success is not.
+	defer s.invalidateInstances(host)
+
 	tmpl, err := s.lookup(ctx, host, req.Template)
 	if err != nil {
 		return err
@@ -570,6 +592,14 @@ func (s *Service) List(ctx context.Context, host, tmpl string) ([]Observed, erro
 // template id, so a pod for a template the daemon doesn't know about is
 // silently omitted.
 func (s *Service) ListAllInstances(ctx context.Context, host string) ([]Observed, error) {
+	return s.instCache.get(host, func() ([]Observed, error) {
+		return s.listAllInstancesLive(ctx, host)
+	})
+}
+
+// listAllInstancesLive performs the live podman sweep (no caching). See
+// ListAllInstances for the cached entry point.
+func (s *Service) listAllInstancesLive(ctx context.Context, host string) ([]Observed, error) {
 	if _, ok := s.host(host); !ok {
 		return nil, ErrUnknownHost
 	}
@@ -577,18 +607,44 @@ func (s *Service) ListAllInstances(ctx context.Context, host string) ([]Observed
 	if err != nil {
 		return nil, fmt.Errorf("list templates: %w", err)
 	}
+
+	type result struct {
+		obs []Observed
+		err error
+	}
+	const maxWorkers = 8
+	sem := make(chan struct{}, maxWorkers)
+	results := make([]result, len(tmpls))
+	var wg sync.WaitGroup
+	for i, t := range tmpls {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, t store.Template) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			tmplID := t.Meta.ID
+			pods, err := s.client.PodList(ctx, host, map[string]string{"podman-api/template": tmplID})
+			if err != nil {
+				results[i] = result{err: fmt.Errorf("list %s: %w", tmplID, err)}
+				return
+			}
+			secretEnvs := secretEnvNames(t.Body)
+			var part []Observed
+			for _, p := range pods {
+				slug := p.Labels["podman-api/slug"]
+				part = append(part, Normalize(p, tmplID, slug, nil, secretEnvs))
+			}
+			results[i] = result{obs: part}
+		}(i, t)
+	}
+	wg.Wait()
+
 	var out []Observed
-	for _, t := range tmpls {
-		tmplID := t.Meta.ID
-		pods, err := s.client.PodList(ctx, host, map[string]string{"podman-api/template": tmplID})
-		if err != nil {
-			return nil, fmt.Errorf("list %s: %w", tmplID, err)
+	for _, r := range results {
+		if r.err != nil {
+			return nil, r.err // first error in template order, matching prior serial semantics
 		}
-		secretEnvs := secretEnvNames(t.Body)
-		for _, p := range pods {
-			slug := p.Labels["podman-api/slug"]
-			out = append(out, Normalize(p, tmplID, slug, nil, secretEnvs))
-		}
+		out = append(out, r.obs...)
 	}
 	return out, nil
 }
@@ -645,6 +701,7 @@ func (s *Service) Restart(ctx context.Context, host, tmpl, slug string) error {
 
 func (s *Service) lifecycle(ctx context.Context, host, tmpl, slug string,
 	op func(context.Context, string, string) error) error {
+	defer s.invalidateInstances(host)
 	if _, err := s.lookup(ctx, host, tmpl); err != nil {
 		return err
 	}
@@ -835,6 +892,8 @@ func (s *Service) pruneInstanceResources(ctx context.Context, host, tmpl, slug s
 
 // Delete removes the pod and optionally its volumes and per-instance secrets.
 func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts DeleteOptions) error {
+	defer s.invalidateInstances(host)
+
 	if _, err := s.lookup(ctx, host, tmpl); err != nil {
 		return err
 	}
