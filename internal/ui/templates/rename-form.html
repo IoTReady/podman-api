@@ -2,11 +2,24 @@
 <h2>Rename {{.Template}} / {{.Slug}} on {{.Host}}</h2>
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
 <p class="subtitle">Changes the slug, migrating all data and secrets to the new name. The instance is stopped during migration.</p>
-<form hx-post="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/rename" hx-target="#main" hx-push-url="true" class="pure-form pure-form-stacked">
+<div class="card"><div class="card-b">
+<form hx-post="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/rename" hx-target="#main" hx-push-url="true" class="form">
   <input type="hidden" name="csrf_token" value="{{.CSRF}}">
-  <label>New slug <input name="new_slug" value="" placeholder="e.g. myapp-v2" required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" title="Lowercase letters, digits, hyphens (no leading/trailing hyphen)"></label>
-  <label>Domains (comma-separated, optional) <input name="domains" value="{{.Domains}}" placeholder="app.example.com"></label>
-  <label><input type="checkbox" name="keep_old_standby" value="true"> Keep old instance as standby (stopped, with volumes intact)</label>
-  <button type="submit" class="pure-button pure-button-primary" hx-disabled-elt="this">Rename</button>
+  <div class="field">
+    <label>New slug</label>
+    <input name="new_slug" value="" placeholder="e.g. myapp-v2" required pattern="[a-z0-9]([a-z0-9-]*[a-z0-9])?" title="Lowercase letters, digits, hyphens (no leading/trailing hyphen)">
+  </div>
+  <div class="field">
+    <label>Domains (comma-separated, optional)</label>
+    <input name="domains" value="{{.Domains}}" placeholder="app.example.com">
+  </div>
+  <div class="field">
+    <label><input type="checkbox" name="keep_old_standby" value="true"> Keep old instance as standby (stopped, with volumes intact)</label>
+  </div>
+  <div class="toolbar" style="margin-top:22px">
+    <button type="submit" class="btn primary" hx-disabled-elt="this">Rename</button>
+    <a class="btn ghost" href="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}" hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}" hx-target="#main" hx-push-url="true">Cancel</a>
+  </div>
 </form>
+</div></div>
 {{end}}

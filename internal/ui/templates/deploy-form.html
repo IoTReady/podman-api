@@ -6,24 +6,41 @@
 <h2>Deploy on {{.Host}}</h2>
 {{end}}
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-<form hx-post="{{if .EditMode}}/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/edit{{else}}/ui/hosts/{{.Host}}/deploy{{end}}" hx-target="#main" class="pure-form pure-form-stacked">
+<div class="card"><div class="card-b">
+<form hx-post="{{if .EditMode}}/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/edit{{else}}/ui/hosts/{{.Host}}/deploy{{end}}" hx-target="#main" class="form">
   <input type="hidden" name="csrf_token" value="{{.CSRF}}">
   {{if .EditMode}}
-  <label>Template
+  <div class="field">
+    <label>Template</label>
     <select name="template" disabled>
       <option value="{{.Inst.Template}}" selected>{{.Inst.Template}}</option>
     </select>
-  </label>
-  <label>Slug <input name="slug" value="{{.Inst.Slug}}" required readonly></label>
+  </div>
+  <div class="field">
+    <label>Slug</label>
+    <input name="slug" value="{{.Inst.Slug}}" required readonly>
+  </div>
   {{else}}
-  <label>Template
+  <div class="field">
+    <label>Template</label>
     <select name="template" hx-post="/ui/hosts/{{.Host}}/deploy/form" hx-target="#main" hx-trigger="change" hx-include="closest form">
       {{range .Templates}}<option value="{{.Meta.ID}}"{{if eq .Meta.ID $.Selected}} selected{{end}}>{{.Meta.ID}}</option>{{end}}
     </select>
-  </label>
-  <label>Slug <input name="slug" value="{{.Slug}}" required></label>
+  </div>
+  <div class="field">
+    <label>Slug</label>
+    <input name="slug" value="{{.Slug}}" required>
+  </div>
   {{end}}
   {{template "instance-fields" .}}
-  <button type="submit" class="pure-button pure-button-primary" hx-disabled-elt="this">{{if .EditMode}}Apply changes{{else}}Deploy{{end}}</button>
+  <div class="toolbar" style="margin-top:22px">
+    <button type="submit" class="btn primary" hx-disabled-elt="this">{{if .EditMode}}Apply changes{{else}}Deploy{{end}}</button>
+    {{if .EditMode}}
+    <a class="btn ghost" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}" hx-target="#main" hx-push-url="true">Cancel</a>
+    {{else}}
+    <a class="btn ghost" href="/ui/hosts/{{.Host}}" hx-get="/ui/hosts/{{.Host}}" hx-target="#main" hx-push-url="true">Cancel</a>
+    {{end}}
+  </div>
 </form>
+</div></div>
 {{end}}

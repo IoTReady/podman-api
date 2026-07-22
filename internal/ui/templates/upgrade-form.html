@@ -2,10 +2,18 @@
 <h2>Upgrade {{.Template}} / {{.Slug}} on {{.Host}}</h2>
 {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
 <p class="subtitle">Changes the image only. Existing parameters and secrets are reused; to rotate a secret, manage it separately.</p>
-<form hx-post="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/upgrade" hx-target="#main" class="pure-form pure-form-stacked">
+<div class="card"><div class="card-b">
+<form hx-post="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/upgrade" hx-target="#main" class="form">
   <input type="hidden" name="csrf_token" value="{{.CSRF}}">
   {{if .CurrentImage}}<p class="subtitle">Current: <code>{{.CurrentImage}}</code></p>{{end}}
-  <label>New image <input name="image" value="{{.CurrentImage}}" placeholder="docker.io/library/postgres:16" required></label>
-  <button type="submit" class="pure-button pure-button-primary" hx-disabled-elt="this">Upgrade</button>
+  <div class="field">
+    <label>New image</label>
+    <input name="image" value="{{.CurrentImage}}" placeholder="docker.io/library/postgres:16" required>
+  </div>
+  <div class="toolbar" style="margin-top:22px">
+    <button type="submit" class="btn primary" hx-disabled-elt="this">Upgrade</button>
+    <a class="btn ghost" href="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}" hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}" hx-target="#main" hx-push-url="true">Cancel</a>
+  </div>
 </form>
+</div></div>
 {{end}}
