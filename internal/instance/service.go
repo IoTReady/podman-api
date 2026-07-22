@@ -10,6 +10,7 @@ import (
 	"slices"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/iotready/podman-api/extension"
 	"github.com/iotready/podman-api/internal/config"
@@ -91,6 +92,7 @@ type Service struct {
 	ingressNet string                                 // shared ingress network; "" when ingress disabled
 	blobs      BlobStore                              // backup artifact store; set via SetBlobStore (nil → backups disabled)
 	sidecar    SidecarInjector                        // sidecar injector; set via SetSidecarInjector (nil → no injection)
+	instCache  *instanceCache                         // per-host read cache over ListAllInstances (default 3s TTL)
 
 	verifyVolumes bool // verify each migrated volume's content before reaping the source
 
@@ -114,6 +116,7 @@ func NewService(client podman.Client, hosts []config.Host) *Service {
 	}
 	s.ingress = ingress.Disabled{}
 	s.SetHosts(hosts)
+	s.instCache = newInstanceCache(3 * time.Second)
 	return s
 }
 
@@ -140,6 +143,19 @@ func (s *Service) SetBlobStore(bs BlobStore) { s.blobs = bs }
 // SetSidecarInjector wires a sidecar injector that is called after template
 // rendering but before the pod YAML is applied.
 func (s *Service) SetSidecarInjector(si SidecarInjector) { s.sidecar = si }
+
+// SetInstanceCacheTTL replaces the per-host ListAllInstances cache with one of
+// the given TTL. ttl == 0 disables caching (live passthrough). Wire from the
+// server if the operator wants a non-default window; the default is 3s.
+func (s *Service) SetInstanceCacheTTL(ttl time.Duration) {
+	s.instCache = newInstanceCache(ttl)
+}
+
+// invalidateInstances drops the cached instance list for a host so the next
+// ListAllInstances re-sweeps. Called by mutating methods.
+func (s *Service) invalidateInstances(host string) {
+	s.instCache.invalidate(host)
+}
 
 // SetIngress enables ingress reconciliation. network is the shared podman
 // network app pods join; passing a real controller marks ingress enabled so
@@ -570,6 +586,14 @@ func (s *Service) List(ctx context.Context, host, tmpl string) ([]Observed, erro
 // template id, so a pod for a template the daemon doesn't know about is
 // silently omitted.
 func (s *Service) ListAllInstances(ctx context.Context, host string) ([]Observed, error) {
+	return s.instCache.get(host, func() ([]Observed, error) {
+		return s.listAllInstancesLive(ctx, host)
+	})
+}
+
+// listAllInstancesLive performs the live podman sweep (no caching). See
+// ListAllInstances for the cached entry point.
+func (s *Service) listAllInstancesLive(ctx context.Context, host string) ([]Observed, error) {
 	if _, ok := s.host(host); !ok {
 		return nil, ErrUnknownHost
 	}

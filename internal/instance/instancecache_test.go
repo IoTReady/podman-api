@@ -1,6 +1,7 @@
 package instance
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"sync/atomic"
@@ -96,5 +97,34 @@ func TestInstanceCache_CollapsesConcurrentFetches(t *testing.T) {
 	wg.Wait()
 	if got := atomic.LoadInt32(&calls); got != 1 {
 		t.Errorf("fetch called %d times, want 1 (concurrent calls must collapse)", got)
+	}
+}
+
+// TestListAllInstances_CachesAcrossCalls drives ListAllInstances through the
+// real per-host cache using the package's existing podman fake (newSvc, see
+// service_test.go): a second call within the TTL must not re-sweep PodList,
+// and invalidateInstances must force the next call to re-sweep.
+func TestListAllInstances_CachesAcrossCalls(t *testing.T) {
+	svc, f := newSvc(t)
+	svc.SetInstanceCacheTTL(time.Minute)
+
+	ctx := context.Background()
+	if _, err := svc.ListAllInstances(ctx, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	before := f.PodListCallCount()
+	if _, err := svc.ListAllInstances(ctx, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	if after := f.PodListCallCount(); after != before {
+		t.Errorf("PodList called again (%d -> %d); second list should hit cache", before, after)
+	}
+
+	svc.invalidateInstances("h1")
+	if _, err := svc.ListAllInstances(ctx, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	if after := f.PodListCallCount(); after == before {
+		t.Errorf("PodList not called after invalidate; expected a refetch")
 	}
 }
