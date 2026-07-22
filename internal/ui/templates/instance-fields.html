@@ -9,12 +9,13 @@
         keeps a falsy default (false/0) from vanishing under template truthiness
         (#100), matching mergeParamDefaults' nil-check. */ -}}
   {{- $ph := index $.Placeholders .Name}}
-  <label>{{$label}}{{if .Required}} (required){{end}}
+  <div class="field">
+    <label>{{$label}}{{if .Required}} (required){{end}}</label>
     <input name="param.{{.Name}}"{{if .Required}} required{{end}}{{if $ph}} placeholder="{{$ph}}"{{end}} value="{{index $.Values (printf "param.%s" .Name)}}">
     {{- if and (not $.EditMode) (eq .Name "port") (gt $.PortSuggestion 0)}}
-      <small class="hint">Suggested: <strong>{{$.PortSuggestion}}</strong>{{if $.PortsInUse}} · In use: {{$.PortsInUse}}{{end}}</small>
+      <div class="hint">Suggested: <strong>{{$.PortSuggestion}}</strong>{{if $.PortsInUse}} · In use: {{$.PortsInUse}}{{end}}</div>
     {{- end}}
-  </label>
+  </div>
 {{end}}
 {{if .Tmpl.Meta.Secrets.PerInstance}}
 <div class="label">SECRETS</div>
@@ -24,11 +25,14 @@
   {{- if and $.EditMode (not $val)}}
     {{- $ph = "unchanged"}}
   {{- end}}
-  <label>{{.}} <input type="password" name="secret.{{.}}"{{if $ph}} placeholder="{{$ph}}"{{end}}{{if $val}} value="{{$val}}"{{end}}></label>
+  <div class="field">
+    <label>{{.}}</label>
+    <input type="password" name="secret.{{.}}"{{if $ph}} placeholder="{{$ph}}"{{end}}{{if $val}} value="{{$val}}"{{end}}>
+  </div>
 {{end}}
 {{end}}
 {{if .HostRefs}}
 <div class="label">REQUIRED HOST SECRETS</div>
-{{range .HostRefs}}<div>{{.Name}} — {{if .Present}}present{{else}}<strong>MISSING</strong>{{end}}</div>{{end}}
+{{range .HostRefs}}<div class="field">{{.Name}} — {{if .Present}}<span class="badge ok"><span class="dot"></span>present</span>{{else}}<span class="badge bad"><span class="dot"></span>MISSING</span>{{end}}</div>{{end}}
 {{end}}
 {{end}}

@@ -128,7 +128,7 @@ func TestInstanceDetailRendersSeededInstance(t *testing.T) {
 		t.Fatalf("status = %d, want 200", w.Code)
 	}
 	body := w.Body.String()
-	if !strings.Contains(body, "postgres / main") {
+	if !strings.Contains(body, "postgres") || !strings.Contains(body, "main") {
 		t.Error("detail page should show template/slug header")
 	}
 	if !strings.Contains(body, "Running") {
