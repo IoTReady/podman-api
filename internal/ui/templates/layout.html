@@ -65,6 +65,15 @@
   });
 })();
 </script>
+<script>
+(function(){
+  var loading = document.querySelector('.loading');
+  if (!loading) return;
+  document.body.addEventListener('htmx:beforeRequest', function() { loading.classList.add('active'); });
+  document.body.addEventListener('htmx:afterRequest', function() { loading.classList.remove('active'); });
+  document.body.addEventListener('htmx:responseError', function() { loading.classList.remove('active'); });
+})();
+</script>
 </body>
 </html>{{end}}
 
