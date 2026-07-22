@@ -3,6 +3,7 @@ package instance
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -281,4 +282,33 @@ func TestReconcileSpecsOnHost_IngressEnabled(t *testing.T) {
 	// Ingress should have been reconciled exactly once.
 	assert.Equal(t, 1, ingCtl.reconcileCalls)
 	assert.Equal(t, "h1", ingCtl.lastHost)
+}
+
+// TestReconcileSpecsOnHost_InvalidatesInstanceCache proves boot converge
+// (which re-creates a missing pod via PlayKube outside the normal
+// Apply/Delete/lifecycle funnels) drops the host's cached instance list, so a
+// read served from a pre-converge cache does not stay stale for up to a TTL
+// after the pod comes back up.
+func TestReconcileSpecsOnHost_InvalidatesInstanceCache(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	svc.SetInstanceCacheTTL(time.Minute)
+	ctx := context.Background()
+
+	// Seed a spec whose pod is missing, so ReconcileSpecsOnHost re-converges it.
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+
+	// Prime the cache (pod missing, so it sweeps empty and caches that).
+	if _, err := svc.ListAllInstances(ctx, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	before := fc.PodListCallCount()
+
+	svc.ReconcileSpecsOnHost(ctx, "h1")
+
+	if _, err := svc.ListAllInstances(ctx, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	if after := fc.PodListCallCount(); after == before {
+		t.Error("ListAllInstances hit stale cache after boot converge; expected invalidation + refetch")
+	}
 }

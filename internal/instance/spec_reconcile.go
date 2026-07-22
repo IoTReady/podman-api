@@ -49,7 +49,7 @@ func (s *Service) ReconcileSpecsOnHost(ctx context.Context, hostID string) {
 		return
 	}
 
-	needsIngress := false
+	reconverged := false
 	for _, k := range keys {
 		reconciled, err := s.reconcileOneSpec(ctx, hostID, k.Template, k.Slug)
 		if errors.Is(err, errTemplateSkipped) {
@@ -59,17 +59,26 @@ func (s *Service) ReconcileSpecsOnHost(ctx context.Context, hostID string) {
 			log.Printf("boot converge %s/%s/%s: %v", hostID, k.Template, k.Slug, err)
 		} else if reconciled {
 			log.Printf("boot converge %s/%s/%s: re-converged (pod was missing)", hostID, k.Template, k.Slug)
-			needsIngress = true
+			reconverged = true
 		} else {
 			log.Printf("boot converge %s/%s/%s: already running", hostID, k.Template, k.Slug)
 		}
+	}
+
+	// Any pod re-created by boot converge (via PlayKube, outside the normal
+	// Apply/Delete/lifecycle funnels that already invalidate) changes this
+	// host's instance list. Drop the cache once, after the loop, rather than
+	// per-instance, so a host with many already-running specs doesn't force
+	// an extra sweep for a no-op reconcile.
+	if reconverged {
+		s.invalidateInstances(hostID)
 	}
 
 	// Reconcile ingress once per host rather than once per instance, avoiding
 	// N Caddyfile generations and reloads when N instances are reconverged.
 	// The reconcile is idempotent — it reads all specs from the store for this
 	// host and derives routes from scratch.
-	if needsIngress && s.ingressEnabled() {
+	if reconverged && s.ingressEnabled() {
 		if err := s.ingress.Reconcile(ctx, hostID); err != nil {
 			log.Printf("boot converge %s: ingress reconcile failed: %v", hostID, err)
 		}
