@@ -79,3 +79,27 @@ func TestRedesignAssets(t *testing.T) {
 		t.Error("layout still links pure-min.css")
 	}
 }
+
+func TestShellChrome(t *testing.T) {
+	u, err := New(Config{Version: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// An authenticated page (dashboard) renders the shell; build minimal data.
+	rec := httptest.NewRecorder()
+	data := map[string]any{"Shell": true, "Hosts": []any{}}
+	u.render(rec, httptest.NewRequest("GET", "/ui", nil), http.StatusOK, "dashboard", data)
+	body := rec.Body.String()
+	for _, want := range []string{
+		`data-theme`,                         // pre-paint theme init
+		`localStorage`,                       // toggle persistence
+		`id="theme-toggle"`,                  // the toggle control
+		`/ui/static/htmx-ext-preload.min.js`, // preload ext embedded
+		`hx-ext=`,                            // preload extension enabled
+		`class="sidebar"`,                    // shell present
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("shell missing %q", want)
+		}
+	}
+}
