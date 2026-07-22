@@ -3,6 +3,7 @@ package ui
 import (
 	"net/http"
 	"sort"
+	"sync"
 )
 
 func (u *UI) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -11,16 +12,24 @@ func (u *UI) dashboard(w http.ResponseWriter, r *http.Request) {
 		ID        string
 		Instances int
 	}
-	summaries := make([]hostSummary, 0, len(hosts))
+	summaries := make([]hostSummary, len(hosts))
+	var wg sync.WaitGroup
+	for i, h := range hosts {
+		wg.Add(1)
+		go func(i int, id string) {
+			defer wg.Done()
+			n := 0
+			if obs, err := u.cfg.Svc.ListAllInstances(r.Context(), id); err == nil {
+				n = len(obs)
+			}
+			summaries[i] = hostSummary{ID: id, Instances: n}
+		}(i, h.ID)
+	}
+	wg.Wait()
+
 	totalInstances := 0
-	for _, h := range hosts {
-		obs, err := u.cfg.Svc.ListAllInstances(r.Context(), h.ID)
-		n := 0
-		if err == nil {
-			n = len(obs)
-		}
-		totalInstances += n
-		summaries = append(summaries, hostSummary{ID: h.ID, Instances: n})
+	for _, s := range summaries {
+		totalInstances += s.Instances
 	}
 	sort.Slice(summaries, func(i, j int) bool {
 		return summaries[i].ID < summaries[j].ID
