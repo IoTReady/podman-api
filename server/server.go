@@ -308,7 +308,7 @@ func RunWithFlags(opts ...Option) error {
 			return ui.NewOperatorAuthenticator(*opHolder.Load()).Authenticate(user, pass)
 		})
 		tokenMgr = auth.NewTokenManager(*keysFile, keyStore)
-		uiApp, err = ui.New(ui.Config{Svc: svc, Jobs: jobStore, Auth: authr, Secure: *uiSecureCookie, TokenMgr: tokenMgr})
+		uiApp, err = ui.New(ui.Config{Svc: svc, Jobs: jobStore, Auth: authr, Secure: *uiSecureCookie, TokenMgr: tokenMgr, Version: Version})
 		if err != nil {
 			return fmt.Errorf("ui: %w", err)
 		}

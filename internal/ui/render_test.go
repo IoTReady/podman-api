@@ -46,6 +46,22 @@ func TestRenderUnknownBlockIs500(t *testing.T) {
 	}
 }
 
+func TestLayoutCacheBustsAssets(t *testing.T) {
+	u, err := New(Config{Version: "v1.2.3"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/ui/login", nil) // full-page (no HX-Request) → layout
+	u.render(rec, req, http.StatusOK, "login", map[string]any{})
+	body := rec.Body.String()
+	for _, asset := range []string{"/ui/static/app.css?v=v1.2.3", "/ui/static/pure-min.css?v=v1.2.3", "/ui/static/htmx.min.js?v=v1.2.3"} {
+		if !strings.Contains(body, asset) {
+			t.Errorf("layout missing cache-busted asset %q\nbody:\n%s", asset, body)
+		}
+	}
+}
+
 func TestErrorStatus(t *testing.T) {
 	cases := map[error]int{
 		instance.ErrUnknownHost:       http.StatusNotFound,

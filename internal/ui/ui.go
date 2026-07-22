@@ -39,6 +39,7 @@ type Config struct {
 	SessionTTL time.Duration
 	Secure     bool               // set Secure flag on the session cookie (true in production)
 	TokenMgr   *auth.TokenManager // optional; enables /ui/tokens if non-nil
+	Version    string             // build version; used to cache-bust static asset URLs (?v=)
 }
 
 // UI holds parsed templates and dependencies and produces the /ui sub-router.

@@ -30,6 +30,10 @@ func (u *UI) render(w http.ResponseWriter, r *http.Request, status int, block st
 		data = map[string]any{}
 	}
 	data["CSRF"] = csrfFromRequest(r)
+	// Version cache-busts static asset URLs in the layout (<link ...?v=>).
+	// Injected here (like CSRF) so it is present on every page, including the
+	// chrome-free login page which still renders the layout <head>.
+	data["Version"] = u.cfg.Version
 
 	if u.tmpl.Lookup(block) == nil {
 		log.Printf("ui: render: unknown template block %q [%s %s]", block, r.Method, r.URL.Path)
