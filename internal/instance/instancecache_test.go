@@ -132,9 +132,9 @@ func TestInstanceCache_InvalidateDuringInFlightFetchIsNotOverwritten(t *testing.
 		_, _ = c.get("h1", fetch)
 	}()
 
-	<-started               // fetch #1 is in flight
-	c.invalidate("h1")      // invalidate races the in-flight fetch
-	close(release)          // let fetch #1 finish and attempt to store
+	<-started          // fetch #1 is in flight
+	c.invalidate("h1") // invalidate races the in-flight fetch
+	close(release)     // let fetch #1 finish and attempt to store
 	<-done
 
 	// The stale result from fetch #1 must not have been cached: a subsequent

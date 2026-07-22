@@ -50,7 +50,15 @@ func (c *instanceCache) get(host string, fetch func() ([]Observed, error)) ([]Ob
 			return e.obs, nil
 		}
 	}
-	// Join an in-flight fetch for the same host.
+	// Join an in-flight fetch for the same host. Joiners share the leader's
+	// result and its context: (a) if the leader's request is cancelled, joiners
+	// get that cancellation error even with live contexts of their own — errors
+	// aren't cached, so the next call simply retries; (b) a joiner whose call
+	// began before a concurrent invalidate() still returns that in-flight (now
+	// pre-mutation) slice for this one sweep, even though the store below is
+	// correctly skipped via the generation check. So read-your-writes is
+	// guaranteed for the mutating caller's own next read; a concurrent reader
+	// may observe up-to-one-sweep-stale data, bounded anyway by the TTL.
 	if call, ok := c.inflight[host]; ok {
 		c.mu.Unlock()
 		call.wg.Wait()
