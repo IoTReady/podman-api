@@ -250,6 +250,36 @@ func TestDelete_InvalidatesInstanceCache(t *testing.T) {
 	}
 }
 
+// TestRestart_InvalidatesInstanceCache proves the shared lifecycle funnel
+// (used by Start/Stop/Restart) drops the per-host cache entry so the next
+// ListAllInstances re-sweeps instead of serving stale running-state that
+// predates the mutation.
+func TestRestart_InvalidatesInstanceCache(t *testing.T) {
+	svc, f := newSvc(t)
+	svc.SetInstanceCacheTTL(time.Minute)
+	ctx := context.Background()
+
+	if err := svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+
+	// Prime the cache post-Apply (Apply itself already invalidates).
+	if _, err := svc.ListAllInstances(ctx, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	before := f.PodListCallCount()
+
+	if err := svc.Restart(ctx, "h1", "postgres", "demo"); err != nil {
+		t.Fatalf("restart: %v", err)
+	}
+	if _, err := svc.ListAllInstances(ctx, "h1"); err != nil {
+		t.Fatal(err)
+	}
+	if f.PodListCallCount() == before {
+		t.Error("ListAllInstances hit stale cache after Restart; expected invalidation + refetch")
+	}
+}
+
 func TestListAllInstances_PropagatesTemplateError(t *testing.T) {
 	svc, f := newTestServiceWithFakeTemplates(t, 3)
 	svc.SetInstanceCacheTTL(0)

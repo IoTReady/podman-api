@@ -701,6 +701,7 @@ func (s *Service) Restart(ctx context.Context, host, tmpl, slug string) error {
 
 func (s *Service) lifecycle(ctx context.Context, host, tmpl, slug string,
 	op func(context.Context, string, string) error) error {
+	defer s.invalidateInstances(host)
 	if _, err := s.lookup(ctx, host, tmpl); err != nil {
 		return err
 	}
