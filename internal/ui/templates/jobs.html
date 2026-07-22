@@ -1,16 +1,27 @@
 {{define "jobs"}}
-<h2>Jobs</h2>
-{{if .Disabled}}<p>The job store is not enabled.</p>
+<div class="phead"><div><h1>Jobs</h1></div></div>
+{{if .Disabled}}
+<p class="sub">The job store is not enabled.</p>
 {{else if .Jobs}}
-<table class="pure-table">
-  <thead><tr><th>ID</th><th>Kind</th><th>State</th></tr></thead>
-  <tbody>
-  {{range .Jobs}}
-    <tr class="clickable" hx-get="/ui/jobs/{{.ID}}" hx-target="#main" hx-push-url="true">
-      <td data-label="ID">{{.ID}}</td><td data-label="Kind">{{.Kind}}</td><td data-label="State">{{.State}}</td>
-    </tr>
-  {{end}}
-  </tbody>
-</table>
-{{else}}<p>No jobs yet.</p>{{end}}
+<div class="card">
+  <table class="tbl">
+    <thead><tr><th>ID</th><th>Kind</th><th>State</th></tr></thead>
+    <tbody>
+    {{range .Jobs}}
+      <tr class="clickable" hx-get="/ui/jobs/{{.ID}}" hx-target="#main" hx-push-url="true" preload="mouseover">
+        <td class="idcell" data-label="ID">{{.ID}}</td>
+        <td data-label="Kind">{{.Kind}}</td>
+        <td data-label="State">
+          {{if eq .State "done"}}<span class="badge ok"><span class="dot"></span>{{.State}}</span>
+          {{else if eq .State "failed"}}<span class="badge bad"><span class="dot"></span>{{.State}}</span>
+          {{else if eq .State "running"}}<span class="badge warn"><span class="dot"></span>{{.State}}</span>
+          {{else}}<span class="badge muted"><span class="dot"></span>{{.State}}</span>{{end}}
+          <span class="go">→</span>
+        </td>
+      </tr>
+    {{end}}
+    </tbody>
+  </table>
+</div>
+{{else}}<p class="sub">No jobs yet.</p>{{end}}
 {{end}}

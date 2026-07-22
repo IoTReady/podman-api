@@ -1,13 +1,17 @@
 {{define "logs-page"}}
-<div class="inst-head">
-  <strong>{{.Template}} / {{.Slug}}</strong> — Logs
-  <a class="pure-button"
+<div class="phead">
+  <div>
+    <h1>{{.Template}} / {{.Slug}}</h1>
+    <div class="sub">Logs</div>
+  </div>
+  <span class="sp"></span>
+  <a class="btn ghost sm"
      href="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}"
      hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}"
      hx-target="#main" hx-push-url="true">← Instance</a>
 </div>
-<div class="log-controls">
-  <select name="container"
+<div class="toolbar" style="margin-bottom:14px">
+  <select name="container" class="mono"
           hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs"
           hx-target="#main" hx-push-url="true"
           hx-trigger="change" hx-include="[name='follow']">
@@ -17,20 +21,23 @@
   </select>
   <input type="hidden" name="follow" value="{{.Follow}}">
   {{if .Follow}}
-  <button hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs?container={{.Container}}&follow=false"
+  <button class="btn sm" hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs?container={{.Container}}&follow=false"
           hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Pause</button>
   {{else}}
-  <button hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs?container={{.Container}}&follow=true"
+  <button class="btn sm" hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs?container={{.Container}}&follow=true"
           hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Follow</button>
   {{end}}
 </div>
 {{if .Follow}}
 <script src="/ui/static/htmx-ext-sse.min.js"></script>
-<pre id="log-lines"
-     hx-ext="sse"
-     sse-connect="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs/stream?container={{.Container}}"
-     sse-swap="log"
-     hx-swap="beforeend"></pre>
+<div class="logs">
+  <div class="logs-h"><span class="t">Logs</span><span class="badge ok" style="margin-left:auto"><span class="dot"></span>following</span></div>
+  <pre id="log-lines"
+       hx-ext="sse"
+       sse-connect="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}/logs/stream?container={{.Container}}"
+       sse-swap="log"
+       hx-swap="beforeend"></pre>
+</div>
 <script>
 (function(){
   var pre = document.getElementById('log-lines');
@@ -45,7 +52,10 @@
 })();
 </script>
 {{else}}
-<pre id="log-lines">{{range .Lines}}{{.}}
+<div class="logs">
+  <div class="logs-h"><span class="t">Logs</span><span class="badge muted" style="margin-left:auto"><span class="dot"></span>paused</span></div>
+  <pre id="log-lines">{{range .Lines}}{{.}}
 {{end}}</pre>
+</div>
 {{end}}
 {{end}}
