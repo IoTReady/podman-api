@@ -28,6 +28,7 @@ import (
 	"github.com/iotready/podman-api/internal/evacuate"
 	"github.com/iotready/podman-api/internal/ingress"
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/inventory"
 	"github.com/iotready/podman-api/internal/jobs"
 	"github.com/iotready/podman-api/internal/migrate"
 	"github.com/iotready/podman-api/internal/obs"
@@ -85,6 +86,9 @@ func RunWithFlags(opts ...Option) error {
 		pruneThreshold = fs.Int("prune-disk-threshold", 85, "disk used% high-water that triggers an early prune; 0 disables the threshold trigger")
 		pruneScope     = fs.String("prune-scope", "dangling", "default prune scopes, comma-separated: dangling,all-images,containers,build-cache,volumes")
 		pruneDryRun    = fs.Bool("prune-dry-run", false, "default dry-run: report reclaimable space without removing anything")
+
+		inventoryInterval = fs.Duration("inventory-refresh-interval", 30*time.Second, "background inventory refresh cadence per host; 0 disables the poller (falls back to the lazy 3s cache)")
+		inventoryTimeout  = fs.Duration("inventory-refresh-timeout", 20*time.Second, "per-host timeout for one background inventory refresh")
 
 		ingressEnabled   = fs.Bool("ingress-enabled", false, "enable per-host Caddy ingress + auto-TLS")
 		ingressNetwork   = fs.String("ingress-network", "podman-api-ingress", "shared podman network app pods join for ingress")
@@ -252,6 +256,21 @@ func RunWithFlags(opts ...Option) error {
 		log.Printf("prune scheduler enabled (interval %s, disk threshold %d%%, scopes %v)", *pruneInterval, *pruneThreshold, def.Scope)
 	}
 
+	var invPoller *inventory.Poller
+	if *inventoryInterval > 0 {
+		svc.EnableWarmInventory()
+		invPoller = &inventory.Poller{Svc: svc, Interval: *inventoryInterval, Timeout: *inventoryTimeout}
+		invPoller.Start(runnerCtx, func() []string {
+			hs := *hostsHolder.Load()
+			ids := make([]string, len(hs))
+			for i, h := range hs {
+				ids[i] = h.ID
+			}
+			return ids
+		})
+		log.Printf("inventory poller enabled (interval %s, per-host timeout %s)", *inventoryInterval, *inventoryTimeout)
+	}
+
 	if c.backupScheduler != nil {
 		ctrl := &backupctl.Controller{Svc: svc, Jobs: db}
 		runBackupScheduler(runnerCtx, c.backupScheduler, ctrl)
@@ -392,6 +411,9 @@ func RunWithFlags(opts ...Option) error {
 		cancelRunner()
 		if pruneSched != nil {
 			pruneSched.Wait()
+		}
+		if invPoller != nil {
+			invPoller.Wait()
 		}
 		<-ingressLoopDone
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
