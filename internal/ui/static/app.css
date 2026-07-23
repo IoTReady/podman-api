@@ -49,6 +49,11 @@ h1,h2,h3{margin:0;font-weight:600;letter-spacing:-.02em}
 
 /* ============================================================= SHELL */
 .app{display:grid;grid-template-columns:248px 1fr;min-height:100vh}
+/* The backdrop is a mobile-only overlay but a direct grid child of .app. Without
+   this base rule it renders as a block on desktop, eating the 1fr content column
+   and wrapping .main onto grid row 2 under the sidebar (blank content area). The
+   ≤640px media query re-enables it (and .open toggles it) for the drawer. */
+.sidebar-backdrop{display:none}
 .sidebar{
   background:var(--rail);border-right:1px solid var(--border);
   display:flex;flex-direction:column;padding:18px 14px;gap:22px;position:sticky;top:0;height:100vh;
