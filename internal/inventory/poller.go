@@ -81,6 +81,23 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 		}(h)
 	}
 	wg.Wait()
+	p.pruneState(hosts)
+}
+
+// pruneState drops transition-log state for hosts no longer in the active set
+// (e.g. removed via SIGHUP), so the map can't grow unbounded over host churn.
+func (p *Poller) pruneState(hosts []string) {
+	keep := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		keep[h] = true
+	}
+	p.mu.Lock()
+	for h := range p.state {
+		if !keep[h] {
+			delete(p.state, h)
+		}
+	}
+	p.mu.Unlock()
 }
 
 // logTransition logs only when a host's reachability changes (or is first seen

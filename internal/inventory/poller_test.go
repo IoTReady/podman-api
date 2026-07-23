@@ -77,3 +77,31 @@ func TestPollerStopsOnContextCancel(t *testing.T) {
 		t.Fatal("Wait did not return after cancel")
 	}
 }
+
+func TestPollerPrunesStateForRemovedHosts(t *testing.T) {
+	f := newFakeRefresher()
+	// state is normally initialised by Start; set it directly since this test
+	// drives tick() without the goroutine loop.
+	p := &Poller{Svc: f, Interval: time.Hour, Timeout: time.Second, state: map[string]bool{}}
+	ctx := context.Background()
+
+	p.tick(ctx, []string{"a", "b"})
+	p.mu.Lock()
+	_, hasB := p.state["b"]
+	n := len(p.state)
+	p.mu.Unlock()
+	if !hasB || n != 2 {
+		t.Fatalf("after first tick, state should hold both hosts, got %d entries (hasB=%v)", n, hasB)
+	}
+
+	// "b" leaves the active host set (e.g. removed on SIGHUP).
+	p.tick(ctx, []string{"a"})
+	p.mu.Lock()
+	_, stillB := p.state["b"]
+	_, hasA := p.state["a"]
+	n2 := len(p.state)
+	p.mu.Unlock()
+	if stillB || !hasA || n2 != 1 {
+		t.Fatalf("after pruning, state should hold only {a}, got %d entries (hasA=%v stillB=%v)", n2, hasA, stillB)
+	}
+}
