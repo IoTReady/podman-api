@@ -84,24 +84,24 @@
     <div class="nav-label">Hosts</div>
     <div class="nav">
       {{range .Hosts}}
-      <a href="/ui/hosts/{{.ID}}" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover"{{if eq .ID $.ActiveHost}} class="active"{{end}}>{{.ID}}</a>
+      <a href="/ui/hosts/{{.ID}}" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover"{{if eq .ID $.ActiveHost}} class="active"{{end}}><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="3" width="20" height="7" rx="1.5"/><rect x="2" y="14" width="20" height="7" rx="1.5"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></svg>{{.ID}}</a>
       {{end}}
     </div>
   </div>
   <div>
     <div class="nav-label">Operate</div>
     <div class="nav">
-      <a href="/ui/jobs" hx-get="/ui/jobs" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover"{{if eq "jobs" $.ActivePage}} class="active"{{end}}>Jobs</a>
-      {{if .TokensEnabled}}<a href="/ui/tokens" hx-get="/ui/tokens" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover"{{if eq "tokens" $.ActivePage}} class="active"{{end}}>Tokens</a>{{end}}
+      <a href="/ui/jobs" hx-get="/ui/jobs" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover"{{if eq "jobs" $.ActivePage}} class="active"{{end}}><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>Jobs</a>
+      {{if .TokensEnabled}}<a href="/ui/tokens" hx-get="/ui/tokens" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover"{{if eq "tokens" $.ActivePage}} class="active"{{end}}><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>Tokens</a>{{end}}
     </div>
   </div>
   <div class="sb-spacer"></div>
   <div class="sb-foot">
-    <button id="theme-toggle" class="iconbtn" type="button" title="Toggle theme" aria-label="Toggle theme">◑</button>
+    <button id="theme-toggle" class="iconbtn" type="button" title="Toggle theme" aria-label="Toggle theme"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg></button>
     <span class="sb-spacer"></span>
     <form method="post" action="/ui/logout">
       <input type="hidden" name="csrf_token" value="{{.CSRF}}">
-      <button class="iconbtn" type="submit" title="Sign out" aria-label="Sign out">Sign out</button>
+      <button class="btn ghost sm" type="submit" title="Sign out" aria-label="Sign out"><svg class="ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>Sign out</button>
     </form>
   </div>
 </nav>
