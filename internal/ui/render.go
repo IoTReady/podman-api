@@ -3,7 +3,6 @@ package ui
 import (
 	"bytes"
 	"errors"
-	"html/template"
 	"log"
 	"net/http"
 
@@ -42,15 +41,21 @@ func (u *UI) render(w http.ResponseWriter, r *http.Request, status int, block st
 	}
 
 	var buf bytes.Buffer
-	var err error
-	if r.Header.Get("HX-Request") == "true" {
-		err = u.tmpl.ExecuteTemplate(&buf, block, data)
-	} else {
-		// The layout renders a template named "body"; define it per-request to
-		// delegate to the (validated) block. Clone so concurrent requests don't
-		// race on redefining "body".
-		var t *template.Template
-		if t, err = u.tmpl.Clone(); err == nil {
+	// Always render off a per-request Clone of the master set; the master
+	// template must NEVER be executed directly. html/template forbids Clone()
+	// once a set has been executed ("cannot Clone after it has executed"), so a
+	// single direct Execute on u.tmpl poisons every later Clone. htmx-boosted
+	// navigation makes the fragment path fire first in the wild, so executing
+	// the master there (as this code once did) 500s every subsequent full-page
+	// load. Cloning both paths keeps the master pristine and also isolates the
+	// per-request redefinition of "body" from concurrent requests.
+	t, err := u.tmpl.Clone()
+	if err == nil {
+		if r.Header.Get("HX-Request") == "true" {
+			err = t.ExecuteTemplate(&buf, block, data)
+		} else {
+			// The layout renders a template named "body"; define it per-request
+			// to delegate to the (validated) block.
 			if _, err = t.New("body").Parse(`{{template "` + block + `" .}}`); err == nil {
 				err = t.ExecuteTemplate(&buf, "layout", data)
 			}

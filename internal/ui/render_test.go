@@ -34,6 +34,40 @@ func TestRenderFullPageVsFragment(t *testing.T) {
 	}
 }
 
+// TestRenderFragmentThenFullPage reproduces the v1.0.18 regression: an HTMX
+// fragment render must not poison the shared template set for later full-page
+// renders. html/template forbids Clone() after Execute(), so if the fragment
+// path executes the master template directly, every subsequent full-page render
+// (which clones the master to redefine "body") 500s with "cannot Clone after it
+// has executed". htmx-boosted navigation makes the fragment request come first
+// in the wild, so this order — fragment, then full page — is the one that broke
+// production while the safe order in TestRenderFullPageVsFragment stayed green.
+func TestRenderFragmentThenFullPage(t *testing.T) {
+	u, err := New(Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// HX-Request first (this is what an htmx-boosted navigation sends).
+	frag := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/ui/login", nil)
+	r.Header.Set("HX-Request", "true")
+	u.render(frag, r, http.StatusOK, "login", map[string]any{})
+	if frag.Code != http.StatusOK {
+		t.Fatalf("fragment render: status = %d, want 200", frag.Code)
+	}
+
+	// Full page after — must still succeed (not 500 on a poisoned Clone()).
+	full := httptest.NewRecorder()
+	u.render(full, httptest.NewRequest("GET", "/ui/login", nil), http.StatusOK, "login", map[string]any{})
+	if full.Code != http.StatusOK {
+		t.Fatalf("full page after fragment: status = %d, want 200", full.Code)
+	}
+	if !strings.Contains(full.Body.String(), "<!DOCTYPE html>") {
+		t.Error("full page should include the layout")
+	}
+}
+
 func TestRenderUnknownBlockIs500(t *testing.T) {
 	u, err := New(Config{})
 	if err != nil {
