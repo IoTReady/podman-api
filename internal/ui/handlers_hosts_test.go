@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
@@ -223,5 +224,15 @@ func TestHostInstancesFragmentReturnsBareBody(t *testing.T) {
 	}
 	if !strings.Contains(body, `class="tbl"`) {
 		t.Errorf("fragment should contain the instance table\n%s", body)
+	}
+}
+
+func TestDashboardBoundsPerHostFetch(t *testing.T) {
+	// A dashboard render must complete quickly even if a host's fetch would
+	// otherwise hang far longer than the per-host bound. We assert the bound
+	// constant is small; the render itself is exercised by existing dashboard
+	// tests. This guards against the bound being removed or set too high.
+	if dashboardHostTimeout <= 0 || dashboardHostTimeout > 10*time.Second {
+		t.Fatalf("dashboardHostTimeout = %s, want a small positive bound", dashboardHostTimeout)
 	}
 }

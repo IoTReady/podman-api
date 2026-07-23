@@ -6,9 +6,16 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/iotready/podman-api/internal/instance"
 )
+
+// dashboardHostTimeout bounds each per-host instance fetch on the dashboard
+// fan-out so one cold or unreachable host can't stall the whole page (warm
+// reads return instantly; this only bites on a cold/dead host). Mirrors the
+// JSON /hosts path's 5s per-host bound.
+const dashboardHostTimeout = 5 * time.Second
 
 func (u *UI) dashboard(w http.ResponseWriter, r *http.Request) {
 	hosts := u.cfg.Svc.Hosts()
@@ -22,8 +29,10 @@ func (u *UI) dashboard(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, id string) {
 			defer wg.Done()
+			hctx, cancel := context.WithTimeout(r.Context(), dashboardHostTimeout)
+			defer cancel()
 			n := 0
-			if obs, err := u.cfg.Svc.ListAllInstances(r.Context(), id); err == nil {
+			if obs, err := u.cfg.Svc.ListAllInstances(hctx, id); err == nil {
 				n = len(obs)
 			}
 			summaries[i] = hostSummary{ID: id, Instances: n}
