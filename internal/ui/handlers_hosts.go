@@ -1,9 +1,13 @@
 package ui
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"sort"
 	"sync"
+
+	"github.com/iotready/podman-api/internal/instance"
 )
 
 func (u *UI) dashboard(w http.ResponseWriter, r *http.Request) {
@@ -41,16 +45,42 @@ func (u *UI) dashboard(w http.ResponseWriter, r *http.Request) {
 	}))
 }
 
+// hostInstancesData builds the view model shared by the full host page and its
+// pollable fragment. It never returns a hard error for an unreachable host —
+// stale data (or an empty "unreachable" panel) is surfaced instead, per the
+// warm-cache serve-last-known-good contract. A genuinely unknown host still
+// errors so the caller can 404.
+func (u *UI) hostInstancesData(ctx context.Context, host string) (map[string]any, error) {
+	obs, fresh, err := u.cfg.Svc.ListAllInstancesWithMeta(ctx, host)
+	if err != nil && errors.Is(err, instance.ErrUnknownHost) {
+		return nil, err
+	}
+	return map[string]any{
+		"Host":        host,
+		"ActiveHost":  host,
+		"Instances":   obs,
+		"AgeSeconds":  int(fresh.Age().Seconds()),
+		"Unreachable": !fresh.Reachable,
+		"Cold":        !fresh.HasData,
+	}, nil
+}
+
 func (u *UI) hostInstances(w http.ResponseWriter, r *http.Request) {
-	host := r.PathValue("host")
-	obs, err := u.cfg.Svc.ListAllInstances(r.Context(), host)
+	data, err := u.hostInstancesData(r.Context(), r.PathValue("host"))
 	if err != nil {
 		u.renderError(w, r, err)
 		return
 	}
-	u.render(w, r, http.StatusOK, "host-instances", u.pageData(map[string]any{
-		"Host":       host,
-		"ActiveHost": host,
-		"Instances":  obs,
-	}))
+	u.render(w, r, http.StatusOK, "host-instances", u.pageData(data))
+}
+
+// hostInstancesFragment renders just the instance table + freshness cue for the
+// htmx poll on the host page. render() returns a bare block for HX requests.
+func (u *UI) hostInstancesFragment(w http.ResponseWriter, r *http.Request) {
+	data, err := u.hostInstancesData(r.Context(), r.PathValue("host"))
+	if err != nil {
+		u.renderError(w, r, err)
+		return
+	}
+	u.render(w, r, http.StatusOK, "host-instances-body", u.pageData(data))
 }

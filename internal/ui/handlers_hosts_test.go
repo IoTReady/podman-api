@@ -184,3 +184,44 @@ func TestHostInstancesPageRenders(t *testing.T) {
 		t.Error("host page should have a Deploy action")
 	}
 }
+
+func TestHostPageHasPollingFragmentAndFreshnessCue(t *testing.T) {
+	u := uiWithService(t)
+	w := authedGet(t, u, "/ui/hosts/edge-1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	// The data region polls the fragment endpoint.
+	if !strings.Contains(body, `hx-get="/ui/hosts/edge-1/fragment"`) {
+		t.Errorf("host page missing polling fragment hx-get\n%s", body)
+	}
+	if !strings.Contains(body, `hx-trigger="every 10s"`) {
+		t.Errorf("host page missing 10s poll trigger\n%s", body)
+	}
+	// Freshness cue is present on a reachable host (edge-1 is up in the fake).
+	if !strings.Contains(body, "updated") {
+		t.Errorf("host page missing freshness cue\n%s", body)
+	}
+}
+
+func TestHostInstancesFragmentReturnsBareBody(t *testing.T) {
+	u := uiWithService(t)
+	tok, _ := u.cfg.Sessions.Create(Identity{Subject: "op", Scopes: []string{"*"}})
+	r := httptest.NewRequest("GET", "/ui/hosts/edge-1/fragment", nil)
+	r.AddCookie(&http.Cookie{Name: sessionCookie, Value: tok})
+	r.Header.Set("HX-Request", "true") // htmx poll
+	w := httptest.NewRecorder()
+	u.Handler().ServeHTTP(w, r)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "<!DOCTYPE html>") {
+		t.Errorf("fragment must not include the layout\n%s", body)
+	}
+	if !strings.Contains(body, `class="tbl"`) {
+		t.Errorf("fragment should contain the instance table\n%s", body)
+	}
+}

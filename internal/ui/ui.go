@@ -167,6 +167,7 @@ func (u *UI) Handler() http.Handler {
 	guardW := func(h http.HandlerFunc) http.Handler { return u.requireSession(u.requireCSRF(h)) }
 	mux.Handle("GET /ui", guard(u.dashboard))
 	mux.Handle("GET /ui/hosts/{host}", guard(u.hostInstances))
+	mux.Handle("GET /ui/hosts/{host}/fragment", guard(u.hostInstancesFragment))
 	mux.Handle("GET /ui/hosts/{host}/instances/{template}/{slug}", guard(u.instanceDetail))
 	mux.Handle("GET /ui/hosts/{host}/instances/{template}/{slug}/edit", guard(u.editForm))
 	mux.Handle("POST /ui/hosts/{host}/instances/{template}/{slug}/edit", guardW(u.editApply))
