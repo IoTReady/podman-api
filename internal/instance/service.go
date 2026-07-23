@@ -592,9 +592,39 @@ func (s *Service) List(ctx context.Context, host, tmpl string) ([]Observed, erro
 // template id, so a pod for a template the daemon doesn't know about is
 // silently omitted.
 func (s *Service) ListAllInstances(ctx context.Context, host string) ([]Observed, error) {
-	return s.instCache.get(host, func() ([]Observed, error) {
+	obs, _, err := s.instCache.getWithMeta(host, func() ([]Observed, error) {
 		return s.listAllInstancesLive(ctx, host)
 	})
+	return obs, err
+}
+
+// ListAllInstancesWithMeta is ListAllInstances plus freshness metadata (when the
+// data was captured and whether the host was reachable on the last refresh), for
+// UI callers that render a staleness cue.
+func (s *Service) ListAllInstancesWithMeta(ctx context.Context, host string) ([]Observed, Freshness, error) {
+	return s.instCache.getWithMeta(host, func() ([]Observed, error) {
+		return s.listAllInstancesLive(ctx, host)
+	})
+}
+
+// EnableWarmInventory switches the instance cache into warm mode so entries are
+// served without expiry and kept fresh by the inventory poller. Call once at
+// startup, before serving traffic, when the poller is enabled.
+func (s *Service) EnableWarmInventory() { s.instCache.setWarm(true) }
+
+// RefreshHost performs a live inventory sweep of host and stores it in the warm
+// cache. On failure it marks the host's last-known-good entry unreachable
+// (keeping the data) and returns the error for the caller to log. This is the
+// only proactive cache populator; the background poller calls it per tick.
+func (s *Service) RefreshHost(ctx context.Context, host string) error {
+	gen := s.instCache.beginRefresh(host)
+	obs, err := s.listAllInstancesLive(ctx, host)
+	if err != nil {
+		s.instCache.markUnreachable(host, gen)
+		return err
+	}
+	s.instCache.put(host, gen, obs, time.Now())
+	return nil
 }
 
 // listAllInstancesLive performs the live podman sweep (no caching). See

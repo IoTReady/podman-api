@@ -121,6 +121,25 @@ func TestInstanceDetailNotFoundIs404(t *testing.T) {
 	}
 }
 
+// TestLifecycleDeleteRendersFullHostViewModel guards against a regression
+// where the delete branch re-rendered host-instances with a partial view
+// model (missing AgeSeconds/Unreachable/Cold), producing the literal string
+// "<no value>" in the freshness line instead of the polling fragment markup.
+func TestLifecycleDeleteRendersFullHostViewModel(t *testing.T) {
+	u := uiWithSeededInstance(t)
+	w := authedAction(t, u, "/ui/hosts/edge-1/instances/postgres/main/delete")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	body := w.Body.String()
+	if strings.Contains(body, "<no value>") {
+		t.Error("host-instances view model after delete is incomplete: body contains the literal \"<no value>\" bug signature")
+	}
+	if !strings.Contains(body, `hx-get="/ui/hosts/edge-1/fragment"`) {
+		t.Error("host-instances after delete should render the full shell with the polling fragment (hx-get to /fragment)")
+	}
+}
+
 func TestInstanceDetailRendersSeededInstance(t *testing.T) {
 	u := uiWithSeededInstance(t)
 	w := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/main")

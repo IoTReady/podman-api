@@ -176,12 +176,12 @@ func (u *UI) lifecycle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if action == "delete" {
-		obs, lerr := u.cfg.Svc.ListAllInstances(ctx, host)
-		if lerr != nil {
-			u.renderError(w, r, lerr)
+		data, derr := u.hostInstancesData(ctx, host)
+		if derr != nil {
+			u.renderError(w, r, derr)
 			return
 		}
-		u.render(w, r, http.StatusOK, "host-instances", u.pageData(map[string]any{"Host": host, "ActiveHost": host, "Instances": obs}))
+		u.render(w, r, http.StatusOK, "host-instances", u.pageData(data))
 		return
 	}
 	obs, gerr := u.cfg.Svc.Get(ctx, host, tmpl, slug)

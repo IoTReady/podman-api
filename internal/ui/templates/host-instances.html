@@ -6,6 +6,23 @@
     <span class="sp"></span>
     <a class="btn primary sm" href="/ui/hosts/{{.Host}}/deploy" hx-get="/ui/hosts/{{.Host}}/deploy" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">+ Deploy</a>
   </div>
+  <div id="hi-body" hx-get="/ui/hosts/{{.Host}}/fragment" hx-trigger="every 10s" hx-swap="innerHTML">
+    {{template "host-instances-body" .}}
+  </div>
+</div>
+{{end}}
+
+{{define "host-instances-body"}}
+<div class="freshness sub">
+  {{if .Unreachable}}
+    <span class="badge warn"><span class="dot"></span>unreachable{{if not .Cold}} — last seen {{.AgeSeconds}}s ago{{end}}</span>
+  {{else if not .Cold}}
+    <span class="mut">updated {{.AgeSeconds}}s ago</span>
+  {{end}}
+</div>
+{{if .Cold}}
+  <div class="skeleton mut">Loading inventory…</div>
+{{else}}
   <table class="tbl">
     <thead><tr><th>Template / Slug</th><th>Status</th></tr></thead>
     <tbody>
@@ -24,5 +41,5 @@
     {{end}}
     </tbody>
   </table>
-</div>
+{{end}}
 {{end}}
