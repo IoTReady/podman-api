@@ -1,6 +1,22 @@
 {{define "job-detail"}}
-<h2>Job {{.Job.ID}} — {{.Job.State}}</h2>
-<div>kind: {{.Job.Kind}}</div>
-{{if .Job.Error}}<div class="error">{{.Job.Error}}</div>{{end}}
-<ol>{{range .Job.Steps}}<li>{{.Step}} {{.Detail}}{{if .Count}} (×{{.Count}}){{end}}</li>{{end}}</ol>
+<div class="phead">
+  <div>
+    <h1>Job <span class="mono">{{.Job.ID}}</span></h1>
+    <div class="sub">{{.Job.Kind}}</div>
+  </div>
+  <span class="sp"></span>
+  {{if eq .Job.State "done"}}<span class="badge ok"><span class="dot"></span>{{.Job.State}}</span>
+  {{else if eq .Job.State "failed"}}<span class="badge bad"><span class="dot"></span>{{.Job.State}}</span>
+  {{else if eq .Job.State "running"}}<span class="badge warn"><span class="dot"></span>{{.Job.State}}</span>
+  {{else}}<span class="badge muted"><span class="dot"></span>{{.Job.State}}</span>{{end}}
+</div>
+{{if .Job.Error}}<div class="card" style="margin-bottom:16px"><div class="card-b" style="color:var(--bad)">{{.Job.Error}}</div></div>{{end}}
+<div class="card">
+  <div class="card-h"><span class="t">Steps</span></div>
+  <div class="card-b">
+    <ol style="margin:0;padding-left:1.2em">
+      {{range .Job.Steps}}<li>{{.Step}} {{.Detail}}{{if .Count}} <span class="mono mut">(×{{.Count}})</span>{{end}}</li>{{end}}
+    </ol>
+  </div>
+</div>
 {{end}}

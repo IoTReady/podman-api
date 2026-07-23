@@ -1,88 +1,97 @@
 {{define "instance-detail"}}
 {{if .ActionError}}<div class="error">{{.ActionError}}</div>{{end}}
 {{if .Notice}}<div class="notice">{{.Notice}}</div>{{end}}
-<div class="inst-head">
-  <div class="inst-title">
-    <strong>{{.Inst.Template}} / {{.Inst.Slug}}</strong> · {{.Inst.Pod.Status}}
+<div class="phead">
+  <div>
+    <h1>{{.Inst.Template}} <span style="color:var(--faint);font-weight:400">/</span> <span class="mono">{{.Inst.Slug}}</span></h1>
   </div>
-  <span class="actions">
-    <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/start"   hx-target="#main" hx-disabled-elt="this">Start</button>
-    <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/stop"    hx-target="#main" hx-disabled-elt="this">Stop</button>
-    <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/restart" hx-target="#main" hx-disabled-elt="this">Restart</button>
-    <a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/edit" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/edit" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Edit</a>
-    {{if .CanUpgrade}}<a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Upgrade</a>{{end}}
-    <a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/rename" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/rename" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Rename</a>
-    {{if .HasSecrets}}<a class="pure-button" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/secrets" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/secrets" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Manage secrets</a>{{end}}
-    <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/delete" hx-target="#main"
-            hx-confirm="Delete {{.Inst.Template}}/{{.Inst.Slug}}?" hx-disabled-elt="this">Delete</button>
-  </span>
+  <div class="sp"></div>
+  {{if eq .Inst.Pod.Status "Running"}}
+    {{if .Inst.Ready}}<span class="badge ok"><span class="dot"></span>{{.Inst.Pod.Status}}</span>{{else}}<span class="badge warn"><span class="dot"></span>{{.Inst.Pod.Status}}</span>{{end}}
+  {{else}}
+    <span class="badge muted"><span class="dot"></span>{{.Inst.Pod.Status}}</span>
+  {{end}}
 </div>
-<div class="detail-section containers">
-  <div class="section-title">CONTAINERS</div>
-  <div class="detail-grid">
+<div class="toolbar" style="margin-bottom:18px">
+  <button class="btn ghost sm" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/start"   hx-target="#main" hx-disabled-elt="this">Start</button>
+  <button class="btn ghost sm" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/stop"    hx-target="#main" hx-disabled-elt="this">Stop</button>
+  <button class="btn ghost sm" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/restart" hx-target="#main" hx-disabled-elt="this">Restart</button>
+  <a class="btn ghost sm" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/edit" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/edit" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Edit</a>
+  {{if .CanUpgrade}}<a class="btn ghost sm" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/upgrade" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Upgrade</a>{{end}}
+  <a class="btn ghost sm" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/rename" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/rename" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Rename</a>
+  {{if .HasSecrets}}<a class="btn ghost sm" href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/secrets" hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/secrets" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">Manage secrets</a>{{end}}
+  <button class="btn danger sm" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/delete" hx-target="#main"
+          hx-confirm="Delete {{.Inst.Template}}/{{.Inst.Slug}}?" hx-disabled-elt="this">Delete</button>
+</div>
+<div class="card containers">
+  <div class="card-h"><span class="t">Containers</span></div>
+  <div class="card-b"><div class="dgrid">
     {{range .Inst.Containers}}
-    <div class="grid-row">
-      <div class="grid-cell" data-label="Name">{{.Name}}</div>
-      <div class="grid-cell" data-label="Image">{{.Image}}</div>
-      <div class="grid-cell" data-label="Status">{{.Status}} (restarts {{.RestartCount}})</div>
-      <div class="grid-cell" data-label="Health">
-        {{if eq .Health "healthy"}}<span class="health-dot healthy" title="healthy">●</span> healthy
-        {{else if eq .Health "starting"}}<span class="health-dot starting" title="starting">●</span> starting
-        {{else if eq .Health "unhealthy"}}<span class="health-dot unhealthy" title="unhealthy">●</span> unhealthy
+    <div class="drow">
+      <div class="k-mono" data-label="Name">{{.Name}}</div>
+      <div class="k-mono" data-label="Image"><span class="mut">{{.Image}}</span></div>
+      <div class="sub-td" data-label="Status">{{.Status}} · <span class="mono">{{.RestartCount}}</span> restarts</div>
+      <span class="badge {{if eq .Health "healthy"}}ok{{else if eq .Health "starting"}}warn{{else if eq .Health "unhealthy"}}bad{{else}}muted{{end}}" data-label="Health">
+        {{if eq .Health "healthy"}}<span class="dot"></span>healthy
+        {{else if eq .Health "starting"}}<span class="dot"></span>starting
+        {{else if eq .Health "unhealthy"}}<span class="dot"></span>unhealthy
         {{else}}—{{end}}
-      </div>
+      </span>
     </div>
     {{end}}
-  </div>
+  </div></div>
 </div>
-<div class="detail-section volumes">
-  <div class="section-title">VOLUMES</div>
-  <div class="detail-grid">
+<div class="card volumes">
+  <div class="card-h"><span class="t">Volumes</span></div>
+  <div class="card-b"><div class="dgrid">
     {{range .Inst.Volumes}}
-    <div class="grid-row">
-      <div class="grid-cell" data-label="Name">{{.Name}}</div>
-      <div class="grid-cell" data-label="Size">{{.SizeBytes | formatBytes}}</div>
+    <div class="drow" style="--cols:1fr auto">
+      <div class="k-mono" data-label="Name">{{.Name}}</div>
+      <div class="sub-td mono" data-label="Size">{{.SizeBytes | formatBytes}}</div>
     </div>
     {{end}}
-  </div>
+  </div></div>
 </div>
-<div class="detail-section backups">
-  <div class="section-title">BACKUPS</div>
-  <button class="pure-button" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/backup" hx-target="#main"
-          hx-confirm="Back up {{.Inst.Template}}/{{.Inst.Slug}} now? The instance is stopped for the duration of the backup." hx-disabled-elt="this">Back up now</button>
-  <div class="detail-grid" style="margin-top: 0.5rem">
+<div class="card backups">
+  <div class="card-h"><span class="t">Backups</span><span class="sp"></span>
+    <button class="btn sm" hx-post="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/backup" hx-target="#main"
+            hx-confirm="Back up {{.Inst.Template}}/{{.Inst.Slug}} now? The instance is stopped for the duration of the backup." hx-disabled-elt="this">Back up now</button>
+  </div>
+  <div class="card-b"><div class="dgrid">
     {{range .Backups}}
-    <div class="grid-row">
-      <div class="grid-cell" data-label="Backup">
-        {{.ID}} · {{.Created.UTC.Format "2006-01-02 15:04:05"}} · {{.State}}{{if .Image}} · {{.Image}}{{end}}
+    <div class="drow" style="--cols:1fr auto auto">
+      <div class="k-mono" data-label="Backup">
+        {{.ID}} <span class="mut">· {{.Created.UTC.Format "2006-01-02 15:04:05"}} · {{.State}}{{if .Image}} · {{.Image}}{{end}}</span>
       </div>
-      <div class="grid-cell actions">
+      <span data-label="Restore">
         {{if eq .State "complete"}}
-        <button class="pure-button" hx-post="/ui/backups/{{.ID}}/restore" hx-target="#main"
+        <button class="btn sm ghost" hx-post="/ui/backups/{{.ID}}/restore" hx-target="#main"
                 hx-confirm="Restore {{.ID}}? This stops the instance and OVERWRITES its current data." hx-disabled-elt="this">Restore</button>
         {{end}}
-      </div>
-      <div class="grid-cell actions">
-        <button class="pure-button" hx-post="/ui/backups/{{.ID}}/delete" hx-target="#main"
+      </span>
+      <span data-label="Delete">
+        <button class="btn sm danger" hx-post="/ui/backups/{{.ID}}/delete" hx-target="#main"
                 hx-confirm="Delete backup {{.ID}}?" hx-disabled-elt="this">Delete</button>
-      </div>
+      </span>
     </div>
     {{end}}
-  </div>
+  </div></div>
 </div>
-<div class="detail-section env">
-  <div class="section-title">ENV</div>
-  <div class="detail-grid">
+<div class="card env">
+  <div class="card-h"><span class="t">Environment</span></div>
+  <div class="card-b"><div class="dgrid">
     {{range $k, $v := .Inst.EnvSummary}}
-    <div class="grid-row">
-      <div class="grid-cell" data-label="Key"><code>{{$k}}</code></div>
-      <div class="grid-cell" data-label="Value"><code>{{$v}}</code></div>
+    <div class="drow">
+      <div class="k-mono" data-label="Key">{{$k}}</div>
+      <div class="k-mono" data-label="Value"><span class="mut">{{$v}}</span></div>
     </div>
     {{end}}
-  </div>
+  </div></div>
 </div>
-<a class="pure-button"
-   href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/logs?follow=true"
-   hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/logs?follow=true"
-   hx-target="#main" hx-push-url="true">Logs</a>
+<div class="toolbar" style="margin-top:16px">
+  <a class="btn sm"
+     href="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/logs?follow=true"
+     hx-get="/ui/hosts/{{.Host}}/instances/{{.Inst.Template}}/{{.Inst.Slug}}/logs?follow=true"
+     hx-target="#main" hx-push-url="true">Logs</a>
+</div>
 {{end}}

@@ -4,25 +4,39 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>podman-api</title>
+  <!-- Pre-paint theme init: reads the persisted/preferred theme and sets
+       data-theme on <html> before first paint, so there is no flash of the
+       wrong theme. Must run in <head>, before any CSS-visible content. -->
+  <script>(function(){try{var t=localStorage.getItem('theme');
+    if(!t)t=matchMedia('(prefers-color-scheme:dark)').matches?'dark':'light';
+    document.documentElement.setAttribute('data-theme',t);}catch(e){}})();</script>
   <!-- Swap 4xx/5xx responses too (htmx ignores them by default), so inline
-       validation errors and renderError fragments land in their target. -->
-  <meta name="htmx-config" content='{"responseHandling":[{"code":"204","swap":false},{"code":"[1-5]..","swap":true}]}'>
-  <link rel="stylesheet" href="/ui/static/pure-min.css?v={{.Version}}">
+       validation errors and renderError fragments land in their target.
+       globalViewTransitions enables the View Transitions API for htmx swaps
+       (falls back to an instant swap in browsers without support). -->
+  <meta name="htmx-config" content='{"globalViewTransitions":true,"responseHandling":[{"code":"204","swap":false},{"code":"[1-5]..","swap":true}]}'>
   <link rel="stylesheet" href="/ui/static/app.css?v={{.Version}}">
   <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2280%22>🐳</text></svg>">
   <script src="/ui/static/htmx.min.js?v={{.Version}}" defer></script>
+  <script src="/ui/static/htmx-ext-preload.min.js?v={{.Version}}" defer></script>
 </head>
 <!-- The header name is the well-known csrfHeader constant (internal/ui/session.go); hardcoded here so a missing data field can't silently produce an empty header and break every htmx mutation. -->
-<body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}'>
+<body hx-headers='{"X-CSRF-Token": "{{.CSRF}}"}' hx-ext="preload">
   {{/* Authenticated pages set .Shell and render inside the persistent shell
        (sidebar + #main); the login page does not and renders bare. Gating on
        .Shell (not .Hosts) keeps the chrome even when zero hosts are configured. */}}
   {{if .Shell}}
-  <div class="shell">
+  <div class="app">
     <button id="hamburger" class="hamburger" type="button" aria-label="Toggle navigation">☰</button>
     {{template "nav" .}}
     <div class="sidebar-backdrop"></div>
-    <main id="main">{{template "body" .}}</main>
+    <div class="main">
+      <div class="topbar">
+        <div class="crumb"><b>podman-api</b></div>
+        <div class="loading"></div>
+      </div>
+      <main id="main">{{template "body" .}}</main>
+    </div>
   </div>
   {{else}}
   {{template "body" .}}
@@ -39,22 +53,56 @@
   document.body.addEventListener('htmx:afterSwap', close);
 })();
 </script>
+<script>
+(function(){
+  var btn = document.getElementById('theme-toggle');
+  if (!btn) return;
+  btn.addEventListener('click', function() {
+    var cur = document.documentElement.getAttribute('data-theme');
+    var next = cur === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    try { localStorage.setItem('theme', next); } catch (e) {}
+  });
+})();
+</script>
+<script>
+(function(){
+  var loading = document.querySelector('.loading');
+  if (!loading) return;
+  document.body.addEventListener('htmx:beforeRequest', function() { loading.classList.add('active'); });
+  document.body.addEventListener('htmx:afterRequest', function() { loading.classList.remove('active'); });
+  document.body.addEventListener('htmx:responseError', function() { loading.classList.remove('active'); });
+})();
+</script>
 </body>
 </html>{{end}}
 
 {{define "nav"}}
 <nav class="sidebar">
-  <div class="label">HOSTS</div>
-  <ul>
-    {{range .Hosts}}
-    <li{{if eq .ID $.ActiveHost}} class="active"{{end}}><a href="/ui/hosts/{{.ID}}" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true" hx-disabled-elt="this">{{.ID}}</a></li>
-    {{end}}
-  </ul>
-  <a href="/ui/jobs" hx-get="/ui/jobs" hx-target="#main" hx-push-url="true" hx-disabled-elt="this"{{if eq "jobs" $.ActivePage}} class="active"{{end}}>Jobs</a>
-  {{if .TokensEnabled}}<a href="/ui/tokens" hx-get="/ui/tokens" hx-target="#main" hx-push-url="true" hx-disabled-elt="this"{{if eq "tokens" $.ActivePage}} class="active"{{end}}>Tokens</a>{{end}}
-  <form method="post" action="/ui/logout">
-    <input type="hidden" name="csrf_token" value="{{.CSRF}}">
-    <button type="submit">Sign out</button>
-  </form>
+  <div class="brand"><span class="mark">◆</span><b>podman-api</b></div>
+  <div>
+    <div class="nav-label">Hosts</div>
+    <div class="nav">
+      {{range .Hosts}}
+      <a href="/ui/hosts/{{.ID}}" hx-get="/ui/hosts/{{.ID}}" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover"{{if eq .ID $.ActiveHost}} class="active"{{end}}>{{.ID}}</a>
+      {{end}}
+    </div>
+  </div>
+  <div>
+    <div class="nav-label">Operate</div>
+    <div class="nav">
+      <a href="/ui/jobs" hx-get="/ui/jobs" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover"{{if eq "jobs" $.ActivePage}} class="active"{{end}}>Jobs</a>
+      {{if .TokensEnabled}}<a href="/ui/tokens" hx-get="/ui/tokens" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover"{{if eq "tokens" $.ActivePage}} class="active"{{end}}>Tokens</a>{{end}}
+    </div>
+  </div>
+  <div class="sb-spacer"></div>
+  <div class="sb-foot">
+    <button id="theme-toggle" class="iconbtn" type="button" title="Toggle theme" aria-label="Toggle theme">◑</button>
+    <span class="sb-spacer"></span>
+    <form method="post" action="/ui/logout">
+      <input type="hidden" name="csrf_token" value="{{.CSRF}}">
+      <button class="iconbtn" type="submit" title="Sign out" aria-label="Sign out">Sign out</button>
+    </form>
+  </div>
 </nav>
 {{end}}

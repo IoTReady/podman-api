@@ -55,7 +55,7 @@ func TestLayoutCacheBustsAssets(t *testing.T) {
 	req := httptest.NewRequest("GET", "/ui/login", nil) // full-page (no HX-Request) → layout
 	u.render(rec, req, http.StatusOK, "login", map[string]any{})
 	body := rec.Body.String()
-	for _, asset := range []string{"/ui/static/app.css?v=v1.2.3", "/ui/static/pure-min.css?v=v1.2.3", "/ui/static/htmx.min.js?v=v1.2.3"} {
+	for _, asset := range []string{"/ui/static/app.css?v=v1.2.3", "/ui/static/htmx.min.js?v=v1.2.3"} {
 		if !strings.Contains(body, asset) {
 			t.Errorf("layout missing cache-busted asset %q\nbody:\n%s", asset, body)
 		}

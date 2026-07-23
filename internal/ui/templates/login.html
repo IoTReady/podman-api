@@ -1,11 +1,21 @@
 {{define "login"}}
-<div class="login">
-  <h1>podman-api</h1>
-  {{if .Error}}<p class="error">{{.Error}}</p>{{end}}
-  <form method="post" action="/ui/login" class="pure-form pure-form-stacked">
-    <label>Username <input name="username" placeholder="username" autofocus></label>
-    <label>Password <input name="password" type="password" placeholder="password"></label>
-    <button type="submit" class="pure-button pure-button-primary">Sign in</button>
-  </form>
+<div class="login" style="min-height:100vh;display:flex;align-items:center;justify-content:center;background:var(--bg)">
+  <div class="card" style="width:100%;max-width:340px">
+    <div class="card-h"><span class="mark" style="width:26px;height:26px;border-radius:7px;background:linear-gradient(150deg,var(--accent),#E08900);display:grid;place-items:center;color:#231600;font-weight:700;font-size:15px">◆</span><span class="t" style="text-transform:none;font-size:15px;letter-spacing:normal;color:var(--text);font-weight:600">podman-api</span></div>
+    <div class="card-b" style="padding-top:16px;padding-bottom:16px">
+      {{if .Error}}<div style="color:var(--bad);font-size:13px;margin-bottom:12px">{{.Error}}</div>{{end}}
+      <form method="post" action="/ui/login" class="form">
+        <div class="field">
+          <label for="login-username">Username</label>
+          <input id="login-username" name="username" placeholder="username" autofocus>
+        </div>
+        <div class="field">
+          <label for="login-password">Password</label>
+          <input id="login-password" name="password" type="password" placeholder="password">
+        </div>
+        <button type="submit" class="btn primary" style="width:100%;justify-content:center">Sign in</button>
+      </form>
+    </div>
+  </div>
 </div>
 {{end}}
