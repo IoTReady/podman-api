@@ -56,8 +56,8 @@ enhancement.
 
 ```
 server.go RunWithFlags
-  └─ inventory.Poller (new, started under runnerCtx)      every INVENTORY_REFRESH_INTERVAL
-        └─ per-host goroutine, bounded by INVENTORY_REFRESH_TIMEOUT
+  └─ inventory.Poller (new, started under runnerCtx)      every -inventory-refresh-interval
+        └─ per-host goroutine, bounded by -inventory-refresh-timeout
               └─ Service.RefreshHost(ctx, host)           live fetch → cache put
                     └─ instanceCache.put(host, entry)     data + fetchedAt + reachable + lastErr
 
@@ -124,7 +124,7 @@ A `Poller` type started in `server.go` under `runnerCtx`, mirroring
 - `Wait()` for clean shutdown.
 - Each tick loads the current host set (`hostsHolder.Load()`) and fans out **one
   goroutine per host**, each calling `Service.RefreshHost` under its **own
-  per-host timeout** (`INVENTORY_REFRESH_TIMEOUT`, default 20s < the 30s cadence)
+  per-host timeout** (`-inventory-refresh-timeout`, default 20s < the 30s cadence)
   so a hung host can't bleed into the next cycle.
 - **Log once per state transition** (reachable↔unreachable) to avoid the log spam
   the ingress loop produces.
@@ -148,15 +148,19 @@ A `Poller` type started in `server.go` under `runnerCtx`, mirroring
   lacks (the JSON `/hosts` path already has 5s), relevant only on cold start
   since warm reads are instant.
 
-### Component 5 — Config (env-only; OSS server owns the flag set)
+### Component 5 — Config (CLI flags; OSS server owns the flag set)
 
-| Env | Default | Meaning |
+Following the OSS idiom (`-prune-interval`, `-ingress-reconcile-interval`), two
+new `fs.Duration` flags on the server flag set:
+
+| Flag | Default | Meaning |
 |---|---|---|
-| `INVENTORY_REFRESH_INTERVAL` | `30s` | poll cadence per host; `0` disables the poller |
-| `INVENTORY_REFRESH_TIMEOUT` | `20s` | per-host bound per refresh |
+| `-inventory-refresh-interval` | `30s` | poll cadence per host; `0` disables the poller |
+| `-inventory-refresh-timeout` | `20s` | per-host bound per refresh |
 
-Both are Go durations, validated at startup (fail-fast, like the S3 duration
-knobs). Parsed OSS-side; the pro repo remains env-only with no new flags.
+`flag.Duration` parses/validates at startup for free. The pro binary inherits
+this flag set via `server.RunWithFlags`, so no pro code change; the engine-infra
+systemd unit can pass the flags if a non-default cadence is wanted.
 
 ## Error handling
 
@@ -181,8 +185,8 @@ knobs). Parsed OSS-side; the pro repo remains env-only with no new flags.
 
 ## Rollout
 
-1. Land in OSS behind the new env knobs (default-on at 30s).
+1. Land in OSS behind the two new flags (default-on at 30s).
 2. Tag an OSS release.
 3. `make bump V=<tag>` in podman-api-pro, build, deploy to engine-infra.
-4. No pro code change; the two env knobs may optionally be set in the
+4. No pro code change; the two flags may optionally be passed in the
    `podman-api` user service environment.
