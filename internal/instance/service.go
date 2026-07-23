@@ -592,9 +592,10 @@ func (s *Service) List(ctx context.Context, host, tmpl string) ([]Observed, erro
 // template id, so a pod for a template the daemon doesn't know about is
 // silently omitted.
 func (s *Service) ListAllInstances(ctx context.Context, host string) ([]Observed, error) {
-	return s.instCache.get(host, func() ([]Observed, error) {
+	obs, _, err := s.instCache.getWithMeta(host, func() ([]Observed, error) {
 		return s.listAllInstancesLive(ctx, host)
 	})
+	return obs, err
 }
 
 // listAllInstancesLive performs the live podman sweep (no caching). See

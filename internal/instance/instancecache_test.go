@@ -328,3 +328,129 @@ func TestListAllInstances_PropagatesTemplateError(t *testing.T) {
 		t.Fatal("expected error from failing template, got nil")
 	}
 }
+
+func TestCacheWarmServesWithoutFetchAndIgnoresTTL(t *testing.T) {
+	c := newInstanceCache(3 * time.Second)
+	c.setWarm(true)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return base }
+
+	// Poller populates the entry.
+	gen := c.beginRefresh("h")
+	c.put("h", gen, []Observed{{Template: "t", Slug: "a"}}, base)
+
+	// A much later read (well past ttl) still serves the warm entry with no fetch.
+	c.now = func() time.Time { return base.Add(time.Hour) }
+	fetched := false
+	obs, fresh, err := c.getWithMeta("h", func() ([]Observed, error) {
+		fetched = true
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if fetched {
+		t.Fatal("warm hit must not fetch")
+	}
+	if len(obs) != 1 || obs[0].Slug != "a" {
+		t.Fatalf("obs = %+v", obs)
+	}
+	if !fresh.Reachable || !fresh.HasData || !fresh.FetchedAt.Equal(base) {
+		t.Fatalf("fresh = %+v", fresh)
+	}
+}
+
+func TestCacheColdMissFetchesAndPopulates(t *testing.T) {
+	c := newInstanceCache(3 * time.Second)
+	c.setWarm(true)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return base }
+
+	calls := 0
+	obs, fresh, err := c.getWithMeta("h", func() ([]Observed, error) {
+		calls++
+		return []Observed{{Slug: "x"}}, nil
+	})
+	if err != nil || calls != 1 || len(obs) != 1 {
+		t.Fatalf("cold miss: obs=%+v calls=%d err=%v", obs, calls, err)
+	}
+	if !fresh.HasData || !fresh.Reachable {
+		t.Fatalf("fresh = %+v", fresh)
+	}
+	// Second read is now a warm hit (no fetch).
+	_, _, _ = c.getWithMeta("h", func() ([]Observed, error) {
+		calls++
+		return nil, nil
+	})
+	if calls != 1 {
+		t.Fatalf("expected warm hit, calls=%d", calls)
+	}
+}
+
+func TestCacheMarkUnreachableKeepsLastKnownGood(t *testing.T) {
+	c := newInstanceCache(3 * time.Second)
+	c.setWarm(true)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return base }
+	gen := c.beginRefresh("h")
+	c.put("h", gen, []Observed{{Slug: "a"}}, base)
+
+	// A later refresh fails.
+	gen2 := c.beginRefresh("h")
+	c.markUnreachable("h", gen2)
+
+	obs, fresh, err := c.getWithMeta("h", func() ([]Observed, error) {
+		t.Fatal("must not fetch when last-known-good exists")
+		return nil, nil
+	})
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len(obs) != 1 || obs[0].Slug != "a" {
+		t.Fatalf("obs = %+v (should keep last-known-good)", obs)
+	}
+	if fresh.Reachable {
+		t.Fatal("fresh.Reachable should be false after markUnreachable")
+	}
+	if !fresh.HasData {
+		t.Fatal("fresh.HasData should stay true (we still have data)")
+	}
+}
+
+func TestCacheColdFetchErrorReturnsErrNoData(t *testing.T) {
+	c := newInstanceCache(3 * time.Second)
+	c.setWarm(true)
+	boom := errors.New("connection refused")
+	obs, fresh, err := c.getWithMeta("h", func() ([]Observed, error) {
+		return nil, boom
+	})
+	if !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want boom", err)
+	}
+	if obs != nil || fresh.HasData || fresh.Reachable {
+		t.Fatalf("cold error should be empty+unreachable: obs=%+v fresh=%+v", obs, fresh)
+	}
+}
+
+func TestCachePutSkippedAfterInvalidate(t *testing.T) {
+	c := newInstanceCache(3 * time.Second)
+	c.setWarm(true)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return base }
+
+	// Refresh begins, captures gen.
+	gen := c.beginRefresh("h")
+	// A mutation invalidates before the refresh stores its (now stale) result.
+	c.invalidate("h")
+	c.put("h", gen, []Observed{{Slug: "stale"}}, base)
+
+	// Entry must be cold (the stale put was dropped), so the next read fetches.
+	fetched := false
+	c.getWithMeta("h", func() ([]Observed, error) {
+		fetched = true
+		return []Observed{{Slug: "fresh"}}, nil
+	})
+	if !fetched {
+		t.Fatal("stale put should have been dropped, forcing a cold fetch")
+	}
+}
