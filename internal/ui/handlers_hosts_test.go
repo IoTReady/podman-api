@@ -227,12 +227,13 @@ func TestHostInstancesFragmentReturnsBareBody(t *testing.T) {
 	}
 }
 
-func TestDashboardBoundsPerHostFetch(t *testing.T) {
-	// A dashboard render must complete quickly even if a host's fetch would
-	// otherwise hang far longer than the per-host bound. We assert the bound
-	// constant is small; the render itself is exercised by existing dashboard
-	// tests. This guards against the bound being removed or set too high.
-	if dashboardHostTimeout <= 0 || dashboardHostTimeout > 10*time.Second {
-		t.Fatalf("dashboardHostTimeout = %s, want a small positive bound", dashboardHostTimeout)
+func TestHostFetchTimeoutIsBounded(t *testing.T) {
+	// Both the dashboard fan-out and the host page / fragment bound their
+	// per-host live fetch with hostFetchTimeout so one cold/unreachable host
+	// can't stall the render. We assert the bound is small; the renders
+	// themselves are exercised by other tests. Guards against the bound being
+	// removed or set too high.
+	if hostFetchTimeout <= 0 || hostFetchTimeout > 10*time.Second {
+		t.Fatalf("hostFetchTimeout = %s, want a small positive bound", hostFetchTimeout)
 	}
 }

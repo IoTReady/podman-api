@@ -11,11 +11,13 @@ import (
 	"github.com/iotready/podman-api/internal/instance"
 )
 
-// dashboardHostTimeout bounds each per-host instance fetch on the dashboard
-// fan-out so one cold or unreachable host can't stall the whole page (warm
-// reads return instantly; this only bites on a cold/dead host). Mirrors the
-// JSON /hosts path's 5s per-host bound.
-const dashboardHostTimeout = 5 * time.Second
+// hostFetchTimeout bounds a per-host instance fetch that can hit live podman —
+// the dashboard fan-out and the host page / fragment. Warm reads return
+// instantly; this only bites on a cold host that has never succeeded (never
+// cached in warm mode), so one such host can't stall the dashboard OR the host
+// page up to podman's 10-minute op timeout. Mirrors the JSON /hosts path's 5s
+// per-host bound.
+const hostFetchTimeout = 5 * time.Second
 
 func (u *UI) dashboard(w http.ResponseWriter, r *http.Request) {
 	hosts := u.cfg.Svc.Hosts()
@@ -29,7 +31,7 @@ func (u *UI) dashboard(w http.ResponseWriter, r *http.Request) {
 		wg.Add(1)
 		go func(i int, id string) {
 			defer wg.Done()
-			hctx, cancel := context.WithTimeout(r.Context(), dashboardHostTimeout)
+			hctx, cancel := context.WithTimeout(r.Context(), hostFetchTimeout)
 			defer cancel()
 			n := 0
 			if obs, err := u.cfg.Svc.ListAllInstances(hctx, id); err == nil {
@@ -60,6 +62,11 @@ func (u *UI) dashboard(w http.ResponseWriter, r *http.Request) {
 // warm-cache serve-last-known-good contract. A genuinely unknown host still
 // errors so the caller can 404.
 func (u *UI) hostInstancesData(ctx context.Context, host string) (map[string]any, error) {
+	// Bound the fetch: a warm host returns instantly, but a cold host that has
+	// never succeeded is not cached in warm mode, so this would otherwise be an
+	// unbounded live podman sweep on every page load and every 10s fragment poll.
+	ctx, cancel := context.WithTimeout(ctx, hostFetchTimeout)
+	defer cancel()
 	obs, fresh, err := u.cfg.Svc.ListAllInstancesWithMeta(ctx, host)
 	if err != nil && errors.Is(err, instance.ErrUnknownHost) {
 		return nil, err
