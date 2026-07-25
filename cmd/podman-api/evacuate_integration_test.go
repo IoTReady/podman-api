@@ -169,7 +169,7 @@ func TestEvacuate_TwoSockets_LocalOnly(t *testing.T) {
 	tok := "evactoken"
 	hash, _ := config.HashToken(tok)
 	keys := []config.APIKey{{ID: "evac", SecretHash: hash, Scopes: []string{"instances:*", "hosts:read", "jobs:read"}}}
-	r := api.NewRouter(svc, db, auth.NewKeyStore(keys), nil, nil, runner)
+	r := api.NewRouter(svc, db, auth.NewKeyStore(keys), nil, nil, runner, "itest")
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 

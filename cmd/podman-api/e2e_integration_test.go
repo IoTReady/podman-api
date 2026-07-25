@@ -81,7 +81,7 @@ func TestE2E_FullLifecycle_LocalOnly(t *testing.T) {
 	mem := store.NewMemory()
 	require.NoError(t, mem.PutTemplate(context.Background(), store.Template{Meta: meta, Body: body, Origin: "seed"}))
 	svc.SetStore(mem)
-	r := api.NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil)
+	r := api.NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil, "itest")
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 
