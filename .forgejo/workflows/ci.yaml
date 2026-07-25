@@ -64,6 +64,14 @@ jobs:
       - name: go vet
         run: go vet -tags "$GO_TAGS" ./...
 
+      # The integration suite is behind a build tag, so the steps above never
+      # compile it — its call sites silently rot against signature changes
+      # until the podman-in-podman job builds it, and that job is slow, needs
+      # a privileged runner, and only runs after everything else. Vetting with
+      # the tag needs no podman socket and catches the drift here instead.
+      - name: go vet (integration-tagged code compiles)
+        run: go vet -tags "$GO_TAGS integration" ./...
+
       - name: gofmt -l (fail on any unformatted file)
         run: |
           # Print the diff for clarity, then fail if any output is produced.
