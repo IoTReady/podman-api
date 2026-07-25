@@ -431,8 +431,19 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 // waitRunning polls the dest pod until Running, bounded by verifyTimeout and the
 // caller's context.
 func (s *Service) waitRunning(ctx context.Context, host, tmpl, slug string) error {
-	if err := s.waitReady(ctx, host, tmpl, slug, verifyTimeout, verifyStableCount); err != nil {
+	// grantStartPeriod: a timeout here fails the whole migrate, so the wait must
+	// not give up on a container that is still inside the start period its own
+	// spec granted it (#196).
+	if err := s.waitReady(ctx, host, tmpl, slug, readyOpts{
+		timeout:          verifyTimeout,
+		stableCount:      verifyStableCount,
+		grantStartPeriod: true,
+	}); err != nil {
 		if errors.Is(err, errReadyTimeout) {
+			if errors.Is(err, errStillStarting) {
+				return fmt.Errorf("pod %s still inside its healthcheck start period after %s — it has not failed, but did not report healthy in time",
+					podName(tmpl, slug), verifyTimeout)
+			}
 			return fmt.Errorf("pod %s not running within %s", podName(tmpl, slug), verifyTimeout)
 		}
 		return err

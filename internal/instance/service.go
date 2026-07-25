@@ -324,16 +324,16 @@ func (s *Service) ApplyAndObserve(ctx context.Context, host string, req ApplyReq
 	if err := s.Apply(ctx, host, req, opts); err != nil {
 		return Observed{}, err
 	}
-	readyErr := s.waitReady(ctx, host, req.Template, req.Slug, deployVerifyTimeout, deployVerifyStableCount)
+	readyErr := s.waitReady(ctx, host, req.Template, req.Slug, readyOpts{
+		timeout:     deployVerifyTimeout,
+		stableCount: deployVerifyStableCount,
+	})
 	obs, err := s.Get(ctx, host, req.Template, req.Slug)
 	if err != nil {
 		return Observed{}, err
 	}
-	if errors.Is(readyErr, errReadyTimeout) {
-		obs.Warnings = append(obs.Warnings, fmt.Sprintf(
-			"readiness timeout: healthcheck did not pass within %s — the app may still be initialising",
-			deployVerifyTimeout,
-		))
+	if w := readinessWarning(readyErr); w != "" {
+		obs.Warnings = append(obs.Warnings, w)
 	}
 	return obs, nil
 }
@@ -717,16 +717,16 @@ func (s *Service) Start(ctx context.Context, host, tmpl, slug string) (Observed,
 	if err := s.lifecycle(ctx, host, tmpl, slug, s.client.PodStart); err != nil {
 		return Observed{}, err
 	}
-	readyErr := s.waitReady(ctx, host, tmpl, slug, deployVerifyTimeout, deployVerifyStableCount)
+	readyErr := s.waitReady(ctx, host, tmpl, slug, readyOpts{
+		timeout:     deployVerifyTimeout,
+		stableCount: deployVerifyStableCount,
+	})
 	obs, err := s.Get(ctx, host, tmpl, slug)
 	if err != nil {
 		return Observed{}, err
 	}
-	if errors.Is(readyErr, errReadyTimeout) {
-		obs.Warnings = append(obs.Warnings, fmt.Sprintf(
-			"readiness timeout: healthcheck did not pass within %s — the app may still be initialising",
-			deployVerifyTimeout,
-		))
+	if w := readinessWarning(readyErr); w != "" {
+		obs.Warnings = append(obs.Warnings, w)
 	}
 	return obs, nil
 }
