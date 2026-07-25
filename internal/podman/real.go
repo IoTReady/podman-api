@@ -399,6 +399,10 @@ func enrichContainer(c *Container, ins *define.InspectContainerData) {
 	if ins.State != nil && ins.State.Health != nil {
 		c.Health = ins.State.Health.Status
 	}
+	if ins.Config != nil && ins.Config.Healthcheck != nil {
+		c.HealthStartPeriod = ins.Config.Healthcheck.StartPeriod
+		c.HealthInterval = ins.Config.Healthcheck.Interval
+	}
 	c.RestartCount = int(ins.RestartCount)
 	if ins.HostConfig != nil {
 		// PortBindings maps "<containerPort>/<protocol>" -> []HostPort, so

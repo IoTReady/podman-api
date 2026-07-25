@@ -20,11 +20,18 @@ type Container struct {
 	Status   string
 	// Health is the container's healthcheck status: "" when the container
 	// declares no healthcheck, otherwise "healthy" / "unhealthy" / "starting".
-	Health       string
-	StartedAt    time.Time
-	RestartCount int
-	Ports        []PortMapping
-	Env          map[string]string
+	Health string
+	// HealthStartPeriod and HealthInterval are the container's *declared*
+	// healthcheck timings, both zero when it declares no healthcheck. They are
+	// the grace the container was promised, so readiness waits can bound
+	// themselves by the spec they are verifying rather than by a fixed constant
+	// that may be shorter than the first check can possibly run (#196).
+	HealthStartPeriod time.Duration
+	HealthInterval    time.Duration
+	StartedAt         time.Time
+	RestartCount      int
+	Ports             []PortMapping
+	Env               map[string]string
 }
 
 type PortMapping struct {
