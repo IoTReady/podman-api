@@ -72,6 +72,25 @@ podman-api \
 
 A `contrib/install.sh` script creates a dedicated user, installs the binary, and enables the service.
 
+When the background inventory poller is enabled (`-inventory-refresh-interval`,
+default 30s), `/metrics` additionally exposes per-container state rendered from
+the warm inventory cache:
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `podman_api_container_restarts_total` | host, template, slug, container | podman's restart count. Resets to 0 when the pod is recreated, so a redeploy appears as a counter reset. |
+| `podman_api_container_running` | host, template, slug, container | 1 if the container status is `running`. |
+| `podman_api_container_healthy` | host, template, slug, container | 1 healthy, 0 unhealthy or starting, **-1 when the container declares no healthcheck**. |
+| `podman_api_instance_ready` | host, template, slug | 1 if every container reports a healthy or absent healthcheck. |
+| `podman_api_host_reachable` | host | 1 if the most recent inventory refresh succeeded. |
+| `podman_api_inventory_age_seconds` | host | Seconds since the last *successful* refresh. |
+
+The last two are not optional decoration. When a host becomes unreachable the
+cache keeps serving last-known-good data, so `podman_api_container_running`
+stays at 1 for the duration of the outage. Any alert built on the container
+metrics should be gated on `podman_api_host_reachable == 1`, with a separate
+alert on staleness.
+
 ## Admin UI
 
 An embedded, server-rendered admin UI (HTMX + PureCSS) is served at `/ui`. Disabled unless `-operator-file <path>` is set. Pass `-ui-secure-cookie` when serving over HTTPS.

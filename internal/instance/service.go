@@ -612,6 +612,14 @@ func (s *Service) ListAllInstancesWithMeta(ctx context.Context, host string) ([]
 // startup, before serving traffic, when the poller is enabled.
 func (s *Service) EnableWarmInventory() { s.instCache.setWarm(true) }
 
+// InventorySnapshot returns the warm cache's current contents for every host
+// that has an entry, without triggering a fetch. It is meaningful only when the
+// inventory poller is running — with the lazy cache, entries appear only after a
+// read, so a snapshot would under-report.
+func (s *Service) InventorySnapshot() map[string]HostInventory {
+	return s.instCache.snapshot()
+}
+
 // RefreshHost performs a live inventory sweep of host and stores it in the warm
 // cache. On failure it marks the host's last-known-good entry unreachable
 // (keeping the data) and returns the error for the caller to log. This is the

@@ -259,15 +259,19 @@ func RunWithFlags(opts ...Option) error {
 	var invPoller *inventory.Poller
 	if *inventoryInterval > 0 {
 		svc.EnableWarmInventory()
-		invPoller = &inventory.Poller{Svc: svc, Interval: *inventoryInterval, Timeout: *inventoryTimeout}
-		invPoller.Start(runnerCtx, func() []string {
+		hostIDs := func() []string {
 			hs := *hostsHolder.Load()
 			ids := make([]string, len(hs))
 			for i, h := range hs {
 				ids[i] = h.ID
 			}
 			return ids
-		})
+		}
+		invPoller = &inventory.Poller{Svc: svc, Interval: *inventoryInterval, Timeout: *inventoryTimeout}
+		invPoller.Start(runnerCtx, hostIDs)
+		// Same host list as the poller, so a host that has never been polled
+		// still reports host_reachable 0 instead of being silently absent.
+		registerInventoryMetrics(prometheus.DefaultRegisterer, svc, hostIDs, true)
 		log.Printf("inventory poller enabled (interval %s, per-host timeout %s)", *inventoryInterval, *inventoryTimeout)
 	}
 
@@ -463,6 +467,17 @@ func RunWithFlags(opts ...Option) error {
 	}
 	<-idleClosed
 	return nil
+}
+
+// registerInventoryMetrics registers the per-container inventory collector, but
+// only when the background poller is running. With the poller disabled the warm
+// cache is filled lazily by reads, so a snapshot would report never-read hosts
+// as cold — a metric that lies is worse than one that is absent.
+func registerInventoryMetrics(reg prometheus.Registerer, src obs.InventorySource, hosts func() []string, pollerEnabled bool) *obs.InventoryCollector {
+	if !pollerEnabled {
+		return nil
+	}
+	return obs.NewInventoryCollector(reg, src, hosts)
 }
 
 func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics) (jobs.Registry, jobs.Reconcilers) {

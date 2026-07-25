@@ -16,6 +16,7 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 	"github.com/iotready/podman-api/internal/ui"
 	"github.com/iotready/podman-api/templates"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 )
 
@@ -210,5 +211,45 @@ func TestComposeHandlerNilUIReturnsAPIRouter(t *testing.T) {
 	h.ServeHTTP(w, r)
 	if w.Code != 200 {
 		t.Fatalf("nil UI should pass through to API router, got %d", w.Code)
+	}
+}
+
+type stubInventory struct{}
+
+func (stubInventory) InventorySnapshot() map[string]instance.HostInventory { return nil }
+
+func TestRegisterInventoryMetrics_NilWhenPollerDisabled(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	got := registerInventoryMetrics(reg, stubInventory{}, func() []string { return nil }, false)
+	if got != nil {
+		t.Fatal("collector registered with the poller disabled; the warm cache is not being filled")
+	}
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(mfs) != 0 {
+		t.Fatalf("registry has %d metric families, want 0", len(mfs))
+	}
+}
+
+func TestRegisterInventoryMetrics_RegistersWhenPollerEnabled(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	got := registerInventoryMetrics(reg, stubInventory{}, func() []string { return []string{"h1"} }, true)
+	if got == nil {
+		t.Fatal("collector not registered with the poller enabled")
+	}
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawReachable bool
+	for _, mf := range mfs {
+		if mf.GetName() == "podman_api_host_reachable" {
+			sawReachable = true
+		}
+	}
+	if !sawReachable {
+		t.Fatal("podman_api_host_reachable missing after registration")
 	}
 }

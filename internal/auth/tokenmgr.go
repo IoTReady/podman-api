@@ -13,8 +13,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-var ErrTokenNotFound      = errors.New("token id not found")
-var ErrTokenIDExists      = errors.New("token id already exists")
+var ErrTokenNotFound = errors.New("token id not found")
+var ErrTokenIDExists = errors.New("token id already exists")
 var ErrTokenScopesRequired = errors.New("at least one scope is required")
 
 // TokenManager manages the on-disk keys.yaml and the live KeyStore atomically.

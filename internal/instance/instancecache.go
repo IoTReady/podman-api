@@ -168,3 +168,31 @@ func (c *instanceCache) invalidate(host string) {
 	c.gen[host]++
 	c.mu.Unlock()
 }
+
+// HostInventory is a point-in-time view of one host's cached inventory, as read
+// by the metrics collector. It mirrors instEntry, which is unexported.
+type HostInventory struct {
+	Observed  []Observed
+	FetchedAt time.Time
+	Reachable bool
+	HasData   bool
+}
+
+// snapshot returns the cache's current contents without fetching. Every other
+// read path blocks on a live sweep for a cold host; the metrics collector runs
+// on the scrape path and must never do that. The returned map is a fresh copy;
+// the Observed slices inside it are shared and read-only, as elsewhere.
+func (c *instanceCache) snapshot() map[string]HostInventory {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]HostInventory, len(c.data))
+	for host, e := range c.data {
+		out[host] = HostInventory{
+			Observed:  e.obs,
+			FetchedAt: e.fetchedAt,
+			Reachable: e.reachable,
+			HasData:   e.hasData,
+		}
+	}
+	return out
+}

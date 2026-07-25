@@ -454,3 +454,77 @@ func TestCachePutSkippedAfterInvalidate(t *testing.T) {
 		t.Fatal("stale put should have been dropped, forcing a cold fetch")
 	}
 }
+
+func TestInstanceCache_SnapshotNeverFetchesOnColdMiss(t *testing.T) {
+	c := newInstanceCache(time.Minute)
+	// Sanity: the ordinary read path *does* fetch on a cold miss. The whole
+	// point of snapshot() is that it does not, so assert both halves here.
+	var fetched bool
+	if _, err := c.get("h1", func() ([]Observed, error) {
+		fetched = true
+		return []Observed{{Slug: "a"}}, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !fetched {
+		t.Fatal("get() did not fetch on a cold miss; test premise is wrong")
+	}
+
+	c2 := newInstanceCache(time.Minute)
+	if got := c2.snapshot(); len(got) != 0 {
+		t.Fatalf("cold snapshot = %v, want empty and no fetch", got)
+	}
+	// A snapshot must not have populated the cache as a side effect either.
+	if len(c2.data) != 0 {
+		t.Fatalf("snapshot populated the cache: %v", c2.data)
+	}
+}
+
+func TestInstanceCache_SnapshotReportsEntries(t *testing.T) {
+	c := newInstanceCache(time.Minute)
+	at := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	c.put("h1", c.gen["h1"], []Observed{{Template: "t", Slug: "a"}}, at)
+
+	snap := c.snapshot()
+	e, ok := snap["h1"]
+	if !ok {
+		t.Fatal("h1 missing from snapshot")
+	}
+	if !e.HasData || !e.Reachable {
+		t.Fatalf("h1 = %+v, want HasData and Reachable", e)
+	}
+	if !e.FetchedAt.Equal(at) {
+		t.Fatalf("FetchedAt = %v, want %v", e.FetchedAt, at)
+	}
+	if len(e.Observed) != 1 || e.Observed[0].Slug != "a" {
+		t.Fatalf("Observed = %+v, want one instance with slug a", e.Observed)
+	}
+}
+
+func TestInstanceCache_SnapshotKeepsDataWhenUnreachable(t *testing.T) {
+	c := newInstanceCache(time.Minute)
+	at := time.Date(2026, 7, 25, 12, 0, 0, 0, time.UTC)
+	c.put("h1", c.gen["h1"], []Observed{{Template: "t", Slug: "a"}}, at)
+	c.markUnreachable("h1", c.gen["h1"])
+
+	e := c.snapshot()["h1"]
+	if e.Reachable {
+		t.Fatal("Reachable = true, want false after markUnreachable")
+	}
+	if !e.HasData || len(e.Observed) != 1 {
+		t.Fatalf("e = %+v, want last-known-good data retained", e)
+	}
+	if !e.FetchedAt.Equal(at) {
+		t.Fatalf("FetchedAt = %v, want the last successful fetch time %v", e.FetchedAt, at)
+	}
+}
+
+func TestInstanceCache_SnapshotIsACopy(t *testing.T) {
+	c := newInstanceCache(time.Minute)
+	c.put("h1", c.gen["h1"], []Observed{{Slug: "a"}}, time.Now())
+	snap := c.snapshot()
+	delete(snap, "h1")
+	if _, ok := c.snapshot()["h1"]; !ok {
+		t.Fatal("mutating the returned map mutated the cache")
+	}
+}
