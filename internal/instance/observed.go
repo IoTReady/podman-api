@@ -49,11 +49,20 @@ type ObservedVolume struct {
 }
 
 // Normalize builds Observed from a Pod + the volumes the API thinks the
-// instance owns. Env vars whose names appear in secretEnvs (the set derived
-// from the template's secretKeyRef blocks) are dropped from env_summary so
-// secret material never returns to the CMS. A defensive substring check on
-// SECRET also catches anything not anchored to a known template.
-func Normalize(p podman.Pod, template, slug string, vols []podman.Volume, secretEnvs map[string]bool) Observed {
+// instance owns. env_summary is redacted in two passes, because neither alone
+// is sufficient:
+//
+//   - by NAME: names in secretEnvs (derived from the template's secretKeyRef
+//     blocks) plus a defensive substring check on SECRET. This sees only what
+//     the stored template declares.
+//   - by VALUE: values in secretVals (the instance's known secret values, from
+//     the stored spec). A SidecarInjector adds containers and env after the
+//     template body was stored, so its secretKeyRef env is invisible to the
+//     name pass — this pass catches it however the value arrived (#198).
+//
+// Either match omits the key from env_summary entirely; there is no redaction
+// marker. Both sets may be nil.
+func Normalize(p podman.Pod, template, slug string, vols []podman.Volume, secretEnvs, secretVals map[string]bool) Observed {
 	out := Observed{
 		Template: template,
 		Slug:     slug,
@@ -86,7 +95,7 @@ func Normalize(p podman.Pod, template, slug string, vols []podman.Volume, secret
 	out.EnvSummary = map[string]string{}
 	for _, c := range p.Containers {
 		for k, v := range c.Env {
-			if secretEnvs[k] || strings.Contains(strings.ToUpper(k), "SECRET") {
+			if secretEnvs[k] || secretVals[v] || strings.Contains(strings.ToUpper(k), "SECRET") {
 				continue
 			}
 			out.EnvSummary[k] = v

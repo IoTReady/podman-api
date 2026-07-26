@@ -3,6 +3,7 @@ package instance
 import (
 	"testing"
 
+	"github.com/iotready/podman-api/internal/store"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -92,4 +93,23 @@ spec:
 	assert.True(t, got["RESTORE_TOKEN"], "an initContainer secretKeyRef must be detected")
 	assert.True(t, got["APP_KEY"], "container secretKeyRefs must still be detected")
 	assert.False(t, got["RESTORE_MODE"], "a literal-valued initContainer env is not a secret")
+}
+
+func TestSecretValues(t *testing.T) {
+	sp := store.Spec{
+		Secrets: map[string]string{"password": "p4ssw0rd", "blank": ""},
+		InjectorSecrets: []store.InjectorSecret{
+			{Name: "vpn-psk", Key: "postgres-demo-vpn-psk", Value: "s3cr3t-psk"},
+			{Name: "empty", Key: "k", Value: ""},
+		},
+	}
+	got := secretValues(sp)
+	assert.True(t, got["p4ssw0rd"], "template-declared secret values are included")
+	assert.True(t, got["s3cr3t-psk"], "injector-declared secret values are included")
+	assert.False(t, got[""], "empty values must be excluded — they would blank every empty env var")
+	assert.Len(t, got, 2)
+}
+
+func TestSecretValues_EmptySpec(t *testing.T) {
+	assert.Empty(t, secretValues(store.Spec{}))
 }

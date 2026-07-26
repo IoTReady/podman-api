@@ -37,7 +37,7 @@ func TestNormalize(t *testing.T) {
 
 	obs := Normalize(p, "postgres", "demo", []podman.Volume{
 		{Name: "postgres-demo-data", SizeBytes: 100},
-	}, map[string]bool{"POSTGRES_PASSWORD": true})
+	}, map[string]bool{"POSTGRES_PASSWORD": true}, nil)
 
 	assert.Equal(t, "postgres", obs.Template)
 	assert.Equal(t, "demo", obs.Slug)
@@ -65,7 +65,7 @@ func TestNormalize_HealthPropagation(t *testing.T) {
 			{Name: "sidecar", Image: "alpine", Status: "Running", Health: ""},
 		},
 	}
-	obs := Normalize(p, "web", "s1", nil, nil)
+	obs := Normalize(p, "web", "s1", nil, nil, nil)
 
 	require.Len(t, obs.Containers, 2)
 	assert.Equal(t, "healthy", obs.Containers[0].Health)
@@ -119,8 +119,47 @@ func TestNormalize_ReadyAggregation(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			p := podman.Pod{Status: "Running", Containers: tt.containers}
-			obs := Normalize(p, "web", "s1", nil, nil)
+			obs := Normalize(p, "web", "s1", nil, nil, nil)
 			assert.Equal(t, tt.wantReady, obs.Ready)
 		})
 	}
+}
+
+// An env var whose VALUE matches a known instance secret is dropped even when
+// its NAME is not in the template-derived set — this is the injector case from
+// #198, where the secretKeyRef lives only in the post-injection manifest.
+func TestNormalize_RedactsByValue(t *testing.T) {
+	p := podman.Pod{
+		Status: "Running",
+		Containers: []podman.Container{
+			{
+				Name:   "vpn",
+				Status: "Running",
+				Env:    map[string]string{"VPN_PSK": "s3cr3t-psk", "VPN_ENDPOINT": "vpn.example.com"},
+			},
+		},
+	}
+
+	obs := Normalize(p, "erp", "acme", nil, nil, map[string]bool{"s3cr3t-psk": true})
+
+	_, leaked := obs.EnvSummary["VPN_PSK"]
+	assert.False(t, leaked, "an env var whose value is a known secret must be redacted")
+	assert.Equal(t, "vpn.example.com", obs.EnvSummary["VPN_ENDPOINT"], "unrelated env vars survive")
+}
+
+// An empty string must never be treated as a secret value: it would blank every
+// legitimately-empty env var in the summary.
+func TestNormalize_EmptySecretValueDoesNotBlankEnv(t *testing.T) {
+	p := podman.Pod{
+		Status: "Running",
+		Containers: []podman.Container{
+			{Name: "app", Status: "Running", Env: map[string]string{"OPTIONAL_FLAG": ""}},
+		},
+	}
+
+	obs := Normalize(p, "web", "s1", nil, nil, map[string]bool{})
+
+	v, present := obs.EnvSummary["OPTIONAL_FLAG"]
+	assert.True(t, present, "an empty env var is not a secret")
+	assert.Equal(t, "", v)
 }

@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/iotready/podman-api/internal/store"
 	"gopkg.in/yaml.v3"
 )
 
@@ -62,6 +63,29 @@ func secretEnvNames(body string) map[string]bool {
 		}
 		scan("initContainers")
 		scan("containers")
+	}
+	return out
+}
+
+// secretValues returns the set of plaintext secret values recorded for an
+// instance: the template-declared per-instance secrets plus every value a
+// SidecarInjector declared. Normalize drops any env_summary entry whose value
+// is in this set, which catches injector-added secretKeyRef env that
+// secretEnvNames cannot see (#198).
+//
+// Empty values are excluded deliberately: a secret stored as "" would otherwise
+// blank every legitimately-empty env var in the summary.
+func secretValues(sp store.Spec) map[string]bool {
+	out := map[string]bool{}
+	for _, v := range sp.Secrets {
+		if v != "" {
+			out[v] = true
+		}
+	}
+	for _, s := range sp.InjectorSecrets {
+		if s.Value != "" {
+			out[s.Value] = true
+		}
 	}
 	return out
 }

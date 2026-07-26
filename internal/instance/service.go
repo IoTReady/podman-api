@@ -565,7 +565,7 @@ func (s *Service) Get(ctx context.Context, host, tmpl, slug string) (Observed, e
 			vols = append(vols, vv)
 		}
 	}
-	return Normalize(p, tmpl, slug, vols, secretEnvNames(t.Body)), nil
+	return Normalize(p, tmpl, slug, vols, secretEnvNames(t.Body), nil), nil
 }
 
 // List returns all instances of a given template on a host.
@@ -582,7 +582,7 @@ func (s *Service) List(ctx context.Context, host, tmpl string) ([]Observed, erro
 	out := make([]Observed, 0, len(pods))
 	for _, p := range pods {
 		slug := p.Labels["podman-api/slug"]
-		out = append(out, Normalize(p, tmpl, slug, nil, secretEnvs))
+		out = append(out, Normalize(p, tmpl, slug, nil, secretEnvs, nil))
 	}
 	return out, nil
 }
@@ -670,7 +670,7 @@ func (s *Service) listAllInstancesLive(ctx context.Context, host string) ([]Obse
 			var part []Observed
 			for _, p := range pods {
 				slug := p.Labels["podman-api/slug"]
-				part = append(part, Normalize(p, tmplID, slug, nil, secretEnvs))
+				part = append(part, Normalize(p, tmplID, slug, nil, secretEnvs, nil))
 			}
 			results[i] = result{obs: part}
 		}(i, t)
