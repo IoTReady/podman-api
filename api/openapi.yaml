@@ -309,7 +309,19 @@ components:
         env_summary:
           type: object
           additionalProperties: {type: string}
-          description: env vars excluding any sourced from secretKeyRef
+          description: >-
+            Non-secret env vars. Entries are omitted when their name is known
+            to come from secretKeyRef (from the stored template body) or when
+            their value matches a secret recorded for this instance. The whole
+            field may be absent when the instance's recorded secrets could not
+            be read — see warnings.
+        warnings:
+          type: array
+          items: {type: string}
+          description: >-
+            Human-readable non-fatal notices about this observation, e.g. a
+            readiness timeout or that env_summary was withheld because the
+            instance's secrets were unreadable.
 
     ApplyRequest:
       type: object

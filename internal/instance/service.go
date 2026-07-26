@@ -565,7 +565,93 @@ func (s *Service) Get(ctx context.Context, host, tmpl, slug string) (Observed, e
 			vols = append(vols, vv)
 		}
 	}
-	return Normalize(p, tmpl, slug, vols, secretEnvNames(t.Body)), nil
+	vals, specErr := s.instanceSecretValues(ctx, host, tmpl, slug)
+	obs := Normalize(p, tmpl, slug, vols, secretEnvNames(t.Body), vals)
+	if specErr != nil {
+		obs.EnvSummary = nil
+		obs.Warnings = append(obs.Warnings, envSummaryWithheldWarning(specErr))
+	}
+	return obs, nil
+}
+
+// envSummaryWithheldWarning is the Observed.Warnings entry used when an
+// instance's stored spec cannot be read. Without the spec we cannot know which
+// env values are secret, so env_summary is withheld rather than returned
+// possibly-unredacted (#198). The rest of the observation is unaffected.
+func envSummaryWithheldWarning(err error) string {
+	return fmt.Sprintf("env_summary withheld: instance secrets unreadable (%v)", err)
+}
+
+// instanceSecretValues loads one instance's known secret values for env_summary
+// redaction. A missing spec is NOT an error: the pod simply has no recorded
+// secrets (never applied by this core, or its spec was deleted while it ran),
+// and withholding env_summary for it would regress every such instance for no
+// security gain. A corrupt or undecryptable spec IS an error — the caller
+// withholds env_summary rather than risk returning secret material.
+func (s *Service) instanceSecretValues(ctx context.Context, host, tmpl, slug string) (map[string]bool, error) {
+	sp, err := s.store.GetSpec(ctx, host, tmpl, slug)
+	if errors.Is(err, store.ErrNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return secretValues(sp), nil
+}
+
+// specSecrets is one instance's redaction input for a host-wide sweep: either
+// its known secret values, or the error that made them unknowable.
+type specSecrets struct {
+	vals map[string]bool
+	err  error
+}
+
+// hostSecretValues loads the secret values of every stored instance on host in
+// one pass, so a list sweep does not issue a store read per pod inside its
+// worker fan-out. Instances absent from the returned map have no stored spec
+// and are redacted by name alone.
+//
+// A failure to enumerate the host's specs is returned as the second value, NOT
+// folded into the map: a map miss means "no stored spec" (name-pass only), so
+// returning an empty map on enumeration failure would silently revert the whole
+// host to name-only redaction. Callers apply the returned error to every
+// instance on the host instead, which fails closed.
+func (s *Service) hostSecretValues(ctx context.Context, host string) (map[store.SpecKey]specSecrets, error) {
+	keys, err := s.store.ListSpecKeys(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	out := map[store.SpecKey]specSecrets{}
+	for _, k := range keys {
+		sp, gerr := s.store.GetSpec(ctx, host, k.Template, k.Slug)
+		if errors.Is(gerr, store.ErrNotFound) {
+			// The spec was deleted between ListSpecKeys and this read. Match
+			// instanceSecretValues: no recorded spec is not an error, so skip
+			// the key and let it fall through to name-only redaction, rather
+			// than recording it as an unreadable-spec error.
+			continue
+		}
+		if gerr != nil {
+			out[k] = specSecrets{err: gerr}
+			continue
+		}
+		out[k] = specSecrets{vals: secretValues(sp)}
+	}
+	return out, nil
+}
+
+// applySecretRedaction finishes one observation: it withholds env_summary when
+// this instance's secrets were unreadable, or when the whole host sweep failed.
+func applySecretRedaction(obs Observed, ss specSecrets, sweepErr error) Observed {
+	err := sweepErr
+	if err == nil {
+		err = ss.err
+	}
+	if err != nil {
+		obs.EnvSummary = nil
+		obs.Warnings = append(obs.Warnings, envSummaryWithheldWarning(err))
+	}
+	return obs
 }
 
 // List returns all instances of a given template on a host.
@@ -579,10 +665,13 @@ func (s *Service) List(ctx context.Context, host, tmpl string) ([]Observed, erro
 		return nil, err
 	}
 	secretEnvs := secretEnvNames(t.Body)
+	vals, sweepErr := s.hostSecretValues(ctx, host)
 	out := make([]Observed, 0, len(pods))
 	for _, p := range pods {
 		slug := p.Labels["podman-api/slug"]
-		out = append(out, Normalize(p, tmpl, slug, nil, secretEnvs))
+		ss := vals[store.SpecKey{Template: tmpl, Slug: slug}]
+		obs := Normalize(p, tmpl, slug, nil, secretEnvs, ss.vals)
+		out = append(out, applySecretRedaction(obs, ss, sweepErr))
 	}
 	return out, nil
 }
@@ -645,6 +734,7 @@ func (s *Service) listAllInstancesLive(ctx context.Context, host string) ([]Obse
 	if err != nil {
 		return nil, fmt.Errorf("list templates: %w", err)
 	}
+	vals, sweepErr := s.hostSecretValues(ctx, host)
 
 	type result struct {
 		obs []Observed
@@ -670,7 +760,9 @@ func (s *Service) listAllInstancesLive(ctx context.Context, host string) ([]Obse
 			var part []Observed
 			for _, p := range pods {
 				slug := p.Labels["podman-api/slug"]
-				part = append(part, Normalize(p, tmplID, slug, nil, secretEnvs))
+				ss := vals[store.SpecKey{Template: tmplID, Slug: slug}]
+				obs := Normalize(p, tmplID, slug, nil, secretEnvs, ss.vals)
+				part = append(part, applySecretRedaction(obs, ss, sweepErr))
 			}
 			results[i] = result{obs: part}
 		}(i, t)
