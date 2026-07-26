@@ -165,6 +165,7 @@ func TestHandlers_RejectMalformedJSON(t *testing.T) {
 		{"apply", "PUT", "/hosts/h1/instances/app/hello"},
 		{"upgrade", "POST", "/hosts/h1/instances/app/hello/upgrade"},
 		{"upgrade-image", "POST", "/hosts/h1/instances/app/hello/upgrade-image"},
+		{"patch-parameters", "PATCH", "/hosts/h1/instances/app/hello/parameters"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

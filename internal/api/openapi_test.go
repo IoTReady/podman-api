@@ -46,6 +46,7 @@ func TestOpenAPI_ServedAndParseable(t *testing.T) {
 		"/hosts/{host}/instances/{template}/{slug}/start",
 		"/hosts/{host}/instances/{template}/{slug}/upgrade",
 		"/hosts/{host}/instances/{template}/{slug}/upgrade-image",
+		"/hosts/{host}/instances/{template}/{slug}/parameters",
 		"/hosts/{host}/instances/{template}/{slug}/logs",
 		"/hosts/{host}/bulk",
 		"/evacuate",

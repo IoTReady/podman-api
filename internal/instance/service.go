@@ -961,6 +961,99 @@ func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug st
 	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
 }
 
+// UpdateInstanceParameters overlays newParams onto the instance's stored render
+// parameters and re-applies (Replace=true), restarting the pod. Names absent
+// from newParams keep their existing value; a parameter cannot be deleted this
+// way (that still needs a full PUT). An empty newParams is rejected so a blank
+// submit does not pointlessly restart the instance. Returns ErrInstanceNotFound
+// when no spec is stored, or the store's error (incl. store.ErrSpecCorrupt or
+// store.ErrSecretsUndecryptable) when the spec cannot be read.
+//
+// The stored per-instance secrets are reused as-is and never need to be
+// supplied by the caller — they are write-only plaintext the operator cannot
+// read back, which is exactly why a parameter change had no API route before
+// (pro#74). Like UpgradeImage it sets AllowMissingSecrets, so a template that
+// gained a required per-instance secret after the instance was deployed does not
+// block a parameter change to that already-running instance (the missing secret
+// was already missing; the update never worsens the pod).
+//
+// slug is NOT settable through newParams: if the stored spec already has a
+// "slug" entry, it is pinned back to the canonical slug after the overlay
+// below, the same way migrate.go and rename.go pin it before re-applying.
+// Without this, a caller-supplied "slug" parameter (a declared template
+// parameter, so it passes render.Validate) would render a manifest for a
+// *different* pod while this method still holds and reports success under the
+// original slug's lock — the wrong pod gets replaced (destructively, if it
+// already exists) and the persisted spec for the original slug ends up
+// describing a pod no later Start/Stop/Delete can find. The HTTP handler also
+// rejects a "slug" key up front (defence in depth); this pin makes the method
+// itself safe for any caller.
+//
+// The pin is conditional (only fires when "slug" is already a key in merged)
+// because nothing requires a template to declare "slug" as a parameter at all
+// — a singleton template can hardcode metadata.name and never mention it. On
+// such a template an unconditional write would inject an undeclared "slug"
+// key and render.Validate would reject every PATCH with
+// `unknown parameter "slug"`. A caller trying to *introduce* slug on a
+// template that doesn't declare it is still rejected by render.Validate, which
+// is the correct outcome — the safety property above is unaffected.
+//
+// applyLocked discards the stored spec's InjectorSecrets and rebuilds the list
+// by re-running the sidecar injector, then persists the fresh list — injector-
+// declared secrets are re-derived on this path, not preserved, unlike the boot-
+// converge path in spec_reconcile.go.
+//
+// Replace: true means podman tears the pod down before creating the new one,
+// and the spec is only persisted after a successful play; a parameter change
+// that renders a manifest podman refuses to play returns an error with the pod
+// gone and the stored spec still describing the pre-update state — recovery is
+// boot converge or a manual re-apply.
+//
+// The load (GetSpec) and re-apply (applyLocked) happen atomically under the
+// per-instance lock: the overlay is a read-modify-write of the stored
+// parameters, so holding the lock across both halves keeps a concurrent
+// rotation/upgrade of the same instance from reading the pre-commit spec and
+// dropping this update. It takes only the instance lock (no host lock): the
+// update re-applies the instance's own already-persisted domains unchanged,
+// which validateIngress excludes from its uniqueness check, so it can never
+// create a new cross-instance domain claim and needs no per-host lock. Domains
+// are not derivable from parameters — they come from ApplyRequest.Domains, which
+// this method does not accept. (If a future edit let this method *change*
+// domains, the missing host lock would become a real bug — the no-hostLock
+// safety rests on domains being unchanged.) (#114)
+func (s *Service) UpdateInstanceParameters(ctx context.Context, host, tmpl, slug string, newParams map[string]any) error {
+	if len(newParams) == 0 {
+		return errors.New("no parameters to update")
+	}
+	lock := s.instanceLock(host, tmpl, slug)
+	lock.Lock()
+	defer lock.Unlock()
+	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrInstanceNotFound
+		}
+		return fmt.Errorf("load spec: %w", err)
+	}
+	merged := maps.Clone(spec.Parameters)
+	if merged == nil {
+		merged = map[string]any{}
+	}
+	for k, v := range newParams {
+		merged[k] = v
+	}
+	if _, ok := merged["slug"]; ok {
+		merged["slug"] = slug // canonical slug always wins; pod name must match podName()
+	}
+	return s.applyLocked(ctx, host, ApplyRequest{
+		Template:   tmpl,
+		Slug:       slug,
+		Parameters: merged,
+		Secrets:    maps.Clone(spec.Secrets),
+		Domains:    spec.Domains,
+	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
+}
+
 // StoredSpec returns the persisted spec (parameters, secrets, domains) for an
 // existing instance, so the UI edit form can pre-populate parameters and merge
 // secrets before re-applying. The caller must NOT render or log the returned

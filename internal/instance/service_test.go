@@ -74,6 +74,9 @@ spec:
   containers:
     - name: db
       image: {{.image}}
+      env:
+        - name: POSTGRES_DB
+          value: {{.db}}
 `,
 		Origin: "seed",
 	}
@@ -896,4 +899,177 @@ func TestService_List_SweepFailure_WithholdsEnvSummaryForEveryInstance(t *testin
 		require.Len(t, obs.Warnings, 1)
 		assert.Contains(t, obs.Warnings[0], "env_summary withheld")
 	}
+}
+
+// The core of pro#74: a parameter change must not require the caller to supply
+// the instance's sealed secrets, which are write-only and unrecoverable.
+func TestService_UpdateInstanceParameters_OverlaysAndKeepsSecrets(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	// No secrets supplied — only the one parameter being changed.
+	require.NoError(t, svc.UpdateInstanceParameters(ctx, "h1", "postgres", "demo",
+		map[string]any{"db": "newdb"}))
+
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, "newdb", sp.Parameters["db"], "the changed parameter is persisted")
+	assert.Equal(t, "app", sp.Parameters["user"], "untouched parameters keep their stored value")
+	assert.Equal(t, "docker.io/library/postgres:16", sp.Parameters["image"])
+	assert.Equal(t, "p", sp.Secrets["password"], "sealed secrets survive untouched")
+
+	require.NotEmpty(t, f.PlayCalls, "the instance is re-applied")
+	assert.Contains(t, f.PlayCalls[len(f.PlayCalls)-1].YAML, "newdb",
+		"the changed parameter reaches the played manifest")
+}
+
+// Domains are re-applied verbatim from the stored spec. This is what makes the
+// missing host lock safe, so it is asserted rather than assumed.
+func TestService_UpdateInstanceParameters_PreservesDomains(t *testing.T) {
+	svc, _, mem := newSvcMem(t)
+	ctx := context.Background()
+	req := pgApply("demo")
+	require.NoError(t, svc.Apply(ctx, "h1", req, ApplyOptions{Replace: true}))
+
+	before, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+
+	require.NoError(t, svc.UpdateInstanceParameters(ctx, "h1", "postgres", "demo",
+		map[string]any{"db": "newdb"}))
+
+	after, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, before.Domains, after.Domains, "domains must pass through unchanged")
+}
+
+// An unknown parameter is rejected by template validation before any host
+// mutation, so nothing is played and the stored spec is untouched.
+func TestService_UpdateInstanceParameters_UnknownParameterRejected(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	playsBefore := len(f.PlayCalls)
+
+	err := svc.UpdateInstanceParameters(ctx, "h1", "postgres", "demo",
+		map[string]any{"not_a_real_parameter": "x"})
+	require.Error(t, err)
+
+	assert.Len(t, f.PlayCalls, playsBefore, "a rejected update must not replay the pod")
+	sp, gerr := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, gerr)
+	assert.NotContains(t, sp.Parameters, "not_a_real_parameter",
+		"a rejected update must not persist the bad parameter")
+	assert.Equal(t, "app", sp.Parameters["db"], "the original value survives a rejected update")
+}
+
+// An empty map is rejected: a blank submit must not restart a pod for nothing.
+func TestService_UpdateInstanceParameters_EmptyRejected(t *testing.T) {
+	svc, f, _ := newSvcMem(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	playsBefore := len(f.PlayCalls)
+
+	require.Error(t, svc.UpdateInstanceParameters(ctx, "h1", "postgres", "demo", map[string]any{}))
+	require.Error(t, svc.UpdateInstanceParameters(ctx, "h1", "postgres", "demo", nil))
+	assert.Len(t, f.PlayCalls, playsBefore, "an empty update must not touch the host")
+}
+
+// pro#74 fix 1 (service layer): "slug" is a declared parameter on postgres.yaml
+// (and in this test template), so it passes render.Validate — the overlay's
+// canonical-slug pin is the only thing stopping it from renaming the pod out
+// from under the lock this method holds. A caller other than the HTTP handler
+// (which rejects "slug" earlier) must still be safe.
+func TestService_UpdateInstanceParameters_SlugParameterIgnored(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	playsBefore := len(f.PlayCalls)
+
+	require.NoError(t, svc.UpdateInstanceParameters(ctx, "h1", "postgres", "demo",
+		map[string]any{"slug": "other", "db": "newdb"}))
+
+	require.Len(t, f.PlayCalls, playsBefore+1)
+	last := f.PlayCalls[len(f.PlayCalls)-1]
+	assert.Contains(t, last.YAML, "name: postgres-demo",
+		"the played manifest must still name the original pod, not \"other\"")
+	assert.NotContains(t, last.YAML, "postgres-other")
+
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, "demo", sp.Parameters["slug"], "the stored spec's slug must be unchanged")
+	assert.Equal(t, "newdb", sp.Parameters["db"], "the legitimate parameter change still applies")
+
+	// And no spec was ever created under the injected slug.
+	_, err = mem.GetSpec(ctx, "h1", "postgres", "other")
+	assert.ErrorIs(t, err, store.ErrNotFound)
+}
+
+// singletonTemplate is a fixture that does NOT declare "slug" as a parameter —
+// legal per ParseMeta/validateMeta, which never require it — and hardcodes
+// metadata.name rather than templating it from {{.slug}}. Regression fixture
+// for pro#74 fix 2: the canonical-slug pin in UpdateInstanceParameters must not
+// unconditionally inject "slug" into merged, or render.Validate rejects it as
+// an unknown parameter on a template shaped like this one.
+func singletonTemplate() store.Template {
+	return store.Template{
+		Meta: render.Meta{
+			ID:         "singleton",
+			Parameters: requiredParams("image", "greeting"),
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: singleton-app
+spec:
+  containers:
+    - name: app
+      image: {{.image}}
+      env:
+        - name: GREETING
+          value: {{.greeting}}
+`,
+		Origin: "seed",
+	}
+}
+
+// pro#74 fix 2 (regression): a template that never declares "slug" as a
+// parameter is legal (ParseMeta/validateMeta never require it), and a
+// singleton template with a hardcoded metadata.name is a realistic shape for
+// that. The overlay's canonical-slug pin must not unconditionally inject
+// "slug" into the merged parameters on such a template, or every PATCH fails
+// with "unknown parameter \"slug\"" via render.Validate — a regression versus
+// UpgradeImage, which injects no such key.
+func TestService_UpdateInstanceParameters_SlugNotDeclared(t *testing.T) {
+	f := fake.New()
+	svc, mem := newSvcWith(t, f, []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}, singletonTemplate())
+	ctx := context.Background()
+
+	require.NoError(t, svc.Apply(ctx, "h1", ApplyRequest{
+		Template: "singleton",
+		Slug:     "only",
+		Parameters: map[string]any{
+			"image": "docker.io/library/app:1", "greeting": "hi",
+		},
+	}, ApplyOptions{Replace: true}))
+	playsBefore := len(f.PlayCalls)
+
+	require.NoError(t, svc.UpdateInstanceParameters(ctx, "h1", "singleton", "only",
+		map[string]any{"greeting": "bonjour"}))
+
+	assert.Len(t, f.PlayCalls, playsBefore+1)
+	last := f.PlayCalls[len(f.PlayCalls)-1]
+	assert.Contains(t, last.YAML, "bonjour")
+
+	sp, err := mem.GetSpec(ctx, "h1", "singleton", "only")
+	require.NoError(t, err)
+	assert.Equal(t, "bonjour", sp.Parameters["greeting"], "the changed parameter is persisted")
+	assert.NotContains(t, sp.Parameters, "slug", "slug must not be injected into a template that never declared it")
+}
+
+func TestService_UpdateInstanceParameters_UnknownInstance(t *testing.T) {
+	svc, _, _ := newSvcMem(t)
+	err := svc.UpdateInstanceParameters(context.Background(), "h1", "postgres", "nope",
+		map[string]any{"db": "x"})
+	assert.ErrorIs(t, err, ErrInstanceNotFound)
 }

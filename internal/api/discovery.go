@@ -41,6 +41,13 @@ Content-Type: application/json
 
 {"parameters": {"image": "registry.example.com/app:v1.2", "port": 8080}}
 
+### Change parameters without re-supplying secrets
+PATCH /hosts/{host}/instances/{template}/{slug}/parameters
+{"parameters": {"port": 8081}}
+Omitted parameter names keep their stored value; a parameter cannot be
+deleted this way. "slug" is rejected — use
+POST /hosts/{host}/instances/{template}/{slug}/rename instead.
+
 ### List all instances on a host
 GET /hosts/{host}/instances
 

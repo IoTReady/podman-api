@@ -356,6 +356,15 @@ components:
       properties:
         image: {type: string}
 
+    UpdateParametersRequest:
+      type: object
+      required: [parameters]
+      properties:
+        parameters:
+          type: object
+          additionalProperties: true
+          minProperties: 1
+
     MigrateRequest:
       type: object
       required: [from_host, to_host, template, slug]
@@ -1011,6 +1020,40 @@ paths:
       responses:
         '200':
           description: upgraded
+          content: {application/json: {schema: {$ref: '#/components/schemas/Observed'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '502': {$ref: '#/components/responses/UpstreamError'}
+      x-required-scope: instances:write
+
+  /hosts/{host}/instances/{template}/{slug}/parameters:
+    patch:
+      tags: [lifecycle]
+      summary: change render parameters, reusing the instance's sealed secrets
+      description: >-
+        Overlays the supplied parameters onto the instance's stored spec and
+        re-applies with replace, reusing the sealed per-instance secrets and the
+        persisted domains unchanged. Parameter names absent from the request keep
+        their stored value; a parameter cannot be deleted through this route (use
+        PUT, which requires every secret). Requires no secrets in the request —
+        the sealed values are unrecoverable plaintext an operator cannot read back,
+        so before this route a parameter change on such an instance was impossible.
+        A per-instance secret the template added after deploy does not block the
+        update (the missing secret was already missing). `slug` cannot be changed
+        through this route (400 invalid_body); use the rename route instead. This
+        route replaces the pod, so a parameter change that renders a manifest
+        podman refuses can leave the instance down until a boot converge or a
+        manual re-apply.
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateID'}
+        - {$ref: '#/components/parameters/Slug'}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/UpdateParametersRequest'}}}
+      responses:
+        '200':
+          description: updated
           content: {application/json: {schema: {$ref: '#/components/schemas/Observed'}}}
         '400': {$ref: '#/components/responses/BadRequest'}
         '404': {$ref: '#/components/responses/NotFound'}

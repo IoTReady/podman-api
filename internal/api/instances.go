@@ -273,6 +273,52 @@ func (h *handlers) upgradeImageInstance(w http.ResponseWriter, r *http.Request) 
 	WriteJSON(w, http.StatusOK, obs)
 }
 
+// patchInstanceParameters overlays the request's parameters onto the instance's
+// stored spec and re-applies. Unlike PUT it requires no secrets: the sealed
+// per-instance secrets are reused from the store, which is what makes a
+// parameter change possible at all on an instance whose secret plaintext the
+// operator can no longer read (pro#74). Omitted parameter names keep their
+// stored value; a parameter cannot be deleted through this route. A "slug" key
+// is rejected outright — slug drives metadata.name/secretKeyRef/claimName in
+// the rendered manifest, so silently accepting a change would replay it against
+// a different pod than the one this route's path (and lock) name; use POST
+// .../rename instead. Because this route replaces the pod, a rejected manifest
+// can leave the instance down until a boot converge or manual re-apply — see
+// Service.UpdateInstanceParameters.
+func (h *handlers) patchInstanceParameters(w http.ResponseWriter, r *http.Request) {
+	host := r.PathValue("host")
+	tmpl := r.PathValue("template")
+	slug := r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
+	var body struct {
+		Parameters map[string]any `json:"parameters"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+		return
+	}
+	if len(body.Parameters) == 0 {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "parameters is required and must not be empty"})
+		return
+	}
+	if _, ok := body.Parameters["slug"]; ok {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "slug cannot be changed through this route; use POST .../rename"})
+		return
+	}
+	if err := h.svc.UpdateInstanceParameters(r.Context(), host, tmpl, slug, body.Parameters); err != nil {
+		WriteError(w, err)
+		return
+	}
+	obs, err := h.svc.Get(r.Context(), host, tmpl, slug)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, obs)
+}
+
 func (h *handlers) renameInstance(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	tmpl := r.PathValue("template")
