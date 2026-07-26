@@ -1005,6 +1005,68 @@ func TestService_UpdateInstanceParameters_SlugParameterIgnored(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrNotFound)
 }
 
+// singletonTemplate is a fixture that does NOT declare "slug" as a parameter —
+// legal per ParseMeta/validateMeta, which never require it — and hardcodes
+// metadata.name rather than templating it from {{.slug}}. Regression fixture
+// for pro#74 fix 2: the canonical-slug pin in UpdateInstanceParameters must not
+// unconditionally inject "slug" into merged, or render.Validate rejects it as
+// an unknown parameter on a template shaped like this one.
+func singletonTemplate() store.Template {
+	return store.Template{
+		Meta: render.Meta{
+			ID:         "singleton",
+			Parameters: requiredParams("image", "greeting"),
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: singleton-app
+spec:
+  containers:
+    - name: app
+      image: {{.image}}
+      env:
+        - name: GREETING
+          value: {{.greeting}}
+`,
+		Origin: "seed",
+	}
+}
+
+// pro#74 fix 2 (regression): a template that never declares "slug" as a
+// parameter is legal (ParseMeta/validateMeta never require it), and a
+// singleton template with a hardcoded metadata.name is a realistic shape for
+// that. The overlay's canonical-slug pin must not unconditionally inject
+// "slug" into the merged parameters on such a template, or every PATCH fails
+// with "unknown parameter \"slug\"" via render.Validate — a regression versus
+// UpgradeImage, which injects no such key.
+func TestService_UpdateInstanceParameters_SlugNotDeclared(t *testing.T) {
+	f := fake.New()
+	svc, mem := newSvcWith(t, f, []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}, singletonTemplate())
+	ctx := context.Background()
+
+	require.NoError(t, svc.Apply(ctx, "h1", ApplyRequest{
+		Template: "singleton",
+		Slug:     "only",
+		Parameters: map[string]any{
+			"image": "docker.io/library/app:1", "greeting": "hi",
+		},
+	}, ApplyOptions{Replace: true}))
+	playsBefore := len(f.PlayCalls)
+
+	require.NoError(t, svc.UpdateInstanceParameters(ctx, "h1", "singleton", "only",
+		map[string]any{"greeting": "bonjour"}))
+
+	assert.Len(t, f.PlayCalls, playsBefore+1)
+	last := f.PlayCalls[len(f.PlayCalls)-1]
+	assert.Contains(t, last.YAML, "bonjour")
+
+	sp, err := mem.GetSpec(ctx, "h1", "singleton", "only")
+	require.NoError(t, err)
+	assert.Equal(t, "bonjour", sp.Parameters["greeting"], "the changed parameter is persisted")
+	assert.NotContains(t, sp.Parameters, "slug", "slug must not be injected into a template that never declared it")
+}
+
 func TestService_UpdateInstanceParameters_UnknownInstance(t *testing.T) {
 	svc, _, _ := newSvcMem(t)
 	err := svc.UpdateInstanceParameters(context.Background(), "h1", "postgres", "nope",

@@ -26,6 +26,15 @@ func TestPatchParameters_ReusesSealedSecret(t *testing.T) {
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
+	// f.SecretData is an append/overwrite-only log of every SecretCreate call —
+	// SecretRemove (unlike the real backend) never prunes it, so the setup PUT's
+	// write above would still be sitting there even if the PATCH dropped the
+	// secret entirely. Clear it immediately before the PATCH so the assertion
+	// below can only pass if UpdateInstanceParameters actually re-creates the
+	// secret from the stored spec.
+	secretName := "app-cfg-auth_secret"
+	delete(f.SecretData["h1"], secretName)
+
 	resp = postJSON(t, srv, tok, "PATCH", "/hosts/h1/instances/app/cfg/parameters",
 		`{"parameters":{"image":"i:2"}}`)
 	defer resp.Body.Close()
@@ -42,9 +51,8 @@ func TestPatchParameters_ReusesSealedSecret(t *testing.T) {
 	// The sealed secret must survive the re-apply with its original value: the
 	// PATCH request carried no secrets at all, so this is only possible if
 	// UpdateInstanceParameters reused spec.Secrets from the store.
-	secretName := "app-cfg-auth_secret"
 	raw, ok := f.SecretData["h1"][secretName]
-	require.True(t, ok, "sealed secret %q must still be present on the host after PATCH", secretName)
+	require.True(t, ok, "sealed secret %q must be re-created on the host by the PATCH", secretName)
 	assert.Contains(t, string(raw), base64.StdEncoding.EncodeToString([]byte("s")),
 		"sealed secret value must be unchanged")
 }

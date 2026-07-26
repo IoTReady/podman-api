@@ -977,16 +977,26 @@ func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug st
 // block a parameter change to that already-running instance (the missing secret
 // was already missing; the update never worsens the pod).
 //
-// slug is NOT settable through newParams: it is pinned to the canonical slug
-// after the overlay below, the same way migrate.go and rename.go pin it before
-// re-applying. Without this, a caller-supplied "slug" parameter (a declared
-// template parameter, so it passes render.Validate) would render a manifest for
-// a *different* pod while this method still holds and reports success under the
+// slug is NOT settable through newParams: if the stored spec already has a
+// "slug" entry, it is pinned back to the canonical slug after the overlay
+// below, the same way migrate.go and rename.go pin it before re-applying.
+// Without this, a caller-supplied "slug" parameter (a declared template
+// parameter, so it passes render.Validate) would render a manifest for a
+// *different* pod while this method still holds and reports success under the
 // original slug's lock — the wrong pod gets replaced (destructively, if it
 // already exists) and the persisted spec for the original slug ends up
 // describing a pod no later Start/Stop/Delete can find. The HTTP handler also
 // rejects a "slug" key up front (defence in depth); this pin makes the method
 // itself safe for any caller.
+//
+// The pin is conditional (only fires when "slug" is already a key in merged)
+// because nothing requires a template to declare "slug" as a parameter at all
+// — a singleton template can hardcode metadata.name and never mention it. On
+// such a template an unconditional write would inject an undeclared "slug"
+// key and render.Validate would reject every PATCH with
+// `unknown parameter "slug"`. A caller trying to *introduce* slug on a
+// template that doesn't declare it is still rejected by render.Validate, which
+// is the correct outcome — the safety property above is unaffected.
 //
 // applyLocked discards the stored spec's InjectorSecrets and rebuilds the list
 // by re-running the sidecar injector, then persists the fresh list — injector-
@@ -1032,7 +1042,9 @@ func (s *Service) UpdateInstanceParameters(ctx context.Context, host, tmpl, slug
 	for k, v := range newParams {
 		merged[k] = v
 	}
-	merged["slug"] = slug // canonical slug always wins; pod name must match podName()
+	if _, ok := merged["slug"]; ok {
+		merged["slug"] = slug // canonical slug always wins; pod name must match podName()
+	}
 	return s.applyLocked(ctx, host, ApplyRequest{
 		Template:   tmpl,
 		Slug:       slug,
