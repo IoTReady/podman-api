@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/render"
 )
 
 // Observed is the JSON shape returned for an instance.
@@ -16,7 +17,13 @@ type Observed struct {
 	Containers []ObservedContainer `json:"containers"`
 	Volumes    []ObservedVolume    `json:"volumes,omitempty"`
 	EnvSummary map[string]string   `json:"env_summary,omitempty"`
-	Warnings   []string            `json:"warnings,omitempty"`
+	// Parameters is the instance's stored render parameters, as last applied
+	// (#200). Only the single-instance Get path populates it; list sweeps leave
+	// it nil so a host listing stays cheap and small. Absent (not null) when the
+	// instance has no stored spec, or when that spec is unreadable. Never
+	// carries secret material — see PublicParameters.
+	Parameters map[string]any `json:"parameters,omitempty"`
+	Warnings   []string       `json:"warnings,omitempty"`
 }
 
 type ObservedPod struct {
@@ -106,6 +113,48 @@ func Normalize(p podman.Pod, template, slug string, vols []podman.Volume, secret
 	}
 	if len(out.EnvSummary) == 0 {
 		out.EnvSummary = nil
+	}
+	return out
+}
+
+// PublicParameters returns an instance's stored render parameters with anything
+// that could carry secret material removed, for Observed.Parameters (#200).
+//
+// Secrets are stored in Spec.Secrets (encrypted at rest) and reach the pod via
+// secretKeyRef, so parameters are non-secret by construction — but a
+// user-authored template may declare a parameter with `secret: true`, and its
+// value lands in the plaintext parameters column like any other. So the same
+// two-pass redaction env_summary uses applies here:
+//
+//   - by NAME: parameters whose ParamDef sets Secret are dropped.
+//   - by VALUE: string parameters whose value equals one of this instance's
+//     known secret values are dropped, catching a secret that was passed as a
+//     parameter without being declared one. An empty string never matches.
+//
+// A dropped parameter is omitted entirely; there is no redaction marker.
+// Returns nil (so the field is absent, not null) when nothing survives.
+func PublicParameters(m render.Meta, params map[string]any, secretVals map[string]bool) map[string]any {
+	if len(params) == 0 {
+		return nil
+	}
+	secretNames := make(map[string]bool, len(m.Parameters))
+	for _, p := range m.Parameters {
+		if p.Secret {
+			secretNames[p.Name] = true
+		}
+	}
+	out := make(map[string]any, len(params))
+	for k, v := range params {
+		if secretNames[k] {
+			continue
+		}
+		if s, ok := v.(string); ok && s != "" && secretVals[s] {
+			continue
+		}
+		out[k] = v
+	}
+	if len(out) == 0 {
+		return nil
 	}
 	return out
 }
