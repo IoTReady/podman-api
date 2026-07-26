@@ -41,6 +41,8 @@ type Memory struct {
 
 	PutErr    error
 	DeleteErr error
+
+	getSpecErr error
 }
 
 // NewMemory returns an empty in-memory store.
@@ -71,11 +73,21 @@ func (m *Memory) PutSpec(_ context.Context, s Spec) error {
 func (m *Memory) GetSpec(_ context.Context, host, template, slug string) (Spec, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.getSpecErr != nil {
+		return Spec{}, m.getSpecErr
+	}
 	s, ok := m.specs[memKey(host, template, slug)]
 	if !ok {
 		return Spec{}, ErrNotFound
 	}
 	return s, nil
+}
+
+// FailGetSpec makes every subsequent GetSpec return err. Test-only.
+func (m *Memory) FailGetSpec(err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.getSpecErr = err
 }
 
 func (m *Memory) DeleteSpec(_ context.Context, host, template, slug string) error {

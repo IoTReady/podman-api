@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/iotready/podman-api/extension"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/podman/fake"
@@ -673,4 +674,142 @@ func TestStart_WarningOnUnhealthy(t *testing.T) {
 	assert.False(t, obs.Ready)
 	require.Len(t, obs.Warnings, 1)
 	assert.Contains(t, obs.Warnings[0], "readiness timeout")
+}
+
+// #198 regression: a SidecarInjector adds a container whose env comes from a
+// secretKeyRef the stored template body never declared. The name pass cannot
+// see it; the value pass must.
+func TestService_Get_RedactsInjectorAddedSecretEnv(t *testing.T) {
+	svc, f, _ := newSvcMem(t)
+	ctx := context.Background()
+
+	const psk = "s3cr3t-psk-value"
+	svc.SetSidecarInjector(&recordingInjector{
+		out: `apiVersion: v1
+kind: Pod
+metadata:
+  name: postgres-demo
+spec:
+  containers:
+    - name: db
+      image: docker.io/library/postgres:16
+    - name: vpn
+      image: docker.io/strongswan/strongswan:6.0.5
+      env:
+        - name: VPN_PSK
+          valueFrom:
+            secretKeyRef:
+              name: postgres-demo-vpn-psk
+              key: postgres-demo-vpn-psk
+`,
+		secrets: []extension.InjectedSecret{
+			{Name: "vpn-psk", Key: "postgres-demo-vpn-psk", Value: psk},
+		},
+	})
+
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	// The fake podman client does not resolve secretKeyRef into container env,
+	// so stand in for what a real host would report back.
+	f.AddPod("h1", podman.Pod{
+		Name:   "postgres-demo",
+		Status: "Running",
+		Labels: map[string]string{"podman-api/template": "postgres", "podman-api/slug": "demo"},
+		Containers: []podman.Container{
+			{Name: "db", Status: "Running", Env: map[string]string{"POSTGRES_DB": "app"}},
+			{Name: "vpn", Status: "Running", Env: map[string]string{"VPN_PSK": psk, "VPN_ENDPOINT": "vpn.example.com"}},
+		},
+	})
+
+	obs, err := svc.Get(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+
+	for k, v := range obs.EnvSummary {
+		assert.NotEqual(t, psk, v, "env_summary[%s] leaked the injected secret", k)
+	}
+	assert.Equal(t, "app", obs.EnvSummary["POSTGRES_DB"], "non-secret env still reported")
+	assert.Equal(t, "vpn.example.com", obs.EnvSummary["VPN_ENDPOINT"], "non-secret sidecar env still reported")
+	assert.Empty(t, obs.Warnings, "a readable spec produces no warning")
+}
+
+// An unreadable spec means the secret values are unknowable, so env_summary is
+// withheld entirely and the instance carries a warning — it must not leak, and
+// it must not fail the request.
+func TestService_Get_UnreadableSpec_WithholdsEnvSummary(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	f.AddPod("h1", podman.Pod{
+		Name:   "postgres-demo",
+		Status: "Running",
+		Labels: map[string]string{"podman-api/template": "postgres", "podman-api/slug": "demo"},
+		Containers: []podman.Container{
+			{Name: "db", Status: "Running", Env: map[string]string{"POSTGRES_DB": "app"}},
+		},
+	})
+	mem.FailGetSpec(store.ErrSecretsUndecryptable)
+
+	obs, err := svc.Get(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err, "an unreadable spec must not fail the request")
+	assert.Nil(t, obs.EnvSummary, "env_summary is withheld when secrets are unreadable")
+	require.Len(t, obs.Warnings, 1)
+	assert.Contains(t, obs.Warnings[0], "env_summary withheld")
+	assert.Equal(t, "Running", obs.Pod.Status, "the rest of the observation survives")
+	require.Len(t, obs.Containers, 1)
+}
+
+// A pod with no stored spec has no RECORDED secrets, not unreadable ones. It
+// keeps its env_summary (name-pass redaction only) rather than being withheld.
+func TestService_Get_NoStoredSpec_KeepsEnvSummary(t *testing.T) {
+	svc, f, _ := newSvcMem(t)
+	ctx := context.Background()
+
+	f.AddPod("h1", podman.Pod{
+		Name:   "postgres-orphan",
+		Status: "Running",
+		Labels: map[string]string{"podman-api/template": "postgres", "podman-api/slug": "orphan"},
+		Containers: []podman.Container{
+			{Name: "db", Status: "Running", Env: map[string]string{"POSTGRES_DB": "app"}},
+		},
+	})
+
+	obs, err := svc.Get(ctx, "h1", "postgres", "orphan")
+	require.NoError(t, err)
+	assert.Equal(t, "app", obs.EnvSummary["POSTGRES_DB"])
+	assert.Empty(t, obs.Warnings)
+}
+
+// The list path must redact by value as well — it is the endpoint the UI and
+// the inventory poller read most often.
+func TestService_List_RedactsInjectorAddedSecretEnv(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+
+	const psk = "list-path-psk"
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	sp.InjectorSecrets = append(sp.InjectorSecrets, store.InjectorSecret{
+		Name: "vpn-psk", Key: "postgres-demo-vpn-psk", Value: psk,
+	})
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	f.AddPod("h1", podman.Pod{
+		Name:   "postgres-demo",
+		Status: "Running",
+		Labels: map[string]string{"podman-api/template": "postgres", "podman-api/slug": "demo"},
+		Containers: []podman.Container{
+			{Name: "vpn", Status: "Running", Env: map[string]string{"VPN_PSK": psk, "VPN_ENDPOINT": "vpn.example.com"}},
+		},
+	})
+
+	list, err := svc.List(ctx, "h1", "postgres")
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	for k, v := range list[0].EnvSummary {
+		assert.NotEqual(t, psk, v, "env_summary[%s] leaked the injected secret on the list path", k)
+	}
+	assert.Equal(t, "vpn.example.com", list[0].EnvSummary["VPN_ENDPOINT"])
 }
