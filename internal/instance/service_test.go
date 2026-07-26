@@ -74,6 +74,9 @@ spec:
   containers:
     - name: db
       image: {{.image}}
+      env:
+        - name: POSTGRES_DB
+          value: {{.db}}
 `,
 		Origin: "seed",
 	}
@@ -896,4 +899,85 @@ func TestService_List_SweepFailure_WithholdsEnvSummaryForEveryInstance(t *testin
 		require.Len(t, obs.Warnings, 1)
 		assert.Contains(t, obs.Warnings[0], "env_summary withheld")
 	}
+}
+
+// The core of pro#74: a parameter change must not require the caller to supply
+// the instance's sealed secrets, which are write-only and unrecoverable.
+func TestService_UpdateInstanceParameters_OverlaysAndKeepsSecrets(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	// No secrets supplied — only the one parameter being changed.
+	require.NoError(t, svc.UpdateInstanceParameters(ctx, "h1", "postgres", "demo",
+		map[string]any{"db": "newdb"}))
+
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, "newdb", sp.Parameters["db"], "the changed parameter is persisted")
+	assert.Equal(t, "app", sp.Parameters["user"], "untouched parameters keep their stored value")
+	assert.Equal(t, "docker.io/library/postgres:16", sp.Parameters["image"])
+	assert.Equal(t, "p", sp.Secrets["password"], "sealed secrets survive untouched")
+
+	require.NotEmpty(t, f.PlayCalls, "the instance is re-applied")
+	assert.Contains(t, f.PlayCalls[len(f.PlayCalls)-1].YAML, "newdb",
+		"the changed parameter reaches the played manifest")
+}
+
+// Domains are re-applied verbatim from the stored spec. This is what makes the
+// missing host lock safe, so it is asserted rather than assumed.
+func TestService_UpdateInstanceParameters_PreservesDomains(t *testing.T) {
+	svc, _, mem := newSvcMem(t)
+	ctx := context.Background()
+	req := pgApply("demo")
+	require.NoError(t, svc.Apply(ctx, "h1", req, ApplyOptions{Replace: true}))
+
+	before, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+
+	require.NoError(t, svc.UpdateInstanceParameters(ctx, "h1", "postgres", "demo",
+		map[string]any{"db": "newdb"}))
+
+	after, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, before.Domains, after.Domains, "domains must pass through unchanged")
+}
+
+// An unknown parameter is rejected by template validation before any host
+// mutation, so nothing is played and the stored spec is untouched.
+func TestService_UpdateInstanceParameters_UnknownParameterRejected(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	playsBefore := len(f.PlayCalls)
+
+	err := svc.UpdateInstanceParameters(ctx, "h1", "postgres", "demo",
+		map[string]any{"not_a_real_parameter": "x"})
+	require.Error(t, err)
+
+	assert.Len(t, f.PlayCalls, playsBefore, "a rejected update must not replay the pod")
+	sp, gerr := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, gerr)
+	assert.NotContains(t, sp.Parameters, "not_a_real_parameter",
+		"a rejected update must not persist the bad parameter")
+	assert.Equal(t, "app", sp.Parameters["db"], "the original value survives a rejected update")
+}
+
+// An empty map is rejected: a blank submit must not restart a pod for nothing.
+func TestService_UpdateInstanceParameters_EmptyRejected(t *testing.T) {
+	svc, f, _ := newSvcMem(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	playsBefore := len(f.PlayCalls)
+
+	require.Error(t, svc.UpdateInstanceParameters(ctx, "h1", "postgres", "demo", map[string]any{}))
+	require.Error(t, svc.UpdateInstanceParameters(ctx, "h1", "postgres", "demo", nil))
+	assert.Len(t, f.PlayCalls, playsBefore, "an empty update must not touch the host")
+}
+
+func TestService_UpdateInstanceParameters_UnknownInstance(t *testing.T) {
+	svc, _, _ := newSvcMem(t)
+	err := svc.UpdateInstanceParameters(context.Background(), "h1", "postgres", "nope",
+		map[string]any{"db": "x"})
+	assert.ErrorIs(t, err, ErrInstanceNotFound)
 }

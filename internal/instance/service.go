@@ -961,6 +961,64 @@ func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug st
 	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
 }
 
+// UpdateInstanceParameters overlays newParams onto the instance's stored render
+// parameters and re-applies (Replace=true), restarting the pod. Names absent
+// from newParams keep their existing value; a parameter cannot be deleted this
+// way (that still needs a full PUT). An empty newParams is rejected so a blank
+// submit does not pointlessly restart the instance. Returns ErrInstanceNotFound
+// when no spec is stored, or the store's error (incl. store.ErrSpecCorrupt or
+// store.ErrSecretsUndecryptable) when the spec cannot be read.
+//
+// The stored per-instance secrets are reused as-is and never need to be
+// supplied by the caller — they are write-only plaintext the operator cannot
+// read back, which is exactly why a parameter change had no API route before
+// (pro#74). Like UpgradeImage it sets AllowMissingSecrets, so a template that
+// gained a required per-instance secret after the instance was deployed does not
+// block a parameter change to that already-running instance (the missing secret
+// was already missing; the update never worsens the pod).
+//
+// The load (GetSpec) and re-apply (applyLocked) happen atomically under the
+// per-instance lock: the overlay is a read-modify-write of the stored
+// parameters, so holding the lock across both halves keeps a concurrent
+// rotation/upgrade of the same instance from reading the pre-commit spec and
+// dropping this update. It takes only the instance lock (no host lock): the
+// update re-applies the instance's own already-persisted domains unchanged,
+// which validateIngress excludes from its uniqueness check, so it can never
+// create a new cross-instance domain claim and needs no per-host lock. Domains
+// are not derivable from parameters — they come from ApplyRequest.Domains, which
+// this method does not accept. (If a future edit let this method *change*
+// domains, the missing host lock would become a real bug — the no-hostLock
+// safety rests on domains being unchanged.) (#114)
+func (s *Service) UpdateInstanceParameters(ctx context.Context, host, tmpl, slug string, newParams map[string]any) error {
+	if len(newParams) == 0 {
+		return errors.New("no parameters to update")
+	}
+	lock := s.instanceLock(host, tmpl, slug)
+	lock.Lock()
+	defer lock.Unlock()
+	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrInstanceNotFound
+		}
+		return fmt.Errorf("load spec: %w", err)
+	}
+	merged := maps.Clone(spec.Parameters)
+	if merged == nil {
+		merged = map[string]any{}
+	}
+	for k, v := range newParams {
+		merged[k] = v
+	}
+	return s.applyLocked(ctx, host, ApplyRequest{
+		Template:   tmpl,
+		Slug:       slug,
+		Parameters: merged,
+		Secrets:    spec.Secrets,
+		Domains:    spec.Domains,
+	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
+}
+
 // StoredSpec returns the persisted spec (parameters, secrets, domains) for an
 // existing instance, so the UI edit form can pre-populate parameters and merge
 // secrets before re-applying. The caller must NOT render or log the returned
