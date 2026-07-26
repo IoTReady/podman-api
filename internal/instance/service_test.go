@@ -148,6 +148,71 @@ func TestService_Apply_Then_Get(t *testing.T) {
 	assert.Equal(t, "Running", obs.Pod.Status)
 }
 
+// #201: "slug" is a declared parameter on postgres.yaml, so a parameters.slug
+// that disagrees with the request's canonical slug passes render.Validate and
+// would render (and --replace) a manifest named for a *different* pod, while
+// the lock, the podExists/drain gates, instanceSecretName, validateIngress and
+// the persisted spec all keep using the canonical slug. applyLocked pins the
+// canonical slug so no caller of any apply path can move the pod name.
+//
+// Half (a): the pod actually played is named for the canonical slug.
+func TestService_Apply_SlugParameterPinnedToCanonicalSlug(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+
+	req := pgApply("demo")
+	req.Parameters["slug"] = "other" // hand-crafted disagreement
+
+	require.NoError(t, svc.Apply(ctx, "h1", req, ApplyOptions{Replace: true}))
+
+	require.Len(t, f.PlayCalls, 1)
+	assert.Contains(t, f.PlayCalls[0].YAML, "name: postgres-demo",
+		"the played manifest must name the pod for the request's slug, not the parameter's")
+	assert.NotContains(t, f.PlayCalls[0].YAML, "postgres-other")
+
+	_, err := f.PodInspect(ctx, "h1", "postgres-demo")
+	require.NoError(t, err, "the pod exists under the canonical slug")
+	_, err = f.PodInspect(ctx, "h1", "postgres-other")
+	assert.ErrorIs(t, err, podman.ErrNotFound, "no pod was created under the parameter's slug")
+
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, "demo", sp.Parameters["slug"], "the persisted spec renders the pod it names")
+}
+
+// #201 half (b): the blast radius. A pre-existing instance living at the
+// parameter's slug must be left completely untouched — before the pin, the
+// play would have torn its pod down with --replace and stood up a broken
+// replacement, under no lock and invisible to validateIngress.
+func TestService_Apply_SlugParameterLeavesOtherInstanceUntouched(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+
+	// A healthy, unrelated instance at the slug the attacker-parameter names.
+	victim := pgApply("other")
+	victim.Parameters["image"] = "docker.io/library/postgres:15"
+	require.NoError(t, svc.Apply(ctx, "h1", victim, ApplyOptions{Replace: true}))
+	before, err := f.PodInspect(ctx, "h1", "postgres-other")
+	require.NoError(t, err)
+
+	req := pgApply("demo")
+	req.Parameters["slug"] = "other"
+	req.Parameters["image"] = "docker.io/library/postgres:17"
+	require.NoError(t, svc.Apply(ctx, "h1", req, ApplyOptions{Replace: true}))
+
+	after, err := f.PodInspect(ctx, "h1", "postgres-other")
+	require.NoError(t, err, "the victim pod must still be up")
+	assert.Equal(t, before.Created, after.Created, "the victim pod must not have been replaced")
+	require.NotEmpty(t, after.Containers)
+	assert.Equal(t, "docker.io/library/postgres:15", after.Containers[0].ImageTag,
+		"the victim pod must still run its own image")
+
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "other")
+	require.NoError(t, err)
+	assert.Equal(t, "docker.io/library/postgres:15", sp.Parameters["image"],
+		"the victim's stored spec must be unchanged")
+}
+
 func TestService_Apply_RequiresHostSecret(t *testing.T) {
 	svc, _ := newSvc(t)
 	// shared-pull-token is intentionally not seeded on the fake host.

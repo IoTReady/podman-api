@@ -50,3 +50,26 @@ func validInstancePath(w http.ResponseWriter, tmpl, slug string) bool {
 	}
 	return true
 }
+
+// validSlugParameter checks a deploy body's parameters["slug"] against the
+// instance's canonical slug. slug is a declared parameter in the bundled
+// templates and drives metadata.name/secretKeyRef.name/claimName, so a body
+// that names one instance in the path and another in the parameters would
+// render (and, on PUT, --replace) a *different* pod than the one this request
+// locks, gates and persists — see Service.applyLocked, which pins the
+// canonical slug so no caller can move the pod name. This is the friendlier
+// edge-level version of that pin, matching the "slug" rejection on
+// PATCH .../parameters. A parameters["slug"] equal to the canonical slug is
+// normal and passes. Returns true if the body is acceptable; otherwise writes
+// the 400 response and returns false. (#201)
+func validSlugParameter(w http.ResponseWriter, params map[string]any, slug string) bool {
+	v, ok := params["slug"]
+	if !ok || v == any(slug) {
+		return true
+	}
+	WriteJSON(w, http.StatusBadRequest, ErrorBody{
+		Code:    "invalid_body",
+		Message: "slug in parameters does not match the instance slug; use POST .../rename to change a slug",
+	})
+	return false
+}
