@@ -20,10 +20,11 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 )
 
-func newSrvFull(t *testing.T) (*httptest.Server, string, *fake.Fake) {
-	tok := "t"
-	hash, _ := config.HashToken(tok)
-	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*", "secrets:*", "hosts:read", "templates:*"}}}
+// newTestServer builds the shared "app" fixture (parameters slug+image, a
+// single per-instance secret auth_secret) behind an httptest.Server guarded
+// by the given API keys, and returns the fake podman backend alongside it so
+// callers can assert on what got applied.
+func newTestServer(t *testing.T, keys []config.APIKey) (*httptest.Server, *fake.Fake) {
 	tmpl := store.Template{
 		Meta: render.Meta{
 			ID: "app",
@@ -55,7 +56,23 @@ spec:
 	svc.SetStore(mem)
 	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil, ""))
 	t.Cleanup(srv.Close)
+	return srv, f
+}
+
+func newSrvFull(t *testing.T) (*httptest.Server, string, *fake.Fake) {
+	tok := "t"
+	hash, _ := config.HashToken(tok)
+	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*", "secrets:*", "hosts:read", "templates:*"}}}
+	srv, f := newTestServer(t, keys)
 	return srv, tok, f
+}
+
+// newSrvWithKeys builds the same fixture as newSrvFull but with a caller-
+// supplied key set, for tests that need a restricted-scope token (e.g.
+// asserting a write route 403s a read-only key).
+func newSrvWithKeys(t *testing.T, keys []config.APIKey) *httptest.Server {
+	srv, _ := newTestServer(t, keys)
+	return srv
 }
 
 func TestApplyAndGetInstance(t *testing.T) {
