@@ -62,6 +62,9 @@ func (h *handlers) createInstance(w http.ResponseWriter, r *http.Request) {
 	if !validInstancePath(w, req.Template, req.Slug) {
 		return
 	}
+	if !validSlugParameter(w, req.Parameters, req.Slug) {
+		return
+	}
 	if err := ingress.ValidateDomains(req.Domains); err != nil {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_domains", Message: err.Error()})
 		return
@@ -97,6 +100,9 @@ func (h *handlers) applyInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Template = pathTmpl
 	req.Slug = pathSlug
+	if !validSlugParameter(w, req.Parameters, req.Slug) {
+		return
+	}
 
 	if err := ingress.ValidateDomains(req.Domains); err != nil {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_domains", Message: err.Error()})

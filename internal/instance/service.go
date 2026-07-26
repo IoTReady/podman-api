@@ -359,6 +359,30 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 	// and render, so callers can omit optional params for a one-click deploy.
 	// Caller-supplied values always win; only absent keys are filled.
 	req.Parameters = render.ApplyDefaults(tmpl.Meta, req.Parameters)
+	// slug is NOT settable through req.Parameters: if the parameters already
+	// carry a "slug" key it is pinned back to the canonical req.Slug, the same
+	// way migrate.go and rename.go pin it before re-applying. slug is a
+	// declared parameter in the bundled templates and drives metadata.name,
+	// secretKeyRef.name and claimName, so a "slug" parameter disagreeing with
+	// req.Slug would render — and, with Replace, destructively tear down and
+	// replace — a *different* pod, while everything else here (the per-instance
+	// lock, the podExists/drain gates, instanceSecretName, validateIngress, the
+	// persisted spec) keeps using req.Slug. The wrong instance goes down under
+	// no lock and the persisted spec describes a pod no later
+	// Start/Stop/Delete can find. Every apply path funnels through here, so
+	// this pin closes it for all callers, not just the HTTP handlers (which
+	// also reject a disagreeing parameters.slug up front — defence in depth).
+	//
+	// The pin is conditional (only fires when "slug" is already a key) for the
+	// same reason as the one in UpdateInstanceParameters: nothing requires a
+	// template to declare "slug" as a parameter, and an unconditional write
+	// would inject an undeclared key that render.Validate below rejects with
+	// `unknown parameter "slug"` on every such template. A caller trying to
+	// *introduce* slug where the template doesn't declare it is still rejected
+	// by render.Validate, which is the correct outcome. (#201)
+	if _, ok := req.Parameters["slug"]; ok {
+		req.Parameters["slug"] = req.Slug // canonical slug always wins; pod name must match podName()
+	}
 	validate := render.Validate
 	if opts.AllowMissingSecrets {
 		validate = render.ValidateAllowMissingSecrets

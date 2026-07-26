@@ -97,6 +97,45 @@ func TestApplyAndGetInstance(t *testing.T) {
 	assert.Equal(t, "hello", got["slug"])
 }
 
+// #201 (API edge): the path/body slug reconciliation above never looked at
+// parameters["slug"], which is what actually renders metadata.name. A
+// disagreeing parameters.slug is rejected with the same 400 invalid_body shape
+// PATCH .../parameters uses, on both deploy routes, before the host is touched.
+// (applyLocked pins the canonical slug regardless — this is the friendly half.)
+func TestDeployRoutes_RejectMismatchedSlugParameter(t *testing.T) {
+	for _, tc := range []struct {
+		name, method, path, body string
+	}{
+		{
+			name: "put", method: "PUT", path: "/hosts/h1/instances/app/hello",
+			body: `{"template":"app","slug":"hello","parameters":{"slug":"other","image":"i:1"},"secrets":{"auth_secret":"s"}}`,
+		},
+		{
+			name: "post", method: "POST", path: "/hosts/h1/instances",
+			body: `{"template":"app","slug":"hello","parameters":{"slug":"other","image":"i:1"},"secrets":{"auth_secret":"s"}}`,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, tok, f := newSrvFull(t)
+			resp := postJSON(t, srv, tok, tc.method, tc.path, tc.body)
+			defer resp.Body.Close()
+			assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+			assert.Contains(t, bodyString(t, resp), "slug in parameters does not match")
+			assert.Empty(t, f.PlayCalls, "a rejected body must not reach the host")
+		})
+	}
+}
+
+// A parameters.slug that agrees with the path is the normal case (the bundled
+// templates declare slug) and must still be accepted.
+func TestDeployRoutes_AcceptMatchingSlugParameter(t *testing.T) {
+	srv, tok, _ := newSrvFull(t)
+	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	resp := postJSON(t, srv, tok, "PUT", "/hosts/h1/instances/app/hello", body)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
 func TestCreateConflict(t *testing.T) {
 	srv, tok, _ := newSrvFull(t)
 	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
