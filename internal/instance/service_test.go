@@ -827,6 +827,78 @@ func TestService_Get_UnreadableSpec_WithholdsEnvSummary(t *testing.T) {
 	require.Len(t, obs.Containers, 1)
 }
 
+// Get reports the parameters the instance was last applied with, so a client
+// can read a shared value back before rewriting it (#200).
+func TestService_Get_ReportsStoredParameters(t *testing.T) {
+	svc, _, _ := newSvcMem(t)
+	ctx := context.Background()
+
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	obs, err := svc.Get(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	require.NotNil(t, obs.Parameters)
+	assert.Equal(t, "docker.io/library/postgres:16", obs.Parameters["image"])
+	assert.Equal(t, "app", obs.Parameters["db"])
+	for k, v := range obs.Parameters {
+		assert.NotEqual(t, "p", v, "parameters[%s] leaked the instance secret", k)
+	}
+}
+
+// No stored spec means nothing to report: the field is absent, not null.
+func TestService_Get_NoStoredSpec_OmitsParameters(t *testing.T) {
+	svc, f, _ := newSvcMem(t)
+	ctx := context.Background()
+
+	f.AddPod("h1", podman.Pod{
+		Name:   "postgres-orphan",
+		Status: "Running",
+		Labels: map[string]string{"podman-api/template": "postgres", "podman-api/slug": "orphan"},
+		Containers: []podman.Container{
+			{Name: "db", Status: "Running"},
+		},
+	})
+
+	obs, err := svc.Get(ctx, "h1", "postgres", "orphan")
+	require.NoError(t, err)
+	assert.Nil(t, obs.Parameters)
+}
+
+// An unreadable spec withholds the parameters along with env_summary.
+func TestService_Get_UnreadableSpec_OmitsParameters(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	f.AddPod("h1", podman.Pod{
+		Name:   "postgres-demo",
+		Status: "Running",
+		Labels: map[string]string{"podman-api/template": "postgres", "podman-api/slug": "demo"},
+		Containers: []podman.Container{
+			{Name: "db", Status: "Running"},
+		},
+	})
+	mem.FailGetSpec(store.ErrSecretsUndecryptable)
+
+	obs, err := svc.Get(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.Nil(t, obs.Parameters, "parameters are withheld when the spec is unreadable")
+}
+
+// The list path does not carry parameters — a host sweep stays lean, and #200
+// only asks for the single-instance read.
+func TestService_List_OmitsParameters(t *testing.T) {
+	svc, _, _ := newSvcMem(t)
+	ctx := context.Background()
+
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	list, err := svc.List(ctx, "h1", "postgres")
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Nil(t, list[0].Parameters)
+}
+
 // A pod with no stored spec has no RECORDED secrets, not unreadable ones. It
 // keeps its env_summary (name-pass redaction only) rather than being withheld.
 func TestService_Get_NoStoredSpec_KeepsEnvSummary(t *testing.T) {

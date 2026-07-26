@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
@@ -134,6 +136,58 @@ func TestDeployRoutes_AcceptMatchingSlugParameter(t *testing.T) {
 	resp := postJSON(t, srv, tok, "PUT", "/hosts/h1/instances/app/hello", body)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
+}
+
+// The GET body carries the stored render parameters so a client can read a
+// shared value back before a read-modify-write (#200). The per-instance secret
+// must not appear anywhere in that body.
+func TestGetInstance_ReturnsStoredParameters(t *testing.T) {
+	srv, tok, _ := newSrvFull(t)
+
+	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s3cr3t"}}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/hello", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	resp = authedReq(t, srv, tok, "GET", "/hosts/h1/instances/app/hello")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	raw, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	var got map[string]any
+	require.NoError(t, json.Unmarshal(raw, &got))
+	params, ok := got["parameters"].(map[string]any)
+	require.True(t, ok, "parameters must be present: %s", raw)
+	assert.Equal(t, "i:1", params["image"])
+	assert.Equal(t, "hello", params["slug"])
+	assert.NotContains(t, string(raw), "s3cr3t", "no secret material in the GET body")
+}
+
+// A pod with no stored spec omits the field entirely rather than emitting null.
+func TestGetInstance_NoStoredSpec_OmitsParameters(t *testing.T) {
+	srv, tok, f := newSrvFull(t)
+	f.AddPod("h1", podman.Pod{
+		Name:   "app-orphan",
+		Status: "Running",
+		Labels: map[string]string{"podman-api/template": "app", "podman-api/slug": "orphan"},
+		Containers: []podman.Container{
+			{Name: "app", Status: "Running"},
+		},
+	})
+
+	resp := authedReq(t, srv, tok, "GET", "/hosts/h1/instances/app/orphan")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	_, present := got["parameters"]
+	assert.False(t, present, "parameters is omitted, not null, with no stored spec")
 }
 
 func TestCreateConflict(t *testing.T) {

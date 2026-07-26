@@ -589,11 +589,21 @@ func (s *Service) Get(ctx context.Context, host, tmpl, slug string) (Observed, e
 			vols = append(vols, vv)
 		}
 	}
-	vals, specErr := s.instanceSecretValues(ctx, host, tmpl, slug)
+	sp, haveSpec, specErr := s.instanceSpec(ctx, host, tmpl, slug)
+	var vals map[string]bool
+	if haveSpec {
+		vals = secretValues(sp)
+	}
 	obs := Normalize(p, tmpl, slug, vols, secretEnvNames(t.Body), vals)
 	if specErr != nil {
 		obs.EnvSummary = nil
 		obs.Warnings = append(obs.Warnings, envSummaryWithheldWarning(specErr))
+	}
+	if haveSpec {
+		// The stored parameters an operator can read back before a
+		// read-modify-write of a shared value (#200). An unreadable or absent
+		// spec leaves the field out entirely rather than emitting null.
+		obs.Parameters = PublicParameters(t.Meta, sp.Parameters, vals)
 	}
 	return obs, nil
 }
@@ -606,21 +616,24 @@ func envSummaryWithheldWarning(err error) string {
 	return fmt.Sprintf("env_summary withheld: instance secrets unreadable (%v)", err)
 }
 
-// instanceSecretValues loads one instance's known secret values for env_summary
-// redaction. A missing spec is NOT an error: the pod simply has no recorded
-// secrets (never applied by this core, or its spec was deleted while it ran),
-// and withholding env_summary for it would regress every such instance for no
-// security gain. A corrupt or undecryptable spec IS an error — the caller
-// withholds env_summary rather than risk returning secret material.
-func (s *Service) instanceSecretValues(ctx context.Context, host, tmpl, slug string) (map[string]bool, error) {
+// instanceSpec loads one instance's stored spec, the source of both the
+// env_summary redaction inputs and the reported parameters. The bool reports
+// whether a spec was found.
+//
+// A missing spec is NOT an error: the pod simply has no recorded state (never
+// applied by this core, or its spec was deleted while it ran), and withholding
+// env_summary for it would regress every such instance for no security gain. A
+// corrupt or undecryptable spec IS an error — the caller withholds env_summary
+// rather than risk returning secret material.
+func (s *Service) instanceSpec(ctx context.Context, host, tmpl, slug string) (store.Spec, bool, error) {
 	sp, err := s.store.GetSpec(ctx, host, tmpl, slug)
 	if errors.Is(err, store.ErrNotFound) {
-		return nil, nil
+		return store.Spec{}, false, nil
 	}
 	if err != nil {
-		return nil, err
+		return store.Spec{}, false, err
 	}
-	return secretValues(sp), nil
+	return sp, true, nil
 }
 
 // specSecrets is one instance's redaction input for a host-wide sweep: either
@@ -650,7 +663,7 @@ func (s *Service) hostSecretValues(ctx context.Context, host string) (map[store.
 		sp, gerr := s.store.GetSpec(ctx, host, k.Template, k.Slug)
 		if errors.Is(gerr, store.ErrNotFound) {
 			// The spec was deleted between ListSpecKeys and this read. Match
-			// instanceSecretValues: no recorded spec is not an error, so skip
+			// instanceSpec: no recorded spec is not an error, so skip
 			// the key and let it fall through to name-only redaction, rather
 			// than recording it as an unreadable-spec error.
 			continue

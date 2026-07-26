@@ -315,6 +315,18 @@ components:
             their value matches a secret recorded for this instance. The whole
             field may be absent when the instance's recorded secrets could not
             be read — see warnings.
+        parameters:
+          type: object
+          additionalProperties: true
+          description: >-
+            The instance's stored render parameters, as last applied — read
+            these before a read-modify-write of a shared value. Populated only
+            by GET /hosts/{host}/instances/{template}/{slug}; host and template
+            listings omit it. Absent when the instance has no stored spec, or
+            when that spec is unreadable. Never carries secret material:
+            secrets are stored separately and reach the pod via secretKeyRef,
+            and any parameter a template declares `secret: true` (or whose
+            value matches a recorded secret) is omitted.
         warnings:
           type: array
           items: {type: string}

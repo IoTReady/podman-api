@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/iotready/podman-api/internal/podman"
+	"github.com/iotready/podman-api/internal/render"
 )
 
 func TestNormalize(t *testing.T) {
@@ -162,4 +163,37 @@ func TestNormalize_EmptySecretValueDoesNotBlankEnv(t *testing.T) {
 	v, present := obs.EnvSummary["OPTIONAL_FLAG"]
 	assert.True(t, present, "an empty env var is not a secret")
 	assert.Equal(t, "", v)
+}
+
+// PublicParameters is the redaction gate for Observed.Parameters (#200): a
+// parameter a template declared `secret: true` is dropped by name, and any
+// string parameter whose value happens to equal one of the instance's secrets
+// is dropped by value.
+func TestPublicParameters_RedactsSecretBearingEntries(t *testing.T) {
+	m := render.Meta{Parameters: []render.ParamDef{
+		{Name: "image", Type: "string"},
+		{Name: "admin_token", Type: "string", Secret: true},
+	}}
+	params := map[string]any{
+		"image":       "i:1",
+		"admin_token": "declared-secret",
+		"smuggled":    "sealed-value",
+		"port":        5432,
+		"empty":       "",
+	}
+
+	out := PublicParameters(m, params, map[string]bool{"sealed-value": true, "": true})
+
+	assert.Equal(t, "i:1", out["image"])
+	assert.Equal(t, 5432, out["port"])
+	assert.Equal(t, "", out["empty"], "an empty value never matches a secret")
+	assert.NotContains(t, out, "admin_token", "a secret-declared parameter is dropped by name")
+	assert.NotContains(t, out, "smuggled", "a parameter carrying a known secret value is dropped")
+}
+
+// Nothing to report yields nil, so the JSON field is absent rather than null.
+func TestPublicParameters_EmptyIsNil(t *testing.T) {
+	assert.Nil(t, PublicParameters(render.Meta{}, nil, nil))
+	m := render.Meta{Parameters: []render.ParamDef{{Name: "tok", Secret: true}}}
+	assert.Nil(t, PublicParameters(m, map[string]any{"tok": "x"}, nil))
 }

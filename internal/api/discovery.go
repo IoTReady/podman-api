@@ -41,6 +41,14 @@ Content-Type: application/json
 
 {"parameters": {"image": "registry.example.com/app:v1.2", "port": 8080}}
 
+### Read an instance back, including its stored parameters
+GET /hosts/{host}/instances/{template}/{slug}
+The response carries "parameters" — the values the instance was last applied
+with — so a shared parameter can be read, edited and written back without
+regenerating it. Secret-bearing entries are omitted, and the field is absent
+when the instance has no readable stored spec. Host listings
+(GET /hosts/{host}/instances) omit it.
+
 ### Change parameters without re-supplying secrets
 PATCH /hosts/{host}/instances/{template}/{slug}/parameters
 {"parameters": {"port": 8081}}
