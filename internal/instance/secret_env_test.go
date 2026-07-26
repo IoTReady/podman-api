@@ -60,3 +60,36 @@ spec:
 	assert.True(t, got["AUTH_SECRET"])
 	assert.True(t, got["AWS_ACCESS_KEY_ID"])
 }
+
+func TestSecretEnvNames_InitContainers(t *testing.T) {
+	body := `apiVersion: v1
+kind: Pod
+metadata:
+  name: app-{{.slug}}
+spec:
+  initContainers:
+    - name: restore
+      image: {{.image}}
+      env:
+        - name: RESTORE_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: app-{{.slug}}-restore
+              key: app-{{.slug}}-restore
+        - name: RESTORE_MODE
+          value: full
+  containers:
+    - name: app
+      image: {{.image}}
+      env:
+        - name: APP_KEY
+          valueFrom:
+            secretKeyRef:
+              name: app-{{.slug}}-key
+              key: app-{{.slug}}-key
+`
+	got := secretEnvNames(body)
+	assert.True(t, got["RESTORE_TOKEN"], "an initContainer secretKeyRef must be detected")
+	assert.True(t, got["APP_KEY"], "container secretKeyRefs must still be detected")
+	assert.False(t, got["RESTORE_MODE"], "a literal-valued initContainer env is not a secret")
+}
