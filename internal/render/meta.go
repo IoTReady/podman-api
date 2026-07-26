@@ -46,7 +46,16 @@ type ParamDef struct {
 	Default     any      `yaml:"default,omitempty" json:"default,omitempty"`
 	Placeholder string   `yaml:"placeholder,omitempty" json:"placeholder,omitempty"`
 	Options     []string `yaml:"options,omitempty" json:"options,omitempty"`
-	Secret      bool     `yaml:"secret,omitempty" json:"secret,omitempty"`
+
+	// Secret is rejected, not honored: a template declaring it fails validation
+	// (ValidateParamDefs). Parameter values are stored in a plaintext column, so
+	// the flag once promised an encryption-at-rest guarantee the storage layer
+	// never delivered — it only ever redacted the value from GET responses.
+	// Authors want secrets.per_instance, which is encrypted at rest and reaches
+	// the pod via secretKeyRef. The field is kept solely so the flag is *seen*
+	// and refused: meta is decoded with non-strict YAML, so deleting it would
+	// silently ignore `secret: true` instead of failing on it. (#205)
+	Secret bool `yaml:"secret,omitempty" json:"secret,omitempty"`
 }
 
 type Secrets struct {
@@ -112,6 +121,21 @@ func NormalizeParams(m *Meta) error {
 			m.Parameters[i].Type = "string"
 		} else if !validParamTypes[p.Type] {
 			return fmt.Errorf("template-meta: parameter %q has unknown type %q", p.Name, p.Type)
+		}
+	}
+	return nil
+}
+
+// ValidateParamDefs checks the parameter declarations themselves (as opposed to
+// Validate, which checks supplied values against them). It rejects a parameter
+// marked `secret: true`: parameter values land in a plaintext column, so the
+// flag cannot mean what it says. secrets.per_instance is the encrypted-at-rest
+// path and already does this job. (#205)
+func ValidateParamDefs(m Meta) error {
+	for _, p := range m.Parameters {
+		if p.Secret {
+			return fmt.Errorf("template-meta: parameter %q sets secret: true, which is not supported "+
+				"(parameters are stored in plaintext); declare it under secrets.per_instance instead", p.Name)
 		}
 	}
 	return nil
@@ -197,6 +221,10 @@ func ParseMeta(src string) (Meta, string, error) {
 
 	// Validate and normalise parameter types.
 	if err := NormalizeParams(&wrapper.Meta); err != nil {
+		return Meta{}, "", err
+	}
+
+	if err := ValidateParamDefs(wrapper.Meta); err != nil {
 		return Meta{}, "", err
 	}
 

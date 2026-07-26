@@ -172,6 +172,35 @@ kind: Pod
 	require.Contains(t, err.Error(), "float")
 }
 
+func TestParseMeta_RejectsSecretParameter(t *testing.T) {
+	src := `# template-meta:
+#   id: x
+#   parameters:
+#     - name: api_token
+#       type: string
+#       secret: true
+---
+kind: Pod
+`
+	_, _, err := ParseMeta(src)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "api_token")
+	require.Contains(t, err.Error(), "secrets.per_instance")
+}
+
+func TestValidateParamDefs(t *testing.T) {
+	m := Meta{ID: "x", Parameters: []ParamDef{
+		{Name: "image", Type: "string"},
+		{Name: "api_token", Type: "string", Secret: true},
+	}}
+	err := ValidateParamDefs(m)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "api_token")
+
+	m.Parameters[1].Secret = false
+	require.NoError(t, ValidateParamDefs(m))
+}
+
 func TestParseMeta_PreBackup(t *testing.T) {
 	src := `# template-meta:
 #   id: example

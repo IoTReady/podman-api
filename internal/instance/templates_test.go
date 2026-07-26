@@ -144,6 +144,28 @@ func TestValidateTemplate_MissingIngressContainer(t *testing.T) {
 	assert.Contains(t, err.Error(), "web")
 }
 
+// A template that declares a parameter as `secret: true` is rejected outright:
+// parameters are stored in a plaintext column, so the flag promises encryption
+// at rest that the storage layer never delivered. Authors use
+// secrets.per_instance, which is encrypted and wired via secretKeyRef. (#205)
+func TestValidateTemplate_RejectsSecretParameter(t *testing.T) {
+	ctx := context.Background()
+	svc, mem := tmplSvc(t)
+
+	tpl := webTemplate()
+	tpl.Meta.Parameters = append(tpl.Meta.Parameters, render.ParamDef{
+		Name: "api_token", Type: "string", Secret: true,
+	})
+	err := svc.CreateTemplate(ctx, tpl)
+	require.ErrorIs(t, err, ErrInvalidTemplate)
+	assert.Contains(t, err.Error(), "api_token")
+	assert.Contains(t, err.Error(), "secrets.per_instance")
+
+	// Nothing was persisted, so no plaintext-parameter trap can be deployed.
+	_, err = mem.GetTemplate(ctx, "web")
+	require.ErrorIs(t, err, store.ErrNotFound)
+}
+
 func TestDeleteTemplate_BlockedWhenInUse(t *testing.T) {
 	ctx := context.Background()
 	f := fake.New()
