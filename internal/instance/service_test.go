@@ -975,6 +975,36 @@ func TestService_UpdateInstanceParameters_EmptyRejected(t *testing.T) {
 	assert.Len(t, f.PlayCalls, playsBefore, "an empty update must not touch the host")
 }
 
+// pro#74 fix 1 (service layer): "slug" is a declared parameter on postgres.yaml
+// (and in this test template), so it passes render.Validate — the overlay's
+// canonical-slug pin is the only thing stopping it from renaming the pod out
+// from under the lock this method holds. A caller other than the HTTP handler
+// (which rejects "slug" earlier) must still be safe.
+func TestService_UpdateInstanceParameters_SlugParameterIgnored(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	playsBefore := len(f.PlayCalls)
+
+	require.NoError(t, svc.UpdateInstanceParameters(ctx, "h1", "postgres", "demo",
+		map[string]any{"slug": "other", "db": "newdb"}))
+
+	require.Len(t, f.PlayCalls, playsBefore+1)
+	last := f.PlayCalls[len(f.PlayCalls)-1]
+	assert.Contains(t, last.YAML, "name: postgres-demo",
+		"the played manifest must still name the original pod, not \"other\"")
+	assert.NotContains(t, last.YAML, "postgres-other")
+
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, "demo", sp.Parameters["slug"], "the stored spec's slug must be unchanged")
+	assert.Equal(t, "newdb", sp.Parameters["db"], "the legitimate parameter change still applies")
+
+	// And no spec was ever created under the injected slug.
+	_, err = mem.GetSpec(ctx, "h1", "postgres", "other")
+	assert.ErrorIs(t, err, store.ErrNotFound)
+}
+
 func TestService_UpdateInstanceParameters_UnknownInstance(t *testing.T) {
 	svc, _, _ := newSvcMem(t)
 	err := svc.UpdateInstanceParameters(context.Background(), "h1", "postgres", "nope",

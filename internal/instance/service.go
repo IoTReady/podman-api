@@ -977,6 +977,28 @@ func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug st
 // block a parameter change to that already-running instance (the missing secret
 // was already missing; the update never worsens the pod).
 //
+// slug is NOT settable through newParams: it is pinned to the canonical slug
+// after the overlay below, the same way migrate.go and rename.go pin it before
+// re-applying. Without this, a caller-supplied "slug" parameter (a declared
+// template parameter, so it passes render.Validate) would render a manifest for
+// a *different* pod while this method still holds and reports success under the
+// original slug's lock — the wrong pod gets replaced (destructively, if it
+// already exists) and the persisted spec for the original slug ends up
+// describing a pod no later Start/Stop/Delete can find. The HTTP handler also
+// rejects a "slug" key up front (defence in depth); this pin makes the method
+// itself safe for any caller.
+//
+// applyLocked discards the stored spec's InjectorSecrets and rebuilds the list
+// by re-running the sidecar injector, then persists the fresh list — injector-
+// declared secrets are re-derived on this path, not preserved, unlike the boot-
+// converge path in spec_reconcile.go.
+//
+// Replace: true means podman tears the pod down before creating the new one,
+// and the spec is only persisted after a successful play; a parameter change
+// that renders a manifest podman refuses to play returns an error with the pod
+// gone and the stored spec still describing the pre-update state — recovery is
+// boot converge or a manual re-apply.
+//
 // The load (GetSpec) and re-apply (applyLocked) happen atomically under the
 // per-instance lock: the overlay is a read-modify-write of the stored
 // parameters, so holding the lock across both halves keeps a concurrent
@@ -1010,11 +1032,12 @@ func (s *Service) UpdateInstanceParameters(ctx context.Context, host, tmpl, slug
 	for k, v := range newParams {
 		merged[k] = v
 	}
+	merged["slug"] = slug // canonical slug always wins; pod name must match podName()
 	return s.applyLocked(ctx, host, ApplyRequest{
 		Template:   tmpl,
 		Slug:       slug,
 		Parameters: merged,
-		Secrets:    spec.Secrets,
+		Secrets:    maps.Clone(spec.Secrets),
 		Domains:    spec.Domains,
 	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
 }

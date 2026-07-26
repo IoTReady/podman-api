@@ -1039,7 +1039,11 @@ paths:
         the sealed values are unrecoverable plaintext an operator cannot read back,
         so before this route a parameter change on such an instance was impossible.
         A per-instance secret the template added after deploy does not block the
-        update (the missing secret was already missing).
+        update (the missing secret was already missing). `slug` cannot be changed
+        through this route (400 invalid_body); use the rename route instead. This
+        route replaces the pod, so a parameter change that renders a manifest
+        podman refuses can leave the instance down until a boot converge or a
+        manual re-apply.
       parameters:
         - {$ref: '#/components/parameters/HostID'}
         - {$ref: '#/components/parameters/TemplateID'}
