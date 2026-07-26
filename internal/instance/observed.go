@@ -58,7 +58,10 @@ type ObservedVolume struct {
 //   - by VALUE: values in secretVals (the instance's known secret values, from
 //     the stored spec). A SidecarInjector adds containers and env after the
 //     template body was stored, so its secretKeyRef env is invisible to the
-//     name pass — this pass catches it however the value arrived (#198).
+//     name pass — this pass catches it however the value arrived (#198). An
+//     empty string never matches here, even if secretVals contains "" — a
+//     legitimately-empty env var must never be blanked, and callers building
+//     secretVals are expected to exclude "" too (defense in depth).
 //
 // Either match omits the key from env_summary entirely; there is no redaction
 // marker. Both sets may be nil.
@@ -95,7 +98,7 @@ func Normalize(p podman.Pod, template, slug string, vols []podman.Volume, secret
 	out.EnvSummary = map[string]string{}
 	for _, c := range p.Containers {
 		for k, v := range c.Env {
-			if secretEnvs[k] || secretVals[v] || strings.Contains(strings.ToUpper(k), "SECRET") {
+			if secretEnvs[k] || (v != "" && secretVals[v]) || strings.Contains(strings.ToUpper(k), "SECRET") {
 				continue
 			}
 			out.EnvSummary[k] = v

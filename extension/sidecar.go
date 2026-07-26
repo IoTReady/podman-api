@@ -29,11 +29,16 @@ type TemplateVolume struct {
 // inlining a plaintext value.
 //
 // Declaring a secret here is also what keeps it out of the instance API's
-// env_summary: the core redacts any env value matching a declared secret,
-// including env an injector added via secretKeyRef, which the template body
-// cannot reveal (#198). An injector that inlines a credential as a literal
-// `value:` without declaring it here will have that value returned in
-// cleartext from GET /hosts/{host}/instances/{template}/{slug}.
+// env_summary: the core redacts any env value matching a secret it records
+// for this instance — the values here plus any template-declared secrets in
+// the stored spec — including env an injector added via secretKeyRef, which
+// the template body cannot reveal (#198). That boundary is "values the core
+// records for this instance", not "anything referenced via secretKeyRef":
+// a secretKeyRef pointing at a pre-existing per-host secret (not part of the
+// instance's stored spec) or an `envFrom: [{secretRef: …}]` bulk import (not
+// parsed by the name pass at all) is NOT covered and will have its value
+// returned in cleartext from GET /hosts/{host}/instances/{template}/{slug}.
+// Prefer InjectedSecret for anything an injector needs redacted.
 type InjectedSecret struct {
 	// Name is the short secret name (e.g. "litestream-s3-key"). The core
 	// namespaces it to the instance as it does for template-declared secrets.

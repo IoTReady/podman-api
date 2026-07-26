@@ -813,3 +813,87 @@ func TestService_List_RedactsInjectorAddedSecretEnv(t *testing.T) {
 	}
 	assert.Equal(t, "vpn.example.com", list[0].EnvSummary["VPN_ENDPOINT"])
 }
+
+// listAllInstancesLive (via ListAllInstances) is a structurally different call
+// site from List: its vals lookup happens inside a per-template goroutine and
+// is keyed on tmplID rather than the request's template. It is also the path
+// that fills the warm inventory cache read by the UI list, the inventory
+// poller, and ListAllInstancesWithMeta — the highest-traffic consumer of
+// env_summary. A refactor that dropped the value set there would pass the
+// rest of the suite while re-opening the leak, so it needs its own coverage.
+func TestService_ListAllInstances_RedactsInjectorAddedSecretEnv(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+
+	const psk = "list-all-path-psk"
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	sp.InjectorSecrets = append(sp.InjectorSecrets, store.InjectorSecret{
+		Name: "vpn-psk", Key: "postgres-demo-vpn-psk", Value: psk,
+	})
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	f.AddPod("h1", podman.Pod{
+		Name:   "postgres-demo",
+		Status: "Running",
+		Labels: map[string]string{"podman-api/template": "postgres", "podman-api/slug": "demo"},
+		Containers: []podman.Container{
+			{Name: "vpn", Status: "Running", Env: map[string]string{"VPN_PSK": psk, "VPN_ENDPOINT": "vpn.example.com"}},
+		},
+	})
+
+	list, err := svc.ListAllInstances(ctx, "h1")
+	require.NoError(t, err)
+	require.NotEmpty(t, list)
+	found := false
+	for _, obs := range list {
+		for k, v := range obs.EnvSummary {
+			assert.NotEqual(t, psk, v, "env_summary[%s] leaked the injected secret on the ListAllInstances path", k)
+		}
+		if obs.Template == "postgres" && obs.Slug == "demo" {
+			found = true
+			assert.Equal(t, "vpn.example.com", obs.EnvSummary["VPN_ENDPOINT"], "non-secret env still reported")
+		}
+	}
+	assert.True(t, found, "expected postgres/demo in ListAllInstances output")
+}
+
+// A ListSpecKeys failure fails the whole-host sweep, which must withhold
+// env_summary for every instance on the host (fail closed) without failing
+// the List call itself — a store read failure must never fail an API request.
+func TestService_List_SweepFailure_WithholdsEnvSummaryForEveryInstance(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo1"), ApplyOptions{Replace: true}))
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo2"), ApplyOptions{Replace: true}))
+	f.AddPod("h1", podman.Pod{
+		Name:   "postgres-demo1",
+		Status: "Running",
+		Labels: map[string]string{"podman-api/template": "postgres", "podman-api/slug": "demo1"},
+		Containers: []podman.Container{
+			{Name: "db", Status: "Running", Env: map[string]string{"POSTGRES_DB": "app"}},
+		},
+	})
+	f.AddPod("h1", podman.Pod{
+		Name:   "postgres-demo2",
+		Status: "Running",
+		Labels: map[string]string{"podman-api/template": "postgres", "podman-api/slug": "demo2"},
+		Containers: []podman.Container{
+			{Name: "db", Status: "Running", Env: map[string]string{"POSTGRES_DB": "app"}},
+		},
+	})
+
+	mem.ListSpecKeysErr = errors.New("enumeration failed")
+
+	list, err := svc.List(ctx, "h1", "postgres")
+	require.NoError(t, err, "a store read failure must not fail the request")
+	require.Len(t, list, 2)
+	for _, obs := range list {
+		assert.Nil(t, obs.EnvSummary, "env_summary must be withheld for %s/%s when the sweep fails", obs.Template, obs.Slug)
+		require.Len(t, obs.Warnings, 1)
+		assert.Contains(t, obs.Warnings[0], "env_summary withheld")
+	}
+}

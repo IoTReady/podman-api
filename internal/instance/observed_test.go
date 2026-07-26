@@ -157,7 +157,7 @@ func TestNormalize_EmptySecretValueDoesNotBlankEnv(t *testing.T) {
 		},
 	}
 
-	obs := Normalize(p, "web", "s1", nil, nil, map[string]bool{})
+	obs := Normalize(p, "web", "s1", nil, nil, map[string]bool{"": true})
 
 	v, present := obs.EnvSummary["OPTIONAL_FLAG"]
 	assert.True(t, present, "an empty env var is not a secret")

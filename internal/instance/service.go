@@ -624,6 +624,13 @@ func (s *Service) hostSecretValues(ctx context.Context, host string) (map[store.
 	out := map[store.SpecKey]specSecrets{}
 	for _, k := range keys {
 		sp, gerr := s.store.GetSpec(ctx, host, k.Template, k.Slug)
+		if errors.Is(gerr, store.ErrNotFound) {
+			// The spec was deleted between ListSpecKeys and this read. Match
+			// instanceSecretValues: no recorded spec is not an error, so skip
+			// the key and let it fall through to name-only redaction, rather
+			// than recording it as an unreadable-spec error.
+			continue
+		}
 		if gerr != nil {
 			out[k] = specSecrets{err: gerr}
 			continue

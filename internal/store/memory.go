@@ -39,8 +39,9 @@ type Memory struct {
 	templates   map[string]Template
 	backups     map[string]Backup // id -> Backup
 
-	PutErr    error
-	DeleteErr error
+	PutErr          error
+	DeleteErr       error
+	ListSpecKeysErr error
 
 	getSpecErr error
 }
@@ -107,6 +108,9 @@ func (m *Memory) DeleteSpec(_ context.Context, host, template, slug string) erro
 func (m *Memory) ListSpecKeys(_ context.Context, host string) ([]SpecKey, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.ListSpecKeysErr != nil {
+		return nil, m.ListSpecKeysErr
+	}
 	out := []SpecKey{}
 	for _, s := range m.specs {
 		if s.Host == host {
