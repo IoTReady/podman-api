@@ -195,9 +195,18 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string, force bool) err
 //  3. If the template declares ingress, its container must be non-empty and its
 //     port in 1..65535 (render.ValidateIngress), AND the rendered pod must
 //     contain a container whose name matches Ingress.Container.
+//  4. No parameter may set `secret: true` (render.ValidateParamDefs) — parameter
+//     values are stored in plaintext, so authors must use secrets.per_instance.
 func ValidateTemplate(t store.Template) error {
 	if !render.ValidName(t.Meta.ID) {
 		return fmt.Errorf("%w: id %q must match %s", ErrInvalidTemplate, t.Meta.ID, render.NameRe.String())
+	}
+
+	// API-created templates build render.Meta directly and so skip ParseMeta's
+	// checks; re-run the parameter-declaration validation here so a `secret:
+	// true` parameter can never be persisted, whatever the entry point. (#205)
+	if err := render.ValidateParamDefs(t.Meta); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
 
 	// Validate the ingress declaration (container non-empty, port in range)
