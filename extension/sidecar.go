@@ -27,6 +27,13 @@ type TemplateVolume struct {
 // used for template-declared secrets) before PlayKube and reaps it on instance
 // Delete, so the injected sidecar can reference it via secretKeyRef instead of
 // inlining a plaintext value.
+//
+// Declaring a secret here is also what keeps it out of the instance API's
+// env_summary: the core redacts any env value matching a declared secret,
+// including env an injector added via secretKeyRef, which the template body
+// cannot reveal (#198). An injector that inlines a credential as a literal
+// `value:` without declaring it here will have that value returned in
+// cleartext from GET /hosts/{host}/instances/{template}/{slug}.
 type InjectedSecret struct {
 	// Name is the short secret name (e.g. "litestream-s3-key"). The core
 	// namespaces it to the instance as it does for template-declared secrets.
