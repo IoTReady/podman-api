@@ -840,6 +840,18 @@ func (r *Real) ContainerStats(ctx context.Context, id string) ([]ContainerStats,
 	}
 	select {
 	case <-c.Done():
+		// The binding's own goroutine (containers.Stats) does an unbuffered,
+		// non-select send on ch and only closes it (and the response body)
+		// after that send completes. Abandoning ch here without a further
+		// receive would leave that goroutine blocked forever on the send,
+		// leaking it and the underlying HTTP connection. Drain it in the
+		// background: for a non-streaming call (Stream=false, as set above)
+		// the binding goroutine sends at most one report and then returns,
+		// so a single receive is always enough to unblock and let it clean
+		// up, whether that receive yields the report or the zero value from
+		// a channel the goroutine closed without sending (e.g. because it
+		// observed the same ctx cancellation via response.Request.Context()).
+		go func() { <-ch }()
 		return nil, c.Err()
 	case rep, ok := <-ch:
 		if !ok {

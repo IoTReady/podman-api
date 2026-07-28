@@ -587,6 +587,7 @@ func (f *Fake) ContainerStats(_ context.Context, h string) ([]podman.ContainerSt
 	}
 	return f.ContainerStatsVal[h], nil
 }
+
 func (f *Fake) UsedHostPorts(_ context.Context, h string) ([]podman.PortMapping, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
