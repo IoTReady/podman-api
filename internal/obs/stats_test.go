@@ -78,11 +78,12 @@ func TestStatsCollectorAbsentWhenNoSample(t *testing.T) {
 	absent(t, got, "podman_api_container_cpu_seconds_total")
 }
 
-// The regression this pins: an unreachable host keeps its last-known Observed
-// containers in the inventory, so Collect still enumerates it. Once the poller
-// has dropped its stats entry the series must go absent — if the entry were
-// retained instead, every scrape would re-emit the last sample and the
-// cumulative counters would read as containers that went idle.
+// The regression this pins: an unreachable host is still a configured host, so
+// Collect still visits it, and the inventory still holds its last-known Observed
+// containers. Once the poller has dropped its stats entry the series must go
+// absent — if the entry were retained instead, every scrape would re-emit the
+// last sample and the cumulative counters would read as containers that went
+// idle.
 func TestStatsCollectorAbsentForUnreachableHostAfterDrop(t *testing.T) {
 	inv := statsInv("h1", "engine", "valvo", "engine-valvo-engine")
 	h := inv.snap["h1"]

@@ -133,11 +133,13 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			// second failure for something reachability has already reported.
 			//
 			// But skipping is not the same as not caring: the cached samples
-			// must still be retired, or the collector — which enumerates hosts
-			// from the inventory, and the inventory keeps a down host's
-			// last-known containers — would re-emit them on every scrape for as
-			// long as the host stays down. Cumulative counters that stop
-			// advancing read as an idle container; absent is the honest answer.
+			// must still be retired. A host that is merely unreachable is still in
+			// the configured host list, which is what the collector enumerates,
+			// and the inventory still holds its last-known containers to supply
+			// the join keys — so without the drop every scrape would re-emit that
+			// last sample for as long as the host stays down. Cumulative counters
+			// that stop advancing read as an idle container; absent is the honest
+			// answer.
 			//
 			// statsState is deliberately left as-is either way: no sample was
 			// attempted, so there is no outcome to record, and keeping the last
@@ -199,6 +201,14 @@ func (p *Poller) logTransition(host string, err error) {
 // logStatsTransition logs stats-sampler failures only when the outcome changes,
 // mirroring logTransition. Kept separate from the inventory state so a stats
 // failure can never be mistaken for — or influence — host reachability.
+//
+// Expect this pair of messages to alternate on a host whose inventory refresh
+// chronically consumes most of Timeout: sampling shares that one per-host budget
+// (see tick), so whatever is left over lands either side of what the stats call
+// needs, and the outcome flips tick to tick. That is the shared budget working
+// as designed, not a sampler fault — the fix is the host's refresh latency, or a
+// larger -inventory-refresh-timeout, not anything here. The metrics themselves
+// stay honest throughout: a missed sample renders absent, never stale.
 func (p *Poller) logStatsTransition(host string, err error) {
 	ok := err == nil
 	p.mu.Lock()

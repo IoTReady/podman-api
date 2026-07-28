@@ -174,11 +174,11 @@ func TestPollerStatsErrorDoesNotAffectReachability(t *testing.T) {
 	}
 }
 
-// Skipping the sample must still retire the cached one. Otherwise the collector
-// — which enumerates hosts from the inventory, and the inventory keeps a down
-// host's last-known containers — re-emits the stale sample on every scrape for
-// as long as the host stays down, freezing cumulative counters instead of
-// letting the series go absent.
+// Skipping the sample must still retire the cached one. An unreachable host is
+// still in the configured host list the collector enumerates, and the inventory
+// still holds its last-known containers to supply the join keys, so otherwise
+// the stale sample is re-emitted on every scrape for as long as the host stays
+// down — freezing cumulative counters instead of letting the series go absent.
 func TestPollerDropsStatsForHostWhoseRefreshFailed(t *testing.T) {
 	f := newFakeRefresher()
 	f.failOn["dead"] = true
