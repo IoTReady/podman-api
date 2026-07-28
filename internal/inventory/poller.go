@@ -16,6 +16,18 @@ type Refresher interface {
 	RefreshHost(ctx context.Context, host string) error
 }
 
+// StatsRefresher samples one host's container resource usage.
+// Implemented by *instance.Service.RefreshHostStats.
+type StatsRefresher interface {
+	RefreshHostStats(ctx context.Context, host string) error
+}
+
+// VolumeUsageRefresher sizes one host's volumes.
+// Implemented by *instance.Service.RefreshHostVolumeUsage.
+type VolumeUsageRefresher interface {
+	RefreshHostVolumeUsage(ctx context.Context, host string) error
+}
+
 // Poller periodically refreshes every host's inventory into the service cache.
 // It mirrors internal/prune.Scheduler: an immediate first pass so a fresh start
 // warms within one cycle, per-tick panic recovery, a per-host timeout so one
@@ -25,9 +37,16 @@ type Poller struct {
 	Interval time.Duration
 	Timeout  time.Duration
 
-	mu    sync.Mutex
-	state map[string]bool // host -> last-known reachable, for transition logging
-	wg    sync.WaitGroup
+	// Stats, when non-nil, samples container resource usage on every tick,
+	// alongside the inventory refresh. Its failures are logged and otherwise
+	// ignored: reachability is the inventory refresh's to decide, and the
+	// Grafana alert rules all gate on podman_api_host_reachable.
+	Stats StatsRefresher
+
+	mu         sync.Mutex
+	state      map[string]bool // host -> last-known reachable, for transition logging
+	statsState map[string]bool // host -> last-known stats-sampler outcome (never reachability)
+	wg         sync.WaitGroup
 }
 
 // Start launches the ticker loop until ctx is cancelled. hostsFn returns the
@@ -36,6 +55,9 @@ func (p *Poller) Start(ctx context.Context, hostsFn func() []string) {
 	p.mu.Lock()
 	if p.state == nil {
 		p.state = map[string]bool{}
+	}
+	if p.statsState == nil {
+		p.statsState = map[string]bool{}
 	}
 	p.mu.Unlock()
 
@@ -78,6 +100,13 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			defer cancel()
 			err := p.Svc.RefreshHost(hctx, host)
 			p.logTransition(host, err)
+			// Sampled under its own timeout and its own state map: whatever it
+			// does, the reachability verdict above is already final.
+			if p.Stats != nil {
+				sctx, scancel := context.WithTimeout(ctx, p.Timeout)
+				p.logStatsTransition(host, p.Stats.RefreshHostStats(sctx, host))
+				scancel()
+			}
 		}(h)
 	}
 	wg.Wait()
@@ -95,6 +124,11 @@ func (p *Poller) pruneState(hosts []string) {
 	for h := range p.state {
 		if !keep[h] {
 			delete(p.state, h)
+		}
+	}
+	for h := range p.statsState {
+		if !keep[h] {
+			delete(p.statsState, h)
 		}
 	}
 	p.mu.Unlock()
@@ -117,4 +151,71 @@ func (p *Poller) logTransition(host string, err error) {
 	case seen && !prev && reachable:
 		log.Printf("inventory: host %s reachable again", host)
 	}
+}
+
+// logStatsTransition logs stats-sampler failures only when the outcome changes,
+// mirroring logTransition. Kept separate from the inventory state so a stats
+// failure can never be mistaken for — or influence — host reachability.
+func (p *Poller) logStatsTransition(host string, err error) {
+	ok := err == nil
+	p.mu.Lock()
+	prev, seen := p.statsState[host]
+	p.statsState[host] = ok
+	p.mu.Unlock()
+
+	switch {
+	case !seen && !ok:
+		log.Printf("inventory: host %s container stats unavailable: %v", host, err)
+	case seen && prev && !ok:
+		log.Printf("inventory: host %s container stats unavailable: %v", host, err)
+	case seen && !prev && ok:
+		log.Printf("inventory: host %s container stats available again", host)
+	}
+}
+
+// StartVolumeUsage runs a separate, much slower loop that sizes each host's
+// volumes. It is deliberately NOT part of tick(): podman's system df walks the
+// whole store and can take minutes, so it must never delay an inventory
+// refresh. Failures leave the previous sizing in place; staleness surfaces as
+// podman_api_volume_usage_age_seconds rather than as a gap. It touches no
+// reachability state, for the same reason the stats sampler doesn't.
+func (p *Poller) StartVolumeUsage(ctx context.Context, hostsFn func() []string, r VolumeUsageRefresher, interval, timeout time.Duration) {
+	if r == nil || interval <= 0 {
+		return
+	}
+	p.wg.Add(1)
+	go func() {
+		defer p.wg.Done()
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		run := func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					log.Printf("inventory: volume usage tick panicked: %v", rec)
+				}
+			}()
+			var wg sync.WaitGroup
+			for _, h := range hostsFn() {
+				wg.Add(1)
+				go func(host string) {
+					defer wg.Done()
+					hctx, cancel := context.WithTimeout(ctx, timeout)
+					defer cancel()
+					if err := r.RefreshHostVolumeUsage(hctx, host); err != nil {
+						log.Printf("inventory: host %s volume usage walk failed: %v", host, err)
+					}
+				}(h)
+			}
+			wg.Wait()
+		}
+		run() // prompt first walk so the metric isn't absent for a full interval
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				run()
+			}
+		}
+	}()
 }

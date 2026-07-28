@@ -90,6 +90,10 @@ func RunWithFlags(opts ...Option) error {
 		inventoryInterval = fs.Duration("inventory-refresh-interval", 30*time.Second, "background inventory refresh cadence per host; 0 disables the poller (falls back to the lazy 3s cache)")
 		inventoryTimeout  = fs.Duration("inventory-refresh-timeout", 20*time.Second, "per-host timeout for one background inventory refresh")
 
+		containerStats      = fs.Bool("container-stats", true, "sample per-container CPU/memory/network/block-IO on each inventory tick and export them as Prometheus metrics; requires the inventory poller")
+		volumeUsageInterval = fs.Duration("volume-usage-interval", time.Hour, "cadence for the per-host volume sizing walk (podman system df); 0 disables it")
+		volumeUsageTimeout  = fs.Duration("volume-usage-timeout", 5*time.Minute, "per-host timeout for one volume sizing walk")
+
 		ingressEnabled   = fs.Bool("ingress-enabled", false, "enable per-host Caddy ingress + auto-TLS")
 		ingressNetwork   = fs.String("ingress-network", "podman-api-ingress", "shared podman network app pods join for ingress")
 		ingressAdminAddr = fs.String("ingress-caddy-admin-addr", "localhost:2019", "default Caddy admin API address (host:port); per-host caddy_admin_addr in hosts/*.yaml overrides this. The admin API is unauthenticated, so keep :2019 on a trusted/private network or firewalled to the control plane")
@@ -268,11 +272,27 @@ func RunWithFlags(opts ...Option) error {
 			return ids
 		}
 		invPoller = &inventory.Poller{Svc: svc, Interval: *inventoryInterval, Timeout: *inventoryTimeout}
+		if *containerStats {
+			invPoller.Stats = svc
+		}
 		invPoller.Start(runnerCtx, hostIDs)
+		// Volume sizing runs on its own, much slower loop: podman's system df
+		// walks the whole store and must never delay an inventory refresh.
+		invPoller.StartVolumeUsage(runnerCtx, hostIDs, svc, *volumeUsageInterval, *volumeUsageTimeout)
 		// Same host list as the poller, so a host that has never been polled
 		// still reports host_reachable 0 instead of being silently absent.
 		registerInventoryMetrics(prometheus.DefaultRegisterer, svc, hostIDs, true)
 		log.Printf("inventory poller enabled (interval %s, per-host timeout %s)", *inventoryInterval, *inventoryTimeout)
+		// Both collectors register only inside this block: with the poller off
+		// nothing samples, so an empty metric would lie rather than be absent.
+		if *containerStats {
+			obs.NewStatsCollector(prometheus.DefaultRegisterer, svc, svc)
+			log.Printf("container stats sampling enabled")
+		}
+		if *volumeUsageInterval > 0 {
+			obs.NewVolumeUsageCollector(prometheus.DefaultRegisterer, svc, svc)
+			log.Printf("volume usage sampling enabled (interval %s, per-host timeout %s)", *volumeUsageInterval, *volumeUsageTimeout)
+		}
 	}
 
 	if c.backupScheduler != nil {
