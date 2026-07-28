@@ -107,14 +107,30 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			defer cancel()
 			err := p.Svc.RefreshHost(hctx, host)
 			p.logTransition(host, err)
-			// Sampled under its own timeout and its own state map: whatever it
-			// does, the reachability verdict above is already final.
+			// Sampled under its own state map — whatever it does, the
+			// reachability verdict above is already final — but under the SAME
+			// hctx deadline as the refresh, not a second fresh Timeout.
 			//
-			// A host that just failed its refresh is not sampled: calling anyway
-			// would spend a second full Timeout on it, doubling a hung host's
-			// cost per tick, which (since tick blocks the ticker) stretches
-			// every healthy host's cadence and inflates
-			// podman_api_inventory_age_seconds fleet-wide.
+			// That shared budget is load-bearing. tick blocks the ticker, so a
+			// host's total per-tick cost has to stay under Interval or it
+			// stretches every other host's cadence and inflates
+			// podman_api_inventory_age_seconds fleet-wide — the metric
+			// host-inventory-stale alerts on. Two independent Timeouts make the
+			// per-host bound 2*Timeout, which at the defaults (30s interval, 20s
+			// timeout) is 40s > 30s. Sharing hctx keeps it at exactly Timeout,
+			// the same bound as before stats existed and the only one an
+			// operator reasons about when setting -inventory-refresh-timeout
+			// against -inventory-refresh-interval.
+			//
+			// The cost is that a slow-but-successful refresh leaves the sampler
+			// little or no time and its sample is skipped. That is the correct
+			// trade: a missing sample is a gap in one host's resource series,
+			// which the collector renders as absent; overrunning the interval
+			// degrades the whole fleet's inventory freshness.
+			//
+			// A host that just failed its refresh is not sampled at all: hctx is
+			// most likely already expired, and calling anyway would only log a
+			// second failure for something reachability has already reported.
 			//
 			// But skipping is not the same as not caring: the cached samples
 			// must still be retired, or the collector — which enumerates hosts
@@ -131,9 +147,7 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 				if err != nil {
 					p.Stats.DropHostStats(host)
 				} else {
-					sctx, scancel := context.WithTimeout(ctx, p.Timeout)
-					p.logStatsTransition(host, p.Stats.RefreshHostStats(sctx, host))
-					scancel()
+					p.logStatsTransition(host, p.Stats.RefreshHostStats(hctx, host))
 				}
 			}
 		}(h)

@@ -25,10 +25,13 @@ func statsInv(host, tmpl, slug string, containers ...string) *fakeInventory {
 	}}
 }
 
-func newStatsReg(t *testing.T, st StatsSource, inv InventorySource) *prometheus.Registry {
+func newStatsReg(t *testing.T, st StatsSource, inv InventorySource, hosts ...string) *prometheus.Registry {
 	t.Helper()
+	if len(hosts) == 0 {
+		hosts = []string{"h1"}
+	}
 	reg := prometheus.NewRegistry()
-	NewStatsCollector(reg, st, inv)
+	NewStatsCollector(reg, st, inv, func() []string { return hosts })
 	return reg
 }
 
@@ -89,6 +92,26 @@ func TestStatsCollectorAbsentForUnreachableHostAfterDrop(t *testing.T) {
 	// Stats dropped for h1 (what the poller does when its refresh fails).
 	st := &fakeStats{snap: map[string]instance.HostStats{}}
 	got := gathered(t, newStatsReg(t, st, inv))
+	absent(t, got, "podman_api_container_cpu_seconds_total")
+	absent(t, got, "podman_api_container_memory_bytes")
+}
+
+// A host removed from hosts/*.yaml and reloaded via SIGHUP is pruned from
+// neither the stats cache nor the inventory cache, so iterating either snapshot
+// would re-emit its last sample on every scrape forever. The host list is the
+// authority: once the host is gone, so are its series. The mitigation the
+// README prescribes — gate on podman_api_host_reachable == 1 — is unavailable
+// here, because InventoryCollector stops emitting that series for the same host
+// at the same moment.
+func TestStatsCollectorAbsentForHostNotInHostList(t *testing.T) {
+	st := &fakeStats{snap: map[string]instance.HostStats{
+		"gone": {Containers: map[string]podman.ContainerStats{
+			"engine-valvo-engine": {Name: "engine-valvo-engine", CPUNano: 1, MemUsageBytes: 100},
+		}},
+	}}
+	inv := statsInv("gone", "engine", "valvo", "engine-valvo-engine")
+	// Cache and inventory both still hold "gone"; the configured host list does not.
+	got := gathered(t, newStatsReg(t, st, inv, "h1"))
 	absent(t, got, "podman_api_container_cpu_seconds_total")
 	absent(t, got, "podman_api_container_memory_bytes")
 }

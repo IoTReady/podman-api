@@ -132,6 +132,17 @@ for minutes concurrently with boot. A failed walk leaves the previous sizing in
 place; `podman_api_volume_usage_age_seconds` climbing is how a wedged or
 slow walk becomes visible.
 
+Attributing a size to an instance needs the volume in the inventory, so the
+inventory sweep now populates every volume the *template declares*, without
+inspecting it — the sweep must make no podman call per volume or it would cost
+one round trip per volume per host per tick. That changes what the list route
+reports: `GET /hosts/{host}/instances` lists a template's declared volumes,
+including any that do not exist on the host yet, always with `size_bytes` 0,
+whereas `GET /hosts/{host}/instances/{template}/{slug}` still inspects and so
+lists only volumes that really exist, with their real sizes. Treat the list
+route's `volumes` as names, and the single-instance route as the authority on
+existence and size.
+
 Neither sampler can affect `podman_api_host_reachable`: the Grafana
 Infrastructure Alerts rules gate on it, so a slow `system df` or a stats
 timeout must never be able to silence them.

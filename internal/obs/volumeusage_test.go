@@ -24,10 +24,13 @@ func volInv(host, tmpl, slug string, vols ...string) *fakeInventory {
 	}}
 }
 
-func newVolReg(t *testing.T, src VolumeUsageSource, inv InventorySource) *prometheus.Registry {
+func newVolReg(t *testing.T, src VolumeUsageSource, inv InventorySource, hosts ...string) *prometheus.Registry {
 	t.Helper()
+	if len(hosts) == 0 {
+		hosts = []string{"h1"}
+	}
 	reg := prometheus.NewRegistry()
-	c := NewVolumeUsageCollector(reg, src, inv)
+	c := NewVolumeUsageCollector(reg, src, inv, func() []string { return hosts })
 	c.now = func() time.Time { return testNow }
 	return reg
 }
@@ -63,6 +66,23 @@ func TestVolumeUsageCollectorAgeWithoutSizes(t *testing.T) {
 	}}
 	got := gathered(t, newVolReg(t, src, volInv("h1", "engine", "valvo", "engine-valvo-data")))
 	want(t, got, "podman_api_volume_usage_age_seconds{host=h1}", 3600)
+}
+
+// volumeUsageCache has no drop path at all — it deliberately keeps the last
+// sizing through a failed walk — so a host removed via SIGHUP would otherwise
+// report frozen sizes and an age that climbs without bound forever. The host
+// list, not the cache, decides who is still being walked.
+func TestVolumeUsageCollectorAbsentForHostNotInHostList(t *testing.T) {
+	src := &fakeVolUsage{snap: map[string]instance.HostVolumeUsage{
+		"gone": {
+			Sizes:     map[string]int64{"engine-valvo-data": 4096},
+			FetchedAt: testNow.Add(-90 * time.Second),
+		},
+	}}
+	inv := volInv("gone", "engine", "valvo", "engine-valvo-data")
+	got := gathered(t, newVolReg(t, src, inv, "h1"))
+	absent(t, got, "podman_api_volume_size_bytes")
+	absent(t, got, "podman_api_volume_usage_age_seconds")
 }
 
 // A host that has never been sampled has no age to report — emitting 0 would

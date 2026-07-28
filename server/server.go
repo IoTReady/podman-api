@@ -285,12 +285,15 @@ func RunWithFlags(opts ...Option) error {
 		log.Printf("inventory poller enabled (interval %s, per-host timeout %s)", *inventoryInterval, *inventoryTimeout)
 		// Both collectors register only inside this block: with the poller off
 		// nothing samples, so an empty metric would lie rather than be absent.
+		// Both also take hostIDs, so a host removed on SIGHUP stops emitting
+		// instead of freezing at its last sample — neither cache is pruned on
+		// host removal.
 		if *containerStats {
-			obs.NewStatsCollector(prometheus.DefaultRegisterer, svc, svc)
+			obs.NewStatsCollector(prometheus.DefaultRegisterer, svc, svc, hostIDs)
 			log.Printf("container stats sampling enabled")
 		}
 		if *volumeUsageInterval > 0 {
-			obs.NewVolumeUsageCollector(prometheus.DefaultRegisterer, svc, svc)
+			obs.NewVolumeUsageCollector(prometheus.DefaultRegisterer, svc, svc, hostIDs)
 			log.Printf("volume usage sampling enabled (interval %s, per-host timeout %s)", *volumeUsageInterval, *volumeUsageTimeout)
 		}
 	}

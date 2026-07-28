@@ -826,6 +826,13 @@ func mapContainerStats(s define.ContainerStats) ContainerStats {
 // ContainerStats issues one non-streaming stats call and returns the first
 // (and only) report. Passing nil containers asks podman for every container on
 // the host, so a fleet sample costs one round trip per host.
+//
+// All is deliberately left unset. With an empty name list podman's abi selects
+// GetRunningContainers when All is false and GetAllContainers when it is true —
+// but computeStats then skips every non-running container regardless, swallowing
+// ErrCtrStopped/ErrCtrStateInvalid/ErrNoCgroups because the query was for all.
+// So All:true yields no extra samples; it only enumerates and lock-touches every
+// exited container on the host, once per tick.
 func (r *Real) ContainerStats(ctx context.Context, id string) ([]ContainerStats, error) {
 	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
@@ -833,8 +840,7 @@ func (r *Real) ContainerStats(ctx context.Context, id string) ([]ContainerStats,
 	}
 	defer cancel()
 	stream := false
-	all := true
-	ch, err := containers.Stats(c, nil, &containers.StatsOptions{Stream: &stream, All: &all})
+	ch, err := containers.Stats(c, nil, &containers.StatsOptions{Stream: &stream})
 	if err != nil {
 		return nil, err
 	}
@@ -881,7 +887,13 @@ func (r *Real) VolumeUsage(ctx context.Context, id string) (map[string]int64, er
 		return nil, err
 	}
 	if df == nil {
-		return nil, nil
+		// Unreachable via system.DiskUsage, which never returns (nil, nil) — but
+		// returning (nil, nil) here would look like a successful walk that found
+		// no volumes, and RefreshHostVolumeUsage would then cache an empty map
+		// with a fresh timestamp: every size wiped and volume_usage_age_seconds
+		// reset to 0. The cache's contract is to keep the last sizing through a
+		// failure, so this must be a failure.
+		return nil, errors.New("system df returned no report")
 	}
 	out := make(map[string]int64, len(df.Volumes))
 	for _, v := range df.Volumes {

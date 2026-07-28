@@ -27,13 +27,22 @@ var (
 // VolumeUsageCollector renders volume sizes at scrape time, attributing each
 // volume to its instance via the inventory snapshot. Does no podman I/O.
 type VolumeUsageCollector struct {
-	src VolumeUsageSource
-	inv InventorySource
-	now func() time.Time
+	src   VolumeUsageSource
+	inv   InventorySource
+	hosts func() []string
+	now   func() time.Time
 }
 
-func NewVolumeUsageCollector(reg prometheus.Registerer, src VolumeUsageSource, inv InventorySource) *VolumeUsageCollector {
-	c := &VolumeUsageCollector{src: src, inv: inv, now: time.Now}
+// NewVolumeUsageCollector builds the collector and registers it on reg.
+//
+// hosts must be the same host-list function the inventory poller and
+// InventoryCollector use, and it — not the cache map — is what Collect
+// enumerates. volumeUsageCache deliberately keeps a host's last sizing through
+// a failed walk and has no drop path at all, so iterating a snapshot would
+// leave a host removed on SIGHUP reporting frozen sizes and an ever-climbing
+// podman_api_volume_usage_age_seconds forever.
+func NewVolumeUsageCollector(reg prometheus.Registerer, src VolumeUsageSource, inv InventorySource, hosts func() []string) *VolumeUsageCollector {
+	c := &VolumeUsageCollector{src: src, inv: inv, hosts: hosts, now: time.Now}
 	reg.MustRegister(c)
 	return c
 }
@@ -47,7 +56,17 @@ func (c *VolumeUsageCollector) Collect(ch chan<- prometheus.Metric) {
 	snap := c.src.VolumeUsageSnapshot()
 	now := c.now()
 	inv := c.inv.InventorySnapshot()
-	for host, u := range snap {
+	seen := make(map[string]bool, len(snap))
+	for _, host := range c.hosts() {
+		if seen[host] {
+			continue // a duplicated host id would emit duplicate series and fail Gather
+		}
+		seen[host] = true
+
+		u, ok := snap[host]
+		if !ok {
+			continue
+		}
 		if !u.FetchedAt.IsZero() {
 			ch <- prometheus.MustNewConstMetric(descVolumeUsageAge, prometheus.GaugeValue,
 				now.Sub(u.FetchedAt).Seconds(), host)

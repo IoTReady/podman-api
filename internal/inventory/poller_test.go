@@ -198,10 +198,9 @@ func TestPollerDropsStatsForHostWhoseRefreshFailed(t *testing.T) {
 	}
 }
 
-// A host whose inventory refresh failed has no stats to hand over, and calling
-// anyway would spend a second full Timeout on it — doubling a hung host's cost
-// per tick and, since tick blocks the ticker, stretching every healthy host's
-// refresh cadence past the interval.
+// A host whose inventory refresh failed has no stats to hand over: its hctx is
+// most likely already expired, and calling anyway would only log a second
+// failure for something reachability has already reported.
 func TestPollerSkipsStatsWhenRefreshFailed(t *testing.T) {
 	f := newFakeRefresher()
 	f.failOn["dead"] = true
@@ -230,10 +229,13 @@ func TestPollerSkipsStatsWhenRefreshFailed(t *testing.T) {
 	}
 }
 
-// The stats timeout must be derived from the tick context, not from the
-// already-part-spent per-host inventory context — otherwise a slow refresh
-// silently eats into the sampler's budget.
-func TestPollerStatsTimeoutIsIndependentOfRefresh(t *testing.T) {
+// Refresh and stats share ONE per-host budget: the sampler runs under the same
+// hctx as the refresh that preceded it, so a host's total per-tick cost stays
+// bounded by Timeout. That is the property that matters — tick blocks the
+// ticker, so two independent Timeouts would make the bound 2*Timeout (40s at
+// the 30s/20s defaults), stretching every other host's cadence and inflating
+// podman_api_inventory_age_seconds fleet-wide.
+func TestPollerStatsSharesThePerHostBudgetWithRefresh(t *testing.T) {
 	f := newFakeRefresher()
 	f.delay = 300 * time.Millisecond // a slow-but-successful inventory refresh
 	st := &statsRec{}
@@ -244,11 +246,18 @@ func TestPollerStatsTimeoutIsIndependentOfRefresh(t *testing.T) {
 	cancel()
 	p.Wait()
 
-	// Derived from ctx the sampler sees ~2s; derived from hctx it would see
-	// ~1.7s, since hctx's deadline was set before the 300ms refresh.
-	if left := st.firstRemaining(); left < 1900*time.Millisecond {
-		t.Fatalf("stats context has only %s left: it appears derived from the "+
-			"per-host refresh context rather than the tick context", left)
+	// Under hctx the sampler sees ~1.7s, the Timeout minus what the refresh
+	// already spent. A fresh Timeout of its own would show ~2s and put the
+	// per-host worst case at 2*Timeout.
+	left := st.firstRemaining()
+	if left > 2*time.Second-f.delay {
+		t.Fatalf("stats context has %s left, more than the %s the refresh left "+
+			"of the per-host budget: it appears to have been given a fresh "+
+			"timeout rather than sharing hctx",
+			left, 2*time.Second-f.delay)
+	}
+	if left <= 0 {
+		t.Fatalf("stats context had no budget left (%s); the sampler could never run", left)
 	}
 }
 

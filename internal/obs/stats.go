@@ -57,10 +57,21 @@ var (
 type StatsCollector struct {
 	stats StatsSource
 	inv   InventorySource
+	hosts func() []string
 }
 
-func NewStatsCollector(reg prometheus.Registerer, stats StatsSource, inv InventorySource) *StatsCollector {
-	c := &StatsCollector{stats: stats, inv: inv}
+// NewStatsCollector builds the collector and registers it on reg.
+//
+// hosts must be the same host-list function the inventory poller and
+// InventoryCollector use, and it — not the cache maps — is what Collect
+// enumerates. Neither cache is pruned when a host leaves hosts/*.yaml on
+// SIGHUP, so iterating a snapshot would re-emit that host's last sample on
+// every scrape forever: cumulative counters frozen mid-flight read as idle
+// containers, and the documented mitigation (gate on
+// podman_api_host_reachable == 1) is unavailable because InventoryCollector
+// has already stopped emitting that series for the departed host.
+func NewStatsCollector(reg prometheus.Registerer, stats StatsSource, inv InventorySource, hosts func() []string) *StatsCollector {
+	c := &StatsCollector{stats: stats, inv: inv, hosts: hosts}
 	reg.MustRegister(c)
 	return c
 }
@@ -78,12 +89,19 @@ func (c *StatsCollector) Describe(ch chan<- *prometheus.Desc) {
 
 func (c *StatsCollector) Collect(ch chan<- prometheus.Metric) {
 	stats := c.stats.StatsSnapshot()
-	for host, inv := range c.inv.InventorySnapshot() {
+	snap := c.inv.InventorySnapshot()
+	seen := make(map[string]bool, len(stats))
+	for _, host := range c.hosts() {
+		if seen[host] {
+			continue // a duplicated host id would emit duplicate series and fail Gather
+		}
+		seen[host] = true
+
 		hs, ok := stats[host]
 		if !ok {
 			continue
 		}
-		for _, o := range inv.Observed {
+		for _, o := range snap[host].Observed {
 			for _, ct := range o.Containers {
 				s, ok := hs.Containers[ct.Name]
 				if !ok {
