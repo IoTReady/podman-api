@@ -806,6 +806,56 @@ func podFromList(p *entities.ListPodsReport) Pod {
 	return out
 }
 
+func mapContainerStats(s define.ContainerStats) ContainerStats {
+	out := ContainerStats{
+		Name:            s.Name,
+		CPUNano:         s.CPUNano,
+		MemUsageBytes:   s.MemUsage,
+		MemLimitBytes:   s.MemLimit,
+		BlockReadBytes:  s.BlockInput,
+		BlockWriteBytes: s.BlockOutput,
+		PIDs:            s.PIDs,
+	}
+	for _, n := range s.Network {
+		out.NetRxBytes += n.RxBytes
+		out.NetTxBytes += n.TxBytes
+	}
+	return out
+}
+
+// ContainerStats issues one non-streaming stats call and returns the first
+// (and only) report. Passing nil containers asks podman for every container on
+// the host, so a fleet sample costs one round trip per host.
+func (r *Real) ContainerStats(ctx context.Context, id string) ([]ContainerStats, error) {
+	c, cancel, err := r.opCtxFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	stream := false
+	all := true
+	ch, err := containers.Stats(c, nil, &containers.StatsOptions{Stream: &stream, All: &all})
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case <-c.Done():
+		return nil, c.Err()
+	case rep, ok := <-ch:
+		if !ok {
+			return nil, nil
+		}
+		if rep.Error != nil {
+			return nil, rep.Error
+		}
+		out := make([]ContainerStats, 0, len(rep.Stats))
+		for _, s := range rep.Stats {
+			out = append(out, mapContainerStats(s))
+		}
+		return out, nil
+	}
+}
+
 // ContainerLogs streams log lines from a container. Cancellation propagates
 // bidirectionally: if the caller's ctx is cancelled the underlying
 // containers.Logs call is cancelled (via mergedCtx), and if the producer

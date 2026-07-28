@@ -48,6 +48,29 @@ type Volume struct {
 	SizeBytes int64
 }
 
+// ContainerStats is a point-in-time resource sample for one container, mapped
+// from libpod's define.ContainerStats.
+//
+// The cumulative fields (CPUNano, the byte counters) reset to zero when the
+// container is recreated, exactly as RestartCount does — a redeploy reads as a
+// counter reset, which Prometheus rate()/increase() handle.
+//
+// Podman's own CPU/AvgCPU/MemPerc percentages are deliberately NOT carried:
+// for a non-streaming call they are averaged against container start time, so a
+// container busy at boot and idle since reads as permanently hot. Export the
+// counters and let PromQL derive rates.
+type ContainerStats struct {
+	Name            string
+	CPUNano         uint64 // cumulative CPU time, nanoseconds
+	MemUsageBytes   uint64
+	MemLimitBytes   uint64 // 0 when the container declares no limit
+	NetRxBytes      uint64 // summed across interfaces
+	NetTxBytes      uint64
+	BlockReadBytes  uint64
+	BlockWriteBytes uint64
+	PIDs            uint64
+}
+
 type Secret struct {
 	Name      string
 	CreatedAt time.Time

@@ -40,6 +40,12 @@ type Client interface {
 	// already exists is a no-op (no error).
 	VolumeCreate(ctx context.Context, hostID, name string) error
 
+	// Stats
+	// ContainerStats returns a single non-streaming resource sample for every
+	// container on the host. It is one call per host; the caller attributes
+	// samples to instances by container name.
+	ContainerStats(ctx context.Context, hostID string) ([]ContainerStats, error)
+
 	// Networks
 	// NetworkEnsure creates the named network if absent; creating one that
 	// already exists is a no-op (no error).
