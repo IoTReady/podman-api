@@ -868,6 +868,28 @@ func (r *Real) ContainerStats(ctx context.Context, id string) ([]ContainerStats,
 	}
 }
 
+// VolumeUsage returns each volume's on-disk size in bytes, keyed by volume
+// name, via one `system df` call.
+func (r *Real) VolumeUsage(ctx context.Context, id string) (map[string]int64, error) {
+	c, cancel, err := r.opCtxFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	df, err := system.DiskUsage(c, &system.DiskOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if df == nil {
+		return nil, nil
+	}
+	out := make(map[string]int64, len(df.Volumes))
+	for _, v := range df.Volumes {
+		out[v.VolumeName] = v.Size
+	}
+	return out, nil
+}
+
 // ContainerLogs streams log lines from a container. Cancellation propagates
 // bidirectionally: if the caller's ctx is cancelled the underlying
 // containers.Logs call is cancelled (via mergedCtx), and if the producer

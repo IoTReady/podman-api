@@ -45,6 +45,11 @@ type Client interface {
 	// container on the host. It is one call per host; the caller attributes
 	// samples to instances by container name.
 	ContainerStats(ctx context.Context, hostID string) ([]ContainerStats, error)
+	// VolumeUsage returns each volume's on-disk size in bytes, keyed by volume
+	// name, from one `system df` call. Podman walks images, containers and
+	// volumes to answer this, so it can take minutes on a large store — callers
+	// must run it on a slow cadence with its own timeout, never on a hot path.
+	VolumeUsage(ctx context.Context, hostID string) (map[string]int64, error)
 
 	// Networks
 	// NetworkEnsure creates the named network if absent; creating one that
