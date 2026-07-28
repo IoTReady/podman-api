@@ -798,7 +798,14 @@ func (s *Service) listAllInstancesLive(ctx context.Context, host string) ([]Obse
 			for _, p := range pods {
 				slug := p.Labels["podman-api/slug"]
 				ss := vals[store.SpecKey{Template: tmplID, Slug: slug}]
-				obs := Normalize(p, tmplID, slug, nil, secretEnvs, ss.vals)
+				// Names only, derived from template meta — the same construction
+				// Get uses. No podman call: the sweep must not pay for volume
+				// inspection, and sizes come from the volume-usage cache.
+				var vols []podman.Volume
+				for _, v := range t.Meta.Volumes {
+					vols = append(vols, podman.Volume{Name: tmplID + "-" + slug + "-" + v.Name})
+				}
+				obs := Normalize(p, tmplID, slug, vols, secretEnvs, ss.vals)
 				part = append(part, applySecretRedaction(obs, ss, sweepErr))
 			}
 			results[i] = result{obs: part}
