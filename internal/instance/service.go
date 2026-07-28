@@ -93,6 +93,8 @@ type Service struct {
 	blobs      BlobStore                              // backup artifact store; set via SetBlobStore (nil → backups disabled)
 	sidecar    SidecarInjector                        // sidecar injector; set via SetSidecarInjector (nil → no injection)
 	instCache  *instanceCache                         // per-host read cache over ListAllInstances (default 3s TTL)
+	statsCache *statsCache                            // per-host container resource samples (poller-fed)
+	volCache   *volumeUsageCache                      // per-host volume sizing (slow sampler-fed)
 
 	verifyVolumes bool // verify each migrated volume's content before reaping the source
 
@@ -117,6 +119,8 @@ func NewService(client podman.Client, hosts []config.Host) *Service {
 	s.ingress = ingress.Disabled{}
 	s.SetHosts(hosts)
 	s.instCache = newInstanceCache(3 * time.Second)
+	s.statsCache = newStatsCache()
+	s.volCache = newVolumeUsageCache()
 	return s
 }
 
@@ -744,6 +748,48 @@ func (s *Service) EnableWarmInventory() { s.instCache.setWarm(true) }
 // read, so a snapshot would under-report.
 func (s *Service) InventorySnapshot() map[string]HostInventory {
 	return s.instCache.snapshot()
+}
+
+// RefreshHostStats samples every container's resource usage on host and stores
+// it for the metrics collector. One podman call per host.
+//
+// On error the host's samples are dropped, so its series go absent rather than
+// freezing at their last value. The caller must NOT treat a failure here as the
+// host being unreachable — reachability is the inventory refresh's to decide.
+func (s *Service) RefreshHostStats(ctx context.Context, host string) error {
+	st, err := s.client.ContainerStats(ctx, host)
+	if err != nil {
+		s.statsCache.drop(host)
+		return err
+	}
+	m := make(map[string]podman.ContainerStats, len(st))
+	for _, c := range st {
+		m[c.Name] = c
+	}
+	s.statsCache.put(host, HostStats{Containers: m, FetchedAt: time.Now()})
+	return nil
+}
+
+// StatsSnapshot returns the cached container samples for every host. Never
+// fetches: it runs on the scrape path.
+func (s *Service) StatsSnapshot() map[string]HostStats { return s.statsCache.snapshot() }
+
+// RefreshHostVolumeUsage sizes every volume on host via one `system df` call.
+// Podman walks the whole store to answer, so this belongs on a slow cadence
+// with its own timeout. On error the previous sizing is retained.
+func (s *Service) RefreshHostVolumeUsage(ctx context.Context, host string) error {
+	sizes, err := s.client.VolumeUsage(ctx, host)
+	if err != nil {
+		return err
+	}
+	s.volCache.put(host, HostVolumeUsage{Sizes: sizes, FetchedAt: time.Now()})
+	return nil
+}
+
+// VolumeUsageSnapshot returns the cached volume sizing for every host. Never
+// fetches: it runs on the scrape path.
+func (s *Service) VolumeUsageSnapshot() map[string]HostVolumeUsage {
+	return s.volCache.snapshot()
 }
 
 // RefreshHost performs a live inventory sweep of host and stores it in the warm
