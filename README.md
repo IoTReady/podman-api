@@ -135,6 +135,8 @@ POST   /hosts/{host}/instances/{template}/{slug}/start
 POST   /hosts/{host}/instances/{template}/{slug}/stop
 POST   /hosts/{host}/instances/{template}/{slug}/restart
 POST   /hosts/{host}/instances/{template}/{slug}/upgrade  body: {"image": "..."}
+PATCH  /hosts/{host}/instances/{template}/{slug}/parameters  body: {"parameters": {...}}
+PATCH  /hosts/{host}/instances/{template}/{slug}/secrets     body: {"secrets": {...}}
 
 GET    /hosts/{host}/instances/{template}/{slug}/logs?container=&tail=&follow=
 GET    /hosts/{host}/instances/{template}/{slug}/volumes
@@ -155,4 +157,5 @@ GET    /jobs/{id}
 **Notes:**
 - `POST /migrate` and `POST /evacuate` require `-state-db` (else `501`), validate synchronously, and return `202 {job_id}`. Poll `GET /jobs/{id}` for progress.
 - `?skip_pull=true` on POST/PUT skips the pre-pull step.
+- The two `PATCH` routes change one instance in place and reuse its sealed per-instance secrets, so they work on an instance whose secret plaintext nobody can read back (a full `PUT` requires every declared secret). Both merge — omitted parameters/secrets keep their stored value, and neither can delete one. Both replace the pod.
 - On DELETE, `prune_volumes` and `prune_secrets` default to `false`. Pass both as `true` to reap volumes and secrets. DELETE is idempotent — a prune-requested delete on an already-gone pod still removes orphaned volumes/secrets and returns `204`.

@@ -384,6 +384,18 @@ components:
           additionalProperties: true
           minProperties: 1
 
+    UpdateSecretsRequest:
+      type: object
+      required: [secrets]
+      properties:
+        secrets:
+          type: object
+          description: >-
+            secret name -> new plaintext value; merged into the stored sealed
+            secrets. Values must be non-empty and are never returned by any route.
+          additionalProperties: {type: string, minLength: 1}
+          minProperties: 1
+
     MigrateRequest:
       type: object
       required: [from_host, to_host, template, slug]
@@ -1070,6 +1082,41 @@ paths:
       requestBody:
         required: true
         content: {application/json: {schema: {$ref: '#/components/schemas/UpdateParametersRequest'}}}
+      responses:
+        '200':
+          description: updated
+          content: {application/json: {schema: {$ref: '#/components/schemas/Observed'}}}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '502': {$ref: '#/components/responses/UpstreamError'}
+      x-required-scope: instances:write
+
+  /hosts/{host}/instances/{template}/{slug}/secrets:
+    patch:
+      tags: [lifecycle]
+      summary: add or rotate per-instance secrets, keeping the sealed ones you omit
+      description: >-
+        Merges the supplied secrets into the instance's stored sealed
+        per-instance secrets and re-applies with replace, reusing the stored
+        parameters and persisted domains unchanged. Names absent from the request
+        keep their stored value, so a secret the template gained after deploy can
+        be added without resupplying secrets whose plaintext is sealed and
+        unreadable — the full-spec PUT demands every declared secret, which is
+        impossible on such an instance. A secret cannot be deleted through this
+        route (use PUT, which requires the full set), so an empty value is
+        rejected with 400 invalid_body rather than wiping an unrecoverable
+        secret. Values are request-only: nothing here is ever read back, and the
+        response is the usual Observed. A name the template does not declare is
+        rejected (400 invalid_parameters). This route replaces the pod, so a
+        re-apply podman refuses can leave the instance down until a boot converge
+        or a manual re-apply.
+      parameters:
+        - {$ref: '#/components/parameters/HostID'}
+        - {$ref: '#/components/parameters/TemplateID'}
+        - {$ref: '#/components/parameters/Slug'}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {$ref: '#/components/schemas/UpdateSecretsRequest'}}}
       responses:
         '200':
           description: updated

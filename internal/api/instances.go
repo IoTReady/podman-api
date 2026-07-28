@@ -325,6 +325,59 @@ func (h *handlers) patchInstanceParameters(w http.ResponseWriter, r *http.Reques
 	WriteJSON(w, http.StatusOK, obs)
 }
 
+// patchInstanceSecrets merges the request's secrets into the instance's stored
+// sealed per-instance secrets and re-applies. Names absent from the request keep
+// their stored value, so an operator can add a secret the template gained after
+// deploy without resupplying plaintext they can no longer read — PUT demands the
+// full declared set, and no route ever hands a sealed value back, which before
+// this route made such an addition impossible (#207). Values are request-only:
+// the 200 body is the usual Observed and carries no plaintext. A blank value is
+// rejected — it would wipe an unrecoverable secret, and since this route cannot
+// delete one (use PUT with the full spec for that) a blank can only be a
+// mistake. Like .../parameters this replaces the pod, so a manifest podman
+// refuses can leave the instance down until a boot converge or manual re-apply
+// — see Service.RotateInstanceSecrets.
+func (h *handlers) patchInstanceSecrets(w http.ResponseWriter, r *http.Request) {
+	host := r.PathValue("host")
+	tmpl := r.PathValue("template")
+	slug := r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
+	var body struct {
+		Secrets map[string]string `json:"secrets"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+		return
+	}
+	if len(body.Secrets) == 0 {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "secrets is required and must not be empty"})
+		return
+	}
+	for name, value := range body.Secrets {
+		if value == "" {
+			// The name is safe to echo (it is template-declared metadata, and
+			// the manage-secrets UI already lists it); the value never is.
+			WriteJSON(w, http.StatusBadRequest, ErrorBody{
+				Code:    "invalid_body",
+				Message: "secret " + strconv.Quote(name) + " has an empty value; this route cannot delete a secret",
+			})
+			return
+		}
+	}
+	if err := h.svc.RotateInstanceSecrets(r.Context(), host, tmpl, slug, body.Secrets); err != nil {
+		WriteError(w, err)
+		return
+	}
+	obs, err := h.svc.Get(r.Context(), host, tmpl, slug)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, obs)
+}
+
 func (h *handlers) renameInstance(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	tmpl := r.PathValue("template")
