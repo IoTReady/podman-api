@@ -45,7 +45,25 @@ type statsRec struct {
 	mu        sync.Mutex
 	hosts     []string
 	remaining []time.Duration
+	dropped   []string
 	err       error
+}
+
+func (s *statsRec) DropHostStats(host string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dropped = append(s.dropped, host)
+}
+
+func (s *statsRec) wasDropped(host string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, h := range s.dropped {
+		if h == host {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *statsRec) RefreshHostStats(ctx context.Context, host string) error {
@@ -153,6 +171,30 @@ func TestPollerStatsErrorDoesNotAffectReachability(t *testing.T) {
 	}
 	if !statsSeen || statsOK {
 		t.Fatalf("stats failure not recorded in statsState: seen=%v ok=%v", statsSeen, statsOK)
+	}
+}
+
+// Skipping the sample must still retire the cached one. Otherwise the collector
+// — which enumerates hosts from the inventory, and the inventory keeps a down
+// host's last-known containers — re-emits the stale sample on every scrape for
+// as long as the host stays down, freezing cumulative counters instead of
+// letting the series go absent.
+func TestPollerDropsStatsForHostWhoseRefreshFailed(t *testing.T) {
+	f := newFakeRefresher()
+	f.failOn["dead"] = true
+	st := &statsRec{}
+	p := &Poller{Svc: f, Stats: st, Interval: time.Hour, Timeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx, func() []string { return []string{"live", "dead"} })
+	waitFor(t, "dead host's stats dropped", func() bool { return st.wasDropped("dead") })
+	cancel()
+	p.Wait()
+
+	if st.called("dead") {
+		t.Fatal("the dropped host was sampled after all: the tick pays two timeouts for it")
+	}
+	if st.wasDropped("live") {
+		t.Fatal("a healthy host's samples were dropped")
 	}
 }
 

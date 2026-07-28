@@ -770,6 +770,16 @@ func (s *Service) RefreshHostStats(ctx context.Context, host string) error {
 	return nil
 }
 
+// DropHostStats discards the host's cached samples without sampling it. It is
+// for the caller that decides NOT to call RefreshHostStats at all — e.g. the
+// poller skipping a host whose inventory refresh just failed — which would
+// otherwise leave the last-known sample in the cache forever, freezing the
+// host's series instead of retiring them. Same contract as a failed refresh
+// (see statsCache): absent beats frozen for cumulative counters.
+//
+// No context and no I/O: it costs a tick nothing.
+func (s *Service) DropHostStats(host string) { s.statsCache.drop(host) }
+
 // StatsSnapshot returns the cached container samples for every host. Never
 // fetches: it runs on the scrape path.
 func (s *Service) StatsSnapshot() map[string]HostStats { return s.statsCache.snapshot() }

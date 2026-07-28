@@ -16,10 +16,17 @@ type Refresher interface {
 	RefreshHost(ctx context.Context, host string) error
 }
 
-// StatsRefresher samples one host's container resource usage.
-// Implemented by *instance.Service.RefreshHostStats.
+// StatsRefresher samples one host's container resource usage, or retires the
+// samples it already holds. Implemented by *instance.Service.
+//
+// Both methods are required, not optional: a sampler that can be skipped but
+// not retired freezes a down host's series at their last value. Keeping them on
+// one interface makes that a compile error rather than a silent metrics bug.
 type StatsRefresher interface {
 	RefreshHostStats(ctx context.Context, host string) error
+	// DropHostStats discards the host's cached samples. Called when the host is
+	// not going to be sampled at all. No context: it does no I/O.
+	DropHostStats(host string)
 }
 
 // VolumeUsageRefresher sizes one host's volumes.
@@ -103,19 +110,31 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			// Sampled under its own timeout and its own state map: whatever it
 			// does, the reachability verdict above is already final.
 			//
-			// Skipped when the refresh itself failed: a host that just timed out
-			// has no stats to hand over, and calling anyway would spend a second
-			// full Timeout on it — doubling a hung host's cost per tick, which
-			// (since tick blocks the ticker) stretches every healthy host's
-			// cadence and inflates podman_api_inventory_age_seconds fleet-wide.
-			// statsState is deliberately left as-is across the skip: no sample
-			// was attempted, so there is no outcome to record, and keeping the
-			// last real one means recovery logs the true transition instead of
-			// a spurious one.
-			if p.Stats != nil && err == nil {
-				sctx, scancel := context.WithTimeout(ctx, p.Timeout)
-				p.logStatsTransition(host, p.Stats.RefreshHostStats(sctx, host))
-				scancel()
+			// A host that just failed its refresh is not sampled: calling anyway
+			// would spend a second full Timeout on it, doubling a hung host's
+			// cost per tick, which (since tick blocks the ticker) stretches
+			// every healthy host's cadence and inflates
+			// podman_api_inventory_age_seconds fleet-wide.
+			//
+			// But skipping is not the same as not caring: the cached samples
+			// must still be retired, or the collector — which enumerates hosts
+			// from the inventory, and the inventory keeps a down host's
+			// last-known containers — would re-emit them on every scrape for as
+			// long as the host stays down. Cumulative counters that stop
+			// advancing read as an idle container; absent is the honest answer.
+			//
+			// statsState is deliberately left as-is either way: no sample was
+			// attempted, so there is no outcome to record, and keeping the last
+			// real one means recovery logs the true transition, not a spurious
+			// one.
+			if p.Stats != nil {
+				if err != nil {
+					p.Stats.DropHostStats(host)
+				} else {
+					sctx, scancel := context.WithTimeout(ctx, p.Timeout)
+					p.logStatsTransition(host, p.Stats.RefreshHostStats(sctx, host))
+					scancel()
+				}
 			}
 		}(h)
 	}

@@ -75,6 +75,24 @@ func TestStatsCollectorAbsentWhenNoSample(t *testing.T) {
 	absent(t, got, "podman_api_container_cpu_seconds_total")
 }
 
+// The regression this pins: an unreachable host keeps its last-known Observed
+// containers in the inventory, so Collect still enumerates it. Once the poller
+// has dropped its stats entry the series must go absent — if the entry were
+// retained instead, every scrape would re-emit the last sample and the
+// cumulative counters would read as containers that went idle.
+func TestStatsCollectorAbsentForUnreachableHostAfterDrop(t *testing.T) {
+	inv := statsInv("h1", "engine", "valvo", "engine-valvo-engine")
+	h := inv.snap["h1"]
+	h.Reachable = false // down, but Observed is deliberately retained
+	inv.snap["h1"] = h
+
+	// Stats dropped for h1 (what the poller does when its refresh fails).
+	st := &fakeStats{snap: map[string]instance.HostStats{}}
+	got := gathered(t, newStatsReg(t, st, inv))
+	absent(t, got, "podman_api_container_cpu_seconds_total")
+	absent(t, got, "podman_api_container_memory_bytes")
+}
+
 // MemLimit 0 means "no limit declared"; emitting 0 would make every saturation
 // panel read as fully saturated.
 func TestStatsCollectorOmitsZeroMemLimit(t *testing.T) {

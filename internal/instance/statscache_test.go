@@ -57,6 +57,36 @@ func TestRefreshHostStatsDropsOnError(t *testing.T) {
 	}
 }
 
+// The poller skips sampling a host whose inventory refresh just failed, so the
+// "called and errored" path above is never reached for it. DropHostStats is how
+// that host's samples are still retired instead of freezing at their last value.
+func TestDropHostStatsRetiresSamplesWithoutSampling(t *testing.T) {
+	f := fake.New()
+	f.ContainerStatsVal = map[string][]podman.ContainerStats{
+		"h1": {{Name: "c", CPUNano: 5}},
+		"h2": {{Name: "d", CPUNano: 7}},
+	}
+	svc := statsService(f)
+	for _, h := range []string{"h1", "h2"} {
+		if err := svc.RefreshHostStats(context.Background(), h); err != nil {
+			t.Fatalf("seed refresh %s: %v", h, err)
+		}
+	}
+
+	svc.DropHostStats("h1")
+
+	snap := svc.StatsSnapshot()
+	if _, ok := snap["h1"]; ok {
+		t.Fatal("DropHostStats left the host's samples in the cache")
+	}
+	if _, ok := snap["h2"]; !ok {
+		t.Fatal("DropHostStats discarded another host's samples")
+	}
+	// Dropping an unknown host is a no-op, not a panic: the poller may skip a
+	// host that has never been sampled.
+	svc.DropHostStats("never-seen")
+}
+
 // Volume usage is the opposite: sizes change slowly and the walk is hourly, so
 // a single failure keeps the last value and lets the age metric report the gap.
 func TestRefreshHostVolumeUsageKeepsLastOnError(t *testing.T) {
