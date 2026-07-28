@@ -102,7 +102,17 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			p.logTransition(host, err)
 			// Sampled under its own timeout and its own state map: whatever it
 			// does, the reachability verdict above is already final.
-			if p.Stats != nil {
+			//
+			// Skipped when the refresh itself failed: a host that just timed out
+			// has no stats to hand over, and calling anyway would spend a second
+			// full Timeout on it — doubling a hung host's cost per tick, which
+			// (since tick blocks the ticker) stretches every healthy host's
+			// cadence and inflates podman_api_inventory_age_seconds fleet-wide.
+			// statsState is deliberately left as-is across the skip: no sample
+			// was attempted, so there is no outcome to record, and keeping the
+			// last real one means recovery logs the true transition instead of
+			// a spurious one.
+			if p.Stats != nil && err == nil {
 				sctx, scancel := context.WithTimeout(ctx, p.Timeout)
 				p.logStatsTransition(host, p.Stats.RefreshHostStats(sctx, host))
 				scancel()

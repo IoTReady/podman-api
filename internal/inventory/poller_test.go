@@ -12,6 +12,7 @@ type fakeRefresher struct {
 	mu     sync.Mutex
 	calls  map[string]int
 	failOn map[string]bool
+	delay  time.Duration // simulated refresh cost, for deadline-derivation tests
 }
 
 func newFakeRefresher() *fakeRefresher {
@@ -19,6 +20,9 @@ func newFakeRefresher() *fakeRefresher {
 }
 
 func (f *fakeRefresher) RefreshHost(ctx context.Context, host string) error {
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls[host]++
@@ -34,17 +38,25 @@ func (f *fakeRefresher) count(host string) int {
 	return f.calls[host]
 }
 
-// statsRec records RefreshHostStats calls and returns a fixed error.
+// statsRec records RefreshHostStats calls (and each call's remaining context
+// budget, to pin which context the poller derives the stats timeout from) and
+// returns a fixed error.
 type statsRec struct {
-	mu    sync.Mutex
-	hosts []string
-	err   error
+	mu        sync.Mutex
+	hosts     []string
+	remaining []time.Duration
+	err       error
 }
 
-func (s *statsRec) RefreshHostStats(_ context.Context, host string) error {
+func (s *statsRec) RefreshHostStats(ctx context.Context, host string) error {
+	var left time.Duration
+	if dl, ok := ctx.Deadline(); ok {
+		left = time.Until(dl)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.hosts = append(s.hosts, host)
+	s.remaining = append(s.remaining, left)
 	return s.err
 }
 
@@ -52,6 +64,26 @@ func (s *statsRec) calls() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.hosts)
+}
+
+func (s *statsRec) called(host string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, h := range s.hosts {
+		if h == host {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *statsRec) firstRemaining() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.remaining) == 0 {
+		return 0
+	}
+	return s.remaining[0]
 }
 
 // usageRec records RefreshHostVolumeUsage calls and returns a fixed error.
@@ -124,6 +156,60 @@ func TestPollerStatsErrorDoesNotAffectReachability(t *testing.T) {
 	}
 }
 
+// A host whose inventory refresh failed has no stats to hand over, and calling
+// anyway would spend a second full Timeout on it — doubling a hung host's cost
+// per tick and, since tick blocks the ticker, stretching every healthy host's
+// refresh cadence past the interval.
+func TestPollerSkipsStatsWhenRefreshFailed(t *testing.T) {
+	f := newFakeRefresher()
+	f.failOn["dead"] = true
+	st := &statsRec{}
+	p := &Poller{Svc: f, Stats: st, Interval: time.Hour, Timeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx, func() []string { return []string{"live", "dead"} })
+	waitFor(t, "live host sampled", func() bool { return st.called("live") })
+	cancel()
+	p.Wait()
+
+	if st.called("dead") {
+		t.Fatal("stats sampled a host whose inventory refresh had just failed")
+	}
+	// The skip records no outcome: statsState keeps whatever the last real
+	// sample said (here: nothing), so recovery logs a true transition.
+	p.mu.Lock()
+	_, statsSeen := p.statsState["dead"]
+	reachable := p.state["dead"]
+	p.mu.Unlock()
+	if statsSeen {
+		t.Fatal("a skipped sample must not write statsState")
+	}
+	if reachable {
+		t.Fatal("the failing host should still be recorded unreachable")
+	}
+}
+
+// The stats timeout must be derived from the tick context, not from the
+// already-part-spent per-host inventory context — otherwise a slow refresh
+// silently eats into the sampler's budget.
+func TestPollerStatsTimeoutIsIndependentOfRefresh(t *testing.T) {
+	f := newFakeRefresher()
+	f.delay = 300 * time.Millisecond // a slow-but-successful inventory refresh
+	st := &statsRec{}
+	p := &Poller{Svc: f, Stats: st, Interval: time.Hour, Timeout: 2 * time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx, func() []string { return []string{"h1"} })
+	waitFor(t, "h1 sampled", func() bool { return st.calls() == 1 })
+	cancel()
+	p.Wait()
+
+	// Derived from ctx the sampler sees ~2s; derived from hctx it would see
+	// ~1.7s, since hctx's deadline was set before the 300ms refresh.
+	if left := st.firstRemaining(); left < 1900*time.Millisecond {
+		t.Fatalf("stats context has only %s left: it appears derived from the "+
+			"per-host refresh context rather than the tick context", left)
+	}
+}
+
 // A nil Stats field means the sampler is off; the tick must still run.
 func TestPollerWithoutStatsRefresher(t *testing.T) {
 	f := newFakeRefresher()
@@ -180,10 +266,16 @@ func TestPollerStartVolumeUsageRunsImmediatelyAndStops(t *testing.T) {
 	}
 }
 
-// A failing volume walk must not stop the loop or touch inventory state.
+// A failing volume walk must not stop the loop or touch inventory state. The
+// state maps are pre-seeded (not left nil) so that a stray write would be
+// visible as a changed value rather than panicking on a nil map and being
+// swallowed by the loop's own recover().
 func TestPollerStartVolumeUsageSurvivesErrors(t *testing.T) {
 	u := &usageRec{err: errors.New("df boom")}
-	p := &Poller{Svc: newFakeRefresher(), Interval: time.Hour, Timeout: time.Second}
+	p := &Poller{
+		Svc: newFakeRefresher(), Interval: time.Hour, Timeout: time.Second,
+		state: map[string]bool{"h1": true}, statsState: map[string]bool{"h1": true},
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p.StartVolumeUsage(ctx, func() []string { return []string{"h1"} }, u, 10*time.Millisecond, time.Second)
 	waitFor(t, "repeated walks despite errors", func() bool { return u.calls() >= 2 })
@@ -191,10 +283,55 @@ func TestPollerStartVolumeUsageSurvivesErrors(t *testing.T) {
 	p.Wait()
 
 	p.mu.Lock()
-	n := len(p.state)
+	reachable, n := p.state["h1"], len(p.state)
+	statsOK, sn := p.statsState["h1"], len(p.statsState)
 	p.mu.Unlock()
-	if n != 0 {
-		t.Fatalf("volume usage walk touched inventory reachability state: %d entries", n)
+	if !reachable || n != 1 {
+		t.Fatalf("failing volume walk changed reachability state: h1=%v, %d entries", reachable, n)
+	}
+	if !statsOK || sn != 1 {
+		t.Fatalf("failing volume walk changed stats state: h1=%v, %d entries", statsOK, sn)
+	}
+}
+
+// blockingUsage blocks until its context is cancelled, so Wait() can only
+// return if cancellation propagates into an in-flight walk.
+type blockingUsage struct {
+	entered chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingUsage) RefreshHostVolumeUsage(ctx context.Context, _ string) error {
+	b.once.Do(func() { close(b.entered) })
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// Shutdown calls invPoller.Wait() with no deadline of its own, and a volume walk
+// carries a 5m per-host timeout by default — so cancelling the run context, not
+// that timeout, has to be what ends an in-flight walk.
+func TestPollerStartVolumeUsageWaitReturnsOnCancelMidWalk(t *testing.T) {
+	b := &blockingUsage{entered: make(chan struct{})}
+	p := &Poller{Svc: newFakeRefresher(), Interval: time.Hour, Timeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	// 5 minutes, as in production: if Wait() returns, it is because of cancel.
+	p.StartVolumeUsage(ctx, func() []string { return []string{"h1"} }, b, time.Hour, 5*time.Minute)
+
+	select {
+	case <-b.entered:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("volume walk never started")
+	}
+
+	cancel()
+	done := make(chan struct{})
+	go func() { p.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Wait did not return after cancel with a walk in flight: " +
+			"SIGTERM shutdown would block on the 5m per-host timeout")
 	}
 }
 
