@@ -3,6 +3,8 @@ package inventory
 import (
 	"context"
 	"errors"
+	"log"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -470,4 +472,78 @@ func TestPollerPrunesStateForRemovedHosts(t *testing.T) {
 	if stillB || !hasA || n2 != 1 {
 		t.Fatalf("after pruning, state should hold only {a}, got %d entries (hasA=%v stillB=%v)", n2, hasA, stillB)
 	}
+}
+
+// syncBuf is a mutex-guarded log sink: the walk goroutines write to it
+// concurrently while the test reads it.
+type syncBuf struct {
+	mu sync.Mutex
+	b  strings.Builder
+}
+
+func (s *syncBuf) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.Write(p)
+}
+
+func (s *syncBuf) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.b.String()
+}
+
+func captureLog(t *testing.T) *syncBuf {
+	t.Helper()
+	buf := &syncBuf{}
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(buf)
+	log.SetFlags(0)
+	t.Cleanup(func() { log.SetOutput(prevOut); log.SetFlags(prevFlags) })
+	return buf
+}
+
+// A SIGTERM landing inside a volume walk must not make "volume usage walk
+// failed: context canceled" — once per host — the last thing in the log. The
+// 5m per-host timeout on an hourly cadence, plus the immediate startup walk,
+// gives shutdown a real window to land there.
+func TestPollerStartVolumeUsageSilentOnShutdown(t *testing.T) {
+	buf := captureLog(t)
+	b := &blockingUsage{entered: make(chan struct{})}
+	p := &Poller{Svc: newFakeRefresher(), Interval: time.Hour, Timeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	// Per-host timeout far longer than the test: only cancel can end these walks,
+	// so every host's error is context.Canceled from the run context.
+	p.StartVolumeUsage(ctx, func() []string { return []string{"h1", "h2", "h3"} }, b, time.Hour, 5*time.Minute)
+
+	select {
+	case <-b.entered:
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("volume walk never started")
+	}
+	cancel()
+	p.Wait()
+
+	if got := buf.String(); strings.Contains(got, "volume usage walk failed") {
+		t.Fatalf("shutdown logged a walk failure per host; log was:\n%s", got)
+	}
+}
+
+// The converse: a genuine per-host timeout, with the run context still alive,
+// must still be logged. The guard keys on the run context's Err(), not the
+// per-host timeout context's, precisely so this case stays visible.
+func TestPollerStartVolumeUsageLogsRealTimeout(t *testing.T) {
+	buf := captureLog(t)
+	b := &blockingUsage{entered: make(chan struct{})}
+	p := &Poller{Svc: newFakeRefresher(), Interval: time.Hour, Timeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// Tiny per-host timeout, hourly cadence: the immediate walk times out on its
+	// own while the run context is untouched.
+	p.StartVolumeUsage(ctx, func() []string { return []string{"h1"} }, b, time.Hour, 10*time.Millisecond)
+
+	waitFor(t, "per-host timeout logged", func() bool {
+		return strings.Contains(buf.String(), "host h1 volume usage walk failed")
+	})
 }

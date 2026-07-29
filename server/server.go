@@ -91,7 +91,7 @@ func RunWithFlags(opts ...Option) error {
 		inventoryTimeout  = fs.Duration("inventory-refresh-timeout", 20*time.Second, "per-host timeout for one background inventory refresh")
 
 		containerStats      = fs.Bool("container-stats", true, "sample per-container CPU/memory/network/block-IO on each inventory tick and export them as Prometheus metrics; requires the inventory poller")
-		volumeUsageInterval = fs.Duration("volume-usage-interval", time.Hour, "cadence for the per-host volume sizing walk (podman system df); 0 disables it")
+		volumeUsageInterval = fs.Duration("volume-usage-interval", time.Hour, "cadence for the per-host volume sizing walk (podman system df); 0 disables it; requires the inventory poller")
 		volumeUsageTimeout  = fs.Duration("volume-usage-timeout", 5*time.Minute, "per-host timeout for one volume sizing walk")
 
 		ingressEnabled   = fs.Bool("ingress-enabled", false, "enable per-host Caddy ingress + auto-TLS")
@@ -295,6 +295,12 @@ func RunWithFlags(opts ...Option) error {
 		if *volumeUsageInterval > 0 {
 			obs.NewVolumeUsageCollector(prometheus.DefaultRegisterer, svc, svc, hostIDs)
 			log.Printf("volume usage sampling enabled (interval %s, per-host timeout %s)", *volumeUsageInterval, *volumeUsageTimeout)
+		}
+	} else {
+		setFlags := map[string]bool{}
+		fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+		if w := pollerDisabledMetricsWarning(setFlags, *containerStats, *volumeUsageInterval); w != "" {
+			log.Printf("WARNING: %s", w)
 		}
 	}
 
@@ -501,6 +507,36 @@ func registerInventoryMetrics(reg prometheus.Registerer, src obs.InventorySource
 		return nil
 	}
 	return obs.NewInventoryCollector(reg, src, hosts)
+}
+
+// pollerDisabledMetricsWarning returns the line to log when the inventory
+// poller is off but the operator explicitly asked for metrics only the poller
+// can produce — or "" when there is nothing worth saying. Both resource-metric
+// collectors register inside the poller-enabled block, so with the poller off
+// they emit nothing and log nothing; without this the operator gets no metrics
+// and no explanation. (#209 review)
+//
+// It keys on flags EXPLICITLY SET (flag.FlagSet.Visit), not on "value differs
+// from its default". Both flags are ON by default, so a default-vs-actual test
+// would fire on every deployment that has deliberately turned the poller off —
+// noise, not a diagnosis. And the non-default values that do exist,
+// -container-stats=false and -volume-usage-interval=0, are explicit *disables*:
+// the operator wants no metrics, so there is nothing to warn about. That leaves
+// exactly the confusing case — asked for it, won't get it.
+func pollerDisabledMetricsWarning(setFlags map[string]bool, containerStats bool, volumeUsageInterval time.Duration) string {
+	var asked []string
+	if setFlags["container-stats"] && containerStats {
+		asked = append(asked, "-container-stats")
+	}
+	if setFlags["volume-usage-interval"] && volumeUsageInterval > 0 {
+		asked = append(asked, "-volume-usage-interval")
+	}
+	if len(asked) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s set but the inventory poller is disabled (-inventory-refresh-interval=0): "+
+		"container resource and volume usage metrics require the poller and will NOT be exported",
+		strings.Join(asked, " and "))
 }
 
 func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics) (jobs.Registry, jobs.Reconcilers) {

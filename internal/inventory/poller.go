@@ -254,7 +254,13 @@ func (p *Poller) StartVolumeUsage(ctx context.Context, hostsFn func() []string, 
 					defer wg.Done()
 					hctx, cancel := context.WithTimeout(ctx, timeout)
 					defer cancel()
-					if err := r.RefreshHostVolumeUsage(hctx, host); err != nil {
+					// ctx.Err(), NOT hctx.Err(): a genuine per-host timeout must
+					// still log. Only shutdown is silent — a SIGTERM landing
+					// inside a walk (a 5m timeout on an hourly cadence, plus the
+					// immediate startup walk, gives it a real window) would
+					// otherwise make "volume usage walk failed: context
+					// canceled", once per host, the last thing in the log.
+					if err := r.RefreshHostVolumeUsage(hctx, host); err != nil && ctx.Err() == nil {
 						log.Printf("inventory: host %s volume usage walk failed: %v", host, err)
 					}
 				}(h)
