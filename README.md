@@ -116,6 +116,19 @@ like the liveness metrics above. Disable the sampler with `-container-stats=fals
 (default `true` — an existing deployment picks up one extra call per host per
 tick on upgrade, with no flag change needed).
 
+A *succeeded* refresh is not a guarantee of a sample, and the difference shows
+up as a sawtooth: stats share the refresh's one per-host budget
+(`-inventory-refresh-timeout`, default `20s`) rather than getting a second one,
+so a host whose refresh chronically eats most of that budget leaves the stats
+call whatever is left — sometimes enough, sometimes not. The symptom is that
+host's resource series flipping absent/present tick to tick, with
+`container stats unavailable` / `container stats available again` alternating in
+the log. That is the shared budget working as designed (two independent timeouts
+would make the per-host cost `2 × timeout` and stretch the whole fleet's
+inventory freshness); the lever is the host's refresh latency, or a larger
+`-inventory-refresh-timeout`. The metrics stay honest either way — a missed
+sample renders absent, never stale.
+
 The cumulative series (`_total` suffix) reset when a pod is recreated, exactly
 as `podman_api_container_restarts_total` does; graph them with `rate()` or
 `increase()`, not as raw counters. Podman's own CPU/memory *percentages* are not

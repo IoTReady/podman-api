@@ -50,6 +50,14 @@ type ObservedPortMapping struct {
 	Protocol      string `json:"protocol,omitempty"`
 }
 
+// ObservedVolume names a volume the API believes belongs to the instance. What
+// the name guarantees depends on the path that produced it (#209): only the
+// single-instance Get path inspects volumes, so only there does an entry mean
+// the volume exists on the host and carry a real SizeBytes. List sweeps derive
+// the set from the template's declared volumes without any podman call, so an
+// entry there means "declared, possibly not created yet" and SizeBytes is
+// always 0 — sizes come from the separate volume-usage cache. Treat a swept
+// entry as a name, not as proof of existence.
 type ObservedVolume struct {
 	Name      string `json:"name"`
 	SizeBytes int64  `json:"size_bytes,omitempty"`
