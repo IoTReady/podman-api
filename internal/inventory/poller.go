@@ -50,6 +50,12 @@ type Poller struct {
 	// Grafana alert rules all gate on podman_api_host_reachable.
 	Stats StatsRefresher
 
+	// StatsTimeout bounds one host's stats sample, independently of Timeout.
+	// Zero means defaultStatsTimeout — never "no timeout", so a caller that
+	// forgets to set it cannot hand the sampler an unbounded call. See tick for
+	// why this is a separate budget rather than a share of Timeout (#212).
+	StatsTimeout time.Duration
+
 	mu         sync.Mutex
 	state      map[string]bool // host -> last-known reachable, for transition logging
 	statsState map[string]bool // host -> last-known stats-sampler outcome (never reachability)
@@ -108,29 +114,33 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			err := p.Svc.RefreshHost(hctx, host)
 			p.logTransition(host, err)
 			// Sampled under its own state map — whatever it does, the
-			// reachability verdict above is already final — but under the SAME
-			// hctx deadline as the refresh, not a second fresh Timeout.
+			// reachability verdict above is already final — and under its own
+			// StatsTimeout derived from ctx, NOT from the refresh's hctx.
 			//
-			// That shared budget is load-bearing. tick blocks the ticker, so a
-			// host's total per-tick cost has to stay under Interval or it
+			// It used to share hctx, to keep the per-host bound at exactly
+			// Timeout rather than Timeout+StatsTimeout, since tick blocks the
+			// ticker and a host's total per-tick cost overrunning Interval
 			// stretches every other host's cadence and inflates
-			// podman_api_inventory_age_seconds fleet-wide — the metric
-			// host-inventory-stale alerts on. Two independent Timeouts make the
-			// per-host bound 2*Timeout, which at the defaults (30s interval, 20s
-			// timeout) is 40s > 30s. Sharing hctx keeps it at exactly Timeout,
-			// the same bound as before stats existed and the only one an
-			// operator reasons about when setting -inventory-refresh-timeout
-			// against -inventory-refresh-interval.
+			// podman_api_inventory_age_seconds fleet-wide. In production that
+			// traded a bounded cadence for no metrics at all: on the busiest
+			// host a 29-template sweep consumed nearly all of the 20s budget,
+			// the refresh still returned success so the guard below passed, and
+			// the stats call — 92ms of work — was cancelled the instant it
+			// started by the already-exhausted parent. Not a sawtooth:
+			// permanent starvation, 115 of ~190 containers with no resource
+			// series at all (#212).
 			//
-			// The cost is that a slow-but-successful refresh leaves the sampler
-			// little or no time and its sample is skipped. That is the correct
-			// trade: a missing sample is a gap in one host's resource series,
-			// which the collector renders as absent; overrunning the interval
-			// degrades the whole fleet's inventory freshness.
+			// So the sampler gets its own small budget, and the cadence
+			// invariant it used to guarantee structurally is now checked and
+			// warned about at startup instead (server.statsBudgetWarning):
+			// -inventory-refresh-timeout + -container-stats-timeout must stay
+			// under -inventory-refresh-interval. At the defaults that is
+			// 20s + 5s < 30s.
 			//
-			// A host that just failed its refresh is not sampled at all: hctx is
-			// most likely already expired, and calling anyway would only log a
-			// second failure for something reachability has already reported.
+			// A host that just failed its refresh is not sampled at all: it is
+			// unreachable, so the sample would fail too — now spending a fresh
+			// StatsTimeout to find that out — and would only log a second
+			// failure for something reachability has already reported.
 			//
 			// But skipping is not the same as not caring: the cached samples
 			// must still be retired. A host that is merely unreachable is still in
@@ -149,7 +159,9 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 				if err != nil {
 					p.Stats.DropHostStats(host)
 				} else {
-					p.logStatsTransition(host, p.Stats.RefreshHostStats(hctx, host))
+					sctx, scancel := context.WithTimeout(ctx, p.statsTimeout())
+					p.logStatsTransition(host, p.Stats.RefreshHostStats(sctx, host))
+					scancel()
 				}
 			}
 		}(h)
@@ -157,6 +169,32 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 	wg.Wait()
 	p.pruneState(hosts)
 }
+
+// defaultStatsTimeout bounds one stats sample when StatsTimeout is unset. The
+// call itself measures ~50-100ms even on a 115-container host, so this is
+// generous headroom rather than a tuned value; the server's
+// -container-stats-timeout flag carries the same default.
+const defaultStatsTimeout = 5 * time.Second
+
+// EffectiveStatsTimeout maps a configured stats timeout to the value the poller
+// will actually spend: anything <= 0 means defaultStatsTimeout, never "no
+// timeout" (tick blocks the ticker, so an unbounded stats call would hang the
+// whole poll loop) and never "expire instantly".
+//
+// Exported because the zero-defaulting is not an internal detail: anything
+// reasoning about the per-host budget from the outside — server's startup check
+// that Timeout+StatsTimeout stays under Interval — has to reason about the same
+// effective value, or a bare -container-stats-timeout=0 passes a check the
+// poller then violates by 5s.
+func EffectiveStatsTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultStatsTimeout
+	}
+	return d
+}
+
+// statsTimeout is StatsTimeout normalised through EffectiveStatsTimeout.
+func (p *Poller) statsTimeout() time.Duration { return EffectiveStatsTimeout(p.StatsTimeout) }
 
 // pruneState drops transition-log state for hosts no longer in the active set
 // (e.g. removed via SIGHUP), so the map can't grow unbounded over host churn.
@@ -202,13 +240,13 @@ func (p *Poller) logTransition(host string, err error) {
 // mirroring logTransition. Kept separate from the inventory state so a stats
 // failure can never be mistaken for — or influence — host reachability.
 //
-// Expect this pair of messages to alternate on a host whose inventory refresh
-// chronically consumes most of Timeout: sampling shares that one per-host budget
-// (see tick), so whatever is left over lands either side of what the stats call
-// needs, and the outcome flips tick to tick. That is the shared budget working
-// as designed, not a sampler fault — the fix is the host's refresh latency, or a
-// larger -inventory-refresh-timeout, not anything here. The metrics themselves
-// stay honest throughout: a missed sample renders absent, never stale.
+// Sampling has its own budget (StatsTimeout, see tick), so these messages no
+// longer track the inventory refresh's leftover time — until #212 they did, and
+// a host whose refresh chronically ate most of Timeout would flip its outcome
+// tick to tick, or on the worst host never sample at all. A failure now means
+// the stats call itself exceeded StatsTimeout or the host errored, and the lever
+// is -container-stats-timeout, not -inventory-refresh-timeout. The metrics stay
+// honest either way: a missed sample renders absent, never stale.
 func (p *Poller) logStatsTransition(host string, err error) {
 	ok := err == nil
 	p.mu.Lock()

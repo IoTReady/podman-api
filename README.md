@@ -116,18 +116,26 @@ like the liveness metrics above. Disable the sampler with `-container-stats=fals
 (default `true` — an existing deployment picks up one extra call per host per
 tick on upgrade, with no flag change needed).
 
-A *succeeded* refresh is not a guarantee of a sample, and the difference shows
-up as a sawtooth: stats share the refresh's one per-host budget
-(`-inventory-refresh-timeout`, default `20s`) rather than getting a second one,
-so a host whose refresh chronically eats most of that budget leaves the stats
-call whatever is left — sometimes enough, sometimes not. The symptom is that
-host's resource series flipping absent/present tick to tick, with
-`container stats unavailable` / `container stats available again` alternating in
-the log. That is the shared budget working as designed (two independent timeouts
-would make the per-host cost `2 × timeout` and stretch the whole fleet's
-inventory freshness); the lever is the host's refresh latency, or a larger
+The sample gets its **own** budget, `-container-stats-timeout` (default `5s`),
+independent of `-inventory-refresh-timeout`. It briefly shared the refresh's
+budget, and on the fleet's busiest host that meant no resource metrics at all:
+the inventory sweep consumed nearly the full `20s`, the refresh still returned
+success, and the stats call — under 100ms of work even for 115 containers — was
+cancelled the instant it started. If a host logs
+`container stats unavailable: … context canceled` while its liveness series are
+fine, check that it is running a build with this flag. Repeated
+`container stats unavailable` / `container stats available again` now points at
+the sampler itself: raise `-container-stats-timeout`, not
 `-inventory-refresh-timeout`. The metrics stay honest either way — a missed
 sample renders absent, never stale.
+
+Two independent budgets means a host's worst-case cost for one tick is
+`-inventory-refresh-timeout` + `-container-stats-timeout`, and a tick blocks the
+next one, so **keep that sum under `-inventory-refresh-interval`** (the shipped
+defaults, `20s + 5s < 30s`, satisfy it comfortably). Raising a timeout past that
+line does not refuse to start — it logs a warning naming all three flags, and
+the consequence is a stretched poll cadence fleet-wide, visible as a rising
+`podman_api_inventory_age_seconds`.
 
 The cumulative series (`_total` suffix) reset when a pod is recreated, exactly
 as `podman_api_container_restarts_total` does; graph them with `rate()` or

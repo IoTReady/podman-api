@@ -231,35 +231,63 @@ func TestPollerSkipsStatsWhenRefreshFailed(t *testing.T) {
 	}
 }
 
-// Refresh and stats share ONE per-host budget: the sampler runs under the same
-// hctx as the refresh that preceded it, so a host's total per-tick cost stays
-// bounded by Timeout. That is the property that matters — tick blocks the
-// ticker, so two independent Timeouts would make the bound 2*Timeout (40s at
-// the 30s/20s defaults), stretching every other host's cadence and inflating
-// podman_api_inventory_age_seconds fleet-wide.
-func TestPollerStatsSharesThePerHostBudgetWithRefresh(t *testing.T) {
+// The stats sample must get its OWN budget, derived from the tick context, not
+// from the refresh's hctx. Sharing hctx starved the sampler permanently on the
+// fleet's busiest host: a 29-template sweep consumed nearly all of Timeout, the
+// refresh still returned success, and the stats call was cancelled instantly by
+// the exhausted parent (#212). Here the refresh eats 700ms of a 1s Timeout, so a
+// shared budget would leave ~300ms; an independent StatsTimeout of 5s must show
+// up in full.
+func TestPollerStatsGetsItsOwnBudgetIndependentOfRefresh(t *testing.T) {
 	f := newFakeRefresher()
-	f.delay = 300 * time.Millisecond // a slow-but-successful inventory refresh
+	f.delay = 700 * time.Millisecond // a slow-but-successful inventory refresh
 	st := &statsRec{}
-	p := &Poller{Svc: f, Stats: st, Interval: time.Hour, Timeout: 2 * time.Second}
+	p := &Poller{
+		Svc: f, Stats: st, Interval: time.Hour,
+		Timeout: time.Second, StatsTimeout: 5 * time.Second,
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p.Start(ctx, func() []string { return []string{"h1"} })
 	waitFor(t, "h1 sampled", func() bool { return st.calls() == 1 })
 	cancel()
 	p.Wait()
 
-	// Under hctx the sampler sees ~1.7s, the Timeout minus what the refresh
-	// already spent. A fresh Timeout of its own would show ~2s and put the
-	// per-host worst case at 2*Timeout.
 	left := st.firstRemaining()
-	if left > 2*time.Second-f.delay {
-		t.Fatalf("stats context has %s left, more than the %s the refresh left "+
-			"of the per-host budget: it appears to have been given a fresh "+
-			"timeout rather than sharing hctx",
-			left, 2*time.Second-f.delay)
+	// Anything at or below the refresh's leftover (~300ms) means the sampler is
+	// still sharing hctx. Allow generous slack for scheduling: the only value a
+	// shared budget can produce is < Timeout (1s).
+	if left <= time.Second {
+		t.Fatalf("stats context has only %s left, no more than the %s per-host "+
+			"refresh budget: it appears to still share hctx rather than getting "+
+			"its own StatsTimeout of %s",
+			left, p.Timeout, p.StatsTimeout)
 	}
+	// ...and it must be its own StatsTimeout, not "no timeout at all".
+	if left > p.StatsTimeout {
+		t.Fatalf("stats context has %s left, more than StatsTimeout %s", left, p.StatsTimeout)
+	}
+}
+
+// A caller that leaves StatsTimeout zero must get the default, never an
+// unbounded stats call.
+func TestPollerStatsTimeoutDefaultsWhenUnset(t *testing.T) {
+	f := newFakeRefresher()
+	st := &statsRec{}
+	p := &Poller{
+		Svc: f, Stats: st, Interval: time.Hour, Timeout: time.Hour,
+		state: map[string]bool{}, statsState: map[string]bool{},
+	}
+	p.tick(context.Background(), []string{"h1"})
+
+	left := st.firstRemaining()
 	if left <= 0 {
-		t.Fatalf("stats context had no budget left (%s); the sampler could never run", left)
+		t.Fatalf("stats context had no deadline (%s); an unset StatsTimeout must not mean unbounded", left)
+	}
+	if left > defaultStatsTimeout {
+		t.Fatalf("stats context has %s left, more than the %s default", left, defaultStatsTimeout)
+	}
+	if left < defaultStatsTimeout-time.Second {
+		t.Fatalf("stats context has %s left, well under the %s default", left, defaultStatsTimeout)
 	}
 }
 
