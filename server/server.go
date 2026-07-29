@@ -91,7 +91,7 @@ func RunWithFlags(opts ...Option) error {
 		inventoryTimeout  = fs.Duration("inventory-refresh-timeout", 20*time.Second, "per-host timeout for one background inventory refresh")
 
 		containerStats      = fs.Bool("container-stats", true, "sample per-container CPU/memory/network/block-IO on each inventory tick and export them as Prometheus metrics; requires the inventory poller")
-		containerStatsTO    = fs.Duration("container-stats-timeout", 5*time.Second, "per-host timeout for one container stats sample, independent of -inventory-refresh-timeout; keep it plus -inventory-refresh-timeout under -inventory-refresh-interval")
+		containerStatsTO    = fs.Duration("container-stats-timeout", 5*time.Second, "per-host timeout for one container stats sample, independent of -inventory-refresh-timeout; 0 or negative means the 5s default, never unbounded or instant; keep it plus -inventory-refresh-timeout under -inventory-refresh-interval")
 		volumeUsageInterval = fs.Duration("volume-usage-interval", time.Hour, "cadence for the per-host volume sizing walk (podman system df); 0 disables it; requires the inventory poller")
 		volumeUsageTimeout  = fs.Duration("volume-usage-timeout", 5*time.Minute, "per-host timeout for one volume sizing walk")
 
@@ -568,18 +568,31 @@ func pollerDisabledMetricsWarning(setFlags map[string]bool, containerStats bool,
 // ever made, so the second budget cannot be spent and the sum is hypothetical.
 // Silent with the poller off for the same reason — nothing ticks, and
 // pollerDisabledMetricsWarning already explains that case.
+// It reasons about the EFFECTIVE stats budget, not the raw flag: the poller maps
+// a non-positive StatsTimeout to its 5s default (inventory.EffectiveStatsTimeout),
+// so -container-stats-timeout=0 with a 28s refresh timeout and a 30s interval
+// really spends 33s while a raw-value check would compute 28s and stay silent —
+// a hole in exactly the invariant this function exists to police.
+//
+// -inventory-refresh-timeout gets no such normalisation because the poller
+// applies none: Poller.Timeout is passed to context.WithTimeout verbatim, where
+// 0 means a context that is already expired rather than a default. That is a
+// pre-existing sharp edge (a refresh timeout of 0 fails every refresh
+// immediately, loudly and on every host) and squarely outside #212; the honest
+// sum for that case is the one computed here.
 func statsBudgetWarning(interval, timeout, statsTimeout time.Duration, statsEnabled bool) string {
 	if interval <= 0 || !statsEnabled {
 		return ""
 	}
-	if timeout+statsTimeout < interval {
+	eff := inventory.EffectiveStatsTimeout(statsTimeout)
+	if timeout+eff < interval {
 		return ""
 	}
 	return fmt.Sprintf("-inventory-refresh-timeout (%s) + -container-stats-timeout (%s) = %s, "+
 		"which is not under -inventory-refresh-interval (%s): a slow host can spend a whole "+
 		"interval on one tick and stretch the poll cadence for every host, inflating "+
 		"podman_api_inventory_age_seconds. Lower either timeout or raise the interval",
-		timeout, statsTimeout, timeout+statsTimeout, interval)
+		timeout, eff, timeout+eff, interval)
 }
 
 func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics) (jobs.Registry, jobs.Reconcilers) {

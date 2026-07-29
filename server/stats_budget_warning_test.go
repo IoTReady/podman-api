@@ -43,6 +43,28 @@ func TestStatsBudgetWarning(t *testing.T) {
 			want: []string{"-inventory-refresh-timeout", "poll cadence"},
 		},
 		{
+			// A bare -container-stats-timeout=0 does NOT mean zero budget: the
+			// poller spends its 5s default. A raw-value check computes 28+0=28,
+			// stays silent, and the poller then spends 33s against a 30s
+			// interval — the hole this whole function exists to close. The
+			// message must name the effective 5s, not the flag's literal 0.
+			name: "zero stats timeout is normalised to the default", interval: 30 * time.Second,
+			timeout: 28 * time.Second, statsTO: 0, statsEnabled: true,
+			want: []string{"-container-stats-timeout (5s)", "33s", "30s"},
+		},
+		{
+			// flag.Duration parses -1s happily; same normalisation applies.
+			name: "negative stats timeout is normalised to the default", interval: 30 * time.Second,
+			timeout: 28 * time.Second, statsTO: -1 * time.Second, statsEnabled: true,
+			want: []string{"-container-stats-timeout (5s)", "33s"},
+		},
+		{
+			// The normalisation must not manufacture a warning where the
+			// effective sum genuinely fits: 10s + 5s < 30s.
+			name: "zero stats timeout still silent when the default fits", interval: 30 * time.Second,
+			timeout: 10 * time.Second, statsTO: 0, statsEnabled: true,
+		},
+		{
 			// No sampler, no second budget to spend: warning here would be noise.
 			name: "sampler disabled is silent", interval: 30 * time.Second,
 			timeout: 45 * time.Second, statsTO: 5 * time.Second, statsEnabled: false,

@@ -231,12 +231,6 @@ func TestPollerSkipsStatsWhenRefreshFailed(t *testing.T) {
 	}
 }
 
-// Refresh and stats share ONE per-host budget: the sampler runs under the same
-// hctx as the refresh that preceded it, so a host's total per-tick cost stays
-// bounded by Timeout. That is the property that matters — tick blocks the
-// ticker, so two independent Timeouts would make the bound 2*Timeout (40s at
-// the 30s/20s defaults), stretching every other host's cadence and inflating
-// podman_api_inventory_age_seconds fleet-wide.
 // The stats sample must get its OWN budget, derived from the tick context, not
 // from the refresh's hctx. Sharing hctx starved the sampler permanently on the
 // fleet's busiest host: a 29-template sweep consumed nearly all of Timeout, the

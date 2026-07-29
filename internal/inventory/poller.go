@@ -176,15 +176,25 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 // -container-stats-timeout flag carries the same default.
 const defaultStatsTimeout = 5 * time.Second
 
-// statsTimeout is StatsTimeout, or the default when unset. A zero field must
-// never mean "no timeout": tick blocks the ticker, so an unbounded stats call
-// would hang the whole poll loop.
-func (p *Poller) statsTimeout() time.Duration {
-	if p.StatsTimeout <= 0 {
+// EffectiveStatsTimeout maps a configured stats timeout to the value the poller
+// will actually spend: anything <= 0 means defaultStatsTimeout, never "no
+// timeout" (tick blocks the ticker, so an unbounded stats call would hang the
+// whole poll loop) and never "expire instantly".
+//
+// Exported because the zero-defaulting is not an internal detail: anything
+// reasoning about the per-host budget from the outside — server's startup check
+// that Timeout+StatsTimeout stays under Interval — has to reason about the same
+// effective value, or a bare -container-stats-timeout=0 passes a check the
+// poller then violates by 5s.
+func EffectiveStatsTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
 		return defaultStatsTimeout
 	}
-	return p.StatsTimeout
+	return d
 }
+
+// statsTimeout is StatsTimeout normalised through EffectiveStatsTimeout.
+func (p *Poller) statsTimeout() time.Duration { return EffectiveStatsTimeout(p.StatsTimeout) }
 
 // pruneState drops transition-log state for hosts no longer in the active set
 // (e.g. removed via SIGHUP), so the map can't grow unbounded over host churn.
