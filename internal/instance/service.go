@@ -286,6 +286,19 @@ func (s *Service) lookup(ctx context.Context, host, tmpl string) (store.Template
 
 func podName(tmpl, slug string) string { return tmpl + "-" + slug }
 
+// volumeName is the single definition of a managed volume's name on a host:
+// the template's declared (short) volume name namespaced by instance. Every
+// producer AND every consumer must go through it — since #209 the name is also
+// a Prometheus label that podman_api_volume_size_bytes joins on, so drift
+// between two construction sites no longer fails loudly (a missing volume, an
+// erroring operation) but silently: the join misses and the panel renders
+// empty, with nothing logged anywhere. See #211.
+func volumeName(tmpl, slug, short string) string { return volumeNamePrefix(tmpl, slug) + short }
+
+// volumeNamePrefix is volumeName's instance-scoped prefix, for the one caller
+// (rename) that must strip it off an existing name to recover the short name.
+func volumeNamePrefix(tmpl, slug string) string { return podName(tmpl, slug) + "-" }
+
 func instanceSecretName(tmpl, slug, name string) string {
 	return extension.InstanceSecretName(tmpl, slug, name)
 }
@@ -588,7 +601,7 @@ func (s *Service) Get(ctx context.Context, host, tmpl, slug string) (Observed, e
 	}
 	var vols []podman.Volume
 	for _, v := range t.Meta.Volumes {
-		name := tmpl + "-" + slug + "-" + v.Name
+		name := volumeName(tmpl, slug, v.Name)
 		if vv, err := s.client.VolumeInspect(ctx, host, name); err == nil {
 			vols = append(vols, vv)
 		}
@@ -721,6 +734,10 @@ func (s *Service) List(ctx context.Context, host, tmpl string) ([]Observed, erro
 // known templates. The result is the union of List(host, t) for each catalog
 // template id, so a pod for a template the daemon doesn't know about is
 // silently omitted.
+//
+// Volumes on each result are declared names only — the sweep makes no podman
+// call per volume, so an entry does not mean the volume exists and SizeBytes is
+// always 0. See ObservedVolume; Get is the authority on existence and size.
 func (s *Service) ListAllInstances(ctx context.Context, host string) ([]Observed, error) {
 	obs, _, err := s.instCache.getWithMeta(host, func() ([]Observed, error) {
 		return s.listAllInstancesLive(ctx, host)
@@ -859,7 +876,7 @@ func (s *Service) listAllInstancesLive(ctx context.Context, host string) ([]Obse
 				// inspection, and sizes come from the volume-usage cache.
 				var vols []podman.Volume
 				for _, v := range t.Meta.Volumes {
-					vols = append(vols, podman.Volume{Name: tmplID + "-" + slug + "-" + v.Name})
+					vols = append(vols, podman.Volume{Name: volumeName(tmplID, slug, v.Name)})
 				}
 				obs := Normalize(p, tmplID, slug, vols, secretEnvs, ss.vals)
 				part = append(part, applySecretRedaction(obs, ss, sweepErr))
@@ -1208,7 +1225,7 @@ func (s *Service) pruneInstanceResources(ctx context.Context, host, tmpl, slug s
 	}
 	if volumes {
 		for _, v := range t.Meta.Volumes {
-			_ = s.client.VolumeRemove(ctx, host, tmpl+"-"+slug+"-"+v.Name, true)
+			_ = s.client.VolumeRemove(ctx, host, volumeName(tmpl, slug, v.Name), true)
 		}
 	}
 }
@@ -1383,7 +1400,7 @@ func (s *Service) InstanceVolumes(ctx context.Context, host, tmpl, slug string) 
 	}
 	var out []podman.Volume
 	for _, v := range t.Meta.Volumes {
-		name := tmpl + "-" + slug + "-" + v.Name
+		name := volumeName(tmpl, slug, v.Name)
 		vv, err := s.client.VolumeInspect(ctx, host, name)
 		if errors.Is(err, podman.ErrNotFound) {
 			continue // a declared volume may legitimately not exist yet — skip it

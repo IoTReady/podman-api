@@ -110,8 +110,8 @@ func (s *Service) Rename(ctx context.Context, host, tmpl, slug string, req Renam
 		return fmt.Errorf("list volumes: %w", err)
 	}
 	for _, v := range vols {
-		shortName := v.Name[len(tmpl+"-"+slug+"-"):]
-		newName := tmpl + "-" + req.NewSlug + "-" + shortName
+		shortName := v.Name[len(volumeNamePrefix(tmpl, slug)):]
+		newName := volumeName(tmpl, req.NewSlug, shortName)
 
 		if err := s.client.VolumeCreate(ctx, host, newName); err != nil {
 			return fmt.Errorf("create volume %q: %w", newName, err)
