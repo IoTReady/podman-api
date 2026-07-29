@@ -93,6 +93,8 @@ type Service struct {
 	blobs      BlobStore                              // backup artifact store; set via SetBlobStore (nil → backups disabled)
 	sidecar    SidecarInjector                        // sidecar injector; set via SetSidecarInjector (nil → no injection)
 	instCache  *instanceCache                         // per-host read cache over ListAllInstances (default 3s TTL)
+	statsCache *statsCache                            // per-host container resource samples (poller-fed)
+	volCache   *volumeUsageCache                      // per-host volume sizing (slow sampler-fed)
 
 	verifyVolumes bool // verify each migrated volume's content before reaping the source
 
@@ -117,6 +119,8 @@ func NewService(client podman.Client, hosts []config.Host) *Service {
 	s.ingress = ingress.Disabled{}
 	s.SetHosts(hosts)
 	s.instCache = newInstanceCache(3 * time.Second)
+	s.statsCache = newStatsCache()
+	s.volCache = newVolumeUsageCache()
 	return s
 }
 
@@ -281,6 +285,19 @@ func (s *Service) lookup(ctx context.Context, host, tmpl string) (store.Template
 }
 
 func podName(tmpl, slug string) string { return tmpl + "-" + slug }
+
+// volumeName is the single definition of a managed volume's name on a host:
+// the template's declared (short) volume name namespaced by instance. Every
+// producer AND every consumer must go through it — since #209 the name is also
+// a Prometheus label that podman_api_volume_size_bytes joins on, so drift
+// between two construction sites no longer fails loudly (a missing volume, an
+// erroring operation) but silently: the join misses and the panel renders
+// empty, with nothing logged anywhere. See #211.
+func volumeName(tmpl, slug, short string) string { return volumeNamePrefix(tmpl, slug) + short }
+
+// volumeNamePrefix is volumeName's instance-scoped prefix, for the one caller
+// (rename) that must strip it off an existing name to recover the short name.
+func volumeNamePrefix(tmpl, slug string) string { return podName(tmpl, slug) + "-" }
 
 func instanceSecretName(tmpl, slug, name string) string {
 	return extension.InstanceSecretName(tmpl, slug, name)
@@ -584,7 +601,7 @@ func (s *Service) Get(ctx context.Context, host, tmpl, slug string) (Observed, e
 	}
 	var vols []podman.Volume
 	for _, v := range t.Meta.Volumes {
-		name := tmpl + "-" + slug + "-" + v.Name
+		name := volumeName(tmpl, slug, v.Name)
 		if vv, err := s.client.VolumeInspect(ctx, host, name); err == nil {
 			vols = append(vols, vv)
 		}
@@ -717,6 +734,10 @@ func (s *Service) List(ctx context.Context, host, tmpl string) ([]Observed, erro
 // known templates. The result is the union of List(host, t) for each catalog
 // template id, so a pod for a template the daemon doesn't know about is
 // silently omitted.
+//
+// Volumes on each result are declared names only — the sweep makes no podman
+// call per volume, so an entry does not mean the volume exists and SizeBytes is
+// always 0. See ObservedVolume; Get is the authority on existence and size.
 func (s *Service) ListAllInstances(ctx context.Context, host string) ([]Observed, error) {
 	obs, _, err := s.instCache.getWithMeta(host, func() ([]Observed, error) {
 		return s.listAllInstancesLive(ctx, host)
@@ -744,6 +765,58 @@ func (s *Service) EnableWarmInventory() { s.instCache.setWarm(true) }
 // read, so a snapshot would under-report.
 func (s *Service) InventorySnapshot() map[string]HostInventory {
 	return s.instCache.snapshot()
+}
+
+// RefreshHostStats samples every container's resource usage on host and stores
+// it for the metrics collector. One podman call per host.
+//
+// On error the host's samples are dropped, so its series go absent rather than
+// freezing at their last value. The caller must NOT treat a failure here as the
+// host being unreachable — reachability is the inventory refresh's to decide.
+func (s *Service) RefreshHostStats(ctx context.Context, host string) error {
+	st, err := s.client.ContainerStats(ctx, host)
+	if err != nil {
+		s.statsCache.drop(host)
+		return err
+	}
+	m := make(map[string]podman.ContainerStats, len(st))
+	for _, c := range st {
+		m[c.Name] = c
+	}
+	s.statsCache.put(host, HostStats{Containers: m, FetchedAt: time.Now()})
+	return nil
+}
+
+// DropHostStats discards the host's cached samples without sampling it. It is
+// for the caller that decides NOT to call RefreshHostStats at all — e.g. the
+// poller skipping a host whose inventory refresh just failed — which would
+// otherwise leave the last-known sample in the cache forever, freezing the
+// host's series instead of retiring them. Same contract as a failed refresh
+// (see statsCache): absent beats frozen for cumulative counters.
+//
+// No context and no I/O: it costs a tick nothing.
+func (s *Service) DropHostStats(host string) { s.statsCache.drop(host) }
+
+// StatsSnapshot returns the cached container samples for every host. Never
+// fetches: it runs on the scrape path.
+func (s *Service) StatsSnapshot() map[string]HostStats { return s.statsCache.snapshot() }
+
+// RefreshHostVolumeUsage sizes every volume on host via one `system df` call.
+// Podman walks the whole store to answer, so this belongs on a slow cadence
+// with its own timeout. On error the previous sizing is retained.
+func (s *Service) RefreshHostVolumeUsage(ctx context.Context, host string) error {
+	sizes, err := s.client.VolumeUsage(ctx, host)
+	if err != nil {
+		return err
+	}
+	s.volCache.put(host, HostVolumeUsage{Sizes: sizes, FetchedAt: time.Now()})
+	return nil
+}
+
+// VolumeUsageSnapshot returns the cached volume sizing for every host. Never
+// fetches: it runs on the scrape path.
+func (s *Service) VolumeUsageSnapshot() map[string]HostVolumeUsage {
+	return s.volCache.snapshot()
 }
 
 // RefreshHost performs a live inventory sweep of host and stores it in the warm
@@ -798,7 +871,14 @@ func (s *Service) listAllInstancesLive(ctx context.Context, host string) ([]Obse
 			for _, p := range pods {
 				slug := p.Labels["podman-api/slug"]
 				ss := vals[store.SpecKey{Template: tmplID, Slug: slug}]
-				obs := Normalize(p, tmplID, slug, nil, secretEnvs, ss.vals)
+				// Names only, derived from template meta — the same construction
+				// Get uses. No podman call: the sweep must not pay for volume
+				// inspection, and sizes come from the volume-usage cache.
+				var vols []podman.Volume
+				for _, v := range t.Meta.Volumes {
+					vols = append(vols, podman.Volume{Name: volumeName(tmplID, slug, v.Name)})
+				}
+				obs := Normalize(p, tmplID, slug, vols, secretEnvs, ss.vals)
 				part = append(part, applySecretRedaction(obs, ss, sweepErr))
 			}
 			results[i] = result{obs: part}
@@ -1145,7 +1225,7 @@ func (s *Service) pruneInstanceResources(ctx context.Context, host, tmpl, slug s
 	}
 	if volumes {
 		for _, v := range t.Meta.Volumes {
-			_ = s.client.VolumeRemove(ctx, host, tmpl+"-"+slug+"-"+v.Name, true)
+			_ = s.client.VolumeRemove(ctx, host, volumeName(tmpl, slug, v.Name), true)
 		}
 	}
 }
@@ -1320,7 +1400,7 @@ func (s *Service) InstanceVolumes(ctx context.Context, host, tmpl, slug string) 
 	}
 	var out []podman.Volume
 	for _, v := range t.Meta.Volumes {
-		name := tmpl + "-" + slug + "-" + v.Name
+		name := volumeName(tmpl, slug, v.Name)
 		vv, err := s.client.VolumeInspect(ctx, host, name)
 		if errors.Is(err, podman.ErrNotFound) {
 			continue // a declared volume may legitimately not exist yet — skip it

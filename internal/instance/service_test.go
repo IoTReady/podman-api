@@ -1000,6 +1000,45 @@ func TestService_ListAllInstances_RedactsInjectorAddedSecretEnv(t *testing.T) {
 	assert.True(t, found, "expected postgres/demo in ListAllInstances output")
 }
 
+// The inventory sweep must attribute volume-usage metrics to an instance
+// without paying for a podman VolumeInspect call per volume, so it derives
+// volume names from template meta (the same construction Service.Get uses)
+// and leaves SizeBytes at 0 — sizes are joined in later from the usage cache.
+func TestListAllInstancesPopulatesVolumeNames(t *testing.T) {
+	svc, f, _ := newSvcMem(t)
+	ctx := context.Background()
+
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	f.AddPod("h1", podman.Pod{
+		Name:   "postgres-demo",
+		Status: "Running",
+		Labels: map[string]string{"podman-api/template": "postgres", "podman-api/slug": "demo"},
+	})
+
+	got, err := svc.ListAllInstances(ctx, "h1")
+	if err != nil {
+		t.Fatalf("ListAllInstances: %v", err)
+	}
+	var found *Observed
+	for i := range got {
+		if got[i].Template == "postgres" && got[i].Slug == "demo" {
+			found = &got[i]
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected postgres/demo in ListAllInstances output, got %+v", got)
+	}
+	if len(found.Volumes) != 1 {
+		t.Fatalf("volumes = %+v, want 1", found.Volumes)
+	}
+	if want := "postgres-demo-data"; found.Volumes[0].Name != want {
+		t.Fatalf("volume name = %q, want %q", found.Volumes[0].Name, want)
+	}
+	if found.Volumes[0].SizeBytes != 0 {
+		t.Fatalf("size = %d, want 0 (sweep does not price volumes)", found.Volumes[0].SizeBytes)
+	}
+}
+
 // A ListSpecKeys failure fails the whole-host sweep, which must withhold
 // env_summary for every instance on the host (fail closed) without failing
 // the List call itself — a store read failure must never fail an API request.

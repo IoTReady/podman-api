@@ -91,6 +91,75 @@ stays at 1 for the duration of the outage. Any alert built on the container
 metrics should be gated on `podman_api_host_reachable == 1`, with a separate
 alert on staleness.
 
+**Resource metrics (#209).** With the poller enabled, the same listener also
+exports per-container resource usage:
+
+| Metric | Labels | Meaning |
+|---|---|---|
+| `podman_api_container_cpu_seconds_total` | host, template, slug, container | Cumulative CPU time consumed by the container. |
+| `podman_api_container_memory_bytes` | host, template, slug, container | Current memory usage. |
+| `podman_api_container_memory_limit_bytes` | host, template, slug, container | Declared memory limit. **Absent, not zero, when the container declares no limit.** |
+| `podman_api_container_network_receive_bytes_total` | host, template, slug, container | Bytes received, summed across interfaces. |
+| `podman_api_container_network_transmit_bytes_total` | host, template, slug, container | Bytes transmitted, summed across interfaces. |
+| `podman_api_container_block_read_bytes_total` | host, template, slug, container | Bytes read from block devices. |
+| `podman_api_container_block_write_bytes_total` | host, template, slug, container | Bytes written to block devices. |
+| `podman_api_container_processes` | host, template, slug, container | Number of processes running in the container. |
+| `podman_api_volume_size_bytes` | host, template, slug, volume | On-disk size of a managed volume, from `podman system df`. |
+| `podman_api_volume_usage_age_seconds` | host | Seconds since the last successful volume-usage walk. |
+
+Container stats are sampled with one `containers.Stats` call per host on each
+inventory tick — but only when that tick's inventory refresh for the host
+*succeeded*. A host whose refresh fails is not also charged a second timeout for
+stats; instead its cached samples are dropped, so its container series go
+**absent** on the next scrape rather than freezing at their last value, exactly
+like the liveness metrics above. Disable the sampler with `-container-stats=false`
+(default `true` — an existing deployment picks up one extra call per host per
+tick on upgrade, with no flag change needed).
+
+A *succeeded* refresh is not a guarantee of a sample, and the difference shows
+up as a sawtooth: stats share the refresh's one per-host budget
+(`-inventory-refresh-timeout`, default `20s`) rather than getting a second one,
+so a host whose refresh chronically eats most of that budget leaves the stats
+call whatever is left — sometimes enough, sometimes not. The symptom is that
+host's resource series flipping absent/present tick to tick, with
+`container stats unavailable` / `container stats available again` alternating in
+the log. That is the shared budget working as designed (two independent timeouts
+would make the per-host cost `2 × timeout` and stretch the whole fleet's
+inventory freshness); the lever is the host's refresh latency, or a larger
+`-inventory-refresh-timeout`. The metrics stay honest either way — a missed
+sample renders absent, never stale.
+
+The cumulative series (`_total` suffix) reset when a pod is recreated, exactly
+as `podman_api_container_restarts_total` does; graph them with `rate()` or
+`increase()`, not as raw counters. Podman's own CPU/memory *percentages* are not
+exported: for a non-streaming stats call they're averaged against the
+container's start time, so a container busy at boot and idle since would read as
+permanently hot — the raw counters and `rate()` avoid that.
+
+Volume usage runs on its own, much slower loop, independent of the inventory
+tick, on `-volume-usage-interval` (default `1h`, `0` disables it) with
+`-volume-usage-timeout` (default `5m`) — `podman system df` walks the whole
+store and can take minutes, so it must never delay an inventory refresh. It also
+does an immediate first walk at startup, so on a large store that walk can run
+for minutes concurrently with boot. A failed walk leaves the previous sizing in
+place; `podman_api_volume_usage_age_seconds` climbing is how a wedged or
+slow walk becomes visible.
+
+Attributing a size to an instance needs the volume in the inventory, so the
+inventory sweep now populates every volume the *template declares*, without
+inspecting it — the sweep must make no podman call per volume or it would cost
+one round trip per volume per host per tick. That changes what the list route
+reports: `GET /hosts/{host}/instances` lists a template's declared volumes,
+including any that do not exist on the host yet, always with `size_bytes` 0,
+whereas `GET /hosts/{host}/instances/{template}/{slug}` still inspects and so
+lists only volumes that really exist, with their real sizes. Treat the list
+route's `volumes` as names, and the single-instance route as the authority on
+existence and size.
+
+Neither sampler can affect `podman_api_host_reachable`: the Grafana
+Infrastructure Alerts rules gate on it, so a slow `system df` or a stats
+timeout must never be able to silence them.
+
 ## Admin UI
 
 An embedded, server-rendered admin UI (HTMX + PureCSS) is served at `/ui`. Disabled unless `-operator-file <path>` is set. Pass `-ui-secure-cookie` when serving over HTTPS.

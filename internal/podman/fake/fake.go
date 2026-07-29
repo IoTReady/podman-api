@@ -113,6 +113,20 @@ type Fake struct {
 	// HostInfoCalls counts HostInfo invocations (lets a test assert probe throttling).
 	HostInfoCalls int
 
+	// ContainerStatsVal is returned by ContainerStats, keyed by host ID.
+	ContainerStatsVal map[string][]podman.ContainerStats
+	// ContainerStatsErr, if non-nil, makes ContainerStats return this error.
+	ContainerStatsErr error
+	// ContainerStatsCalls counts ContainerStats invocations.
+	ContainerStatsCalls int
+
+	// VolumeUsageVal is returned by VolumeUsage, keyed by host ID then volume name.
+	VolumeUsageVal map[string]map[string]int64
+	// VolumeUsageErr, if non-nil, makes VolumeUsage return this error.
+	VolumeUsageErr error
+	// VolumeUsageCalls counts VolumeUsage invocations.
+	VolumeUsageCalls int
+
 	// NetworkEnsureCalls records, per host, the network names ensured.
 	NetworkEnsureCalls map[string][]string
 	// NetworkEnsureErr, if non-nil, makes NetworkEnsure fail.
@@ -570,6 +584,27 @@ func (f *Fake) HostInfo(_ context.Context, _ string) (podman.HostInfo, error) {
 	}
 	return f.HostInfoVal, nil
 }
+
+func (f *Fake) ContainerStats(_ context.Context, h string) ([]podman.ContainerStats, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.ContainerStatsCalls++
+	if f.ContainerStatsErr != nil {
+		return nil, f.ContainerStatsErr
+	}
+	return f.ContainerStatsVal[h], nil
+}
+
+func (f *Fake) VolumeUsage(_ context.Context, h string) (map[string]int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.VolumeUsageCalls++
+	if f.VolumeUsageErr != nil {
+		return nil, f.VolumeUsageErr
+	}
+	return f.VolumeUsageVal[h], nil
+}
+
 func (f *Fake) UsedHostPorts(_ context.Context, h string) ([]podman.PortMapping, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

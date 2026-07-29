@@ -133,6 +133,32 @@ func TestPodFromInspect_ZeroCreatedLeftUnset(t *testing.T) {
 	assert.Empty(t, got.Containers)
 }
 
+func TestMapContainerStats(t *testing.T) {
+	in := define.ContainerStats{
+		Name:        "engine-valvo-engine",
+		CPUNano:     12_500_000_000,
+		MemUsage:    734003200,
+		MemLimit:    2147483648,
+		BlockInput:  4096,
+		BlockOutput: 8192,
+		PIDs:        37,
+		Network: map[string]define.ContainerNetworkStats{
+			"eth0": {RxBytes: 100, TxBytes: 200},
+			"eth1": {RxBytes: 5, TxBytes: 7},
+		},
+	}
+	got := mapContainerStats(in)
+	want := ContainerStats{
+		Name: "engine-valvo-engine", CPUNano: 12_500_000_000,
+		MemUsageBytes: 734003200, MemLimitBytes: 2147483648,
+		NetRxBytes: 105, NetTxBytes: 207,
+		BlockReadBytes: 4096, BlockWriteBytes: 8192, PIDs: 37,
+	}
+	if got != want {
+		t.Fatalf("mapContainerStats = %+v, want %+v", got, want)
+	}
+}
+
 func TestPodFromList(t *testing.T) {
 	created := time.Date(2026, 6, 2, 12, 0, 0, 0, time.UTC)
 	rep := &entities.ListPodsReport{

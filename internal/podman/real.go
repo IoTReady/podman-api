@@ -806,6 +806,102 @@ func podFromList(p *entities.ListPodsReport) Pod {
 	return out
 }
 
+func mapContainerStats(s define.ContainerStats) ContainerStats {
+	out := ContainerStats{
+		Name:            s.Name,
+		CPUNano:         s.CPUNano,
+		MemUsageBytes:   s.MemUsage,
+		MemLimitBytes:   s.MemLimit,
+		BlockReadBytes:  s.BlockInput,
+		BlockWriteBytes: s.BlockOutput,
+		PIDs:            s.PIDs,
+	}
+	for _, n := range s.Network {
+		out.NetRxBytes += n.RxBytes
+		out.NetTxBytes += n.TxBytes
+	}
+	return out
+}
+
+// ContainerStats issues one non-streaming stats call and returns the first
+// (and only) report. Passing nil containers asks podman for every container on
+// the host, so a fleet sample costs one round trip per host.
+//
+// All is deliberately left unset. With an empty name list podman's abi selects
+// GetRunningContainers when All is false and GetAllContainers when it is true —
+// but computeStats then skips every non-running container regardless, swallowing
+// ErrCtrStopped/ErrCtrStateInvalid/ErrNoCgroups because the query was for all.
+// So All:true yields no extra samples; it only enumerates and lock-touches every
+// exited container on the host, once per tick.
+func (r *Real) ContainerStats(ctx context.Context, id string) ([]ContainerStats, error) {
+	c, cancel, err := r.opCtxFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	stream := false
+	ch, err := containers.Stats(c, nil, &containers.StatsOptions{Stream: &stream})
+	if err != nil {
+		return nil, err
+	}
+	select {
+	case <-c.Done():
+		// The binding's own goroutine (containers.Stats) does an unbuffered,
+		// non-select send on ch and only closes it (and the response body)
+		// after that send completes. Abandoning ch here without a further
+		// receive would leave that goroutine blocked forever on the send,
+		// leaking it and the underlying HTTP connection. Drain it in the
+		// background: for a non-streaming call (Stream=false, as set above)
+		// the binding goroutine sends at most one report and then returns,
+		// so a single receive is always enough to unblock and let it clean
+		// up, whether that receive yields the report or the zero value from
+		// a channel the goroutine closed without sending (e.g. because it
+		// observed the same ctx cancellation via response.Request.Context()).
+		go func() { <-ch }()
+		return nil, c.Err()
+	case rep, ok := <-ch:
+		if !ok {
+			return nil, nil
+		}
+		if rep.Error != nil {
+			return nil, rep.Error
+		}
+		out := make([]ContainerStats, 0, len(rep.Stats))
+		for _, s := range rep.Stats {
+			out = append(out, mapContainerStats(s))
+		}
+		return out, nil
+	}
+}
+
+// VolumeUsage returns each volume's on-disk size in bytes, keyed by volume
+// name, via one `system df` call.
+func (r *Real) VolumeUsage(ctx context.Context, id string) (map[string]int64, error) {
+	c, cancel, err := r.opCtxFor(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	defer cancel()
+	df, err := system.DiskUsage(c, &system.DiskOptions{})
+	if err != nil {
+		return nil, err
+	}
+	if df == nil {
+		// Unreachable via system.DiskUsage, which never returns (nil, nil) — but
+		// returning (nil, nil) here would look like a successful walk that found
+		// no volumes, and RefreshHostVolumeUsage would then cache an empty map
+		// with a fresh timestamp: every size wiped and volume_usage_age_seconds
+		// reset to 0. The cache's contract is to keep the last sizing through a
+		// failure, so this must be a failure.
+		return nil, errors.New("system df returned no report")
+	}
+	out := make(map[string]int64, len(df.Volumes))
+	for _, v := range df.Volumes {
+		out[v.VolumeName] = v.Size
+	}
+	return out, nil
+}
+
 // ContainerLogs streams log lines from a container. Cancellation propagates
 // bidirectionally: if the caller's ctx is cancelled the underlying
 // containers.Logs call is cancelled (via mergedCtx), and if the producer
