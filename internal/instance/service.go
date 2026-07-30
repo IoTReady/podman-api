@@ -1205,27 +1205,74 @@ func (s *Service) InstanceSecretState(ctx context.Context, host, tmpl, slug stri
 // and/or named volumes on a host. Both names are deterministic from
 // template+slug, so leaving them behind risks a future deploy of the same slug
 // silently reusing stale data (play kube reuses an existing named volume) or
-// stale on-disk credentials. Errors are ignored — this is an idempotent
-// reconcile toward "gone"; callers that need durability handle the spec row
-// separately.
+// stale on-disk credentials. This is an idempotent reconcile toward "gone";
+// callers that need durability handle the spec row separately. Failures other
+// than podman.ErrNotFound are logged (not-found is the expected steady state
+// for an idempotent reconcile and stays quiet) but never returned — a caller
+// asking to prune must not have the rest of Delete fail underneath it.
 func (s *Service) pruneInstanceResources(ctx context.Context, host, tmpl, slug string, secrets, volumes bool, injectorSecrets []store.InjectorSecret) {
 	t, err := s.store.GetTemplate(ctx, tmpl)
-	if err != nil {
-		// Template gone from the catalog: nothing to derive resource names from.
-		// Best-effort prune, so skip rather than fail the caller's reconcile.
-		return
+	haveTemplate := err == nil
+	// Template gone from the catalog: t.Meta.Secrets.PerInstance and
+	// t.Meta.Volumes can't be derived, but injectorSecrets comes from the
+	// stored spec, not the template, so it is still prunable below.
+	//
+	// Logged unless the template is genuinely absent, for the same reason the
+	// podman failures below are: a transient store error here silently skips
+	// BOTH declared loops while the caller still gets its 204 — which is
+	// exactly the #214 failure mode, on a template that still exists. Absence
+	// is the one case that is ordinary and stays quiet.
+	if err != nil && !errors.Is(err, store.ErrNotFound) {
+		log.Printf("prune: get template %s (skipping declared secrets/volumes on %s): %v", tmpl, host, err)
 	}
+
 	if secrets {
-		for _, name := range t.Meta.Secrets.PerInstance {
-			_ = s.client.SecretRemove(ctx, host, instanceSecretName(tmpl, slug, name))
+		if haveTemplate {
+			for _, name := range t.Meta.Secrets.PerInstance {
+				full := instanceSecretName(tmpl, slug, name)
+				if err := s.client.SecretRemove(ctx, host, full); err != nil && !errors.Is(err, podman.ErrNotFound) {
+					log.Printf("prune: remove secret %s on %s: %v", full, host, err)
+				}
+				// The wrapped-secret volume `podman kube play` creates when a
+				// secret: volume mount resolves it holds the DECODED PLAINTEXT
+				// credential on disk (_data/<name>, root-owned) — not template
+				// data. Gated on `secrets`, not `volumes`: prune_secrets=true is
+				// an operator asking for the key to be gone, and gating the key's
+				// own on-disk copy behind a second flag would just recreate the
+				// false all-clear this fix exists to close. It also widens no
+				// blast radius — this is the same name SecretRemove above just
+				// targeted.
+				//
+				// Note the doc comment above says play kube reuses an existing
+				// named volume. That is true of *the volume*, not of its
+				// contents: kube play re-materialises a secret wrapper volume
+				// from the secret on every play, verified on podman 5.8.2 (old
+				// value → pod rm → secret rm + recreate → re-play → new value).
+				// So rotating a leaked credential really does replace it, and
+				// no apply-path change is needed here.
+				if err := s.client.VolumeRemove(ctx, host, full, true); err != nil && !errors.Is(err, podman.ErrNotFound) {
+					log.Printf("prune: remove secret wrapper volume %s on %s: %v", full, host, err)
+				}
+			}
 		}
 		for _, sec := range injectorSecrets {
-			_ = s.client.SecretRemove(ctx, host, instanceSecretName(tmpl, slug, sec.Name))
+			full := instanceSecretName(tmpl, slug, sec.Name)
+			if err := s.client.SecretRemove(ctx, host, full); err != nil && !errors.Is(err, podman.ErrNotFound) {
+				log.Printf("prune: remove injector secret %s on %s: %v", full, host, err)
+			}
+			// Same rationale as above: an injector secret mounted as a volume
+			// gets the same wrapper-volume treatment from podman.
+			if err := s.client.VolumeRemove(ctx, host, full, true); err != nil && !errors.Is(err, podman.ErrNotFound) {
+				log.Printf("prune: remove injector secret wrapper volume %s on %s: %v", full, host, err)
+			}
 		}
 	}
-	if volumes {
+	if volumes && haveTemplate {
 		for _, v := range t.Meta.Volumes {
-			_ = s.client.VolumeRemove(ctx, host, volumeName(tmpl, slug, v.Name), true)
+			name := volumeName(tmpl, slug, v.Name)
+			if err := s.client.VolumeRemove(ctx, host, name, true); err != nil && !errors.Is(err, podman.ErrNotFound) {
+				log.Printf("prune: remove volume %s on %s: %v", name, host, err)
+			}
 		}
 	}
 }
@@ -1253,8 +1300,14 @@ func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts Dele
 	}
 
 	var injectorSecrets []store.InjectorSecret
+	// A GetSpec failure leaves injectorSecrets empty, so the prune below is
+	// never even asked to remove them — VPN PSKs, WireGuard private keys — and
+	// reports nothing wrong. Same silence-is-a-bug reasoning as
+	// pruneInstanceResources itself; a missing spec is ordinary and stays quiet.
 	if spec, err := s.store.GetSpec(ctx, host, tmpl, slug); err == nil {
 		injectorSecrets = spec.InjectorSecrets
+	} else if !errors.Is(err, store.ErrNotFound) {
+		log.Printf("prune: get spec %s/%s on %s (injector secrets will not be pruned): %v", tmpl, slug, host, err)
 	}
 	s.pruneInstanceResources(ctx, host, tmpl, slug, opts.PruneSecrets, opts.PruneVolumes, injectorSecrets)
 	// Reconcile away the desired-state row. This runs even when the pod was

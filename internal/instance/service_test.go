@@ -279,6 +279,112 @@ func TestService_Delete_PrunesOrphanSecretWhenPodAlreadyGone(t *testing.T) {
 	require.Empty(t, secs, "orphaned secret should be pruned")
 }
 
+// #214: `podman kube play` resolving a `secret:` volume mount against a
+// wrapped K8s Secret creates a named volume — same name as the secret —
+// holding the DECODED PLAINTEXT credential on disk. Deleting the pod does not
+// remove it, and (pre-fix) prune never looked for it: `prune_secrets=true`
+// reported success while the plaintext key stayed on disk. The fake client
+// can't reproduce podman's play-kube volume materialization, so this test
+// seeds the wrapper volume by hand (AddVolume) the way the real host would
+// have left it, and asserts prune reaps it under PruneSecrets alone — no
+// PruneVolumes needed, since the wrapper holds credential material, not
+// template data.
+func TestService_Delete_PrunesSecretWrapperVolume_PerInstanceSecret(t *testing.T) {
+	svc, f := newSvc(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("wrapvol"), ApplyOptions{Replace: true}))
+
+	wrapperName := instanceSecretName("postgres", "wrapvol", "password")
+	f.AddVolume("h1", podman.Volume{Name: wrapperName})
+
+	// PruneSecrets alone (no PruneVolumes) must remove the wrapper volume.
+	require.NoError(t, svc.Delete(ctx, "h1", "postgres", "wrapvol", DeleteOptions{PruneSecrets: true}))
+
+	_, err := f.VolumeInspect(ctx, "h1", wrapperName)
+	assert.ErrorIs(t, err, podman.ErrNotFound, "the secret's wrapper volume must be pruned by PruneSecrets alone")
+}
+
+// Same as above but for a SidecarInjector-added secret (e.g. a VPN PSK),
+// which is pruned from the stored spec's InjectorSecrets rather than the
+// template's declared secrets — a separate loop in pruneInstanceResources.
+func TestService_Delete_PrunesSecretWrapperVolume_InjectorSecret(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("injvol"), ApplyOptions{Replace: true}))
+
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "injvol")
+	require.NoError(t, err)
+	sp.InjectorSecrets = append(sp.InjectorSecrets, store.InjectorSecret{
+		Name: "vpn-psk", Key: "postgres-injvol-vpn-psk", Value: "secret-psk",
+	})
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	wrapperName := instanceSecretName("postgres", "injvol", "vpn-psk")
+	f.AddVolume("h1", podman.Volume{Name: wrapperName})
+
+	require.NoError(t, svc.Delete(ctx, "h1", "postgres", "injvol", DeleteOptions{PruneSecrets: true}))
+
+	_, err = f.VolumeInspect(ctx, "h1", wrapperName)
+	assert.ErrorIs(t, err, podman.ErrNotFound, "the injector secret's wrapper volume must be pruned by PruneSecrets alone")
+}
+
+// A declared template data volume is data, not credential material, so it
+// must stay untouched by PruneSecrets and only go with PruneVolumes.
+func TestService_Delete_PruneSecretsAlone_DoesNotTouchDeclaredDataVolume(t *testing.T) {
+	svc, f := newSvc(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("datavol"), ApplyOptions{Replace: true}))
+
+	dataVol := volumeName("postgres", "datavol", "data")
+	f.AddVolume("h1", podman.Volume{Name: dataVol})
+
+	require.NoError(t, svc.Delete(ctx, "h1", "postgres", "datavol", DeleteOptions{PruneSecrets: true}))
+
+	_, err := f.VolumeInspect(ctx, "h1", dataVol)
+	assert.NoError(t, err, "a declared data volume must survive PruneSecrets without PruneVolumes")
+
+	// Sanity: PruneVolumes does remove it.
+	require.NoError(t, svc.Delete(ctx, "h1", "postgres", "datavol", DeleteOptions{PruneVolumes: true}))
+	_, err = f.VolumeInspect(ctx, "h1", dataVol)
+	assert.ErrorIs(t, err, podman.ErrNotFound)
+}
+
+// If the template has since been removed from the catalog, per-instance
+// secrets and declared volumes can no longer be named (they're derived from
+// the template), but injector secrets are recorded on the stored spec and
+// must still be pruned — including their wrapper volumes. Exercised directly
+// against pruneInstanceResources (rather than via Delete/svc.Delete) because
+// Delete's own lookup rejects an unknown template before ever reaching prune
+// — reconcile.go's migrate-reap path is the caller that hits this case for
+// real, calling pruneInstanceResources without that gate.
+func TestPruneInstanceResources_TemplateGone_StillPrunesInjectorSecrets(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("tmplgone"), ApplyOptions{Replace: true}))
+
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "tmplgone")
+	require.NoError(t, err)
+	sp.InjectorSecrets = append(sp.InjectorSecrets, store.InjectorSecret{
+		Name: "vpn-psk", Key: "postgres-tmplgone-vpn-psk", Value: "secret-psk",
+	})
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	injectorSecretName := instanceSecretName("postgres", "tmplgone", "vpn-psk")
+	wrapperName := injectorSecretName
+	f.AddVolume("h1", podman.Volume{Name: wrapperName})
+
+	// Remove the template from the catalog, simulating an instance whose
+	// template was deleted before the instance itself was cleaned up.
+	require.NoError(t, mem.DeleteTemplate(ctx, "postgres"))
+
+	svc.pruneInstanceResources(ctx, "h1", "postgres", "tmplgone", true, true, sp.InjectorSecrets)
+
+	_, err = f.SecretInspect(ctx, "h1", injectorSecretName)
+	assert.ErrorIs(t, err, podman.ErrNotFound, "injector secret must still be pruned when the template is gone")
+	_, err = f.VolumeInspect(ctx, "h1", wrapperName)
+	assert.ErrorIs(t, err, podman.ErrNotFound, "injector secret's wrapper volume must still be pruned when the template is gone")
+}
+
 func TestService_Delete_AbsentInstanceWithoutPruneIsNotFound(t *testing.T) {
 	svc, _ := newSvc(t)
 	// Nothing applied; deleting a non-existent instance without prune flags

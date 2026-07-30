@@ -3,6 +3,7 @@ package instance
 import (
 	"context"
 	"errors"
+	"log"
 
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/store"
@@ -153,9 +154,15 @@ func (s *Service) ReconcileMigrate(ctx context.Context, req MigrateRequest, step
 				// deterministic from template+slug, so a future deploy of the same
 				// slug would otherwise silently remount stale data. Best-effort, like
 				// Delete's own prune — cannot reintroduce the source-proxy coupling.
+				// As in Delete: a GetSpec failure silently means zero injector
+				// secrets are pruned, and nothing reports it. Absence is ordinary
+				// here and stays quiet.
 				var injectorSecrets []store.InjectorSecret
 				if spec, specErr := s.store.GetSpec(mctx, req.FromHost, req.Template, req.Slug); specErr == nil {
 					injectorSecrets = spec.InjectorSecrets
+				} else if !errors.Is(specErr, store.ErrNotFound) {
+					log.Printf("migrate reap: get spec %s/%s on %s (injector secrets will not be pruned): %v",
+						req.Template, req.Slug, req.FromHost, specErr)
 				}
 				s.pruneInstanceResources(mctx, req.FromHost, req.Template, req.Slug, true, true, injectorSecrets)
 				// A store write is local and reliable; a failure is worth retrying so
