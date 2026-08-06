@@ -377,7 +377,12 @@ func RunWithFlags(opts ...Option) error {
 		if !strings.Contains(base, "://") {
 			base = "http://" + base
 		}
-		registryClient = imgregistry.NewHTTPClient(base, auth)
+		// Wrap in the TTL-caching decorator so both the API and UI share one
+		// cache: Tags() resolves every tag's manifest (and every unique
+		// digest's config blob), ~21s cold for the fleet's "engine" repo, and
+		// the UI's list page fires it once per catalog repo on every single
+		// page view. See imgregistry.CachingClient's doc comment.
+		registryClient = imgregistry.NewCachingClient(imgregistry.NewHTTPClient(base, auth), imgregistry.TagsCacheTTL)
 	}
 
 	router := api.NewRouter(svc, jobStore, keyStore, combined, nil, canceller, Version, registryClient)
