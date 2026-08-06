@@ -6,6 +6,7 @@ import (
 	"log"
 	"net/http"
 
+	"github.com/iotready/podman-api/internal/imgregistry"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
@@ -98,6 +99,10 @@ func (u *UI) renderError(w http.ResponseWriter, r *http.Request, err error) {
 // mirroring the JSON API's classify() taxonomy (internal/api/errors.go).
 func errorStatus(err error) int {
 	switch {
+	case errors.Is(err, imgregistry.ErrNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, imgregistry.ErrUnreachable):
+		return http.StatusBadGateway
 	case errors.Is(err, instance.ErrUnknownHost),
 		errors.Is(err, instance.ErrUnknownTemplate),
 		errors.Is(err, instance.ErrInstanceNotFound),

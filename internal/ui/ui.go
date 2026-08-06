@@ -193,7 +193,10 @@ func (u *UI) Handler() http.Handler {
 	mux.Handle("GET /ui/jobs", guard(u.jobsList))
 	mux.Handle("GET /ui/jobs/{id}", guard(u.jobDetail))
 	mux.Handle("GET /ui/registry", guard(u.registryRepos))
-	mux.Handle("GET /ui/registry/{repo}", guard(u.registryTags))
+	// {repo...} (Go 1.22 multi-segment wildcard), not {repo}: Registry v2 repo
+	// names legally contain "/" (e.g. "iotready/engine"), and the API side
+	// uses the same wildcard for the same reason (internal/api/router.go).
+	mux.Handle("GET /ui/registry/{repo...}", guard(u.registryTags))
 
 	if u.cfg.TokenMgr != nil {
 		mux.Handle("GET /ui/tokens", guard(u.tokensList))

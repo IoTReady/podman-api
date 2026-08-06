@@ -80,6 +80,49 @@ func TestUI_RegistryTags_GroupsRenderTogether(t *testing.T) {
 	}
 }
 
+// TestUI_RegistryRepos_LinksNamespacedRepoCorrectly is part of the Critical-2
+// fix: a repo name containing "/" (e.g. "iotready/engine") must render an
+// href that html/template does not mangle and that the {repo...} route below
+// can actually resolve.
+func TestUI_RegistryRepos_LinksNamespacedRepoCorrectly(t *testing.T) {
+	u := uiWithRegistry(t, &fakeRegistryUI{catalog: []string{"iotready/engine"}})
+	w := authedGet(t, u, "/ui/registry")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `href="/ui/registry/iotready/engine"`) {
+		t.Fatalf("expected an href to the namespaced repo, got: %s", w.Body.String())
+	}
+}
+
+// TestUI_RegistryTags_NamespacedRepo is the UI-side half of Critical 2: the
+// {repo...} multi-segment wildcard route must resolve a "/"-containing repo
+// name, where the old {repo} (one-segment) route 404d it.
+func TestUI_RegistryTags_NamespacedRepo(t *testing.T) {
+	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	u := uiWithRegistry(t, &fakeRegistryUI{
+		tags: []imgregistry.TagGroup{{Digest: "sha256:abc", Tags: []string{"latest"}, Created: created}},
+	})
+	w := authedGet(t, u, "/ui/registry/iotready/engine")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "latest") {
+		t.Fatalf("body missing tags: %s", w.Body.String())
+	}
+}
+
+// TestUI_RegistryTags_InvalidRepoNameIs400 is the Important-6 fix: the UI
+// handler must apply the same repo-name validator as the API edge before the
+// value ever reaches u.cfg.Registry.Tags.
+func TestUI_RegistryTags_InvalidRepoNameIs400(t *testing.T) {
+	u := uiWithRegistry(t, &fakeRegistryUI{tags: []imgregistry.TagGroup{}})
+	w := authedGet(t, u, "/ui/registry/Not_Valid!")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", w.Code, w.Body.String())
+	}
+}
+
 func TestUI_RegistryTags_PickerFragmentOmitsPageChrome(t *testing.T) {
 	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	u := uiWithRegistry(t, &fakeRegistryUI{

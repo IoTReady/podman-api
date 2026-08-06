@@ -62,9 +62,15 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 
 	// Registry (read-only browsing of a Docker Registry v2 endpoint). 404 when no
 	// registry client is configured.
+	//
+	// Registry v2 repo names legally contain "/" (e.g. "iotready/engine"), so
+	// {repo} (one path segment) can't address every real repo — {repo...}
+	// (Go 1.22's multi-segment wildcard) is required. That wildcard must be
+	// the mux's last segment, so a separate .../manifests/{ref} route can no
+	// longer follow it; the manifest lookup is folded into the same route via
+	// a "?manifest=<ref>" query parameter instead (see getRepoOrManifest).
 	mux.Handle("GET /registry/repos", guard("instances:read", http.HandlerFunc(h.listRepos)))
-	mux.Handle("GET /registry/repos/{repo}", guard("instances:read", http.HandlerFunc(h.listRepoTags)))
-	mux.Handle("GET /registry/repos/{repo}/manifests/{ref}", guard("instances:read", http.HandlerFunc(h.getManifest)))
+	mux.Handle("GET /registry/repos/{repo...}", guard("instances:read", http.HandlerFunc(h.getRepoOrManifest)))
 
 	// Host secrets.
 	mux.Handle("GET /hosts/{host}/secrets", guard("secrets:read", http.HandlerFunc(h.listSecrets)))

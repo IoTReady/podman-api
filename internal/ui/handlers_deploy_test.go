@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/iotready/podman-api/internal/config"
+	"github.com/iotready/podman-api/internal/imgregistry"
 	"github.com/iotready/podman-api/internal/ingress"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman"
@@ -875,17 +876,100 @@ func TestDeployCreateAcceptsFreePort(t *testing.T) {
 	}
 }
 
+// TestRepoFromImage is the Critical-1 fix: repoFromImage must strip the
+// registry-host prefix so its output lands in the same bare-repo-name
+// namespace Catalog() (and the {repo...} route) use — a host-qualified value
+// like "100.64.0.23:5000/engine" 404s the picker route and 400s the API's
+// ValidRepoName check.
 func TestRepoFromImage(t *testing.T) {
 	cases := []struct{ image, want string }{
-		{"100.64.0.23:5000/engine:latest", "100.64.0.23:5000/engine"},
-		{"100.64.0.23:5000/engine@sha256:abcdef", "100.64.0.23:5000/engine"},
-		{"100.64.0.23:5000/engine", "100.64.0.23:5000/engine"},
-		{"docker.io/library/postgres:16", "docker.io/library/postgres"},
+		{"100.64.0.23:5000/engine:latest", "engine"},
+		{"100.64.0.23:5000/engine@sha256:abcdef", "engine"},
+		{"100.64.0.23:5000/engine", "engine"},
+		{"docker.io/library/postgres:16", "library/postgres"},
+		{"localhost:5000/engine:latest", "engine"},
+		{"localhost/engine", "engine"},
+		// No host prefix at all: a bare repo name, same shape Catalog()
+		// itself returns — must pass through unchanged, not be emptied.
+		{"engine:latest", "engine"},
+		{"engine", "engine"},
+		// Whole string is just a host, with no repo path to address at all.
+		{"100.64.0.23:5000", ""},
+		{"100.64.0.23:5000/", ""},
 		{"", ""},
 	}
 	for _, c := range cases {
 		if got := repoFromImage(c.image); got != c.want {
 			t.Errorf("repoFromImage(%q) = %q, want %q", c.image, got, c.want)
 		}
+	}
+}
+
+// TestUpgradeForm_RegistryRepoResolvesThroughRealPickerRoute is the
+// join-the-whole-path regression test for Critical 1: the previous test only
+// unit-tested repoFromImage in isolation and never actually requested the
+// picker URL it feeds, which is exactly how the original bug (a host-
+// qualified RegistryRepo producing a 404'ing two-segment picker URL) got
+// past review. This drives a realistic host-qualified image through
+// upgradeForm, confirms the rendered picker link is bare ("/ui/registry/engine
+// ?picker=1", not "/ui/registry/100.64.0.23:5000/engine?picker=1"), then
+// actually GETs that URL through the real router and asserts 200 with a Use
+// button — proving the two ends (repoFromImage's output and the {repo...}
+// route + Catalog()'s namespace) agree.
+func TestUpgradeForm_RegistryRepoResolvesThroughRealPickerRoute(t *testing.T) {
+	fc := fake.New()
+	hosts := []config.Host{{ID: "edge-1"}}
+	fc.AddPod("edge-1", podman.Pod{
+		Name:   "engine-main",
+		Status: "Running",
+		Containers: []podman.Container{
+			{Name: "engine-main-app", Image: "100.64.0.23:5000/engine:latest", Status: "Running"},
+		},
+	})
+	mem := store.NewMemory()
+	if err := mem.PutTemplate(context.Background(), store.Template{
+		Meta: render.Meta{ID: "engine", Parameters: []render.ParamDef{{Name: "image", Required: true}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := mem.PutSpec(context.Background(), store.Spec{
+		Host: "edge-1", Template: "engine", Slug: "main",
+		Parameters: map[string]any{"image": "100.64.0.23:5000/engine:latest"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	svc := instance.NewService(fc, hosts)
+	svc.SetStore(mem)
+	hash, _ := config.HashToken("pw")
+	u, err := New(Config{
+		Svc:      svc,
+		Jobs:     mem,
+		Auth:     NewOperatorAuthenticator(config.Operator{Username: "op", PasswordHash: hash}),
+		Registry: &fakeRegistryUI{tags: []imgregistry.TagGroup{{Digest: "sha256:abc", Tags: []string{"latest"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := authedGet(t, u, "/ui/hosts/edge-1/instances/engine/main/upgrade")
+	if w.Code != http.StatusOK {
+		t.Fatalf("upgrade form status = %d, body = %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	const wantLink = `/ui/registry/engine?picker=1`
+	if !strings.Contains(body, wantLink) {
+		t.Fatalf("upgrade form should link to %q (bare repo, not host-qualified); body:\n%s", wantLink, body)
+	}
+	if strings.Contains(body, "100.64.0.23:5000/engine?picker=1") {
+		t.Fatalf("upgrade form must not link to a host-qualified picker URL; body:\n%s", body)
+	}
+
+	// Now actually follow that link through the real router.
+	picker := authedGet(t, u, "/ui/registry/engine?picker=1")
+	if picker.Code != http.StatusOK {
+		t.Fatalf("picker route status = %d, want 200 (this is the join-the-path regression); body = %s", picker.Code, picker.Body.String())
+	}
+	if !strings.Contains(picker.Body.String(), "Use") {
+		t.Fatalf("picker fragment should render a Use button; body:\n%s", picker.Body.String())
 	}
 }

@@ -1,6 +1,10 @@
 package ui
 
-import "net/http"
+import (
+	"net/http"
+
+	"github.com/iotready/podman-api/internal/imgregistry"
+)
 
 func (u *UI) registryRepos(w http.ResponseWriter, r *http.Request) {
 	if u.cfg.Registry == nil {
@@ -24,6 +28,14 @@ func (u *UI) registryTags(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	repo := r.PathValue("repo")
+	// Mirror the API edge's validation (internal/api/registry.go): an
+	// unvalidated repo went straight into u.cfg.Registry.Tags before this
+	// fix, while the API path already checked it — same shared validator now,
+	// both edges.
+	if !imgregistry.ValidRepoName(repo) {
+		http.Error(w, "invalid repository name", http.StatusBadRequest)
+		return
+	}
 	groups, err := u.cfg.Registry.Tags(r.Context(), repo)
 	if err != nil {
 		u.renderError(w, r, err)
