@@ -17,6 +17,7 @@
 - `-registry-address` empty means the feature is entirely absent: routes return 404 (not wired into the mux at all) and no "Registry" nav item renders — never a runtime error path.
 - No new write route is added for upgrades — the picker must call the existing `Service.UpgradeImage` / `upgrade-image` route.
 - Registry unreachable must surface as an explicit error (502-class in the API, an inline error message in the UI), never as a silently empty list.
+- This repo requires build tags for anything that transitively imports `internal/podman` (which includes `internal/api`, `internal/ui`, `server`, `cmd/podman-api`) — a plain `go build ./...`/`go test ./...` at the repo root or on those packages fails on a clean machine (missing `gpgme`/`btrfs` headers). Use `make build`/`make test`/`make vet`, or pass `-tags "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper"` explicitly, exactly as `Makefile` and `CLAUDE.md` document. `internal/imgregistry` itself has no such dependency and its own package tests run fine without tags.
 
 ---
 
@@ -712,10 +713,10 @@ And add `Registry: registryClient` to the `ui.Config{...}` literal at ~line 374:
 
 - [ ] **Step 5: Build**
 
-Run: `cd /home/tej/projects/podman-api && go build ./...`
+Run: `cd /home/tej/projects/podman-api && make build` (or `go build -tags "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper" ./...`)
 Expected: fails at this point because `api.NewRouter` and `ui.Config` don't yet have the new parameter/field — that's expected and resolved in Tasks 4-5. Do not proceed to commit until Task 4 and Task 5 land and the full build is green; if working task-by-task with review gates, note this dependency explicitly to the reviewer rather than committing a non-building tree.
 
-- [ ] **Step 6: Commit** (only once Task 4 and Task 5 have landed and `go build ./...` is clean)
+- [ ] **Step 6: Commit** (only once Task 4 and Task 5 have landed and `make build` is clean)
 
 ```bash
 git add server/server.go
@@ -852,7 +853,7 @@ Add `"fmt"` to the import block (used by `fakeRegistry.Tags`'s error).
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `cd internal/api && go test ./... -run 'TestListRepos|TestListRepoTags' -v`
+Run: `cd /home/tej/projects/podman-api && go test -tags "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper" ./internal/api/... -run 'TestListRepos|TestListRepoTags' -v`
 Expected: FAIL to compile — `handlers.registry` field doesn't exist yet and `NewRouter` doesn't accept the trailing `imgregistry.Client` argument yet.
 
 - [ ] **Step 3: Add the `registry` field and implement the handlers**
@@ -961,7 +962,7 @@ For every match outside `server/server.go` (test helpers, integration tests), ad
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cd /home/tej/projects/podman-api && go build ./... && go test ./internal/api/... -v`
+Run: `cd /home/tej/projects/podman-api && make build && go test -tags "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper" ./internal/api/... -v`
 Expected: all PASS, build clean.
 
 - [ ] **Step 6: Commit**
@@ -1106,7 +1107,7 @@ Add `"strings"` to the import block (used by `strings.Contains` above). `uiWithS
 
 - [ ] **Step 3: Run test to verify it fails**
 
-Run: `cd internal/ui && go test ./... -run TestUI_Registry -v`
+Run: `cd /home/tej/projects/podman-api && go test -tags "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper" ./internal/ui/... -run TestUI_Registry -v`
 Expected: FAIL — `registryRepos`/`registryTags` not defined.
 
 - [ ] **Step 4: Implement the handlers**
@@ -1210,7 +1211,7 @@ Then in `u.pageData` (`internal/ui/ui.go`, ~line 138), add `"RegistryEnabled": u
 
 - [ ] **Step 5: Run tests to verify they pass**
 
-Run: `cd /home/tej/projects/podman-api && go build ./... && go test ./internal/ui/... -v`
+Run: `cd /home/tej/projects/podman-api && make build && go test -tags "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper" ./internal/ui/... -v`
 Expected: all PASS.
 
 - [ ] **Step 6: Commit**
@@ -1255,7 +1256,7 @@ func TestRepoFromImage(t *testing.T) {
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `cd internal/ui && go test ./... -run TestRepoFromImage -v`
+Run: `cd /home/tej/projects/podman-api && go test -tags "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper" ./internal/ui/... -run TestRepoFromImage -v`
 Expected: FAIL — `repoFromImage` not defined.
 
 - [ ] **Step 3: Implement `repoFromImage`**
@@ -1290,7 +1291,7 @@ func repoFromImage(image string) string {
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `cd internal/ui && go test ./... -run TestRepoFromImage -v`
+Run: `cd /home/tej/projects/podman-api && go test -tags "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper" ./internal/ui/... -run TestRepoFromImage -v`
 Expected: PASS.
 
 - [ ] **Step 5: Wire the derived repo into `upgradeForm`**
@@ -1430,12 +1431,12 @@ func TestUI_RegistryTags_PickerFragmentOmitsPageChrome(t *testing.T) {
 
 - [ ] **Step 9: Run all UI tests**
 
-Run: `cd /home/tej/projects/podman-api && go build ./... && go test ./internal/ui/... -v`
+Run: `cd /home/tej/projects/podman-api && make build && go test -tags "containers_image_openpgp exclude_graphdriver_btrfs exclude_graphdriver_devicemapper" ./internal/ui/... -v`
 Expected: all PASS.
 
 - [ ] **Step 10: Run the full test suite**
 
-Run: `cd /home/tej/projects/podman-api && go vet ./... && go test ./...`
+Run: `cd /home/tej/projects/podman-api && make vet && make test`
 Expected: all PASS, `go vet` clean.
 
 - [ ] **Step 11: Commit**
