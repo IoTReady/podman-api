@@ -1,0 +1,17 @@
+{{define "registry-tags-picker"}}
+<table class="table">
+  <thead><tr><th>Tags</th><th>Digest</th><th>Created</th><th></th></tr></thead>
+  <tbody>
+  {{range .Groups}}
+    <tr>
+      <td>{{range $i, $t := .Tags}}{{if $i}}, {{end}}<code>{{$t}}</code>{{end}}</td>
+      <td><code>{{.Digest}}</code></td>
+      <td>{{.Created.Format "2006-01-02 15:04"}}</td>
+      <td><button type="button" class="btn ghost" onclick="document.getElementById('upgrade-image-input').value='{{$.Repo}}@{{.Digest}}'">Use</button></td>
+    </tr>
+  {{else}}
+    <tr><td colspan="4" class="subtitle">No tags found.</td></tr>
+  {{end}}
+  </tbody>
+</table>
+{{end}}

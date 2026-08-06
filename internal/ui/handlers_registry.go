@@ -29,6 +29,13 @@ func (u *UI) registryTags(w http.ResponseWriter, r *http.Request) {
 		u.renderError(w, r, err)
 		return
 	}
+	if r.URL.Query().Get("picker") == "1" {
+		u.render(w, r, http.StatusOK, "registry-tags-picker", u.pageData(map[string]any{
+			"Repo":   repo,
+			"Groups": groups,
+		}))
+		return
+	}
 	u.render(w, r, http.StatusOK, "registry-tags", u.pageData(map[string]any{
 		"Repo":   repo,
 		"Groups": groups,

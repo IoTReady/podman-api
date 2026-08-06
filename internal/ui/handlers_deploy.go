@@ -411,13 +411,18 @@ func (u *UI) upgradeForm(w http.ResponseWriter, r *http.Request) {
 		u.renderError(w, r, err)
 		return
 	}
-	u.render(w, r, http.StatusOK, "upgrade-form", u.pageData(map[string]any{
+	currentImage := firstContainerImage(obs)
+	data := map[string]any{
 		"Host":         host,
 		"ActiveHost":   host,
 		"Template":     tmplID,
 		"Slug":         slug,
-		"CurrentImage": firstContainerImage(obs),
-	}))
+		"CurrentImage": currentImage,
+	}
+	if u.cfg.Registry != nil {
+		data["RegistryRepo"] = repoFromImage(currentImage)
+	}
+	u.render(w, r, http.StatusOK, "upgrade-form", u.pageData(data))
 }
 
 func (u *UI) upgradeApply(w http.ResponseWriter, r *http.Request) {
@@ -562,4 +567,26 @@ func firstContainerImage(obs instance.Observed) string {
 		return obs.Containers[0].Image
 	}
 	return ""
+}
+
+// repoFromImage strips a trailing :tag or @digest from an image reference to
+// get the repository path the registry browser groups tags under. A bare
+// registry host:port/path with neither suffix is returned unchanged. This
+// mirrors the resolution scripts/roll.py already does against a template
+// body when it needs "what repo does this instance's image belong to."
+func repoFromImage(image string) string {
+	if image == "" {
+		return ""
+	}
+	if i := strings.LastIndex(image, "@"); i != -1 {
+		return image[:i]
+	}
+	// A ":" after the last "/" is a tag; a ":" that is part of a host:port
+	// prefix (before the first "/") is not.
+	slash := strings.LastIndex(image, "/")
+	colon := strings.LastIndex(image, ":")
+	if colon > slash {
+		return image[:colon]
+	}
+	return image
 }

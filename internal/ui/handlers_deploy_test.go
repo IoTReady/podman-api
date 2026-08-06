@@ -874,3 +874,18 @@ func TestDeployCreateAcceptsFreePort(t *testing.T) {
 		t.Error("free port should not result in a 409 conflict")
 	}
 }
+
+func TestRepoFromImage(t *testing.T) {
+	cases := []struct{ image, want string }{
+		{"100.64.0.23:5000/engine:latest", "100.64.0.23:5000/engine"},
+		{"100.64.0.23:5000/engine@sha256:abcdef", "100.64.0.23:5000/engine"},
+		{"100.64.0.23:5000/engine", "100.64.0.23:5000/engine"},
+		{"docker.io/library/postgres:16", "docker.io/library/postgres"},
+		{"", ""},
+	}
+	for _, c := range cases {
+		if got := repoFromImage(c.image); got != c.want {
+			t.Errorf("repoFromImage(%q) = %q, want %q", c.image, got, c.want)
+		}
+	}
+}

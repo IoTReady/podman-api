@@ -79,3 +79,20 @@ func TestUI_RegistryTags_GroupsRenderTogether(t *testing.T) {
 		t.Fatalf("body missing tags: %s", w.Body.String())
 	}
 }
+
+func TestUI_RegistryTags_PickerFragmentOmitsPageChrome(t *testing.T) {
+	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	u := uiWithRegistry(t, &fakeRegistryUI{
+		tags: []imgregistry.TagGroup{{Digest: "sha256:abc", Tags: []string{"latest"}, Created: created}},
+	})
+	w := authedGet(t, u, "/ui/registry/engine?picker=1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "Use") {
+		t.Fatalf("expected picker fragment with a Use button: %s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "All repositories") {
+		t.Fatalf("picker fragment should not include the full page's back-link chrome: %s", w.Body.String())
+	}
+}

@@ -8,8 +8,14 @@
   {{if .CurrentImage}}<p class="subtitle">Current: <code>{{.CurrentImage}}</code></p>{{end}}
   <div class="field">
     <label>New image</label>
-    <input name="image" value="{{.CurrentImage}}" placeholder="docker.io/library/postgres:16" required>
+    <input id="upgrade-image-input" name="image" value="{{.CurrentImage}}" placeholder="docker.io/library/postgres:16" required>
   </div>
+  {{if .RegistryRepo}}
+  <div class="field">
+    <a class="btn ghost" hx-get="/ui/registry/{{.RegistryRepo}}?picker=1" hx-target="#registry-picker" hx-swap="innerHTML">Browse registry ({{.RegistryRepo}})</a>
+    <div id="registry-picker"></div>
+  </div>
+  {{end}}
   <div class="toolbar" style="margin-top:22px">
     <button type="submit" class="btn primary" hx-disabled-elt="this">Upgrade</button>
     <a class="btn ghost" href="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}" hx-get="/ui/hosts/{{.Host}}/instances/{{.Template}}/{{.Slug}}" hx-target="#main" hx-push-url="true">Cancel</a>
