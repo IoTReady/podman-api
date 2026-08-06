@@ -46,6 +46,23 @@ func (f *fakeRegistry) Tags(ctx context.Context, repo string) ([]imgregistry.Tag
 	return groups, nil
 }
 
+// TagCount is unused by internal/api (tag count is a UI-only column) but
+// required to satisfy imgregistry.Client.
+func (f *fakeRegistry) TagCount(ctx context.Context, repo string) (int, error) {
+	groups, ok := f.tags[repo]
+	if !ok {
+		if f.unreachableErr != nil {
+			return 0, fmt.Errorf("list tags for %s: %w", repo, f.unreachableErr)
+		}
+		return 0, fmt.Errorf("repo not found: %s: %w", repo, imgregistry.ErrNotFound)
+	}
+	n := 0
+	for _, g := range groups {
+		n += len(g.Tags)
+	}
+	return n, nil
+}
+
 func (f *fakeRegistry) Manifest(ctx context.Context, repo, ref string) (imgregistry.Manifest, error) {
 	m, ok := f.manifests[repo+"/"+ref]
 	if !ok {

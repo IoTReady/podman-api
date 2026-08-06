@@ -473,3 +473,64 @@ func TestHTTPClient_Tags_ResolvesManyTagsConcurrently(t *testing.T) {
 		t.Fatalf("expected concurrent requests (max in-flight >= 4), got %d — Tags may have regressed to serial resolution", got)
 	}
 }
+
+// TestHTTPClient_TagCount_DoesNotResolveManifests is the load-bearing
+// property of TagCount: the repo list calls it once per repo on a single
+// page load, so it must cost exactly one tags-list call. A version that
+// resolved manifests (as Tags does) would reintroduce the ~21s-per-repo
+// cost this method exists to avoid.
+func TestHTTPClient_TagCount_DoesNotResolveManifests(t *testing.T) {
+	var manifestCalls, blobCalls int64
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/engine/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"name":"engine","tags":["latest","v1","v2"]}`))
+	})
+	mux.HandleFunc("/v2/engine/manifests/", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&manifestCalls, 1)
+		w.Write([]byte(`{}`))
+	})
+	mux.HandleFunc("/v2/engine/blobs/", func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&blobCalls, 1)
+		w.Write([]byte(`{}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, Auth{Mode: "none"})
+	n, err := c.TagCount(context.Background(), "engine")
+	if err != nil {
+		t.Fatalf("TagCount: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("TagCount = %d, want 3", n)
+	}
+	if got := atomic.LoadInt64(&manifestCalls); got != 0 {
+		t.Fatalf("TagCount made %d manifest requests, want 0 — it must not resolve manifests", got)
+	}
+	if got := atomic.LoadInt64(&blobCalls); got != 0 {
+		t.Fatalf("TagCount made %d blob requests, want 0 — it must not resolve config blobs", got)
+	}
+}
+
+// TestHTTPClient_TagCount_PaginatesLikeListTags confirms TagCount inherits
+// listTags' Link-header pagination rather than counting only the first page.
+func TestHTTPClient_TagCount_PaginatesLikeListTags(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("last") == "" {
+			w.Header().Set("Link", `</v2/engine/tags/list?n=100&last=a>; rel="next"`)
+			w.Write([]byte(`{"name":"engine","tags":["a","b"]}`))
+			return
+		}
+		w.Write([]byte(`{"name":"engine","tags":["c"]}`))
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, Auth{Mode: "none"})
+	n, err := c.TagCount(context.Background(), "engine")
+	if err != nil {
+		t.Fatalf("TagCount: %v", err)
+	}
+	if n != 3 {
+		t.Fatalf("TagCount = %d, want 3 (2 on page 1 + 1 on page 2)", n)
+	}
+}

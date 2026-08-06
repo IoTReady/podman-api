@@ -2,12 +2,16 @@
 <h2>Registry</h2>
 <div class="card"><div class="card-b">
   <table class="table">
-    <thead><tr><th>Repository</th></tr></thead>
+    <thead><tr><th>Repository</th><th>Tags</th><th title="Sum of each unique image's own uncompressed size — layers shared between images are counted once per image, not deduplicated, so this is not the repo's actual on-disk footprint.">Size (per-image, uncompressed) / last pushed</th></tr></thead>
     <tbody>
     {{range .Repos}}
-      <tr><td><a href="/ui/registry/{{.}}" hx-get="/ui/registry/{{.}}" hx-target="#main" hx-push-url="true">{{.}}</a></td></tr>
+      <tr>
+        <td><a href="/ui/registry/{{.Name}}" hx-get="/ui/registry/{{.Name}}" hx-target="#main" hx-push-url="true">{{.Name}}</a></td>
+        <td>{{if .CountOK}}{{.TagCount}}{{else}}<span class="subtitle">?</span>{{end}}</td>
+        <td hx-get="/ui/registry/{{.Name}}?stats=1" hx-trigger="load" hx-swap="innerHTML"><span class="subtitle">loading…</span></td>
+      </tr>
     {{else}}
-      <tr><td class="subtitle">No repositories found.</td></tr>
+      <tr><td colspan="3" class="subtitle">No repositories found.</td></tr>
     {{end}}
     </tbody>
   </table>

@@ -65,6 +65,7 @@ type TagGroup struct {
 type Client interface {
 	Catalog(ctx context.Context) ([]string, error)
 	Tags(ctx context.Context, repo string) ([]TagGroup, error)
+	TagCount(ctx context.Context, repo string) (int, error)
 	Manifest(ctx context.Context, repo, ref string) (Manifest, error)
 }
 
@@ -372,6 +373,24 @@ func (c *HTTPClient) Tags(ctx context.Context, repo string) ([]TagGroup, error) 
 		return groups[i].Created.After(groups[j].Created)
 	})
 	return groups, nil
+}
+
+// TagCount returns how many tags repo has, without resolving any of them.
+// Deliberately NOT implemented as len(Tags(...)): Tags resolves every tag's
+// manifest and every unique digest's config blob (~21s for the fleet's
+// "engine" repo), while the repo-list page calls this once per repo on a
+// single page load. One tags-list call — paginated, but nothing more — is
+// the whole point.
+//
+// Note this counts tags, not unique digests, so it can exceed len(Tags(...))
+// when several tags share a digest. That is the intended meaning for a
+// "how many tags does this repo have" column.
+func (c *HTTPClient) TagCount(ctx context.Context, repo string) (int, error) {
+	tags, err := c.listTags(ctx, repo)
+	if err != nil {
+		return 0, err
+	}
+	return len(tags), nil
 }
 
 func (c *HTTPClient) listTags(ctx context.Context, repo string) ([]string, error) {
