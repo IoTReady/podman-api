@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"testing"
@@ -15,14 +16,30 @@ import (
 )
 
 type fakeRegistryUI struct {
-	catalog []string
-	tags    []imgregistry.TagGroup
+	catalog   []string
+	tags      []imgregistry.TagGroup
+	tagCounts map[string]int
 }
 
 func (f *fakeRegistryUI) Catalog(ctx context.Context) ([]string, error) { return f.catalog, nil }
 func (f *fakeRegistryUI) Tags(ctx context.Context, repo string) ([]imgregistry.TagGroup, error) {
 	return f.tags, nil
 }
+
+// tagCounts, when non-nil, is what TagCount returns per repo; a repo absent
+// from the map returns an error, letting a test drive the "count failed to
+// resolve" cell.
+func (f *fakeRegistryUI) TagCount(ctx context.Context, repo string) (int, error) {
+	if f.tagCounts == nil {
+		return 0, nil
+	}
+	n, ok := f.tagCounts[repo]
+	if !ok {
+		return 0, fmt.Errorf("repo not found: %s: %w", repo, imgregistry.ErrNotFound)
+	}
+	return n, nil
+}
+
 func (f *fakeRegistryUI) Manifest(ctx context.Context, repo, ref string) (imgregistry.Manifest, error) {
 	return imgregistry.Manifest{}, nil
 }
