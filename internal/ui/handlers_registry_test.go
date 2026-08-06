@@ -3,6 +3,7 @@ package ui
 import (
 	"context"
 	"fmt"
+	"html"
 	"net/http"
 	"strings"
 	"testing"
@@ -18,12 +19,16 @@ import (
 type fakeRegistryUI struct {
 	catalog   []string
 	tags      []imgregistry.TagGroup
+	tagsErr   error // when set, Tags returns this error instead of tags
 	tagCounts map[string]int
 	manifests map[string]imgregistry.Manifest
 }
 
 func (f *fakeRegistryUI) Catalog(ctx context.Context) ([]string, error) { return f.catalog, nil }
 func (f *fakeRegistryUI) Tags(ctx context.Context, repo string) ([]imgregistry.TagGroup, error) {
+	if f.tagsErr != nil {
+		return nil, f.tagsErr
+	}
 	return f.tags, nil
 }
 
@@ -251,6 +256,29 @@ func TestUI_RegistryTags_StatsFragment(t *testing.T) {
 	}
 }
 
+// TestUI_RegistryTags_StatsFragment_TagsErrorRendersOKWithMarker is the
+// Important-2 fix: a repo whose Tags() call fails must not leave the list
+// page's lazy-loaded stats cell stuck on "loading…" forever. HTMX does not
+// swap a non-2xx response by default (the shared u.renderError path used to
+// handle this branch and returns one), so the fragment must render 200 with
+// a visible failure marker instead.
+func TestUI_RegistryTags_StatsFragment_TagsErrorRendersOKWithMarker(t *testing.T) {
+	u := uiWithRegistry(t, &fakeRegistryUI{
+		tagsErr: fmt.Errorf("registry unreachable: %w", imgregistry.ErrUnreachable),
+	})
+	w := authedGet(t, u, "/ui/registry/engine?stats=1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 even though Tags() failed (HTMX won't swap a non-2xx): body = %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "—") {
+		t.Fatalf("expected a visible failure marker in the stats cell: %s", body)
+	}
+	if strings.Contains(body, "card") {
+		t.Fatalf("stats cell must not render full error-card chrome: %s", body)
+	}
+}
+
 // manifestDigestA and manifestDigestB stand in for real sha256 digests in
 // tests below. imgregistry.ValidRef's digestRe demands >=32 hex characters
 // after the "algo:" prefix (it's the same validator guarding the JSON API
@@ -323,19 +351,69 @@ func TestUI_RegistryManifest_InvalidRefIs400(t *testing.T) {
 }
 
 // TestUI_RegistryTags_DigestLinksToDetail confirms the tag table's digest is
-// a way into the detail view, not just a string.
+// a way into the detail view, not just a string — and that the link it
+// produces actually resolves, not merely that it contains the right
+// substring. It uses manifestDigestA (not a short fixture like "sha256:abc")
+// because imgregistry.ValidRef demands >=32 hex characters after the
+// "algo:" prefix; a shorter digest would produce a link that 400s, which is
+// exactly the gap this test exists to close — the original version asserted
+// only "manifest=sha256" appeared in the body, which is also true of a link
+// to a reference nothing can ever resolve.
 func TestUI_RegistryTags_DigestLinksToDetail(t *testing.T) {
 	u := uiWithRegistry(t, &fakeRegistryUI{
 		tags: []imgregistry.TagGroup{
-			{Digest: "sha256:abc", Tags: []string{"latest"}, Created: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
+			{Digest: manifestDigestA, Tags: []string{"latest"}, Created: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
+		},
+		manifests: map[string]imgregistry.Manifest{
+			"engine/" + manifestDigestA: {
+				Digest:       manifestDigestA,
+				ConfigDigest: "sha256:cfg",
+				Size:         1000,
+				Layers:       []imgregistry.Layer{{Digest: "sha256:layer1", Size: 1000}},
+			},
 		},
 	})
 	w := authedGet(t, u, "/ui/registry/engine")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
 	}
-	// html/template URL-encodes the digest's ":" in an href context.
-	if !strings.Contains(w.Body.String(), "manifest=sha256") {
-		t.Fatalf("expected the digest to link to its detail view: %s", w.Body.String())
+	body := w.Body.String()
+
+	href := extractHref(t, body, "manifest=")
+	w2 := authedGet(t, u, href)
+	if w2.Code != http.StatusOK {
+		t.Fatalf("following the tag table's digest link: status = %d, body = %s", w2.Code, w2.Body.String())
+	}
+	detailBody := w2.Body.String()
+	if !strings.Contains(detailBody, "sha256:layer1") {
+		t.Fatalf("detail view did not render the expected layer: %s", detailBody)
+	}
+	if !strings.Contains(detailBody, "engine@"+manifestDigestA) {
+		t.Fatalf("detail view did not render the expected pull ref: %s", detailBody)
+	}
+}
+
+// extractHref finds the first href="..." attribute in body whose value
+// contains marker, and returns the (HTML-unescaped) value. t.Fatal's if none
+// is found.
+func extractHref(t *testing.T, body, marker string) string {
+	t.Helper()
+	const attr = `href="`
+	idx := 0
+	for {
+		i := strings.Index(body[idx:], attr)
+		if i == -1 {
+			t.Fatalf("no href attribute found containing %q in: %s", marker, body)
+		}
+		start := idx + i + len(attr)
+		end := strings.Index(body[start:], `"`)
+		if end == -1 {
+			t.Fatalf("unterminated href attribute in: %s", body)
+		}
+		val := body[start : start+end]
+		if strings.Contains(val, marker) {
+			return html.UnescapeString(val)
+		}
+		idx = start + end
 	}
 }

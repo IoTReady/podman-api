@@ -63,6 +63,24 @@ as its single slowest repo.
   table, and renders a small fragment (`total size · updated <date>`)
   computed from the already-fetched `[]TagGroup` — no new expensive call
   beyond what a normal tag-table view already pays.
+- **Known imprecision (Minor-4, final review):** "total size" sums each
+  `TagGroup`'s own manifest size (config blob + layers), once per unique
+  digest. Layers shared between digests — the common case, since most of a
+  repo's history reuses the same base-image layers — are counted once per
+  digest that references them, not deduplicated. So this is the sum of each
+  image's own uncompressed size, not the repo's actual on-disk footprint,
+  which `TagGroup` carries no data to compute. The column header says so
+  explicitly rather than implying a number this view cannot produce.
+- **Cost is now bounded further by a cache, not just deferred (Important-1,
+  final review):** every `?stats=1` fragment, fired by ~26 rows on every
+  single page view of `/ui/registry`, called `Tags()` fresh — for `engine`
+  that's ~1000 manifest GETs plus 737 config-blob GETs, per visit.
+  `imgregistry.NewCachingClient` wraps the real client with a 5-minute
+  Tags()-only TTL cache (server/server.go wires it around
+  `imgregistry.NewHTTPClient(...)`), so only the first view (or the first
+  view after the TTL) pays the ~21s cold cost; every revisit inside the
+  window is instant. Never caches an error, so a transient registry blip
+  doesn't poison the view for the rest of the TTL.
 
 ## 2. Manifest detail view
 

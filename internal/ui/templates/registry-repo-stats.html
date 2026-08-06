@@ -1,1 +1,1 @@
-{{define "registry-repo-stats"}}{{formatBytes .TotalSize}}{{if not .Newest.IsZero}} <span class="subtitle">· {{.Newest.Format "2006-01-02"}}</span>{{end}}{{end}}
+{{define "registry-repo-stats"}}{{if .StatsError}}<span class="subtitle" title="could not resolve this repo's tags">—</span>{{else}}{{formatBytes .TotalSize}}{{if not .Newest.IsZero}} <span class="subtitle">· {{.Newest.Format "2006-01-02"}}</span>{{end}}{{end}}{{end}}

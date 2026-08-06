@@ -2,6 +2,7 @@ package ui
 
 import (
 	"context"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -59,6 +60,8 @@ func (u *UI) registryRepos(w http.ResponseWriter, r *http.Request) {
 			s := repoSummary{Name: repo}
 			if n, err := u.cfg.Registry.TagCount(rctx, repo); err == nil {
 				s.TagCount, s.CountOK = n, true
+			} else {
+				log.Printf("ui: registry: TagCount(%q): %v", repo, err)
 			}
 			summaries[i] = s
 		}(i, repo)
@@ -110,14 +113,38 @@ func (u *UI) registryTags(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), tagsRequestTimeout)
 	defer cancel()
 	groups, err := u.cfg.Registry.Tags(ctx, repo)
-	if err != nil {
-		u.renderError(w, r, err)
-		return
-	}
+
+	// The stats cell is a small lazy-loaded fragment nested inside the list
+	// page's table (registry-repos.html: hx-trigger="load" on each row), not
+	// a full navigation — so it must catch its own Tags() error rather than
+	// falling into the shared u.renderError path below. renderError returns
+	// a non-2xx status, and HTMX does not swap a non-2xx response by
+	// default, so a failing repo's cell would keep its "loading…"
+	// placeholder forever instead of resolving to a visible failure marker;
+	// worse, if it did swap, renderError's fragment carries full error-card
+	// chrome (headings, card divs) that doesn't belong inside a <td>. So this
+	// branch always renders 200 with a small in-cell marker, and logs the
+	// real error for diagnosis instead of surfacing it to the browser.
 	if r.URL.Query().Get("stats") == "1" {
+		if err != nil {
+			log.Printf("ui: registry: stats Tags(%q): %v", repo, err)
+			u.render(w, r, http.StatusOK, "registry-repo-stats", u.pageData(map[string]any{
+				"StatsError": true,
+			}))
+			return
+		}
 		var total int64
 		var newest time.Time
 		for _, g := range groups {
+			// Sums each unique digest's manifest size once. Layers shared
+			// between digests (the common case: most of engine's 737
+			// digests share most of their base-image layers) are counted
+			// once per digest that references them, so this is each image's
+			// own uncompressed size, NOT the repo's deduplicated on-disk
+			// footprint — TagGroup carries no data that would let us
+			// deduplicate by layer digest across groups. The column header
+			// says so explicitly (registry-repos.html) rather than implying
+			// a number this handler cannot produce.
 			total += g.Size
 			if g.Created.After(newest) {
 				newest = g.Created
@@ -127,6 +154,11 @@ func (u *UI) registryTags(w http.ResponseWriter, r *http.Request) {
 			"TotalSize": total,
 			"Newest":    newest,
 		}))
+		return
+	}
+
+	if err != nil {
+		u.renderError(w, r, err)
 		return
 	}
 	if r.URL.Query().Get("picker") == "1" {

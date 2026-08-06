@@ -4,11 +4,11 @@
 <div class="card"><div class="card-b">
   <div class="field">
     <label>Pull reference</label>
-    <code>{{.Repo}}@{{.Manifest.Digest}}</code>
+    <code>{{.Repo}}@{{if .Manifest.Digest}}{{.Manifest.Digest}}{{else}}{{.Ref}}{{end}}</code>
   </div>
   <div class="field">
     <label>Digest</label>
-    <code>{{.Manifest.Digest}}</code>
+    <code>{{if .Manifest.Digest}}{{.Manifest.Digest}}{{else}}{{.Ref}} <span class="subtitle">(registry did not return a Docker-Content-Digest header; showing the requested reference instead)</span>{{end}}</code>
   </div>
   {{if .Manifest.ConfigDigest}}
   <div class="field">
