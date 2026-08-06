@@ -1,0 +1,36 @@
+{{define "registry-manifest"}}
+<h2>{{.Repo}}</h2>
+<p class="subtitle"><a href="/ui/registry/{{.Repo}}" hx-get="/ui/registry/{{.Repo}}" hx-target="#main" hx-push-url="true">&larr; {{.Repo}} tags</a></p>
+<div class="card"><div class="card-b">
+  <div class="field">
+    <label>Pull reference</label>
+    <code>{{.Repo}}@{{.Manifest.Digest}}</code>
+  </div>
+  <div class="field">
+    <label>Digest</label>
+    <code>{{.Manifest.Digest}}</code>
+  </div>
+  {{if .Manifest.ConfigDigest}}
+  <div class="field">
+    <label>Config digest</label>
+    <code>{{.Manifest.ConfigDigest}}</code>
+  </div>
+  {{end}}
+  <div class="field">
+    <label>Total size</label>
+    {{formatBytes .Manifest.Size}}
+  </div>
+</div></div>
+<div class="card"><div class="card-b">
+  <table class="table">
+    <thead><tr><th>Layer</th><th>Size</th></tr></thead>
+    <tbody>
+    {{range .Manifest.Layers}}
+      <tr><td><code>{{.Digest}}</code></td><td>{{formatBytes .Size}}</td></tr>
+    {{else}}
+      <tr><td colspan="2" class="subtitle">No layers — this is a multi-arch manifest list; each platform entry has its own layers.</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div></div>
+{{end}}

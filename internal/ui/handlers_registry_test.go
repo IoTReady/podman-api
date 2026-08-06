@@ -19,6 +19,7 @@ type fakeRegistryUI struct {
 	catalog   []string
 	tags      []imgregistry.TagGroup
 	tagCounts map[string]int
+	manifests map[string]imgregistry.Manifest
 }
 
 func (f *fakeRegistryUI) Catalog(ctx context.Context) ([]string, error) { return f.catalog, nil }
@@ -41,7 +42,11 @@ func (f *fakeRegistryUI) TagCount(ctx context.Context, repo string) (int, error)
 }
 
 func (f *fakeRegistryUI) Manifest(ctx context.Context, repo, ref string) (imgregistry.Manifest, error) {
-	return imgregistry.Manifest{}, nil
+	m, ok := f.manifests[repo+"/"+ref]
+	if !ok {
+		return imgregistry.Manifest{}, fmt.Errorf("manifest %s/%s: not found: %w", repo, ref, imgregistry.ErrNotFound)
+	}
+	return m, nil
 }
 
 // uiWithRegistry mirrors uiWithService (handlers_hosts_test.go) but also
@@ -243,5 +248,94 @@ func TestUI_RegistryTags_StatsFragment(t *testing.T) {
 	}
 	if strings.Contains(body, "All repositories") {
 		t.Fatalf("stats fragment must not carry full-page chrome: %s", body)
+	}
+}
+
+// manifestDigestA and manifestDigestB stand in for real sha256 digests in
+// tests below. imgregistry.ValidRef's digestRe demands >=32 hex characters
+// after the "algo:" prefix (it's the same validator guarding the JSON API
+// edge), so a short human-readable stand-in like "sha256:abc" or
+// "sha256:idx" is itself an invalid ref and would 400 before ever reaching
+// the fake — these are padded out to a valid length while keeping a
+// recognizable prefix for the substring assertions below.
+var (
+	manifestDigestA = "sha256:abc" + strings.Repeat("0", 32-len("abc"))
+	manifestDigestB = "sha256:1d0" + strings.Repeat("0", 32-len("1d0"))
+)
+
+// TestUI_RegistryManifest_ShowsLayersAndPullRef is the detail view's reason
+// to exist: one digest's layers, config digest, and a copy-pasteable
+// repo@digest reference.
+func TestUI_RegistryManifest_ShowsLayersAndPullRef(t *testing.T) {
+	u := uiWithRegistry(t, &fakeRegistryUI{
+		manifests: map[string]imgregistry.Manifest{
+			"engine/" + manifestDigestA: {
+				Digest:       manifestDigestA,
+				ConfigDigest: "sha256:cfg",
+				Size:         3000,
+				Layers: []imgregistry.Layer{
+					{Digest: "sha256:layer1", Size: 1000},
+					{Digest: "sha256:layer2", Size: 2000},
+				},
+			},
+		},
+	})
+	w := authedGet(t, u, "/ui/registry/engine?manifest="+manifestDigestA)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	for _, want := range []string{"sha256:layer1", "sha256:layer2", "sha256:cfg", "engine@sha256:abc"} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("body missing %q: %s", want, body)
+		}
+	}
+}
+
+// TestUI_RegistryManifest_MultiArchRendersNote: a manifest list has no
+// layers of its own (imgregistry.Manifest leaves Layers empty for an index),
+// so the view must say so rather than render an empty table that reads as
+// broken.
+func TestUI_RegistryManifest_MultiArchRendersNote(t *testing.T) {
+	u := uiWithRegistry(t, &fakeRegistryUI{
+		manifests: map[string]imgregistry.Manifest{
+			"engine/" + manifestDigestB: {Digest: manifestDigestB}, // no layers, no config
+		},
+	})
+	w := authedGet(t, u, "/ui/registry/engine?manifest="+manifestDigestB)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "No layers") {
+		t.Fatalf("expected a no-layers note for a manifest list: %s", w.Body.String())
+	}
+}
+
+// TestUI_RegistryManifest_InvalidRefIs400 mirrors the API edge: an
+// unvalidated ref reaches a client that interpolates it into a registry
+// request path.
+func TestUI_RegistryManifest_InvalidRefIs400(t *testing.T) {
+	u := uiWithRegistry(t, &fakeRegistryUI{manifests: map[string]imgregistry.Manifest{}})
+	w := authedGet(t, u, "/ui/registry/engine?manifest=..%2F..%2Fetc%2Fpasswd")
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400, body = %s", w.Code, w.Body.String())
+	}
+}
+
+// TestUI_RegistryTags_DigestLinksToDetail confirms the tag table's digest is
+// a way into the detail view, not just a string.
+func TestUI_RegistryTags_DigestLinksToDetail(t *testing.T) {
+	u := uiWithRegistry(t, &fakeRegistryUI{
+		tags: []imgregistry.TagGroup{
+			{Digest: "sha256:abc", Tags: []string{"latest"}, Created: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
+		},
+	})
+	w := authedGet(t, u, "/ui/registry/engine")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	// html/template URL-encodes the digest's ":" in an href context.
+	if !strings.Contains(w.Body.String(), "manifest=sha256") {
+		t.Fatalf("expected the digest to link to its detail view: %s", w.Body.String())
 	}
 }

@@ -84,6 +84,29 @@ func (u *UI) registryTags(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid repository name", http.StatusBadRequest)
 		return
 	}
+	// A single-digest detail view needs one Manifest lookup, not the whole
+	// repo's Tags() resolution — so this branch returns before that cost is
+	// paid. Mirrors the JSON API's own ?manifest=<ref> fold on the same
+	// route shape (internal/api/registry.go), which exists because Go's
+	// {repo...} wildcard must be a route's last segment.
+	if ref := r.URL.Query().Get("manifest"); ref != "" {
+		if !imgregistry.ValidRef(ref) {
+			http.Error(w, "invalid manifest reference", http.StatusBadRequest)
+			return
+		}
+		m, err := u.cfg.Registry.Manifest(r.Context(), repo, ref)
+		if err != nil {
+			u.renderError(w, r, err)
+			return
+		}
+		u.render(w, r, http.StatusOK, "registry-manifest", u.pageData(map[string]any{
+			"Repo":     repo,
+			"Ref":      ref,
+			"Manifest": m,
+		}))
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(r.Context(), tagsRequestTimeout)
 	defer cancel()
 	groups, err := u.cfg.Registry.Tags(ctx, repo)

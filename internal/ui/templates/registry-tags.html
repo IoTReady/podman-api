@@ -8,7 +8,7 @@
     {{range .Groups}}
       <tr>
         <td>{{range $i, $t := .Tags}}{{if $i}}, {{end}}<code>{{$t}}</code>{{end}}</td>
-        <td><code>{{.Digest}}</code></td>
+        <td><a href="/ui/registry/{{$.Repo}}?manifest={{.Digest}}" hx-get="/ui/registry/{{$.Repo}}?manifest={{.Digest}}" hx-target="#main" hx-push-url="true"><code>{{.Digest}}</code></a></td>
         <td>{{.Created.Format "2006-01-02 15:04"}}</td>
         <td>{{formatBytes .Size}}</td>
       </tr>
