@@ -1,10 +1,19 @@
 package ui
 
 import (
+	"context"
 	"net/http"
+	"time"
 
 	"github.com/iotready/podman-api/internal/imgregistry"
 )
+
+// tagsRequestTimeout mirrors internal/api/registry.go's bound of the same
+// name: a repo with enough accumulated tags (the fleet's "engine" repo has
+// ~1000) can take a while to resolve even with imgregistry.Tags' bounded
+// concurrency, and without a bound a slow/wedged registry hangs the request
+// indefinitely instead of failing with a clear error page.
+const tagsRequestTimeout = 45 * time.Second
 
 func (u *UI) registryRepos(w http.ResponseWriter, r *http.Request) {
 	if u.cfg.Registry == nil {
@@ -36,7 +45,9 @@ func (u *UI) registryTags(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid repository name", http.StatusBadRequest)
 		return
 	}
-	groups, err := u.cfg.Registry.Tags(r.Context(), repo)
+	ctx, cancel := context.WithTimeout(r.Context(), tagsRequestTimeout)
+	defer cancel()
+	groups, err := u.cfg.Registry.Tags(ctx, repo)
 	if err != nil {
 		u.renderError(w, r, err)
 		return

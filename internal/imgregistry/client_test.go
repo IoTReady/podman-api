@@ -7,8 +7,11 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sort"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestHTTPClient_Catalog_SinglePage(t *testing.T) {
@@ -372,5 +375,101 @@ func TestHTTPClient_Catalog_PaginationCap(t *testing.T) {
 	}
 	if calls > maxPaginationPages+1 {
 		t.Fatalf("expected the loop to stop at the cap, made %d requests", calls)
+	}
+}
+
+// TestHTTPClient_Tags_ResolvesManyTagsConcurrently is the fix for a real
+// production hang: the fleet's "engine" repo carries ~1000 tags accumulated
+// over months of CI builds, and resolving them one manifest/blob fetch at a
+// time made a single Tags call take minutes. This drives 200 tags across 40
+// unique digests through a server that sleeps on every manifest/blob
+// request, and asserts both correctness (every tag lands in the right
+// group) and that resolution is actually concurrent — bounded by
+// tagResolveConcurrency, not serialized.
+func TestHTTPClient_Tags_ResolvesManyTagsConcurrently(t *testing.T) {
+	const numTags = 200
+	const numDigests = 40
+	const perRequestDelay = 10 * time.Millisecond
+
+	tagToDigest := make(map[string]string, numTags)
+	tagNames := make([]string, 0, numTags)
+	for i := 0; i < numTags; i++ {
+		tag := "t" + strconv.Itoa(i)
+		digest := "sha256:d" + strconv.Itoa(i%numDigests)
+		tagToDigest[tag] = digest
+		tagNames = append(tagNames, tag)
+	}
+
+	var inFlight, maxInFlight int64
+	track := func() func() {
+		n := atomic.AddInt64(&inFlight, 1)
+		for {
+			cur := atomic.LoadInt64(&maxInFlight)
+			if n <= cur || atomic.CompareAndSwapInt64(&maxInFlight, cur, n) {
+				break
+			}
+		}
+		return func() { atomic.AddInt64(&inFlight, -1) }
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/engine/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		body := `{"name":"engine","tags":[`
+		for i, tag := range tagNames {
+			if i > 0 {
+				body += ","
+			}
+			body += `"` + tag + `"`
+		}
+		body += `]}`
+		w.Write([]byte(body))
+	})
+	mux.HandleFunc("/v2/engine/manifests/", func(w http.ResponseWriter, r *http.Request) {
+		done := track()
+		defer done()
+		time.Sleep(perRequestDelay)
+		tag := strings.TrimPrefix(r.URL.Path, "/v2/engine/manifests/")
+		digest := tagToDigest[tag]
+		w.Header().Set("Docker-Content-Digest", digest)
+		w.Write([]byte(`{"config":{"digest":"` + digest + `-cfg","size":1},"layers":[]}`))
+	})
+	mux.HandleFunc("/v2/engine/blobs/", func(w http.ResponseWriter, r *http.Request) {
+		done := track()
+		defer done()
+		time.Sleep(perRequestDelay)
+		w.Write([]byte(`{"created":"2026-01-01T00:00:00Z"}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, Auth{Mode: "none"})
+	groups, err := c.Tags(context.Background(), "engine")
+	if err != nil {
+		t.Fatalf("Tags: %v", err)
+	}
+
+	// Correctness: every digest present, every tag in its right group.
+	if len(groups) != numDigests {
+		t.Fatalf("expected %d digest groups, got %d", numDigests, len(groups))
+	}
+	gotTags := 0
+	for _, g := range groups {
+		gotTags += len(g.Tags)
+		for _, tag := range g.Tags {
+			if tagToDigest[tag] != g.Digest {
+				t.Fatalf("tag %q grouped under %q, want %q", tag, g.Digest, tagToDigest[tag])
+			}
+		}
+	}
+	if gotTags != numTags {
+		t.Fatalf("expected %d total tags across groups, got %d", numTags, gotTags)
+	}
+
+	// Concurrency actually happened: a fully serial implementation could
+	// never exceed inFlight==1. tagResolveConcurrency is 16; require at
+	// least a modest fraction of that to rule out a regression back to
+	// one-at-a-time without being flaky about the exact scheduling.
+	if got := atomic.LoadInt64(&maxInFlight); got < 4 {
+		t.Fatalf("expected concurrent requests (max in-flight >= 4), got %d — Tags may have regressed to serial resolution", got)
 	}
 }

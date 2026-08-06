@@ -14,6 +14,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -248,21 +249,71 @@ func (c *HTTPClient) Manifest(ctx context.Context, repo, ref string) (Manifest, 
 	return m, nil
 }
 
+// tagResolveConcurrency bounds how many manifest/blob fetches Tags runs at
+// once. A repo can carry hundreds of tags accumulated over months of CI
+// builds (the fleet's "engine" repo has ~1000) — resolving them one at a
+// time made a single Tags call take minutes; this caps concurrency instead
+// of either serializing (too slow) or firing all requests at once (an
+// accidental thundering-herd against the registry).
+const tagResolveConcurrency = 16
+
+// tagResolution is one tag's resolved manifest, or the error resolving it —
+// captured per-goroutine so the grouping pass below can stay single-threaded
+// and keep its original deterministic, tag-order-preserving behavior.
+type tagResolution struct {
+	tag      string
+	manifest Manifest
+	err      error
+}
+
+// digestGroup pairs a TagGroup being built with the config digest needed to
+// resolve its Created timestamp — kept alongside rather than added to
+// TagGroup itself, since TagGroup is public API and configDigest is only
+// needed transiently during grouping.
+type digestGroup struct {
+	group        *TagGroup
+	configDigest string
+}
+
 // Tags lists every tag in repo, resolves each to its manifest digest, and
 // groups tags that share a digest into one TagGroup. Each unique digest's
 // config blob is fetched once (not once per tag) for its Created timestamp.
-// Groups are sorted newest-Created-first.
+// Manifest and blob-created lookups both run with bounded concurrency
+// (tagResolveConcurrency), not sequentially. Groups are sorted
+// newest-Created-first.
 func (c *HTTPClient) Tags(ctx context.Context, repo string) ([]TagGroup, error) {
 	tagNames, err := c.listTags(ctx, repo)
 	if err != nil {
 		return nil, err
 	}
 
-	byDigest := map[string]*TagGroup{}
+	// Phase 1: resolve every tag's manifest concurrently. Each goroutine
+	// writes only its own index of resolutions, so no synchronization is
+	// needed beyond the WaitGroup.
+	resolutions := make([]tagResolution, len(tagNames))
+	{
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, tagResolveConcurrency)
+		for i, tag := range tagNames {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(i int, tag string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				m, err := c.Manifest(ctx, repo, tag)
+				resolutions[i] = tagResolution{tag: tag, manifest: m, err: err}
+			}(i, tag)
+		}
+		wg.Wait()
+	}
+
+	// Phase 2: group resolved tags by digest, single-threaded (cheap,
+	// in-memory) so grouping stays deterministic and tag order within a
+	// group matches tagNames' order.
+	byDigest := map[string]*digestGroup{}
 	var order []string
-	for _, tag := range tagNames {
-		m, err := c.Manifest(ctx, repo, tag)
-		if err != nil {
+	for _, r := range resolutions {
+		if r.err != nil {
 			// One tag this client cannot resolve (an unsupported media type,
 			// a transient blip) must not hide every other tag in the repo
 			// behind a single error — skip it and keep going. No logger is
@@ -270,29 +321,52 @@ func (c *HTTPClient) Tags(ctx context.Context, repo string) ([]TagGroup, error) 
 			// trade-off (see the design finding this fixes).
 			continue
 		}
-		g, ok := byDigest[m.Digest]
+		dg, ok := byDigest[r.manifest.Digest]
 		if !ok {
-			g = &TagGroup{Digest: m.Digest, Size: m.Size}
-			byDigest[m.Digest] = g
-			order = append(order, m.Digest)
-
-			// A multi-arch manifest list has no single config blob
-			// (ConfigDigest == ""); leave Created zero rather than fetching
-			// a blob that doesn't exist. Likewise, a failed blob fetch for
-			// an ordinary manifest leaves Created zero instead of dropping
-			// the whole digest group — same visibility trade-off as above.
-			if m.ConfigDigest != "" {
-				if created, err := c.blobCreated(ctx, repo, m.ConfigDigest); err == nil {
-					g.Created = created
-				}
+			dg = &digestGroup{
+				group:        &TagGroup{Digest: r.manifest.Digest, Size: r.manifest.Size},
+				configDigest: r.manifest.ConfigDigest,
 			}
+			byDigest[r.manifest.Digest] = dg
+			order = append(order, r.manifest.Digest)
 		}
-		g.Tags = append(g.Tags, tag)
+		dg.group.Tags = append(dg.group.Tags, r.tag)
+	}
+
+	// Phase 3: resolve each unique digest's Created timestamp concurrently —
+	// one blob fetch per digest, not per tag, same as before, but no longer
+	// serialized. Each goroutine writes only its own digestGroup's Created
+	// field, so again no synchronization beyond the WaitGroup is needed.
+	{
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, tagResolveConcurrency)
+		for _, d := range order {
+			dg := byDigest[d]
+			if dg.configDigest == "" {
+				// A multi-arch manifest list has no single config blob;
+				// leave Created zero rather than fetching a blob that
+				// doesn't exist.
+				continue
+			}
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(dg *digestGroup) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				// A failed blob fetch leaves Created zero instead of
+				// dropping the whole digest group — same visibility
+				// trade-off as an unresolvable tag above.
+				if created, err := c.blobCreated(ctx, repo, dg.configDigest); err == nil {
+					dg.group.Created = created
+				}
+			}(dg)
+		}
+		wg.Wait()
 	}
 
 	groups := make([]TagGroup, 0, len(order))
 	for _, d := range order {
-		groups = append(groups, *byDigest[d])
+		groups = append(groups, *byDigest[d].group)
 	}
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].Created.After(groups[j].Created)
