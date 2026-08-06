@@ -137,7 +137,7 @@ func TestBackupRestore_RoundTrip_LocalOnly(t *testing.T) {
 	tok := "bkuptoken"
 	hash, _ := config.HashToken(tok)
 	keys := []config.APIKey{{ID: "bkup", SecretHash: hash, Scopes: []string{"instances:*", "hosts:read"}}}
-	r := api.NewRouter(svc, db, auth.NewKeyStore(keys), nil, nil, runner, "itest")
+	r := api.NewRouter(svc, db, auth.NewKeyStore(keys), nil, nil, runner, "itest", nil)
 	srv := httptest.NewServer(r)
 	defer srv.Close()
 
