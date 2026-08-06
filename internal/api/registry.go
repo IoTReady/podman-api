@@ -1,12 +1,26 @@
 package api
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	"github.com/iotready/podman-api/internal/imgregistry"
 )
+
+// tagsRequestTimeout bounds a single GET .../repos/{repo...} tags-listing
+// call. imgregistry.Tags resolves every tag's manifest (and, per unique
+// digest, a config blob) with bounded concurrency, but a repo with enough
+// tags accumulated over time (the fleet's "engine" repo has ~1000) can still
+// take a while even parallelized. Without this, a slow or wedged registry
+// would hang the request indefinitely instead of failing with a clear 502.
+// listRepos (Catalog) and getManifest (a single Manifest fetch) deliberately
+// have no request-level timeout of their own — both are already bounded by
+// HTTPClient's built-in 10s per-request http.Client.Timeout, which is enough
+// for a call that isn't fanning out over hundreds of tags.
+const tagsRequestTimeout = 45 * time.Second
 
 func (h *handlers) listRepos(w http.ResponseWriter, r *http.Request) {
 	if h.registry == nil {
@@ -52,7 +66,9 @@ func (h *handlers) getRepoOrManifest(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handlers) listRepoTags(w http.ResponseWriter, r *http.Request, repo string) {
-	groups, err := h.registry.Tags(r.Context(), repo)
+	ctx, cancel := context.WithTimeout(r.Context(), tagsRequestTimeout)
+	defer cancel()
+	groups, err := h.registry.Tags(ctx, repo)
 	if err != nil {
 		writeRegistryError(w, err)
 		return
