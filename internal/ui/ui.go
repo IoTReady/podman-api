@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/iotready/podman-api/internal/auth"
+	"github.com/iotready/podman-api/internal/imgregistry"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/store"
 )
@@ -45,6 +46,7 @@ type Config struct {
 	Secure     bool               // set Secure flag on the session cookie (true in production)
 	TokenMgr   *auth.TokenManager // optional; enables /ui/tokens if non-nil
 	Version    string             // build version; used to cache-bust static asset URLs (?v=)
+	Registry   imgregistry.Client // optional; nil hides the "Registry" nav item and 404s its routes
 }
 
 // UI holds parsed templates and dependencies and produces the /ui sub-router.
@@ -144,6 +146,7 @@ func (u *UI) pageData(data map[string]any) map[string]any {
 	// with zero configured hosts still gets nav + sign-out.
 	data["Shell"] = true
 	data["TokensEnabled"] = u.cfg.TokenMgr != nil
+	data["RegistryEnabled"] = u.cfg.Registry != nil
 	// Svc is nil only in template-only construction (tests that never reach an
 	// authenticated handler); guard so pageData can't panic there.
 	if u.cfg.Svc != nil {
@@ -189,6 +192,8 @@ func (u *UI) Handler() http.Handler {
 	mux.Handle("POST /ui/logout", guardW(u.logout))
 	mux.Handle("GET /ui/jobs", guard(u.jobsList))
 	mux.Handle("GET /ui/jobs/{id}", guard(u.jobDetail))
+	mux.Handle("GET /ui/registry", guard(u.registryRepos))
+	mux.Handle("GET /ui/registry/{repo}", guard(u.registryTags))
 
 	if u.cfg.TokenMgr != nil {
 		mux.Handle("GET /ui/tokens", guard(u.tokensList))
