@@ -13,7 +13,7 @@ import (
 )
 
 func newDiscoveryRouter(version string) http.Handler {
-	return api.NewRouter(nil, nil, auth.NewKeyStore(nil), nil, nil, nil, version)
+	return api.NewRouter(nil, nil, auth.NewKeyStore(nil), nil, nil, nil, version, nil)
 }
 
 func TestMCPDiscovery(t *testing.T) {
