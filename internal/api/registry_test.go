@@ -220,3 +220,16 @@ func TestGetManifest_NamespacedRepo(t *testing.T) {
 	body, _ := io.ReadAll(resp.Body)
 	assert.Contains(t, string(body), "sha256:nsdigest")
 }
+
+// TestGetManifest_InvalidRef guards against an unvalidated ref reaching
+// Client.Manifest, which interpolates it unescaped into a registry request
+// path — a ref like "../../../etc/passwd" must be rejected here rather than
+// forwarded to the upstream registry.
+func TestGetManifest_InvalidRef(t *testing.T) {
+	srv, tok := newRegistryTestServer(t, &fakeRegistry{manifests: map[string]imgregistry.Manifest{}})
+	resp := authedRegistryGet(t, srv, tok, "/registry/repos/engine?manifest=..%2F..%2F..%2Fetc%2Fpasswd")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	body, _ := io.ReadAll(resp.Body)
+	assert.Contains(t, string(body), "invalid_parameters")
+}

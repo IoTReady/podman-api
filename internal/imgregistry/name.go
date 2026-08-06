@@ -32,3 +32,25 @@ func ValidRepoName(repo string) bool {
 	}
 	return true
 }
+
+// tagRe matches a Docker Registry v2 tag per the distribution spec's tag
+// grammar: starts with a word character, then up to 127 more word
+// characters/dots/dashes.
+var tagRe = regexp.MustCompile(`^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$`)
+
+// digestRe matches a content digest ("algorithm:hex", e.g.
+// "sha256:abcdef..."), per the distribution spec's digest grammar.
+var digestRe = regexp.MustCompile(`^[a-z0-9]+(?:[+._-][a-z0-9]+)*:[a-fA-F0-9]{32,}$`)
+
+// ValidRef reports whether ref is an acceptable manifest reference: either a
+// tag (tagRe) or a content digest (digestRe). Callers must validate ref
+// before passing it to Client.Manifest, which interpolates it unescaped into
+// a registry request path — an unvalidated ref (e.g. containing "../" or "/")
+// would let a caller steer that request to an arbitrary path on the registry
+// host.
+func ValidRef(ref string) bool {
+	if ref == "" {
+		return false
+	}
+	return tagRe.MatchString(ref) || digestRe.MatchString(ref)
+}

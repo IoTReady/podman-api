@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 
 	"github.com/iotready/podman-api/internal/imgregistry"
@@ -37,6 +38,13 @@ func (h *handlers) getRepoOrManifest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if ref := r.URL.Query().Get("manifest"); ref != "" {
+		if !imgregistry.ValidRef(ref) {
+			WriteJSON(w, http.StatusBadRequest, ErrorBody{
+				Code:    "invalid_parameters",
+				Message: fmt.Sprintf("manifest %q is invalid: must be a tag or a digest (algorithm:hex)", ref),
+			})
+			return
+		}
 		h.getManifest(w, r, repo, ref)
 		return
 	}
