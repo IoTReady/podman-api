@@ -156,3 +156,92 @@ func TestUI_RegistryTags_PickerFragmentOmitsPageChrome(t *testing.T) {
 		t.Fatalf("picker fragment should not include the full page's back-link chrome: %s", w.Body.String())
 	}
 }
+
+// TestUI_RegistryRepos_ShowsTagCounts confirms the list page renders a real
+// per-repo tag count on first paint (fanned out concurrently), not a
+// placeholder the browser has to fill in.
+func TestUI_RegistryRepos_ShowsTagCounts(t *testing.T) {
+	u := uiWithRegistry(t, &fakeRegistryUI{
+		catalog:   []string{"engine", "otp"},
+		tagCounts: map[string]int{"engine": 737, "otp": 13},
+	})
+	w := authedGet(t, u, "/ui/registry")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "737") || !strings.Contains(body, "13") {
+		t.Fatalf("body missing tag counts: %s", body)
+	}
+}
+
+// TestUI_RegistryRepos_CountFailureDoesNotFailPage: one repo whose count
+// cannot be resolved must render as unknown, not take down the whole list.
+func TestUI_RegistryRepos_CountFailureDoesNotFailPage(t *testing.T) {
+	u := uiWithRegistry(t, &fakeRegistryUI{
+		catalog:   []string{"engine", "broken"},
+		tagCounts: map[string]int{"engine": 737}, // "broken" absent -> error
+	})
+	w := authedGet(t, u, "/ui/registry")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 despite one repo's count failing; body = %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "broken") {
+		t.Fatalf("the failing repo should still be listed: %s", body)
+	}
+	if !strings.Contains(body, "737") {
+		t.Fatalf("the working repo's count should still render: %s", body)
+	}
+}
+
+// TestUI_RegistryRepos_LazyLoadsStats confirms each row asks for its own
+// stats fragment after load, rather than the page paying for every repo's
+// full Tags() resolution up front.
+func TestUI_RegistryRepos_LazyLoadsStats(t *testing.T) {
+	u := uiWithRegistry(t, &fakeRegistryUI{
+		catalog:   []string{"engine"},
+		tagCounts: map[string]int{"engine": 737},
+	})
+	w := authedGet(t, u, "/ui/registry")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "/ui/registry/engine?stats=1") {
+		t.Fatalf("expected a lazy stats hx-get for engine: %s", body)
+	}
+	if !strings.Contains(body, `hx-trigger="load"`) {
+		t.Fatalf("expected the stats cell to load on page load: %s", body)
+	}
+}
+
+// TestUI_RegistryTags_StatsFragment renders just the size/last-pushed cell
+// for one repo, with no full-page chrome.
+func TestUI_RegistryTags_StatsFragment(t *testing.T) {
+	created := time.Date(2026, 3, 1, 12, 0, 0, 0, time.UTC)
+	older := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	u := uiWithRegistry(t, &fakeRegistryUI{
+		tags: []imgregistry.TagGroup{
+			{Digest: "sha256:new", Tags: []string{"latest"}, Created: created, Size: 1000},
+			{Digest: "sha256:old", Tags: []string{"v1"}, Created: older, Size: 2000},
+		},
+	})
+	w := authedGet(t, u, "/ui/registry/engine?stats=1")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body.String())
+	}
+	body := w.Body.String()
+	// Total size across both groups: 3000 bytes -> "2.9 KB" via formatBytes
+	// (which uses 1024-based divisors but "KB"/"MB" suffixes, not "KiB").
+	if !strings.Contains(body, "2.9 KB") {
+		t.Fatalf("expected a formatted total size of 2.9 KB: %s", body)
+	}
+	// Newest Created is the one shown.
+	if !strings.Contains(body, "2026-03-01") {
+		t.Fatalf("expected the newest push date: %s", body)
+	}
+	if strings.Contains(body, "All repositories") {
+		t.Fatalf("stats fragment must not carry full-page chrome: %s", body)
+	}
+}

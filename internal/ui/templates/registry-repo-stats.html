@@ -1,0 +1,1 @@
+{{define "registry-repo-stats"}}{{formatBytes .TotalSize}}{{if not .Newest.IsZero}} <span class="subtitle">· {{.Newest.Format "2006-01-02"}}</span>{{end}}{{end}}
