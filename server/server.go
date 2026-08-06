@@ -26,6 +26,7 @@ import (
 	"github.com/iotready/podman-api/internal/backupctl"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/evacuate"
+	"github.com/iotready/podman-api/internal/imgregistry"
 	"github.com/iotready/podman-api/internal/ingress"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/inventory"
@@ -102,6 +103,11 @@ func RunWithFlags(opts ...Option) error {
 
 		operatorFile   = fs.String("operator-file", "", "if set, enable the admin UI and authenticate the single operator against this YAML file (username, password_hash)")
 		uiSecureCookie = fs.Bool("ui-secure-cookie", false, "set the Secure flag on the UI session cookie (enable when serving the UI over HTTPS / behind TLS)")
+
+		registryAddress  = fs.String("registry-address", "", "container registry host:port to browse (e.g. 100.64.0.23:5000); empty disables the registry browser feature entirely")
+		registryAuth     = fs.String("registry-auth", "none", "registry auth mode: none or basic")
+		registryUsername = fs.String("registry-username", "", "registry basic-auth username (only used when -registry-auth=basic)")
+		registryPassword = fs.String("registry-password", "", "registry basic-auth password (only used when -registry-auth=basic); prefer the REGISTRY_PASSWORD env var instead — unlike every other secret input here (-operator-file, -keys-file, -spec-key-file are file-based for the same reason), a flag value is visible in /proc/<pid>/cmdline and a systemd ExecStart")
 	)
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
@@ -356,7 +362,25 @@ func RunWithFlags(opts ...Option) error {
 		return metrics.Middleware()(audit(h))
 	}
 
-	router := api.NewRouter(svc, jobStore, keyStore, combined, nil, canceller, Version)
+	var registryClient imgregistry.Client
+	if strings.TrimSpace(*registryAddress) != "" {
+		auth := imgregistry.Auth{Mode: strings.TrimSpace(*registryAuth)}
+		switch auth.Mode {
+		case "none":
+		case "basic":
+			auth.Username = *registryUsername
+			auth.Password = resolveRegistryPassword(*registryPassword, os.Getenv)
+		default:
+			return fmt.Errorf("registry: invalid -registry-auth %q (must be none or basic)", *registryAuth)
+		}
+		base := *registryAddress
+		if !strings.Contains(base, "://") {
+			base = "http://" + base
+		}
+		registryClient = imgregistry.NewHTTPClient(base, auth)
+	}
+
+	router := api.NewRouter(svc, jobStore, keyStore, combined, nil, canceller, Version, registryClient)
 
 	var opHolder atomic.Pointer[config.Operator]
 	var uiApp *ui.UI
@@ -371,7 +395,7 @@ func RunWithFlags(opts ...Option) error {
 			return ui.NewOperatorAuthenticator(*opHolder.Load()).Authenticate(user, pass)
 		})
 		tokenMgr = auth.NewTokenManager(*keysFile, keyStore)
-		uiApp, err = ui.New(ui.Config{Svc: svc, Jobs: jobStore, Auth: authr, Secure: *uiSecureCookie, TokenMgr: tokenMgr, Version: Version})
+		uiApp, err = ui.New(ui.Config{Svc: svc, Jobs: jobStore, Auth: authr, Secure: *uiSecureCookie, TokenMgr: tokenMgr, Version: Version, Registry: registryClient})
 		if err != nil {
 			return fmt.Errorf("ui: %w", err)
 		}
@@ -691,6 +715,20 @@ func seedTemplates(ctx context.Context, db store.TemplateStore, fsys fs.FS) (int
 		}
 	}
 	return len(seeds), nil
+}
+
+// resolveRegistryPassword picks the registry basic-auth password, preferring
+// the REGISTRY_PASSWORD env var over the -registry-password flag: unlike
+// every other secret input this server takes (-operator-file, -keys-file,
+// -spec-key-file are all file-based for the same reason), a flag value is
+// visible in /proc/<pid>/cmdline and a systemd unit's ExecStart. The flag is
+// kept, not removed, for backward-compat/simplicity — this is additive.
+// getenv is injected for testability (os.Getenv in production).
+func resolveRegistryPassword(flagVal string, getenv func(string) string) string {
+	if envPass := getenv("REGISTRY_PASSWORD"); envPass != "" {
+		return envPass
+	}
+	return flagVal
 }
 
 func splitScopes(s string) []string {

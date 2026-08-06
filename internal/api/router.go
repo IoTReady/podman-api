@@ -5,6 +5,7 @@ import (
 
 	apispec "github.com/iotready/podman-api/api"
 	"github.com/iotready/podman-api/internal/auth"
+	"github.com/iotready/podman-api/internal/imgregistry"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/store"
 )
@@ -14,9 +15,10 @@ import (
 // metricsHandler is an optional handler mounted at GET /metrics; pass nil to omit the endpoint.
 // canceller is an optional JobCanceller for the POST /jobs/{id}/cancel route; pass nil when the job runner is not wired.
 // version is the server's release string (e.g. "v1.0.16", "dev"); included in the /mcp discovery document.
-func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, audit func(http.Handler) http.Handler, metricsHandler http.Handler, canceller JobCanceller, version string) http.Handler {
+// registryClient is an optional imgregistry.Client for the GET /registry/... routes; pass nil to disable registry browsing (routes return 404).
+func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, audit func(http.Handler) http.Handler, metricsHandler http.Handler, canceller JobCanceller, version string, registryClient imgregistry.Client) http.Handler {
 	mux := http.NewServeMux()
-	h := &handlers{svc: svc, jobs: jobs, canceller: canceller}
+	h := &handlers{svc: svc, jobs: jobs, canceller: canceller, registry: registryClient}
 
 	if audit == nil {
 		audit = func(h http.Handler) http.Handler { return h }
@@ -57,6 +59,18 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 	mux.Handle("DELETE /templates/{id}", guard("templates:write", http.HandlerFunc(h.deleteTemplate)))
 	mux.Handle("POST /templates/{id}/clone", guard("templates:write", http.HandlerFunc(h.cloneTemplate)))
 	mux.Handle("GET /templates/{id}/render", guard("templates:read", http.HandlerFunc(h.renderTemplate)))
+
+	// Registry (read-only browsing of a Docker Registry v2 endpoint). 404 when no
+	// registry client is configured.
+	//
+	// Registry v2 repo names legally contain "/" (e.g. "iotready/engine"), so
+	// {repo} (one path segment) can't address every real repo — {repo...}
+	// (Go 1.22's multi-segment wildcard) is required. That wildcard must be
+	// the mux's last segment, so a separate .../manifests/{ref} route can no
+	// longer follow it; the manifest lookup is folded into the same route via
+	// a "?manifest=<ref>" query parameter instead (see getRepoOrManifest).
+	mux.Handle("GET /registry/repos", guard("instances:read", http.HandlerFunc(h.listRepos)))
+	mux.Handle("GET /registry/repos/{repo...}", guard("instances:read", http.HandlerFunc(h.getRepoOrManifest)))
 
 	// Host secrets.
 	mux.Handle("GET /hosts/{host}/secrets", guard("secrets:read", http.HandlerFunc(h.listSecrets)))
@@ -126,4 +140,5 @@ type handlers struct {
 	svc       *instance.Service
 	jobs      store.JobStore
 	canceller JobCanceller
+	registry  imgregistry.Client
 }

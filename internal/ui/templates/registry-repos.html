@@ -1,0 +1,15 @@
+{{define "registry-repos"}}
+<h2>Registry</h2>
+<div class="card"><div class="card-b">
+  <table class="table">
+    <thead><tr><th>Repository</th></tr></thead>
+    <tbody>
+    {{range .Repos}}
+      <tr><td><a href="/ui/registry/{{.}}" hx-get="/ui/registry/{{.}}" hx-target="#main" hx-push-url="true">{{.}}</a></td></tr>
+    {{else}}
+      <tr><td class="subtitle">No repositories found.</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div></div>
+{{end}}

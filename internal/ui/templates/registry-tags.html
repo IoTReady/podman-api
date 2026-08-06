@@ -1,0 +1,21 @@
+{{define "registry-tags"}}
+<h2>{{.Repo}}</h2>
+<p class="subtitle"><a href="/ui/registry" hx-get="/ui/registry" hx-target="#main" hx-push-url="true">&larr; All repositories</a></p>
+<div class="card"><div class="card-b">
+  <table class="table">
+    <thead><tr><th>Tags</th><th>Digest</th><th>Created</th><th>Size</th></tr></thead>
+    <tbody>
+    {{range .Groups}}
+      <tr>
+        <td>{{range $i, $t := .Tags}}{{if $i}}, {{end}}<code>{{$t}}</code>{{end}}</td>
+        <td><code>{{.Digest}}</code></td>
+        <td>{{.Created.Format "2006-01-02 15:04"}}</td>
+        <td>{{formatBytes .Size}}</td>
+      </tr>
+    {{else}}
+      <tr><td colspan="4" class="subtitle">No tags found.</td></tr>
+    {{end}}
+    </tbody>
+  </table>
+</div></div>
+{{end}}

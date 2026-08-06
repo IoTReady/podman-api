@@ -411,13 +411,18 @@ func (u *UI) upgradeForm(w http.ResponseWriter, r *http.Request) {
 		u.renderError(w, r, err)
 		return
 	}
-	u.render(w, r, http.StatusOK, "upgrade-form", u.pageData(map[string]any{
+	currentImage := firstContainerImage(obs)
+	data := map[string]any{
 		"Host":         host,
 		"ActiveHost":   host,
 		"Template":     tmplID,
 		"Slug":         slug,
-		"CurrentImage": firstContainerImage(obs),
-	}))
+		"CurrentImage": currentImage,
+	}
+	if u.cfg.Registry != nil {
+		data["RegistryRepo"] = repoFromImage(currentImage)
+	}
+	u.render(w, r, http.StatusOK, "upgrade-form", u.pageData(data))
 }
 
 func (u *UI) upgradeApply(w http.ResponseWriter, r *http.Request) {
@@ -562,4 +567,59 @@ func firstContainerImage(obs instance.Observed) string {
 		return obs.Containers[0].Image
 	}
 	return ""
+}
+
+// repoFromImage strips a trailing :tag or @digest, then a leading
+// registry-host prefix, from an image reference to get the bare repo name the
+// registry browser groups tags under. This has to match Catalog()'s own
+// namespace (imgregistry.HTTPClient.Catalog returns bare names like "engine",
+// never host-qualified) and the {repo...} route both the API and the UI
+// picker resolve against — a host-qualified value would 400 out of
+// imgregistry.ValidRepoName and request the wrong path regardless.
+//
+// The host-vs-path-element test is the standard Docker heuristic: the first
+// "/"-delimited component is a registry host, not part of the repo path, if
+// it contains "." or ":", or is literally "localhost" — a bare repo name
+// (Catalog()'s own shape) has none of those in its first component. This is
+// deliberately a heuristic, not a certainty (a repo name legally containing a
+// "." in its first component would misparse), matching what scripts/roll.py
+// already does against a template body for the same "what repo does this
+// image belong to" question.
+func repoFromImage(image string) string {
+	if image == "" {
+		return ""
+	}
+	if i := strings.LastIndex(image, "@"); i != -1 {
+		image = image[:i]
+	} else if slash, colon := strings.LastIndex(image, "/"), strings.LastIndex(image, ":"); colon > slash {
+		// A ":" after the last "/" is a tag; a ":" that is part of a
+		// host:port prefix (before the first "/") is not.
+		image = image[:colon]
+	}
+
+	slash := strings.Index(image, "/")
+	if slash == -1 {
+		// No path separator at all: either a bare repo name (return as-is —
+		// Catalog() itself returns single-segment names) or a bare host with
+		// no repo path at all (nothing addressable; return "").
+		if looksLikeRegistryHost(image) {
+			return ""
+		}
+		return image
+	}
+	if first := image[:slash]; looksLikeRegistryHost(first) {
+		image = image[slash+1:]
+		if image == "" {
+			// The whole string was a host with a trailing "/" and nothing
+			// after it — not addressable.
+			return ""
+		}
+	}
+	return image
+}
+
+// looksLikeRegistryHost applies the Docker CLI's own registry-host heuristic
+// to a single "/"-delimited path component.
+func looksLikeRegistryHost(s string) bool {
+	return s == "localhost" || strings.ContainsAny(s, ".:")
 }

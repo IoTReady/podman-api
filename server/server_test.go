@@ -253,3 +253,30 @@ func TestRegisterInventoryMetrics_RegistersWhenPollerEnabled(t *testing.T) {
 		t.Fatal("podman_api_host_reachable missing after registration")
 	}
 }
+
+// TestResolveRegistryPassword is the Important-7 fix: REGISTRY_PASSWORD (env)
+// must win over -registry-password (flag) when both are set, since the whole
+// point is to give operators a way to avoid the flag landing in
+// /proc/<pid>/cmdline — and the flag must still work standalone, since it is
+// kept for backward-compat, not removed.
+func TestResolveRegistryPassword(t *testing.T) {
+	cases := []struct {
+		name    string
+		flagVal string
+		env     map[string]string
+		want    string
+	}{
+		{"env wins over flag", "flag-pass", map[string]string{"REGISTRY_PASSWORD": "env-pass"}, "env-pass"},
+		{"flag used when env unset", "flag-pass", map[string]string{}, "flag-pass"},
+		{"flag used when env empty", "flag-pass", map[string]string{"REGISTRY_PASSWORD": ""}, "flag-pass"},
+		{"empty when neither set", "", map[string]string{}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			getenv := func(k string) string { return c.env[k] }
+			if got := resolveRegistryPassword(c.flagVal, getenv); got != c.want {
+				t.Errorf("resolveRegistryPassword(%q, ...) = %q, want %q", c.flagVal, got, c.want)
+			}
+		})
+	}
+}
