@@ -78,6 +78,10 @@ type Handler struct {
 	Config    Config
 	Metrics   Metrics // optional
 
+	// BlobGC is Stage B (blob reclamation). nil disables it entirely, which is
+	// Stage A only: manifests unlinked, blobs left recoverable. See blobgc.go.
+	BlobGC *BlobGC
+
 	// buildSet overrides the in-use computation. Test seam only; nil in
 	// production, where BuildInUseSet is used.
 	buildSet func(context.Context) (InUseSet, error)
@@ -225,6 +229,16 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 		return nil
 	}
 	jc.Step("summary", fmt.Sprintf("%d manifest(s) deleted", deleted))
+
+	// (6) Stage B: reclaim the blobs those deletions only unlinked. It gates
+	// itself on DryRun/SkipBlobGC too, so the "no pod is ever played on a dry
+	// run" property does not depend on this call site.
+	if h.BlobGC != nil {
+		if err := h.BlobGC.Run(ctx, jc, p); err != nil {
+			h.metric().RunDone("failed")
+			return err
+		}
+	}
 	h.metric().RunDone("succeeded")
 	return nil
 }
