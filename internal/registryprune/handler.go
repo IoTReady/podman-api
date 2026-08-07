@@ -50,6 +50,12 @@ type Metrics interface {
 	// would have surfaced the 2026-08-02 incident within a tick instead of a
 	// week.
 	RepoSkipped(repo string, candidates int)
+	// BytesReclaimed records the bytes Stage B's blob GC freed on disk. It is
+	// called ONLY when the measurement is real (BlobGC.Result.Measured): an
+	// unmeasured run must record nothing rather than zero, because "we could
+	// not size the registry" and "the GC freed nothing" are different facts
+	// and only one of them is a reason to look at the GC.
+	BytesReclaimed(bytes int64)
 }
 
 // candidate is one digest classified deletable, within one repo.
@@ -279,7 +285,18 @@ func (h *Handler) finish(ctx context.Context, jc *jobs.JobContext, kept []repoPl
 	// itself on DryRun/SkipBlobGC too, so the "no pod is ever played on a dry
 	// run" property does not depend on this call site.
 	if h.BlobGC != nil {
-		if err := h.BlobGC.Run(ctx, jc, p); err != nil {
+		// Reclaim, NOT Run: Run discards the Result, and the Result is the
+		// only data path the bytes-reclaimed metric has. Wiring this call site
+		// to the error-only wrapper leaves that metric permanently at zero
+		// while everything still looks correct.
+		res, err := h.BlobGC.Reclaim(ctx, jc, p)
+		// Recorded before the error check, deliberately: the deferred restart
+		// in Reclaim fills the after-size in even on a failing run, and bytes
+		// that really were reclaimed are worth counting whatever the outcome.
+		if res.Measured {
+			h.metric().BytesReclaimed(res.Reclaimed)
+		}
+		if err != nil {
 			h.metric().RunDone("failed")
 			return err
 		}
@@ -577,3 +594,4 @@ type noopMetrics struct{}
 func (noopMetrics) RunDone(string)               {}
 func (noopMetrics) ManifestsDeleted(string, int) {}
 func (noopMetrics) RepoSkipped(string, int)      {}
+func (noopMetrics) BytesReclaimed(int64)         {}
