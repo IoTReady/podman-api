@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/iotready/podman-api/internal/config"
 )
@@ -15,6 +16,12 @@ type Client interface {
 	// Pods
 	PlayKube(ctx context.Context, hostID, yaml string, replace bool, networks ...string) error
 	PodInspect(ctx context.Context, hostID, name string) (Pod, error)
+	// WaitForPodCompletion polls every container in the named pod until each
+	// has exited or timeout elapses. Returns the first non-zero exit code
+	// found (in container order), else 0 if every container exited 0. A
+	// timeout returns a non-nil error (ErrWaitTimeout) — never a zero exit
+	// code, which would misread as success.
+	WaitForPodCompletion(ctx context.Context, hostID, podName string, timeout time.Duration) (exitCode int, err error)
 	PodList(ctx context.Context, hostID string, labelFilters map[string]string) ([]Pod, error)
 	PodStart(ctx context.Context, hostID, name string) error
 	PodStop(ctx context.Context, hostID, name string) error
@@ -125,3 +132,10 @@ type LogOptions struct {
 
 // ErrNotFound is returned when a pod, container, secret, or volume isn't present.
 var ErrNotFound = errors.New("podman: not found")
+
+// ErrWaitTimeout is returned by WaitForPodCompletion when timeout elapses
+// before every container in the pod has exited. It is distinct from a
+// successful wait (which always returns a nil error, even for a non-zero
+// exit code) so callers cannot mistake "we gave up waiting" for "it ran and
+// finished".
+var ErrWaitTimeout = errors.New("podman: timed out waiting for pod completion")

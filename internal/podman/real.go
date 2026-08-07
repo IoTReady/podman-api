@@ -361,6 +361,66 @@ func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool, netwo
 	return err
 }
 
+// waitPollInterval bounds how often WaitForPodCompletion re-inspects the pod
+// while waiting for its containers to exit.
+var waitPollInterval = 2 * time.Second
+
+// WaitForPodCompletion polls the named pod's containers until every one has
+// exited or timeout elapses. It returns the first non-zero exit code found
+// (in container order), else 0. Timing out returns ErrWaitTimeout, never a
+// zero exit code — a caller must not be able to mistake "gave up waiting"
+// for "ran and exited 0".
+func (r *Real) WaitForPodCompletion(ctx context.Context, id, podName string, timeout time.Duration) (int, error) {
+	c, cancel, err := r.opCtxFor(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	defer cancel()
+
+	deadline := time.Now().Add(timeout)
+	for {
+		rep, err := pods.Inspect(c, podName, &pods.InspectOptions{})
+		if err != nil {
+			if isNotFound(err) {
+				return 0, ErrNotFound
+			}
+			return 0, err
+		}
+
+		allExited := true
+		exitCode := 0
+		for _, ci := range rep.Containers {
+			full, err := containers.Inspect(c, ci.ID, &containers.InspectOptions{})
+			if err != nil {
+				if isNotFound(err) {
+					// Container gone mid-poll; treat as exited with whatever
+					// we have so far rather than erroring the whole wait.
+					continue
+				}
+				return 0, err
+			}
+			if full.State == nil || full.State.Running {
+				allExited = false
+				continue
+			}
+			if code := int(full.State.ExitCode); code != 0 && exitCode == 0 {
+				exitCode = code
+			}
+		}
+		if allExited {
+			return exitCode, nil
+		}
+		if time.Now().After(deadline) {
+			return 0, ErrWaitTimeout
+		}
+		select {
+		case <-c.Done():
+			return 0, c.Err()
+		case <-time.After(waitPollInterval):
+		}
+	}
+}
+
 func (r *Real) PodInspect(ctx context.Context, id, name string) (Pod, error) {
 	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
@@ -398,6 +458,10 @@ func enrichContainer(c *Container, ins *define.InspectContainerData) {
 	}
 	if ins.State != nil && ins.State.Health != nil {
 		c.Health = ins.State.Health.Status
+	}
+	if ins.State != nil {
+		c.Exited = !ins.State.Running
+		c.ExitCode = int(ins.State.ExitCode)
 	}
 	if ins.Config != nil && ins.Config.Healthcheck != nil {
 		c.HealthStartPeriod = ins.Config.Healthcheck.StartPeriod

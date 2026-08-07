@@ -99,6 +99,26 @@ func TestEnrichContainer_Health(t *testing.T) {
 	})
 }
 
+func TestEnrichContainer_ExitCode(t *testing.T) {
+	t.Run("exited container reports its code", func(t *testing.T) {
+		var c Container
+		enrichContainer(&c, &define.InspectContainerData{
+			State: &define.InspectContainerState{Running: false, ExitCode: 3},
+		})
+		assert.Equal(t, 3, c.ExitCode)
+		assert.True(t, c.Exited)
+	})
+
+	t.Run("running container is not exited", func(t *testing.T) {
+		var c Container
+		enrichContainer(&c, &define.InspectContainerData{
+			State: &define.InspectContainerState{Running: true, ExitCode: 0},
+		})
+		assert.Equal(t, 0, c.ExitCode)
+		assert.False(t, c.Exited)
+	})
+}
+
 func TestPodFromInspect(t *testing.T) {
 	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	rep := &entities.PodInspectReport{InspectPodData: &define.InspectPodData{

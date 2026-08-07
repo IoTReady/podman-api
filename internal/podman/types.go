@@ -32,6 +32,14 @@ type Container struct {
 	RestartCount      int
 	Ports             []PortMapping
 	Env               map[string]string
+	// ExitCode is the container's last exit code, as libpod reports it. It is
+	// meaningful only when Exited is true; a running container has ExitCode 0
+	// (never populated) alongside Exited false.
+	ExitCode int
+	// Exited reports whether the container has stopped running (libpod's
+	// State.Running == false). Distinguishes "never ran" / "still running"
+	// from "ran and produced ExitCode".
+	Exited bool
 }
 
 type PortMapping struct {

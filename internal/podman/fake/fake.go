@@ -297,6 +297,32 @@ func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool, net
 	return nil
 }
 
+// WaitForPodCompletion computes its result from the containers already
+// recorded on the pod: every container must have Exited=true to succeed,
+// returning the first non-zero ExitCode found (else 0). Any container still
+// not Exited is treated as never finishing within the fake's synchronous
+// model, so it returns podman.ErrWaitTimeout immediately regardless of the
+// requested timeout — tests drive this by seeding pod/container state via
+// AddPod rather than by waiting on a clock.
+func (f *Fake) WaitForPodCompletion(_ context.Context, h, name string, _ time.Duration) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.hostPods(h)[name]
+	if !ok {
+		return 0, podman.ErrNotFound
+	}
+	exitCode := 0
+	for _, c := range p.Containers {
+		if !c.Exited {
+			return 0, podman.ErrWaitTimeout
+		}
+		if c.ExitCode != 0 && exitCode == 0 {
+			exitCode = c.ExitCode
+		}
+	}
+	return exitCode, nil
+}
+
 func (f *Fake) PodInspect(_ context.Context, h, name string) (podman.Pod, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
