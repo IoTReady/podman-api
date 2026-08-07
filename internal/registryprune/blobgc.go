@@ -177,9 +177,16 @@ func (g *BlobGC) validate() error {
 	// registry's own pod name would replace the registry instance and then
 	// DELETE it — gone, not down, with no reconciler in the core to rebuild
 	// it. A copy-paste between two Task 7 flag defaults is all it would take.
-	if g.podName() == g.RegistryPod {
-		return fmt.Errorf("blob GC pod name %q is the registry's own pod name: "+
-			"playing it would replace and then destroy the registry instance", g.podName())
+	//
+	// EqualFold + TrimSpace, matching the server's own startup guard. This one
+	// is the defence-in-depth backstop — it must catch everything that guard
+	// does and then some, because it is what protects a BlobGC constructed
+	// from anywhere else. Plain == made it the WEAKER of the two, which is the
+	// opposite of what a backstop is for: RegistryPod "Registry-Main" against
+	// PodName "registry-main" would sail through and destroy the registry.
+	if strings.EqualFold(strings.TrimSpace(g.podName()), strings.TrimSpace(g.RegistryPod)) {
+		return fmt.Errorf("blob GC pod name %q is the registry's own pod name %q: "+
+			"playing it would replace and then destroy the registry instance", g.podName(), g.RegistryPod)
 	}
 	return nil
 }

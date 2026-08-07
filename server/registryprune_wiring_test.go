@@ -4,7 +4,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/iotready/podman-api/internal/imgregistry"
 	"github.com/iotready/podman-api/internal/obs"
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/registryprune"
@@ -173,19 +172,11 @@ func TestBuildRegistryPrune_EveryFieldIsCarried(t *testing.T) {
 	}
 }
 
-// IMPORTANT 1. classifyAll builds the delete plan AND the cross-repo protected
-// set from ResolveTags; a listing up to TagsCacheTTL (5 min) old — warmed by
-// anything that browsed the repo, an operator's UI page load included — can
-// miss a protected tag pushed minutes ago and let its manifest be deleted. The
-// refusal lives in buildRegistryPrune rather than in a server.go convention
-// precisely so it cannot rot back.
-func TestBuildRegistryPrune_RefusesACachingClient(t *testing.T) {
-	cached := imgregistry.NewCachingClient(testRegistryClient(), imgregistry.TagsCacheTTL)
-	_, err := buildRegistryPrune(*enabledConfig(t), "http://reg.example:5000", cached, testSvc(), nil, nil, nil)
-	if err == nil {
-		t.Fatal("want an error: a cached tag listing can hide a just-pushed protected tag and get its manifest deleted")
-	}
-}
+// There is deliberately no "refuses a CachingClient" test any more: since
+// buildRegistryPrune takes the concrete *imgregistry.HTTPClient, such a test
+// cannot COMPILE. The property moved from a runtime assertion this suite had to
+// police to one the compiler enforces for every decorator, including ones nobody
+// has written yet.
 
 func TestBuildRegistryPrune_RejectsAMalformedRegistryHost(t *testing.T) {
 	// Startup, not the first run. Fail-closed either way, but a run that aborts

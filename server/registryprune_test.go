@@ -52,7 +52,7 @@ func TestRegistryPruneFlags_GCPodDefaultIsNotRegistryPodDefault(t *testing.T) {
 	}
 }
 
-func testRegistryClient() imgregistry.Client {
+func testRegistryClient() *imgregistry.HTTPClient {
 	return imgregistry.NewHTTPClient("http://reg.example:5000", imgregistry.Auth{})
 }
 
@@ -127,6 +127,54 @@ func TestBuildRegistryPrune_RejectsGCPodEqualToRegistryPod(t *testing.T) {
 	)
 	if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil); err == nil {
 		t.Fatal("want an error when the GC pod name is the registry's own pod name")
+	}
+}
+
+// The strengthened guard, pinned. All three mutations (EqualFold back to ==,
+// and dropping either TrimSpace) previously survived the whole suite, so the
+// hardening could silently revert. Each row below fails under exactly one of
+// them.
+func TestBuildRegistryPrune_CollisionGuardIgnoresCaseAndSurroundingSpace(t *testing.T) {
+	for _, tc := range []struct{ name, registryPod, gcPod string }{
+		{"differing case", "Registry-Main", "registry-main"},
+		{"differing case, other way", "registry-main", "REGISTRY-MAIN"},
+		{"leading space on the GC pod", "registry-main", "  registry-main"},
+		{"trailing space on the registry pod", "registry-main  ", "registry-main"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := *parsedRegistryPruneFlags(t,
+				"-registry-prune-enabled",
+				"-registry-prune-host=otp-infra-1",
+				"-registry-prune-registry-pod="+tc.registryPod,
+				"-registry-prune-gc-pod="+tc.gcPod,
+				"-registry-prune-storage-path=/srv/registry",
+			)
+			if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil); err == nil {
+				t.Fatalf("accepted GC pod %q against registry pod %q: playing it would replace and then destroy the registry", tc.gcPod, tc.registryPod)
+			}
+		})
+	}
+}
+
+// The trimmed names are what reach BlobGC, so the package's own backstop
+// compares the same strings this guard did.
+func TestBuildRegistryPrune_TrimsPodNamesBeforeTheyReachBlobGC(t *testing.T) {
+	c := *parsedRegistryPruneFlags(t,
+		"-registry-prune-enabled",
+		"-registry-prune-host=otp-infra-1",
+		"-registry-prune-registry-pod=  registry-main  ",
+		"-registry-prune-gc-pod=  blob-gc-one-shot  ",
+		"-registry-prune-storage-path=/srv/registry",
+	)
+	h, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.BlobGC.RegistryPod != "registry-main" {
+		t.Errorf("RegistryPod = %q, want it trimmed", h.BlobGC.RegistryPod)
+	}
+	if h.BlobGC.PodName != "blob-gc-one-shot" {
+		t.Errorf("PodName = %q, want it trimmed", h.BlobGC.PodName)
 	}
 }
 

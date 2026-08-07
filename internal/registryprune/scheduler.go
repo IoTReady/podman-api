@@ -45,13 +45,33 @@ type Scheduler struct {
 	Now     func() time.Time
 
 	wg sync.WaitGroup
-	// enqueueMu makes the in-flight check and the enqueue that follows it one
+	// enqueueSem makes the in-flight check and the enqueue that follows it one
 	// atomic step. Without it two callers — a tick and an on-demand POST, or
 	// two POSTs — can both pass scanJobs before either has written a row, and
 	// the concurrency guard this whole design leans on evaporates under exactly
 	// the load it exists for.
-	enqueueMu sync.Mutex
+	//
+	// A channel rather than a sync.Mutex because the critical section performs
+	// store I/O (ListJobs, then Enqueue) and one holder is an HTTP request: a
+	// Mutex is not cancellable, so a slow or wedged job store would turn
+	// POST /registry/prune into a hanging connection instead of a timely error.
+	// A caller waiting here can give up when its context does.
+	semOnce    sync.Once
+	enqueueSem chan struct{}
 }
+
+// acquire takes the enqueue lock, or gives up when ctx does.
+func (s *Scheduler) acquire(ctx context.Context) error {
+	s.semOnce.Do(func() { s.enqueueSem = make(chan struct{}, 1) })
+	select {
+	case s.enqueueSem <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *Scheduler) release() { <-s.enqueueSem }
 
 // ErrRunInFlight is returned by EnqueueNow when a run is already queued or
 // running. Two concurrent runs would each classify the whole catalog from a
@@ -116,11 +136,19 @@ func (s *Scheduler) now() time.Time {
 // ticker uses: a manual enqueue that raced past it would put two runs on the
 // same catalog, each reasoning from a listing the other is mutating.
 func (s *Scheduler) EnqueueNow(ctx context.Context) (store.Job, error) {
-	if s.Payload == nil || s.Store == nil {
+	// A nil receiver is reachable the moment anything hands api.WithRegistryPruner
+	// a typed-nil *Scheduler: the interface value is then non-nil, h.pruner == nil
+	// is false, and the request arrives here to panic on the first field read.
+	// server.go guards on the concrete pointer today, so this is robustness for
+	// callers that have not been written yet — but "not configured" is a 500 and
+	// a panic is a dropped connection.
+	if s == nil || s.Payload == nil || s.Store == nil {
 		return store.Job{}, errors.New("registry prune scheduler is not configured")
 	}
-	s.enqueueMu.Lock()
-	defer s.enqueueMu.Unlock()
+	if err := s.acquire(ctx); err != nil {
+		return store.Job{}, fmt.Errorf("waiting to enqueue registry-prune: %w", err)
+	}
+	defer s.release()
 	if inflight, _, _ := s.scanJobs(ctx); inflight {
 		return store.Job{}, ErrRunInFlight
 	}
@@ -142,9 +170,13 @@ func (s *Scheduler) tick(ctx context.Context) {
 		return
 	}
 	// Same lock as EnqueueNow, so the scan and the enqueue below cannot
-	// interleave with an on-demand trigger.
-	s.enqueueMu.Lock()
-	defer s.enqueueMu.Unlock()
+	// interleave with an on-demand trigger. This half is load-bearing in
+	// production specifically: the ticker is live the whole time the route is
+	// reachable, so tick-vs-EnqueueNow is the racing pair that actually occurs.
+	if err := s.acquire(ctx); err != nil {
+		return
+	}
+	defer s.release()
 	inflight, lastSuccess, lastFailure := s.scanJobs(ctx)
 	if inflight {
 		// A registry prune classifies the whole catalog; a second concurrent

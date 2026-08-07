@@ -81,7 +81,26 @@ func registryPruneFlags(fs *flag.FlagSet) *registryPruneConfig {
 // scheduler. An error means the operator asked for the feature and described it
 // in a way that could only misbehave — those fail startup rather than being
 // discovered a tick later, or worse, not discovered at all.
-func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg imgregistry.Client,
+//
+// reg is the CONCRETE *imgregistry.HTTPClient, not the imgregistry.Client
+// interface, and that is the whole point of the parameter's type. classifyAll
+// builds both the delete plan and the cross-repo protected-digest set from
+// ResolveTags; a listing served from imgregistry.CachingClient's 5-minute TTL —
+// warmed by anything that browsed the repo, an operator's UI registry page
+// included — can omit a protected tag pushed minutes ago. Reason it through:
+// digest D is tagged only "feat-x", 31 days old, so it classifies feat-stale and
+// is deletable. Someone re-tags D as the release "2026.08.07" and pushes it three
+// minutes ago. A cached listing still reports [feat-x], nameProtected never sees
+// the CalVer tag, and D enters the plan. The pre-delete backstop cannot rescue it
+// either — nothing has deployed the release yet, so it is in no in-use set. The
+// manifest behind a just-cut release tag is deleted and the tag left dangling.
+//
+// This used to be a runtime type assertion against *CachingClient, which a third
+// decorator would have walked straight past. As a concrete parameter type the
+// compiler refuses any wrapper at all, so the property holds for decorators
+// nobody has written yet. The cache buys the prune nothing regardless: it walks
+// every repo once per run, on an interval, and pays the ~21s cold cost either way.
+func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg *imgregistry.HTTPClient,
 	svc *instance.Service, specs registryprune.SpecSource, pod registryprune.PodRunner,
 	metrics registryprune.Metrics) (*registryprune.Handler, error) {
 
@@ -95,27 +114,6 @@ func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg imgreg
 	if reg == nil {
 		log.Printf("WARNING: -registry-prune-enabled is set but no registry client exists (-registry-address is empty); registry prune is disabled")
 		return nil, nil
-	}
-	// A CACHED client must never reach this handler, and the refusal lives here
-	// rather than in a wiring convention because a convention is exactly what
-	// would rot. classifyAll builds BOTH the delete plan and the cross-repo
-	// protected-digest set from ResolveTags; CachingClient's TTL is 5 minutes
-	// and its entries are warmed by anything that lists a repo, including an
-	// operator loading the UI's registry page, which fans out over the whole
-	// catalog. Reason it through with a concrete digest: D is tagged only
-	// "feat-x", 31 days old, so it classifies feat-stale and is deletable.
-	// Someone re-tags D as the release "2026.08.07" and pushes it three minutes
-	// ago. A cached listing still reports [feat-x]; nameProtected never sees the
-	// CalVer tag, and D enters the plan. The pre-delete backstop cannot rescue
-	// it either — nothing has deployed the release yet, so it is in no in-use
-	// set. The manifest behind a just-cut release tag is deleted and the tag
-	// left dangling. The cache buys the prune nothing anyway: it walks every
-	// repo once per run, on a 24h interval, and pays the ~21s cold cost either
-	// way.
-	if _, cached := reg.(*imgregistry.CachingClient); cached {
-		return nil, fmt.Errorf("registry prune: refusing a caching registry client — " +
-			"tag listings up to imgregistry.TagsCacheTTL old would let a just-pushed protected tag " +
-			"go unseen and its manifest be deleted; pass the uncached *imgregistry.HTTPClient")
 	}
 	if cfg.MaxDeletesPerRepo <= 0 {
 		return nil, fmt.Errorf("registry prune: -registry-prune-max-deletes-per-repo must be positive (it is the per-repo tripwire), got %d", cfg.MaxDeletesPerRepo)

@@ -581,3 +581,28 @@ func TestBlobGC_SizingFailureIsNotAJobFailure(t *testing.T) {
 	}
 	wantStepContaining(t, job, "size unavailable")
 }
+
+// validate() is the defence-in-depth backstop for the destroy-the-whole-registry
+// case, so it must catch at least everything the server's startup guard does.
+// Plain == made it the WEAKER of the two: a BlobGC built anywhere other than
+// buildRegistryPrune with RegistryPod "Registry-Main" and PodName
+// "registry-main" would pass here, and then PlayKube(replace=true) plus
+// PodRemove(force=true) destroys the registry with nothing to rebuild it.
+func TestBlobGC_CollisionGuardIgnoresCaseAndSurroundingSpace(t *testing.T) {
+	for _, tc := range []struct{ name, registryPod, gcPod string }{
+		{"differing case", "Registry-Main", "registry-main"},
+		{"differing case, other way", "registry-main", "REGISTRY-MAIN"},
+		{"leading space on the GC pod", "registry-main", "  registry-main"},
+		{"trailing space on the registry pod", "registry-main  ", "registry-main"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := testBlobGC(&fakeRunner{})
+			g.RegistryPod = tc.registryPod
+			g.PodName = tc.gcPod
+			if err := g.validate(); err == nil {
+				t.Fatalf("validate() accepted GC pod %q against registry pod %q: "+
+					"playing it would replace and then destroy the registry", tc.gcPod, tc.registryPod)
+			}
+		})
+	}
+}

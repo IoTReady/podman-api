@@ -301,11 +301,19 @@ times out; `SkipBlobGC` plays no pod; dry-run plays no pod; the generated manife
   verify → Stage B) would cost a full interval or a hand-edited
   `-registry-prune-interval`. Setting `-registry-prune-interval=0` gives a
   manual-only deployment, which is a reasonable way to run the first few passes.
-- **The prune gets the UNCACHED registry client**, and `buildRegistryPrune` refuses a
-  `*imgregistry.CachingClient` at startup. A cached tag listing (TTL 5 min, warmed by
-  any UI registry page load) can omit a protected tag pushed minutes ago; the digest
-  then classifies deletable and the pre-delete backstop cannot save it, because nothing
-  has deployed the new tag yet. Do not "optimise" this back.
+- **A manually-triggered FAILURE suppresses the next SCHEDULED run for an hour.** A
+  failed run writes `lastFailure`, and `tick`'s `failureBackoff` is one hour regardless
+  of how the run was started. Conservative direction — a persistently unreachable
+  registry is not retried every minute — but during an incident, hammering
+  `POST /registry/prune` quietly delays the automatic cadence. The trigger itself is
+  never backed off, so this costs nothing you cannot work around by triggering again.
+- **The prune gets the UNCACHED registry client**, enforced by
+  `buildRegistryPrune` taking the concrete `*imgregistry.HTTPClient`: a decorator
+  cannot be passed at all, and the compiler says so. A cached tag listing (TTL 5 min,
+  warmed by any UI registry page load) can omit a protected tag pushed minutes ago; the
+  digest then classifies deletable and the pre-delete backstop cannot save it, because
+  nothing has deployed the new tag yet. Do not "optimise" this back by widening the
+  parameter to `imgregistry.Client`.
 
 ---
 

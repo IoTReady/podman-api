@@ -243,14 +243,15 @@ func RunWithFlags(opts ...Option) error {
 	// re-deriving it anywhere else is how every tag-pinned image in the fleet
 	// quietly stops being protected.
 	var registryClient imgregistry.Client
-	// registryPruneClient is the UNCACHED client, and must stay that way.
-	// classifyAll builds the delete plan and the cross-repo protected-digest set
-	// from ResolveTags; a listing up to TagsCacheTTL old — warmed by anything
-	// that browsed the repo, including a UI page load — can miss a protected tag
-	// pushed minutes ago and let its manifest be deleted.
-	// buildRegistryPrune refuses a *imgregistry.CachingClient outright, so this
-	// cannot regress into a wiring convention nobody re-checks.
-	var registryPruneClient imgregistry.Client
+	// registryPruneClient is the UNCACHED client. classifyAll builds the delete
+	// plan and the cross-repo protected-digest set from ResolveTags; a listing up
+	// to TagsCacheTTL old — warmed by anything that browsed the repo, including a
+	// UI page load — can miss a protected tag pushed minutes ago and let its
+	// manifest be deleted. See buildRegistryPrune's doc comment.
+	// Typed CONCRETELY, not as imgregistry.Client: buildRegistryPrune's
+	// parameter type is what makes "the prune never sees a cached listing" a
+	// compile-time property rather than a convention or a runtime check.
+	var registryPruneClient *imgregistry.HTTPClient
 	var registryBase string
 	if strings.TrimSpace(*registryAddress) != "" {
 		auth := imgregistry.Auth{Mode: strings.TrimSpace(*registryAuth)}

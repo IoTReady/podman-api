@@ -161,3 +161,72 @@ func countJobs(t *testing.T, st store.JobStore) int {
 	}
 	return len(js)
 }
+
+// tick-vs-EnqueueNow is the pairing that actually occurs in production: the
+// ticker is live for the whole time the route is reachable. The committed
+// self-vs-self race test does not cover it, and removing tick()'s half of the
+// lock survives that test — and the entire suite — while failing this one on
+// the first trial.
+func TestTickAndEnqueueNowDoNotBothEnqueue(t *testing.T) {
+	for trial := 0; trial < 200; trial++ {
+		ctx := context.Background()
+		mem := store.NewMemory()
+		s := onDemandScheduler(mem)
+		// Nothing has ever run, so tick()'s interval gate is open and both
+		// paths are genuinely eligible to enqueue at the same instant.
+		start := make(chan struct{})
+		done := make(chan struct{}, 2)
+		go func() { <-start; s.tick(ctx); done <- struct{}{} }()
+		go func() { <-start; _, _ = s.EnqueueNow(ctx); done <- struct{}{} }()
+		close(start)
+		<-done
+		<-done
+		if n := countJobs(t, mem); n != 1 {
+			t.Fatalf("trial %d: %d registry-prune jobs enqueued, want exactly 1", trial, n)
+		}
+	}
+}
+
+// A caller waiting on the enqueue lock must give up when its request does. The
+// critical section performs store I/O, and this route is operator-facing during
+// an incident: a wedged job store must produce a timely error, not a hanging
+// connection.
+func TestEnqueueNow_HonoursContextCancellationWhileWaiting(t *testing.T) {
+	mem := store.NewMemory()
+	s := onDemandScheduler(mem)
+
+	// Hold the lock from another goroutine.
+	if err := s.acquire(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer s.release()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := s.EnqueueNow(ctx)
+		errCh <- err
+	}()
+	cancel()
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("EnqueueNow ignored its cancelled context and kept waiting on the lock")
+	}
+	if n := countJobs(t, mem); n != 0 {
+		t.Fatalf("%d jobs enqueued by a cancelled caller", n)
+	}
+}
+
+// A typed-nil *Scheduler behind the api.RegistryPruner interface must answer an
+// error, not panic the request handler. h.pruner == nil is false for such a
+// value, so the nil check in the route cannot catch it.
+func TestEnqueueNow_NilReceiverIsAnErrorNotAPanic(t *testing.T) {
+	var s *Scheduler
+	if _, err := s.EnqueueNow(context.Background()); err == nil {
+		t.Fatal("want an error from a nil *Scheduler")
+	}
+}
