@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/imgregistry"
@@ -37,6 +39,10 @@ type InUseSet struct {
 	// spec, so the gap must be recorded (a job step) rather than left silent.
 	// Entries are "host/slug/container: <image>".
 	NonDigestObserved []string
+	// ForeignSkipped lists the image references skipped as belonging to some
+	// other registry, deduped. A run that skips everything is a misconfigured
+	// registry host, and must be visible rather than silent.
+	ForeignSkipped []string
 }
 
 // Has reports whether digest is protected. digest is normalised the same way
@@ -89,11 +95,12 @@ type ManifestResolver interface {
 
 // Config parameterises BuildInUseSet.
 type Config struct {
-	// RegistryHost is the host[:port] of the registry being pruned, as it
-	// appears in image references (e.g. "reg.example:5000"). It is what
-	// separates our refs from foreign ones; empty aborts, because without it
-	// a host-qualified foreign ref cannot be told from one of ours.
-	RegistryHost string
+	// RegistryHosts are every spelling of the registry being pruned as it may
+	// appear in an image reference (e.g. "reg.example:5000", "reg.example",
+	// "100.64.0.23:5000"). They are what separate our refs from foreign ones;
+	// an empty list aborts, because without one a host-qualified foreign ref
+	// cannot be told from one of ours.
+	RegistryHosts []string
 	// MaxSnapshotAge bounds how stale a host's inventory snapshot may be. Must
 	// be positive — a zero value is treated as unconfigured and aborts, rather
 	// than silently disabling the staleness check.
@@ -129,9 +136,25 @@ func BuildInUseSet(ctx context.Context, hostSrc HostEnumerator, inv InventorySou
 	if cfg.MaxSnapshotAge <= 0 {
 		return InUseSet{}, fmt.Errorf("%w: max snapshot age is not configured", ErrUnsafeToPrune)
 	}
-	if strings.TrimSpace(cfg.RegistryHost) == "" {
-		return InUseSet{}, fmt.Errorf("%w: registry host is not configured, so a foreign image reference cannot be told from one of ours", ErrUnsafeToPrune)
+	if len(cfg.RegistryHosts) == 0 {
+		return InUseSet{}, fmt.Errorf("%w: no registry host is configured, so a foreign image reference cannot be told from one of ours", ErrUnsafeToPrune)
 	}
+	ourHosts := make([]string, 0, len(cfg.RegistryHosts))
+	for _, raw := range cfg.RegistryHosts {
+		h, err := normalizeRegistryHost(raw)
+		if err != nil {
+			// Rejected, never accepted-and-hoped: a registry host that does not
+			// compare equal to our own refs classifies every one of them as
+			// foreign, and the fleet-wide-zero rule does not save us because
+			// digest-pinned containers still populate the set. The run would
+			// proceed and delete every manifest reachable only through a tag.
+			return InUseSet{}, fmt.Errorf("%w: registry host %q: %v", ErrUnsafeToPrune, raw, err)
+		}
+		ourHosts = append(ourHosts, h)
+	}
+	// Every configured host must be swept. Drain is deliberately ignored: a
+	// drained host refuses NEW instances but still runs the pods it has, so its
+	// images are as in-use as any other host's.
 	var hosts []string
 	for _, h := range hostSrc.Hosts() {
 		hosts = append(hosts, h.ID)
@@ -152,6 +175,7 @@ func BuildInUseSet(ctx context.Context, hostSrc HostEnumerator, inv InventorySou
 
 	digests := make(map[string]struct{})
 	var nonDigest []string
+	foreign := make(map[string]struct{})
 
 	for _, host := range hosts {
 		// (a) observed.
@@ -170,35 +194,62 @@ func BuildInUseSet(ctx context.Context, hostSrc HostEnumerator, inv InventorySou
 		}
 		for _, o := range obs {
 			for _, c := range o.Containers {
+				if isPodInfra(c) {
+					// Every pod has one, and on podman 5.8.2 it reports no
+					// image, image digest or image name at all (verified live
+					// across engine-1/2/infra on 2026-08-07: 78 of 78 infra
+					// containers). It runs a locally-built pause image that is
+					// in no registry, so there is nothing to protect — but
+					// treating it as an unresolvable ref would abort every run
+					// on every real host.
+					continue
+				}
 				// podman gives us two views of a running container's image, and
 				// each covers a hole in the other. Image is ImageDigest when
 				// podman has one, but falls back to an image ID, which is NOT a
 				// manifest digest and can never match anything in the registry.
 				// ImageTag is the full reference — what registry-gc.sh
 				// protected. Union both; over-protection is free.
-				d, covered, err := resolveRef(ctx, reg, known, cfg.RegistryHost, c.Image)
+				got, err := resolveRef(ctx, reg, known, ourHosts, c.Image)
 				if err != nil {
 					return InUseSet{}, fmt.Errorf("%w: running container %s/%s/%s: %v", ErrUnsafeToPrune, host, o.Slug, c.Name, err)
 				}
-				if d != "" {
-					digests[d] = struct{}{}
+				covered := got.Covered
+				if got.Digest != "" {
+					digests[got.Digest] = struct{}{}
 				}
-				td, _, terr := resolveRef(ctx, reg, known, cfg.RegistryHost, c.ImageTag)
+				if got.Foreign {
+					foreign[strings.TrimSpace(c.Image)] = struct{}{}
+				}
+				gotTag, terr := resolveRef(ctx, reg, known, ourHosts, c.ImageTag)
 				switch {
 				case terr == nil:
-					if td != "" {
-						digests[td] = struct{}{}
+					if gotTag.Digest != "" {
+						digests[gotTag.Digest] = struct{}{}
+					}
+					if gotTag.Foreign {
+						foreign[strings.TrimSpace(c.ImageTag)] = struct{}{}
 					}
 				case errors.Is(terr, imgregistry.ErrUnreachable):
 					// Never "already gone".
 					return InUseSet{}, fmt.Errorf("%w: resolving image tag of %s/%s/%s: %v", ErrUnsafeToPrune, host, o.Slug, c.Name, terr)
 				default:
-					// An absent or since-re-pushed tag adds nothing. It is not
-					// worth aborting on: when the image itself is digest-form
-					// the digest is already protected, and when it is not, the
-					// gap is recorded below.
+					// An absent or since-re-pushed tag adds nothing. Tolerated
+					// ONLY when the image itself is digest-form, where the
+					// digest is already protected and aborting would deadlock
+					// the job on every rolled instance. When it is not, the
+					// container has no protection at all and the fatal check
+					// below fires.
 				}
 				if !covered {
+					// The image is an image ID, not a manifest digest, so the
+					// entry derived from it can never match anything in the
+					// registry. Resolving ImageTag is not a rescue: if the tag
+					// has MOVED it resolves cleanly to a different digest while
+					// this container's own manifest stays unprotected, with no
+					// error anywhere. Fatal — recorded, then aborted after the
+					// sweep so an operator sees every offending container at
+					// once rather than one per run.
 					msg := fmt.Sprintf("%s/%s/%s: observed image %q is an image ID, not a manifest digest",
 						host, o.Slug, c.Name, c.Image)
 					if terr != nil {
@@ -233,16 +284,31 @@ func BuildInUseSet(ctx context.Context, hostSrc HostEnumerator, inv InventorySou
 					// behind it.
 					continue
 				}
-				d, _, err := resolveRef(ctx, reg, known, cfg.RegistryHost, s)
+				got, err := resolveRef(ctx, reg, known, ourHosts, s)
 				if err != nil {
 					return InUseSet{}, fmt.Errorf("%w: spec %s/%s/%s parameter %q: %v",
 						ErrUnsafeToPrune, host, k.Template, k.Slug, name, err)
 				}
-				if d != "" {
-					digests[d] = struct{}{}
+				if got.Digest != "" {
+					digests[got.Digest] = struct{}{}
+				}
+				if got.Foreign {
+					foreign[strings.TrimSpace(s)] = struct{}{}
 				}
 			}
 		}
+	}
+
+	// A running container whose image is an image ID rather than a manifest
+	// digest may have its real manifest unprotected, and the moved-tag case is
+	// undetectable from here. That is the #64 failure mode, so it is fatal
+	// rather than advisory — the field stays populated so an operator can see
+	// WHICH containers caused it. Verified safe on this fleet: 123 of 123
+	// running app containers carry a digest (engine-1/2/infra, 2026-08-07).
+	if len(nonDigest) > 0 {
+		return InUseSet{NonDigestObserved: nonDigest}, fmt.Errorf(
+			"%w: %d running container(s) report an image ID rather than a manifest digest: %s",
+			ErrUnsafeToPrune, len(nonDigest), strings.Join(nonDigest, "; "))
 	}
 
 	// Matches registry-gc.sh: a fleet-wide zero means the inputs are wrong, not
@@ -250,7 +316,12 @@ func BuildInUseSet(ctx context.Context, hostSrc HostEnumerator, inv InventorySou
 	if len(digests) == 0 {
 		return InUseSet{}, fmt.Errorf("%w: fleet-wide in-use digest count is zero", ErrUnsafeToPrune)
 	}
-	return InUseSet{Digests: digests, NonDigestObserved: nonDigest}, nil
+	skipped := make([]string, 0, len(foreign))
+	for r := range foreign {
+		skipped = append(skipped, r)
+	}
+	sort.Strings(skipped)
+	return InUseSet{Digests: digests, NonDigestObserved: nonDigest, ForeignSkipped: skipped}, nil
 }
 
 // isImageParam reports whether a render parameter name carries an image
@@ -269,22 +340,32 @@ func isImageParam(name string) bool {
 // error aborts the run — a ref quietly skipped is exactly the false negative
 // this package exists to prevent.
 //
-// covered reports whether the answer is trustworthy: true when a real manifest
-// digest was obtained, and true when the ref provably is not ours (nothing to
-// protect, nothing missed). It is false only for podman's algorithm-less image
-// ID, where the value returned cannot match any registry manifest and the
-// caller must record the gap.
-func resolveRef(ctx context.Context, reg ManifestResolver, known map[string]struct{}, registryHost, ref string) (digestOut string, covered bool, err error) {
+// refOutcome is what one image reference resolved to.
+type refOutcome struct {
+	// Digest is the manifest digest to protect, or "" when there is nothing
+	// here to protect.
+	Digest string
+	// Covered reports whether the answer is trustworthy: true when a real
+	// manifest digest was obtained, and true when the ref provably is not ours
+	// (nothing to protect, nothing missed). False only for podman's
+	// algorithm-less image ID, whose value cannot match any registry manifest.
+	Covered bool
+	// Foreign marks a ref skipped because it belongs to another registry, or to
+	// a repository this one does not host.
+	Foreign bool
+}
+
+func resolveRef(ctx context.Context, reg ManifestResolver, known map[string]struct{}, registryHosts []string, ref string) (refOutcome, error) {
 	ref = strings.TrimSpace(ref)
 	if ref == "" {
-		return "", false, errors.New("image reference is empty")
+		return refOutcome{}, errors.New("image reference is empty")
 	}
 	// podman's algorithm-less image ID (InspectContainerData.Image, used when
 	// ImageDigest is empty). Normalising it to sha256 form can only
 	// over-protect, which is free — but it is NOT a manifest digest, so it
 	// cannot count as coverage.
 	if bareImageIDRe.MatchString(strings.ToLower(ref)) {
-		return "sha256:" + strings.ToLower(ref), false, nil
+		return refOutcome{Digest: "sha256:" + strings.ToLower(ref)}, nil
 	}
 
 	name, tag, digest := splitRef(ref)
@@ -292,47 +373,47 @@ func resolveRef(ctx context.Context, reg ManifestResolver, known map[string]stru
 		// Already pinned: no registry round-trip, and nothing the registry
 		// could say would make us protect less.
 		if !imgregistry.IsDigestRef(digest) {
-			return "", false, fmt.Errorf("malformed digest in reference %q", ref)
+			return refOutcome{}, fmt.Errorf("malformed digest in reference %q", ref)
 		}
-		return digest, true, nil
+		return refOutcome{Digest: digest, Covered: true}, nil
 	}
 
-	repo, ours := repoFromName(name, registryHost)
+	repo, ours := repoFromName(name, registryHosts)
 	if !ours {
 		// Host-qualified to some other registry. It must NOT reach the catalog
 		// gate: stripping the host would derive a bare repo name that our
 		// registry may well also host ("postgres"), so the ref would be
 		// queried against us, 404, and abort every run until someone edited a
 		// spec — a self-inflicted deadlock.
-		return "", true, nil
+		return refOutcome{Covered: true, Foreign: true}, nil
 	}
 	if repo == "" {
-		return "", false, fmt.Errorf("cannot derive a repository from reference %q", ref)
+		return refOutcome{}, fmt.Errorf("cannot derive a repository from reference %q", ref)
 	}
 	if _, ok := known[repo]; !ok {
 		// Not a repository this registry hosts — nothing here to delete, so
 		// nothing to protect.
-		return "", true, nil
+		return refOutcome{Covered: true, Foreign: true}, nil
 	}
 	if tag == "" {
 		tag = "latest"
 	}
 	if !imgregistry.ValidRef(tag) || !imgregistry.ValidRepoName(repo) {
-		return "", false, fmt.Errorf("invalid repository/tag in reference %q", ref)
+		return refOutcome{}, fmt.Errorf("invalid repository/tag in reference %q", ref)
 	}
 	m, err := reg.Manifest(ctx, repo, tag)
 	if err != nil {
 		// Includes ErrNotFound: a tag we cannot resolve is a digest we cannot
 		// protect. Never "skip it".
-		return "", false, fmt.Errorf("resolving %s:%s: %w", repo, tag, err)
+		return refOutcome{}, fmt.Errorf("resolving %s:%s: %w", repo, tag, err)
 	}
 	if m.Digest == "" {
-		return "", false, fmt.Errorf("registry returned no digest for %s:%s", repo, tag)
+		return refOutcome{}, fmt.Errorf("registry returned no digest for %s:%s", repo, tag)
 	}
 	if !imgregistry.IsDigestRef(strings.ToLower(m.Digest)) {
-		return "", false, fmt.Errorf("registry returned a malformed digest %q for %s:%s", m.Digest, repo, tag)
+		return refOutcome{}, fmt.Errorf("registry returned a malformed digest %q for %s:%s", m.Digest, repo, tag)
 	}
-	return strings.ToLower(m.Digest), true, nil
+	return refOutcome{Digest: strings.ToLower(m.Digest), Covered: true}, nil
 }
 
 // splitRef breaks an image reference into its name portion (possibly
@@ -360,17 +441,27 @@ func splitRef(ref string) (name, tag, digest string) {
 // Catalog returns), and is still catalog-gated by the caller. The
 // host-vs-path-element test is the standard Docker heuristic, matching
 // internal/ui's repoFromImage and scripts/roll.py.
-func repoFromName(name, registryHost string) (repo string, ours bool) {
+func repoFromName(name string, registryHosts []string) (repo string, ours bool) {
 	if name == "" {
 		return "", true
 	}
-	isOurHost := func(h string) bool { return strings.EqualFold(h, registryHost) }
+	isOurHost := func(h string) bool {
+		for _, r := range registryHosts {
+			if strings.EqualFold(h, r) {
+				return true
+			}
+		}
+		return false
+	}
 	slash := strings.Index(name, "/")
 	if slash == -1 {
 		if looksLikeRegistryHost(name) {
-			// A bare host with no repository path: nothing addressable either
-			// way.
-			return "", isOurHost(name)
+			// A bare host with no repository path. Nothing is addressable
+			// either way, so the two arms agree: repo "" and ours=true, which
+			// the caller turns into "cannot derive a repository" — an error,
+			// not a silent skip. Reporting ours=false here would instead skip
+			// it silently.
+			return "", true
 		}
 		return name, true
 	}
@@ -385,4 +476,47 @@ func repoFromName(name, registryHost string) (repo string, ours bool) {
 
 func looksLikeRegistryHost(s string) bool {
 	return s == "localhost" || strings.ContainsAny(s, ".:")
+}
+
+// isPodInfra recognises a pod's infra container. It needs BOTH signals at once
+// — the name podman gives every infra container, and the total absence of image
+// information — so an ordinary container can never be mistaken for one and
+// skipped. Verified on podman 5.8.2 across engine-1/2/engine-infra
+// (2026-08-07): all 78 infra containers report an empty ImageDigest, Image and
+// ImageName and a "<podid>-infra" name; none of the 123 app containers does
+// either.
+func isPodInfra(c instance.ObservedContainer) bool {
+	return strings.HasSuffix(c.Name, "-infra") &&
+		strings.TrimSpace(c.Image) == "" &&
+		strings.TrimSpace(c.ImageTag) == ""
+}
+
+// normalizeRegistryHost canonicalises one configured spelling of our registry
+// into the bare host[:port] form that appears in an image reference, and
+// rejects anything that is not one.
+//
+// This is load-bearing, not tidying. The comparison it feeds decides whether a
+// ref is ours; a value that never compares equal — a trailing slash, a stray
+// space from an env var, or the "http://host:5000" BaseURL shape
+// imgregistry.NewHTTPClient takes — silently classifies EVERY one of our refs
+// as foreign. The fleet-wide-zero rule does not catch it, because
+// digest-pinned containers still populate the set, so the run proceeds and
+// deletes every manifest that was only reachable through a tag.
+func normalizeRegistryHost(raw string) (string, error) {
+	h := strings.ToLower(strings.TrimSpace(raw))
+	if i := strings.Index(h, "://"); i != -1 {
+		h = h[i+len("://"):]
+	}
+	h = strings.TrimRight(h, "/")
+	h = strings.TrimSpace(h)
+	if h == "" {
+		return "", errors.New("empty")
+	}
+	if strings.ContainsAny(h, "/") {
+		return "", errors.New("must be a bare host[:port], with no path")
+	}
+	if strings.ContainsFunc(h, unicode.IsSpace) {
+		return "", errors.New("must not contain whitespace")
+	}
+	return h, nil
 }
