@@ -21,8 +21,18 @@ type Pod struct {
 type Container struct {
 	ID       string
 	Name     string
-	Image    string // resolved digest, e.g. "docker.io/library/postgres@sha256:..."
-	ImageTag string // human-readable tag, e.g. "docker.io/library/postgres:16"
+	// Image is InspectContainerData.ImageDigest, which is
+	// image.Digest().String(): a BARE digest with no repository, e.g.
+	// "sha256:42283567cae4…". It is NOT the "repo@sha256:…" shape — measured
+	// across 34 non-infra containers on engine-1 (podman 5.8.2, 2026-08-07),
+	// 34/34. When podman has no digest, enrichContainer falls back to
+	// InspectContainerData.Image, a bare 64-hex image ID that is not a manifest
+	// digest at all; a consumer that must resolve against a registry has to
+	// distinguish the two.
+	Image string
+	// ImageTag is InspectContainerData.ImageName, the full reference:
+	// "host/repo:tag" (18/34 in the same survey) or "host/repo@sha256:…" (16/34).
+	ImageTag string
 	Status   string
 	// Health is the container's healthcheck status: "" when the container
 	// declares no healthcheck, otherwise "healthy" / "unhealthy" / "starting".

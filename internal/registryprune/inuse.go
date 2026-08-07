@@ -118,6 +118,44 @@ type Config struct {
 // InspectContainerData.Image carries when ImageDigest is empty).
 var bareImageIDRe = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
+// bareManifestDigestRe matches a bare content digest whose ALGORITHM is one
+// podman can actually emit. imgregistry.IsDigestRef is deliberately not enough
+// on its own here: its pattern accepts any lowercase-alphanumeric run as the
+// algorithm, so an unqualified "<repo>:<40-hex git sha>" — a common tagging
+// convention — matches it and would be claimed as a digest before the ref was
+// ever parsed, protecting a junk key that matches nothing while the manifest
+// the instance actually needs went unprotected and got deleted.
+//
+// InspectContainerData.ImageDigest is image.Digest().String(), which always
+// carries a registered algorithm, so narrowing to sha256/sha512 loses nothing
+// real and closes the ambiguity in the safe direction: an unrecognised
+// algorithm falls through to ordinary parsing, where an unresolvable ref
+// aborts rather than being silently trusted.
+var bareManifestDigestRe = regexp.MustCompile(`^sha(?:256|512):[a-f0-9]{32,}$`)
+
+// isBareManifestDigest reports whether ref is a bare digest (no repository)
+// that we are willing to trust as a manifest digest without parsing.
+func isBareManifestDigest(ref string) bool {
+	return bareManifestDigestRe.MatchString(ref) && imgregistry.IsDigestRef(ref)
+}
+
+// publicRegistryHosts are registry hosts that are, by construction, never ours.
+// They bound the wrong-registry-host rule below: see its comment.
+var publicRegistryHosts = map[string]struct{}{
+	"docker.io":            {},
+	"index.docker.io":      {},
+	"registry-1.docker.io": {},
+	"quay.io":              {},
+	"ghcr.io":              {},
+	"gcr.io":               {},
+	"registry.k8s.io":      {},
+	"k8s.gcr.io":           {},
+	"public.ecr.aws":       {},
+	"mcr.microsoft.com":    {},
+	"registry.gitlab.com":  {},
+	"codeberg.org":         {},
+}
+
 // BuildInUseSet computes the fleet-wide set of digests that must be protected
 // from deletion. It is the union of two sources:
 //
@@ -335,6 +373,17 @@ func BuildInUseSet(ctx context.Context, hostSrc HostEnumerator, inv InventorySou
 	// so nothing else fires. Closing the class: if anything was host-qualified
 	// and none of it was ours, the configuration is wrong, not the fleet. A
 	// sweep with no qualified refs at all is not evidence either way.
+	//
+	// The tally deliberately EXCLUDES refs qualified to a well-known public
+	// registry (docker.io, quay.io, …). Without that exclusion a fleet whose
+	// only host-qualified refs are third-party sidecars — bare-digest observed
+	// images plus a "docker.io/library/postgres:16" parameter, which is a
+	// perfectly ordinary and correct configuration — aborts every run forever,
+	// and nothing an operator can do short of editing a spec clears it. A
+	// public-registry ref is not evidence about our own registry's spelling in
+	// either direction, so it belongs in neither side of the ratio. Every
+	// PRIVATE qualified ref still counts, which is where a stale or mistyped
+	// host actually shows up.
 	if qualifiedSeen > 0 && qualifiedMatched == 0 {
 		return InUseSet{}, fmt.Errorf(
 			"%w: no host-qualified image reference matched a configured registry host %v, out of %d qualified references seen",
@@ -412,14 +461,24 @@ func resolveRef(ctx context.Context, reg ManifestResolver, known map[string]stru
 	// Parsing it as a reference yields repo "sha256", which is in no catalog,
 	// so it would be discarded as foreign and the observed half would protect
 	// nothing at all.
-	if imgregistry.IsDigestRef(strings.ToLower(ref)) {
+	//
+	// Gated on a KNOWN digest algorithm, not on digest-shape alone — see
+	// bareManifestDigestRe.
+	if isBareManifestDigest(strings.ToLower(ref)) {
 		return refOutcome{Digest: strings.ToLower(ref), Covered: true}, nil
 	}
 
 	name, tag, digest := splitRef(ref)
 	if h := hostComponent(name); h != "" {
-		out.Qualified = true
-		out.HostMatched = isOurHost(h, registryHosts)
+		// Only refs that COULD have been ours count toward the
+		// wrong-registry-host tally. A ref qualified to a well-known public
+		// registry says nothing about how our own registry is spelled, so
+		// counting it would turn a perfectly correct configuration into a
+		// permanent abort — see the rule's own comment in BuildInUseSet.
+		if _, public := publicRegistryHosts[strings.ToLower(h)]; !public {
+			out.Qualified = true
+			out.HostMatched = isOurHost(h, registryHosts)
+		}
 	}
 	if digest != "" {
 		// Already pinned: no registry round-trip, and nothing the registry

@@ -165,6 +165,11 @@ func mustAbort(t *testing.T, set InUseSet, err error) {
 	if len(set.Digests) != 0 {
 		t.Fatalf("aborting run must return an empty set, got %d digests: %v", len(set.Digests), set.Digests)
 	}
+	// Valid is documented as the one thing a caller checks before deleting, so
+	// an abort that left it true would defeat every other guard here.
+	if set.Valid {
+		t.Fatal("aborting run must return Valid=false; a caller checking only Valid would proceed to delete")
+	}
 }
 
 func hasDigest(t *testing.T, set InUseSet, d string) {
@@ -198,7 +203,7 @@ func TestBuildInUseSet_SpecOnlyDigestIsProtected(t *testing.T) {
 
 func TestBuildInUseSet_UnionsObservedAndSpecSources(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1": {obs: []instance.Observed{obs("engine", "acme", "reg.example:5000/engine@"+digA)}, fresh: freshOK()},
+		"engine-1": {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
 	}}
 	specs := &fakeSpecs{
 		keys: map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
@@ -227,7 +232,7 @@ func TestBuildInUseSet_UnionsObservedAndSpecSources(t *testing.T) {
 
 func TestBuildInUseSet_DigestPinnedRefNeedsNoRegistryRoundTrip(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1": {obs: []instance.Observed{obs("engine", "acme", "reg.example:5000/engine@"+digA)}, fresh: freshOK()},
+		"engine-1": {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
 	}}
 	specs := &fakeSpecs{
 		keys: map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
@@ -438,23 +443,29 @@ func TestBuildInUseSet_AbortsOnBareHexImageID(t *testing.T) {
 }
 
 // Digests are compared case-insensitively-normalised so an upper-case hex ref
-// cannot slip past a lower-case protected entry.
+// cannot slip past a lower-case protected entry. The observed image is a BARE
+// digest (the measured production shape) with no ImageTag behind it, so the
+// only code path that can produce the lower-case entry is the bare-digest
+// branch — the "@"-split path is not available to rescue it.
 func TestBuildInUseSet_NormalisesDigestCase(t *testing.T) {
 	upper := "SHA256:AAAA000000000000000000000000000000000000000000000000000000000001"
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1": {obs: []instance.Observed{obs("engine", "acme", "reg.example:5000/engine@"+upper)}, fresh: freshOK()},
+		"engine-1": {obs: []instance.Observed{obs("engine", "acme", upper)}, fresh: freshOK()},
 	}}
 	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, &fakeSpecs{}, &fakeReg{catalog: []string{"engine"}}, baseCfg())
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	hasDigest(t, set, digA)
+	if len(set.Digests) != 1 {
+		t.Fatalf("want exactly the normalised digest, got %v", set.Digests)
+	}
 }
 
 // An empty *_image parameter pins nothing — it is not an unresolvable ref.
 func TestBuildInUseSet_EmptyImageParameterIsNotAnAbort(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1": {obs: []instance.Observed{obs("engine", "acme", "reg.example:5000/engine@"+digA)}, fresh: freshOK()},
+		"engine-1": {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
 	}}
 	specs := &fakeSpecs{
 		keys: map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
@@ -802,25 +813,31 @@ func TestBuildInUseSet_NormalisesRegistryHostSpelling(t *testing.T) {
 
 // A registry host that is still not a bare host after normalisation is
 // rejected outright, not accepted-and-hoped.
+//
+// Each case asserts the message of ITS OWN check, not the shared "registry
+// host" prefix: rule 4's abort ("no host-qualified image reference matched a
+// configured registry host …") contains that prefix too, so a substring
+// assertion on it passes even when the check under test has been deleted
+// entirely.
 func TestBuildInUseSet_RejectsMalformedRegistryHost(t *testing.T) {
-	for _, spelling := range []string{
-		"reg.example:5000/some/path",
-		"reg example:5000", // whitespace INSIDE the host, not around it
-		"reg.example:5000\tx",
-		"   ",
-		"",
-		"http://",
+	for _, tc := range []struct{ spelling, wantMsg string }{
+		{"reg.example:5000/some/path", "with no path"},
+		{"reg example:5000", "must not contain whitespace"}, // whitespace INSIDE the host, not around it
+		{"reg.example:5000\tx", "must not contain whitespace"},
+		{"   ", "empty"},
+		{"", "empty"},
+		{"http://", "empty"},
 	} {
-		t.Run(spelling, func(t *testing.T) {
+		t.Run(tc.spelling, func(t *testing.T) {
 			inv, specs, reg := tagOnlyFleet()
 			cfg := baseCfg()
-			cfg.RegistryHosts = []string{spelling}
+			cfg.RegistryHosts = []string{tc.spelling}
 			set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, cfg)
 			mustAbort(t, set, err)
 			// Must be rejected AS A CONFIG ERROR, not stumbled into via the
-			// fleet-wide-zero rule, which would also fire here.
-			if !strings.Contains(err.Error(), "registry host") {
-				t.Fatalf("want a registry-host config error, got %v", err)
+			// fleet-wide-zero rule or rule 4, both of which also fire here.
+			if !strings.Contains(err.Error(), "registry host") || !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Fatalf("want a registry-host error containing %q, got %v", tc.wantMsg, err)
 			}
 		})
 	}
@@ -834,8 +851,8 @@ func TestBuildInUseSet_RejectsMalformedAliasAmongGoodOnes(t *testing.T) {
 	cfg.RegistryHosts = []string{"reg.example:5000", "reg.example/oops"}
 	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, cfg)
 	mustAbort(t, set, err)
-	if !strings.Contains(err.Error(), "registry host") {
-		t.Fatalf("want a registry-host config error, got %v", err)
+	if !strings.Contains(err.Error(), `"reg.example/oops"`) || !strings.Contains(err.Error(), "with no path") {
+		t.Fatalf("want the bad alias named with its own path error, got %v", err)
 	}
 }
 
@@ -1005,23 +1022,55 @@ func TestBuildInUseSet_NoQualifiedRefsAtAllDoesNotTripTheMatchRule(t *testing.T)
 // host component of a reference is rejected: looksLikeRegistryHost is the
 // property matching actually depends on, so anything failing it silently
 // classifies every ref as foreign.
+//
+// The "myreg" case is why this check cannot be left to rule 4: with
+// RegistryHosts=["myreg"] and refs spelled "myreg/engine:v9", hostComponent
+// refuses to see "myreg" as a host at all, so the ref is never Qualified, rule
+// 4 stays silent, the catalog gate misses, and the ref is skipped as foreign —
+// while one digest-pinned container elsewhere keeps the fleet-wide count
+// non-zero. Hence the per-case message assertions.
 func TestBuildInUseSet_RejectsRegistryHostThatCannotAppearInARef(t *testing.T) {
-	for _, spelling := range []string{
-		"myreg",                 // no ".", no ":", not localhost
-		"user@reg.example:5000", // userinfo
-		"reg.example:5000?x=1",  // query
-		"reg.example:5000#frag", // fragment
+	for _, tc := range []struct{ spelling, wantMsg string }{
+		{"myreg", "can never be the host component"},             // no ".", no ":", not localhost
+		{"user@reg.example:5000", "userinfo, query or fragment"}, // userinfo
+		{"reg.example:5000?x=1", "userinfo, query or fragment"},  // query
+		{"reg.example:5000#frag", "userinfo, query or fragment"}, // fragment
 	} {
-		t.Run(spelling, func(t *testing.T) {
+		t.Run(tc.spelling, func(t *testing.T) {
 			inv, specs, reg := tagOnlyFleet()
 			cfg := baseCfg()
-			cfg.RegistryHosts = []string{spelling}
+			cfg.RegistryHosts = []string{tc.spelling}
 			set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, cfg)
 			mustAbort(t, set, err)
-			if !strings.Contains(err.Error(), "registry host") {
-				t.Fatalf("want a registry-host config error, got %v", err)
+			if !strings.Contains(err.Error(), "registry host") || !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Fatalf("want a registry-host error containing %q, got %v", tc.wantMsg, err)
 			}
 		})
+	}
+}
+
+// The looksLikeRegistryHost rejection above is load-bearing in a case rule 4
+// structurally cannot reach. Without it, "myreg" is accepted, every
+// "myreg/engine:v9" ref is skipped as foreign (hostComponent does not see
+// "myreg" as a host, so Qualified is never set), and a single digest-pinned
+// container keeps the fleet-wide count non-zero — the run proceeds and deletes
+// the manifest behind every tag.
+func TestBuildInUseSet_UnhostlikeRegistryHostIsNotCaughtByAnyOtherRule(t *testing.T) {
+	inv := &fakeInv{hosts: map[string]invEntry{
+		// One digest-pinned container: enough to defeat the fleet-wide-zero rule.
+		"engine-1": {obs: []instance.Observed{obs("engine", "acme", digB)}, fresh: freshOK()},
+	}}
+	specs := &fakeSpecs{
+		keys:  map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+		specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{"image": "myreg/engine:v9"}}},
+	}
+	reg := &fakeReg{catalog: []string{"engine"}, manifests: map[string]string{"engine:v9": digA}}
+	cfg := baseCfg()
+	cfg.RegistryHosts = []string{"myreg"}
+	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, cfg)
+	mustAbort(t, set, err)
+	if !strings.Contains(err.Error(), "can never be the host component") {
+		t.Fatalf("only the looksLikeRegistryHost check can catch this; got %v", err)
 	}
 }
 
@@ -1095,4 +1144,139 @@ func TestBuildInUseSet_AbortsOnImagelessAppContainerNamedInfra(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{"engine-1": {obs: []instance.Observed{o}, fresh: freshOK()}}}
 	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, &fakeSpecs{}, &fakeReg{catalog: []string{"engine"}}, baseCfg())
 	mustAbort(t, set, err)
+}
+
+// --- review round 4 ---------------------------------------------------------
+
+// CRITICAL: the bare-digest short-circuit must recognise a MANIFEST digest,
+// not merely "something matching imgregistry's digestRe". That pattern's
+// algorithm part is any lowercase alphanumeric run, so an unqualified
+// "<repo>:<40-hex git sha>" — a very common tagging convention — matches it and
+// is claimed as a digest before splitRef ever runs.
+//
+// Probed against the pre-fix code: err=nil, Valid=true, and the protected set
+// was literally map["engine:9b2c3d4e…"] with ZERO registry calls. Nothing else
+// fires: the ref is unqualified so rule 4 sees nothing, the map is non-empty so
+// the fleet-wide-zero rule is satisfied, and the outcome is Covered so no gap
+// is recorded. The manifest that instance actually needs goes unprotected and
+// is deleted.
+func TestBuildInUseSet_UnqualifiedGitShaTagIsNotAManifestDigest(t *testing.T) {
+	const ref = "engine:9b2c3d4e5f60718293a4b5c6d7e8f90123456789" // 40-hex git sha as a TAG
+	inv := &fakeInv{hosts: map[string]invEntry{"engine-1": {fresh: freshOK()}}}
+	specs := &fakeSpecs{
+		keys:  map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+		specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{"image": ref}}},
+	}
+	reg := &fakeReg{catalog: []string{"engine"}, manifests: map[string]string{ref: digA}}
+
+	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, baseCfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	hasDigest(t, set, digA)
+	if reg.calls != 1 {
+		t.Fatalf("a tag must be resolved through the registry, got %d Manifest calls", reg.calls)
+	}
+	if _, ok := set.Digests[ref]; ok {
+		t.Fatalf("the reference itself was protected as if it were a digest: %v", set.Digests)
+	}
+}
+
+// The host-qualified spelling of the same tag was never affected — the "/"
+// breaks digestRe before the algorithm part can match. Probed (calls=1,
+// digest resolved) rather than assumed, and pinned here so a future
+// "simplification" of the gate cannot quietly change it.
+func TestBuildInUseSet_QualifiedGitShaTagResolvesThroughTheRegistry(t *testing.T) {
+	const tag = "9b2c3d4e5f60718293a4b5c6d7e8f90123456789"
+	inv := &fakeInv{hosts: map[string]invEntry{"engine-1": {fresh: freshOK()}}}
+	specs := &fakeSpecs{
+		keys: map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+		specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{
+			"image": testRegistryHost + "/engine:" + tag,
+		}}},
+	}
+	reg := &fakeReg{catalog: []string{"engine"}, manifests: map[string]string{"engine:" + tag: digA}}
+
+	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, baseCfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	hasDigest(t, set, digA)
+	if reg.calls != 1 {
+		t.Fatalf("want 1 Manifest call, got %d", reg.calls)
+	}
+}
+
+// A digest whose algorithm is neither sha256 nor sha512 is not something
+// podman's ImageDigest (image.Digest().String(), always a registered
+// algorithm) can produce, so it must go down the ordinary parsing path rather
+// than be trusted as a bare digest.
+func TestBuildInUseSet_UnknownDigestAlgorithmIsNotTrustedAsABareDigest(t *testing.T) {
+	const ref = "md5:" + "aaaa000000000000000000000000000000000000000000000000000000000001"
+	inv := &fakeInv{hosts: map[string]invEntry{"engine-1": {fresh: freshOK()}}}
+	specs := &fakeSpecs{
+		keys:  map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+		specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{"image": ref}}},
+	}
+	// "md5" is not in the catalog, so the ordinary path classifies it foreign —
+	// and the fleet-wide-zero rule then aborts. Either way it must NOT end up
+	// protected verbatim.
+	reg := &fakeReg{catalog: []string{"engine"}}
+	set, _ := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, baseCfg())
+	if _, ok := set.Digests[ref]; ok {
+		t.Fatalf("an unknown-algorithm ref was trusted as a manifest digest: %v", set.Digests)
+	}
+}
+
+// Rule 4 (nothing host-qualified matched our registry) exists to catch a
+// configured host that is stale or a typo. A ref qualified to a well-known
+// PUBLIC registry is no evidence either way about how our own registry is
+// spelled, so counting it turns a correct configuration into a permanent
+// block that no operator action short of editing a spec clears.
+//
+// Probed on the pre-fix code: a bare-digest observed image + one
+// "docker.io/library/postgres:16" sidecar parameter gave qualifiedSeen=1,
+// qualifiedMatched=0 and aborted.
+func TestBuildInUseSet_PublicRegistryRefsAloneDoNotTripTheMatchRule(t *testing.T) {
+	inv := &fakeInv{hosts: map[string]invEntry{
+		"engine-1": {obs: []instance.Observed{obs("engine", "acme", digA)}, fresh: freshOK()},
+	}}
+	specs := &fakeSpecs{
+		keys: map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+		specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{
+			"pg_image":  "docker.io/library/postgres:16",
+			"ls_image":  "quay.io/litestream/litestream:0.5.15",
+			"cbg_image": "codeberg.org/example/thing:1",
+		}}},
+	}
+	reg := &fakeReg{catalog: []string{"engine", "postgres"}}
+	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, baseCfg())
+	if err != nil {
+		t.Fatalf("a fleet whose only qualified refs are public must not abort: %v", err)
+	}
+	hasDigest(t, set, digA)
+}
+
+// The carve-out above must not blunt the rule: a ref qualified to a
+// NON-public host that does not match our configured one is still the
+// misconfiguration signal, and still aborts.
+func TestBuildInUseSet_PrivateWrongHostStillTripsTheMatchRule(t *testing.T) {
+	inv := &fakeInv{hosts: map[string]invEntry{
+		"engine-1": {obs: []instance.Observed{obs("engine", "acme", digA)}, fresh: freshOK()},
+	}}
+	specs := &fakeSpecs{
+		keys: map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+		specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{
+			"image":    "reg.example:5000/engine:v9",
+			"pg_image": "docker.io/library/postgres:16",
+		}}},
+	}
+	cfg := baseCfg()
+	cfg.RegistryHosts = []string{"reg2.example:5000"} // well-formed, and wrong
+	reg := &fakeReg{catalog: []string{"engine"}, manifests: map[string]string{"engine:v9": digB}}
+	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, cfg)
+	mustAbort(t, set, err)
+	if !strings.Contains(err.Error(), "no host-qualified") {
+		t.Fatalf("want the no-match rule, got %v", err)
+	}
 }
