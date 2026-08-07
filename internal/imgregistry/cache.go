@@ -36,9 +36,11 @@ func cloneListing(l TagListing) TagListing {
 	}
 }
 
-// CachingClient wraps a Client and caches its Tags() results for ttl, since
-// Tags is the one call expensive enough to matter — for the fleet's "engine"
-// repo, ~1000 manifest GETs plus 737 config-blob GETs, ~21s on a cold cache.
+// CachingClient wraps a Client and caches its ResolveTags() listings for ttl,
+// since resolving a repo's tags is the one call expensive enough to matter —
+// for the fleet's "engine" repo, ~1000 manifest GETs plus 737 config-blob
+// GETs, ~21s on a cold cache. Tags() is served from that same entry, so the
+// two can never disagree about a repo.
 // The list page (internal/ui/handlers_registry.go) fires this once per
 // catalog repo, concurrently, on every single page view — without a cache
 // that's the full per-repo cost paid ~26 times on every visit. With it, only
@@ -56,9 +58,9 @@ func cloneListing(l TagListing) TagListing {
 // list call), and Manifest is one lookup for one digest — caching it would
 // buy little while adding another thing that could go stale.
 //
-// Only a successful Tags() result is cached (see Tags below) — a transient
-// registry blip must not poison every viewer's list page for the rest of the
-// TTL.
+// Only a successful ResolveTags() listing is cached (see ResolveTags below) —
+// a transient registry blip must not poison every viewer's list page for the
+// rest of the TTL.
 type CachingClient struct {
 	inner Client
 	ttl   time.Duration

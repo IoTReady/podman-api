@@ -361,10 +361,35 @@ func (h *Handler) classifyAll(ctx context.Context, jc *jobs.JobContext, repos []
 			jc.Step("classify:"+repo, "ABORTED: "+err.Error())
 			return nil, nil, fmt.Errorf("list tags for %s (aborting before any delete): %w", repo, err)
 		}
+		// A drop whose cause is ErrNotFound is the ONE benign kind: the
+		// registry was asked (with an Accept set that cannot be unsatisfied —
+		// imgregistry HEADs as a last resort) and answered that the tag does
+		// not exist. A tag that no longer exists protects nothing, so its
+		// absence from the listing is the correct view, not a hole in one.
+		// Aborting on it would cost a whole fleet-wide run plus an hour of
+		// scheduler backoff every time CI deletes a tag mid-run. Every other
+		// cause still aborts: imgregistry never collapses ErrNotFound into
+		// ErrUnreachable, so this distinction is free and exact.
 		if len(listing.Dropped) > 0 {
-			err := fmt.Errorf("%w: %s", ErrUnsafeToPrune, describeDrops(repo, listing.Dropped))
-			jc.Step("classify:"+repo, "ABORTED: "+err.Error())
-			return nil, nil, err
+			var hard []imgregistry.DroppedTag
+			var vanished []string
+			for _, d := range listing.Dropped {
+				if errors.Is(d.Err, imgregistry.ErrNotFound) {
+					vanished = append(vanished, d.Tag)
+					continue
+				}
+				hard = append(hard, d)
+			}
+			if len(vanished) > 0 {
+				jc.Step("vanished:"+repo, fmt.Sprintf(
+					"%d tag(s) were deleted from the registry between listing and resolution and are correctly absent from this run's view: %s",
+					len(vanished), listSample(vanished)))
+			}
+			if len(hard) > 0 {
+				err := fmt.Errorf("%w: %s", ErrUnsafeToPrune, describeDrops(repo, hard))
+				jc.Step("classify:"+repo, "ABORTED: "+err.Error())
+				return nil, nil, err
+			}
 		}
 		groups := listing.Groups
 		listings[repo] = groups
@@ -418,7 +443,9 @@ func (h *Handler) classifyAll(ctx context.Context, jc *jobs.JobContext, repos []
 	return plan, protected, nil
 }
 
-// describeDrops explains an aborted run to an operator.
+// describeDrops explains an aborted run to an operator. It is only ever handed
+// the drops that are NOT ErrNotFound — a tag the registry says is gone is
+// benign and recorded separately (see classifyAll).
 //
 // A dropped tag is the client failing to resolve a manifest and carrying on
 // (client.go: the `if r.err != nil` arm of ResolveTags' grouping pass), which

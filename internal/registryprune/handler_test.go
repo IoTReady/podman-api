@@ -969,29 +969,6 @@ func TestPayloadRoundTripsThroughJobArgs(t *testing.T) {
 // Review round 3.
 // ---------------------------------------------------------------------------
 
-// The drop signal is about the CLIENT degrading, never about the world
-// changing. A tag pushed or deleted between two observations is normal and must
-// not abort — the count-comparison this replaced could not tell the two apart,
-// and a registry with ordinary tag churn would have stalled pruning
-// indefinitely behind the scheduler's 1h failure backoff.
-func TestRun_ConcurrentTagChurnDoesNotAbort(t *testing.T) {
-	reg := &fakeClient{
-		catalogs: [][]string{{"engine"}},
-		tags: map[string][]imgregistry.TagGroup{
-			// More groups than any earlier observation would have counted, and
-			// fewer than a later one: nothing was dropped, so nothing aborts.
-			"engine": {orphanGroup(digD, "abc1234"), orphanGroup(digE, "beef123")},
-		},
-	}
-	h := newHandler(t, reg)
-	if _, _, err := runJob(t, h, Payload{Policy: testPolicy()}); err != nil {
-		t.Fatalf("ordinary tag churn must not abort the run: %v", err)
-	}
-	if len(reg.deletes) != 2 {
-		t.Fatalf("want both orphans deleted, got %v", reg.deletes)
-	}
-}
-
 // Important B. The cross-repo protected-digest seeding is load-bearing and was
 // untested: digD is reachable via "latest" in otp and only via a bare-hex tag
 // in engine. Without the seeding, engine's group classifies sha-orphan and the
@@ -1129,6 +1106,14 @@ func (m *mutableRegistry) push(g imgregistry.TagGroup) {
 
 // The production wiring hazard, end to end against a REAL CachingClient.
 //
+// The drop signal is about the CLIENT degrading, never about the world
+// changing. A tag pushed or deleted between two observations is normal and must
+// not abort — the count-comparison this replaced could not tell the two apart,
+// and a registry with ordinary tag churn would have stalled pruning
+// indefinitely behind the scheduler's 1h failure backoff. This is the test that
+// holds that property for a push (see TestRun_ConcurrentlyDeletedTagDoesNotAbort
+// for a deletion).
+//
 // server.go builds exactly one registry client and it is a CachingClient:
 // Tags is cached for 5 minutes (and the registry UI warms that cache on every
 // page view) while TagCount is a live pass-through. Any completeness decision
@@ -1156,4 +1141,97 @@ func TestRun_CachingClientPushMidWindowDoesNotAbort(t *testing.T) {
 	if inner.tagCountCalls != 0 {
 		t.Fatalf("completeness must come from the listing itself, not a second count call (%d made)", inner.tagCountCalls)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Review round 4.
+// ---------------------------------------------------------------------------
+
+// Important 2. A tag deleted between tags/list and its manifest fetch resolves
+// ErrNotFound and lands in Dropped — and aborting on it costs a whole
+// fleet-wide run plus an hour of scheduler backoff, for an event that is
+// routine on a registry with active CI. It is safe by construction: the
+// registry was asked with an Accept set that cannot be unsatisfied (imgregistry
+// HEADs as a last resort) and said the tag is gone, so a tag that no longer
+// exists protects nothing and its absence IS the correct view. Every other drop
+// cause still aborts — see TestRun_IncompleteTagListingAbortsBeforeAnyDelete.
+func TestRun_ConcurrentlyDeletedTagDoesNotAbort(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine"}},
+		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
+		dropped: map[string][]imgregistry.DroppedTag{
+			"engine": {{Tag: "feat-gone", Err: fmt.Errorf("manifest engine/feat-gone: %w", imgregistry.ErrNotFound)}},
+		},
+	}
+	h := newHandler(t, reg)
+	_, job, err := runJob(t, h, Payload{Policy: testPolicy()})
+	if err != nil {
+		t.Fatalf("a concurrently DELETED tag must not abort the run: %v", err)
+	}
+	if len(reg.deletes) != 1 {
+		t.Fatalf("the run must still prune, got %v", reg.deletes)
+	}
+	// Recorded, not silent: an operator reading the job needs to see which
+	// tags the run never got to look at.
+	wantStepContaining(t, job, "feat-gone")
+}
+
+// The converse, and the reason the split is by error KIND rather than by
+// "were there any resolvable tags": one benign drop alongside one unreadable
+// manifest must still abort. A handler that proceeded because SOME drop was
+// benign would delete from a listing with a real hole in it.
+func TestRun_BenignDropAlongsideAnUnreadableOneStillAborts(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine"}},
+		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
+		dropped: map[string][]imgregistry.DroppedTag{
+			"engine": {
+				{Tag: "feat-gone", Err: fmt.Errorf("manifest engine/feat-gone: %w", imgregistry.ErrNotFound)},
+				{Tag: "latest", Err: fmt.Errorf("manifest engine/latest: %w", imgregistry.ErrUnreachable)},
+			},
+		},
+	}
+	h := newHandler(t, reg)
+	_, job, err := runJob(t, h, Payload{Policy: testPolicy()})
+	if !errors.Is(err, ErrUnsafeToPrune) {
+		t.Fatalf("an unreadable tag must abort even alongside a benign drop, got %v", err)
+	}
+	wantNoDeletes(t, reg)
+	// The abort must name the tag that caused it, not the benign one.
+	if !strings.Contains(stepText(job), "ABORTED") || !strings.Contains(stepText(job), "latest") {
+		t.Fatalf("the abort must name the unreadable tag; steps were:\n%s", stepText(job))
+	}
+}
+
+// Minor 1. recordSetDiagnostics runs BEFORE the error check on the recheck
+// build as well as the first one, and only the first ordering was pinned.
+// NonDigestObserved is populated exclusively on an abort path, and the recheck
+// abort is precisely where an operator needs to know which running containers
+// went unprotected — moving the call below the error check would lose that
+// silently while the suite stayed green.
+func TestRun_RecordsRecheckDiagnosticsOnAbort(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine"}},
+		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
+	}
+	h := newHandler(t, reg)
+	calls := 0
+	h.buildSet = func(context.Context) (InUseSet, error) {
+		calls++
+		if calls == 1 {
+			return InUseSet{Valid: true, Digests: map[string]struct{}{digA: {}}}, nil
+		}
+		// The second build fails AND carries diagnostics — exactly what
+		// BuildInUseSet's abort path returns: a populated struct plus an error.
+		return InUseSet{
+				NonDigestObserved: []string{"engine-1 engine/valvo image id " + strings.Repeat("a", 64)},
+			},
+			fmt.Errorf("%w: host engine-1 unreachable", ErrUnsafeToPrune)
+	}
+	_, job, err := runJob(t, h, Payload{Policy: testPolicy()})
+	if err == nil {
+		t.Fatal("a failed recheck build must fail the run")
+	}
+	wantNoDeletes(t, reg)
+	wantStepContaining(t, job, "non-digest")
 }

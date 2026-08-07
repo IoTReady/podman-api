@@ -713,3 +713,167 @@ func TestHTTPClient_ResolveTags_ReportsNoDropsWhenComplete(t *testing.T) {
 		t.Fatalf("a complete listing must report no drops, got %+v", listing.Dropped)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Review round 4: the HEAD fallback.
+// ---------------------------------------------------------------------------
+
+// A manifest whose stored media type is outside manifestAccept is answered
+// 404 MANIFEST_UNKNOWN by distribution — byte-identical to "this tag does not
+// exist". The fleet's registry mirrors third-party images whose older tags are
+// still schema1, and a caller that DELETES treats an unresolvable tag as a
+// reason to abort the whole fleet-wide run: one such tag would wedge pruning
+// silently, behind an hour of backoff. Protection needs only the digest, so
+// the last resort is HEAD with an Accept set that cannot be unsatisfied.
+func TestHTTPClient_ResolveTags_LegacyManifestResolvedByHEAD(t *testing.T) {
+	var headAccept string
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/engine/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"name":"engine","tags":["legacy"]}`))
+	})
+	mux.HandleFunc("/v2/engine/manifests/legacy", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			headAccept = r.Header.Get("Accept")
+			w.Header().Set("Docker-Content-Digest", "sha256:legacydigest")
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		// GET with a negotiated Accept set: the registry cannot satisfy it.
+		http.Error(w, `{"errors":[{"code":"MANIFEST_UNKNOWN"}]}`, http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	listing, err := NewHTTPClient(srv.URL, Auth{Mode: "none"}).ResolveTags(context.Background(), "engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Dropped) != 0 {
+		t.Fatalf("a tag resolvable by HEAD must not be reported as dropped, got %+v", listing.Dropped)
+	}
+	if len(listing.Groups) != 1 || listing.Groups[0].Digest != "sha256:legacydigest" ||
+		listing.Groups[0].Tags[0] != "legacy" {
+		t.Fatalf("expected the tag grouped under its HEAD digest, got %+v", listing.Groups)
+	}
+	// Created is deliberately zero: no config blob was fetched. Callers that
+	// act on age treat zero as unknown and decline to act.
+	if !listing.Groups[0].Created.IsZero() {
+		t.Fatalf("a HEAD-resolved group must carry no Created, got %v", listing.Groups[0].Created)
+	}
+	if headAccept != "*/*" {
+		t.Fatalf("the fallback must not negotiate a media type; Accept was %q", headAccept)
+	}
+}
+
+// The fail-closed half. A registry that cannot answer at all must still
+// produce a drop, and one classified ErrUnreachable — the caller aborts on
+// that, and must NOT read it as "already gone".
+func TestHTTPClient_ResolveTags_HEADFailureStillDrops(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/engine/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"name":"engine","tags":["bad"]}`))
+	})
+	mux.HandleFunc("/v2/engine/manifests/bad", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	listing, err := NewHTTPClient(srv.URL, Auth{Mode: "none"}).ResolveTags(context.Background(), "engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Dropped) != 1 || listing.Dropped[0].Tag != "bad" {
+		t.Fatalf("an unreadable tag must still be dropped, got %+v", listing.Dropped)
+	}
+	if !errors.Is(listing.Dropped[0].Err, ErrUnreachable) {
+		t.Fatalf("want ErrUnreachable, got %v", listing.Dropped[0].Err)
+	}
+	if errors.Is(listing.Dropped[0].Err, ErrNotFound) {
+		t.Fatalf("a 500 must never read as not-found: %v", listing.Dropped[0].Err)
+	}
+}
+
+// A 2xx HEAD with no Docker-Content-Digest is not an answer. Recording it as a
+// resolution would put an empty digest into a group; treating it as "gone"
+// would be the unsafe direction. It is ErrUnreachable.
+func TestHTTPClient_ResolveTags_HEADWithoutDigestHeaderDrops(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/engine/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"name":"engine","tags":["odd"]}`))
+	})
+	mux.HandleFunc("/v2/engine/manifests/odd", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.WriteHeader(http.StatusOK) // no digest header
+			return
+		}
+		http.Error(w, "nope", http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	listing, err := NewHTTPClient(srv.URL, Auth{Mode: "none"}).ResolveTags(context.Background(), "engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Dropped) != 1 || !errors.Is(listing.Dropped[0].Err, ErrUnreachable) {
+		t.Fatalf("want one ErrUnreachable drop, got %+v", listing.Dropped)
+	}
+}
+
+// A tag genuinely deleted between the tags/list call and its manifest fetch
+// must be dropped as ErrNotFound, NOT ErrUnreachable. The prune handler treats
+// exactly this case as benign and proceeds; conflating it with an unreadable
+// manifest would either abort every run that races a tag deletion, or — the
+// unsafe direction — let an unreadable manifest look gone.
+func TestHTTPClient_ResolveTags_DeletedTagDropsAsNotFound(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/engine/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"name":"engine","tags":["gone"]}`))
+	})
+	mux.HandleFunc("/v2/engine/manifests/gone", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"errors":[{"code":"MANIFEST_UNKNOWN"}]}`, http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	listing, err := NewHTTPClient(srv.URL, Auth{Mode: "none"}).ResolveTags(context.Background(), "engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Dropped) != 1 || listing.Dropped[0].Tag != "gone" {
+		t.Fatalf("want the deleted tag reported, got %+v", listing.Dropped)
+	}
+	if !errors.Is(listing.Dropped[0].Err, ErrNotFound) {
+		t.Fatalf("want ErrNotFound after HEAD also 404s, got %v", listing.Dropped[0].Err)
+	}
+	if errors.Is(listing.Dropped[0].Err, ErrUnreachable) {
+		t.Fatalf("a genuine 404 must not read as unreachable: %v", listing.Dropped[0].Err)
+	}
+}
+
+// manifestAccept must name the legacy schema1 and OCI artifact types. Without
+// them the GET path 404s on manifests that exist, and every such tag falls
+// through to the HEAD fallback — correct, but it means the primary path never
+// yields a Created timestamp for them.
+func TestManifestAcceptCoversLegacyAndArtifactMediaTypes(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("Accept")
+		w.Header().Set("Docker-Content-Digest", "sha256:x")
+		w.Write([]byte(`{"config":{"digest":"sha256:c","size":1},"layers":[]}`))
+	}))
+	defer srv.Close()
+
+	if _, err := NewHTTPClient(srv.URL, Auth{Mode: "none"}).Manifest(context.Background(), "engine", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"application/vnd.docker.distribution.manifest.v1+json",
+		"application/vnd.oci.artifact.manifest.v1+json",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Accept %q does not offer %q", got, want)
+		}
+	}
+}

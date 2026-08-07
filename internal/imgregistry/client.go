@@ -219,7 +219,14 @@ func nextLinkPath(link string) string {
 // multi-arch manifest-list/index types. Without the latter, a multi-arch tag
 // (common for base images) gets served whatever the registry's default is
 // and may fail to decode as a plain manifest — see the Manifests field below.
-const manifestAccept = "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json"
+//
+// It also carries the legacy schema1 type and the OCI artifact type, because
+// distribution answers 404 MANIFEST_UNKNOWN — indistinguishable from "this tag
+// does not exist" — when it holds a manifest whose media type no entry here
+// matches. The fleet's registry mirrors third-party images (espressif/idf,
+// koalaman/shellcheck, jioworldcentre/web) whose older tags are still schema1,
+// so an Accept set that omits them turns a present tag into a phantom 404.
+const manifestAccept = "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v1+json, application/vnd.oci.artifact.manifest.v1+json"
 
 // Manifest fetches a single manifest by tag or digest and returns its
 // canonical digest (from Docker-Content-Digest) plus size/layer info.
@@ -282,6 +289,52 @@ func (c *HTTPClient) Manifest(ctx context.Context, repo, ref string) (Manifest, 
 		m.Size += l.Size
 	}
 	return m, nil
+}
+
+// manifestDigest resolves ref to its content digest and NOTHING else, using
+// HEAD with `Accept: */*`.
+//
+// It exists as the last resort before a tag is written off as unresolvable.
+// The full Manifest GET negotiates a media type and decodes a body, and both
+// can fail on a manifest that is perfectly present: distribution answers 404
+// MANIFEST_UNKNOWN when its stored media type is outside the Accept set, and
+// a body this client cannot decode is ErrUnreachable. Neither says the tag is
+// absent. `Accept: */*` cannot be unsatisfiable, and Docker-Content-Digest is
+// all that protecting a digest from deletion requires — so a tag resolved
+// this way is protected, at the cost of a zero Created (which callers that
+// act on age already treat as unknown).
+//
+// The error classification is the caller's real answer about existence:
+// ErrNotFound here means the registry was asked with the broadest possible
+// Accept and still said no.
+func (c *HTTPClient) manifestDigest(ctx context.Context, repo, ref string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead,
+		fmt.Sprintf("%s/v2/%s/manifests/%s", c.BaseURL, repo, ref), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Accept", "*/*")
+	if c.Auth.Mode == "basic" {
+		req.SetBasicAuth(c.Auth.Username, c.Auth.Password)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("registry manifest HEAD %s/%s: %w: %w", repo, ref, ErrUnreachable, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return "", fmt.Errorf("manifest HEAD %s/%s: not found: %w", repo, ref, ErrNotFound)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("registry manifest HEAD %s/%s: status %d: %w", repo, ref, resp.StatusCode, ErrUnreachable)
+	}
+	d := resp.Header.Get("Docker-Content-Digest")
+	if d == "" {
+		// A 2xx with no digest header is not an answer we can use, and
+		// treating it as "gone" would be the unsafe direction.
+		return "", fmt.Errorf("manifest HEAD %s/%s: no Docker-Content-Digest header: %w", repo, ref, ErrUnreachable)
+	}
+	return d, nil
 }
 
 // tagResolveConcurrency bounds how many manifest/blob fetches Tags runs at
@@ -365,13 +418,29 @@ func (c *HTTPClient) ResolveTags(ctx context.Context, repo string) (TagListing, 
 	var dropped []DroppedTag
 	for _, r := range resolutions {
 		if r.err != nil {
-			// One tag this client cannot resolve (an unsupported media type,
-			// a transient blip) must not hide every other tag in the repo
-			// behind a single error — skip it and keep going. It is RECORDED
-			// rather than merely skipped: a caller that deletes cannot be
-			// allowed to mistake a degraded listing for a small repo.
-			dropped = append(dropped, DroppedTag{Tag: r.tag, Err: r.err})
-			continue
+			// Before writing a tag off, ask for its digest alone (HEAD,
+			// `Accept: */*`). The full GET can fail on a manifest that is
+			// present — an unnegotiable media type reads as 404
+			// MANIFEST_UNKNOWN — and for a caller that only needs to know
+			// which digests are reachable by tag, the digest IS the answer.
+			// Without this, one legacy schema1 tag anywhere in the catalog
+			// reports as a drop and wedges pruning for the entire fleet.
+			// Drops are rare, so this runs serially here rather than adding a
+			// second concurrent phase.
+			if d, herr := c.manifestDigest(ctx, repo, r.tag); herr == nil {
+				r.manifest = Manifest{Digest: d} // no config blob: Created stays zero
+			} else {
+				// The HEAD error, not the GET one, is what is recorded: HEAD
+				// asked with an Accept set that cannot be unsatisfied, so its
+				// ErrNotFound/ErrUnreachable verdict is the trustworthy one.
+				// Recording the GET's ErrNotFound here would tell a caller
+				// "this tag is gone" about a tag we simply could not read.
+				dropped = append(dropped, DroppedTag{
+					Tag: r.tag,
+					Err: fmt.Errorf("resolve %s/%s (%v); digest-only HEAD: %w", repo, r.tag, r.err, herr),
+				})
+				continue
+			}
 		}
 		dg, ok := byDigest[r.manifest.Digest]
 		if !ok {
@@ -406,8 +475,13 @@ func (c *HTTPClient) ResolveTags(ctx context.Context, repo string) (TagListing, 
 				defer wg.Done()
 				defer func() { <-sem }()
 				// A failed blob fetch leaves Created zero instead of
-				// dropping the whole digest group — same visibility
-				// trade-off as an unresolvable tag above.
+				// dropping the whole digest group. NOTE this is NOT reported
+				// anywhere — unlike an unresolvable tag, which lands in
+				// Dropped, a failed config-blob fetch is indistinguishable
+				// from a multi-arch index (which genuinely has no config
+				// blob) once this returns. A caller that acts on Created must
+				// therefore treat zero as "age unknown" and decline to act,
+				// rather than as "old".
 				if created, err := c.blobCreated(ctx, repo, dg.configDigest); err == nil {
 					dg.group.Created = created
 				}
