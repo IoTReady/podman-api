@@ -19,8 +19,8 @@ type Pod struct {
 }
 
 type Container struct {
-	ID       string
-	Name     string
+	ID   string
+	Name string
 	// Image is InspectContainerData.ImageDigest, which is
 	// image.Digest().String(): a BARE digest with no repository, e.g.
 	// "sha256:42283567cae4…". It is NOT the "repo@sha256:…" shape — measured
