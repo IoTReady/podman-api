@@ -760,8 +760,61 @@ func TestHTTPClient_ResolveTags_LegacyManifestResolvedByHEAD(t *testing.T) {
 	if !listing.Groups[0].Created.IsZero() {
 		t.Fatalf("a HEAD-resolved group must carry no Created, got %v", listing.Groups[0].Created)
 	}
-	if headAccept != "*/*" {
-		t.Fatalf("the fallback must not negotiate a media type; Accept was %q", headAccept)
+	if headAccept != manifestAccept {
+		t.Fatalf("the fallback must send the same explicit Accept as the GET path; Accept was %q", headAccept)
+	}
+}
+
+// Measured, not reasoned. `Accept: */*` is the obvious way to write "whatever
+// you have" and it is WRONG for distribution: its manifest handler parses
+// Accept by exact media-type string, so `*/*` matches nothing and is NARROWER
+// than the explicit list. Against real registries (see manifestDigest's doc
+// comment for the transcript), `*/*` 404s an ordinary OCI image on both 2.8.3
+// and 3.1.1, and on 2.8.x it makes the registry down-convert a schema2
+// manifest and answer with the CONVERTED manifest's digest — a digest that
+// exists nowhere in storage, which regroups the tag away from its real digest
+// and strips that digest's protection.
+func TestHTTPClient_ManifestDigest_SendsExplicitAcceptNeverWildcard(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodHead {
+			t.Errorf("want HEAD, got %s", r.Method)
+		}
+		got = r.Header.Get("Accept")
+		w.Header().Set("Docker-Content-Digest", "sha256:d")
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	if _, err := NewHTTPClient(srv.URL, Auth{Mode: "none"}).manifestDigest(context.Background(), "engine", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(got, "*/*") {
+		t.Fatalf("HEAD must never offer a wildcard Accept; got %q", got)
+	}
+	if got != manifestAccept {
+		t.Fatalf("HEAD Accept must equal the GET path's, so HEAD is never narrower than the GET it backstops;\n got  %q\n want %q", got, manifestAccept)
+	}
+}
+
+// Minor 4, the GET path's counterpart to manifestDigest's empty-digest guard.
+// A 200 with no Docker-Content-Digest would otherwise yield Digest: "", which
+// groups under the empty string and is eligible to reach Delete(repo, "").
+func TestHTTPClient_Manifest_MissingDigestHeaderIsErrUnreachable(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"config":{"digest":"sha256:c","size":1},"layers":[]}`)) // no digest header
+	}))
+	defer srv.Close()
+
+	m, err := NewHTTPClient(srv.URL, Auth{Mode: "none"}).Manifest(context.Background(), "engine", "v1")
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("want ErrUnreachable, got %v", err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Fatalf("a missing header is not evidence of absence: %v", err)
+	}
+	if m.Digest != "" {
+		t.Fatalf("want the zero Manifest, got %+v", m)
 	}
 }
 
@@ -792,6 +845,9 @@ func TestHTTPClient_ResolveTags_HEADFailureStillDrops(t *testing.T) {
 	if errors.Is(listing.Dropped[0].Err, ErrNotFound) {
 		t.Fatalf("a 500 must never read as not-found: %v", listing.Dropped[0].Err)
 	}
+	if listing.Dropped[0].Vanished {
+		t.Fatalf("an unreadable tag is not a deleted one: %+v", listing.Dropped[0])
+	}
 }
 
 // A 2xx HEAD with no Docker-Content-Digest is not an answer. Recording it as a
@@ -821,15 +877,28 @@ func TestHTTPClient_ResolveTags_HEADWithoutDigestHeaderDrops(t *testing.T) {
 	}
 }
 
+// ---------------------------------------------------------------------------
+// Review round 5: absence comes from the tag list, never from a manifest 404.
+// ---------------------------------------------------------------------------
+
 // A tag genuinely deleted between the tags/list call and its manifest fetch
-// must be dropped as ErrNotFound, NOT ErrUnreachable. The prune handler treats
-// exactly this case as benign and proceeds; conflating it with an unreadable
-// manifest would either abort every run that races a tag deletion, or — the
-// unsafe direction — let an unreadable manifest look gone.
-func TestHTTPClient_ResolveTags_DeletedTagDropsAsNotFound(t *testing.T) {
+// must be marked Vanished — the prune handler treats exactly this case as
+// benign and proceeds, rather than aborting a fleet-wide run every time CI
+// deletes a tag mid-run.
+//
+// The evidence is the SECOND tags/list read, not the manifest's 404: the
+// registry stops listing the tag. Note the first read still lists it, which is
+// what puts the tag into this run's resolution set at all.
+func TestHTTPClient_ResolveTags_DeletedTagIsVanishedPerTheTagList(t *testing.T) {
+	var listCalls int
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v2/engine/tags/list", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"name":"engine","tags":["gone"]}`))
+		listCalls++
+		if listCalls == 1 {
+			w.Write([]byte(`{"name":"engine","tags":["gone"]}`))
+			return
+		}
+		w.Write([]byte(`{"name":"engine","tags":[]}`)) // deleted in between
 	})
 	mux.HandleFunc("/v2/engine/manifests/gone", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"errors":[{"code":"MANIFEST_UNKNOWN"}]}`, http.StatusNotFound)
@@ -844,11 +913,111 @@ func TestHTTPClient_ResolveTags_DeletedTagDropsAsNotFound(t *testing.T) {
 	if len(listing.Dropped) != 1 || listing.Dropped[0].Tag != "gone" {
 		t.Fatalf("want the deleted tag reported, got %+v", listing.Dropped)
 	}
-	if !errors.Is(listing.Dropped[0].Err, ErrNotFound) {
-		t.Fatalf("want ErrNotFound after HEAD also 404s, got %v", listing.Dropped[0].Err)
+	if !listing.Dropped[0].Vanished {
+		t.Fatalf("a tag the registry no longer lists must be Vanished, got %+v", listing.Dropped[0])
 	}
-	if errors.Is(listing.Dropped[0].Err, ErrUnreachable) {
-		t.Fatalf("a genuine 404 must not read as unreachable: %v", listing.Dropped[0].Err)
+	if listCalls < 2 {
+		t.Fatalf("absence must be established by re-reading tags/list, got %d list calls", listCalls)
+	}
+}
+
+// The load-bearing converse, and the reason a manifest 404 is not evidence.
+// distribution answers 404 MANIFEST_UNKNOWN both for a tag that does not exist
+// and for a manifest whose stored media type matches nothing in the request's
+// Accept set — measured on 2.8.3 and 3.1.1 against an ordinary OCI image with
+// `Accept: */*`. Here BOTH the GET and the HEAD 404 while the tag is plainly
+// still in the registry's own tag list. Marking it Vanished would tell the
+// prune handler to proceed with the tag absent from Groups: it loses its name
+// protection and its cross-repo shares-protected seeding, and the image it
+// points at becomes a delete candidate.
+func TestHTTPClient_ResolveTags_StillListedTagIsNeverVanished(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/engine/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"name":"engine","tags":["latest"]}`))
+	})
+	mux.HandleFunc("/v2/engine/manifests/latest", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"errors":[{"code":"MANIFEST_UNKNOWN"}]}`, http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	listing, err := NewHTTPClient(srv.URL, Auth{Mode: "none"}).ResolveTags(context.Background(), "engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Dropped) != 1 {
+		t.Fatalf("want one drop, got %+v", listing.Dropped)
+	}
+	if listing.Dropped[0].Vanished {
+		t.Fatalf("a tag STILL in the registry's tag list must never be Vanished, whatever the manifest endpoint said: %+v", listing.Dropped[0])
+	}
+	if !errors.Is(listing.Dropped[0].Err, ErrUnreachable) {
+		t.Fatalf("want ErrUnreachable, got %v", listing.Dropped[0].Err)
+	}
+}
+
+// The IMPORTANT-3 shape: GET says not-found, HEAD says unreachable. Under the
+// previous design the benign/hard split was read out of the drop's error, so
+// this input's classification hung on client.go formatting the GET's cause
+// with %v rather than %w — an invisible, untested, one-character distance from
+// a live delete. It no longer hangs on anything of the sort: absence is a
+// separate field set only from the tag list, and the tag is still listed here.
+func TestHTTPClient_ResolveTags_GETNotFoundWithHEADUnreachableIsNotVanished(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/engine/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"name":"engine","tags":["latest"]}`))
+	})
+	mux.HandleFunc("/v2/engine/manifests/latest", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		http.Error(w, `{"errors":[{"code":"MANIFEST_UNKNOWN"}]}`, http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	listing, err := NewHTTPClient(srv.URL, Auth{Mode: "none"}).ResolveTags(context.Background(), "engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Dropped) != 1 || listing.Dropped[0].Vanished {
+		t.Fatalf("want one non-Vanished drop, got %+v", listing.Dropped)
+	}
+	if errors.Is(listing.Dropped[0].Err, ErrNotFound) {
+		t.Fatalf("the drop must not read as not-found either: %v", listing.Dropped[0].Err)
+	}
+}
+
+// Fail closed on the evidence itself. If the tag list cannot be re-read, we do
+// not know whether the tag exists — and "we could not check" must never
+// collapse into "it is gone".
+func TestHTTPClient_ResolveTags_UnreadableTagListIsNotVanished(t *testing.T) {
+	var listCalls int
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/engine/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		listCalls++
+		if listCalls == 1 {
+			w.Write([]byte(`{"name":"engine","tags":["latest"]}`))
+			return
+		}
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/v2/engine/manifests/latest", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"errors":[{"code":"MANIFEST_UNKNOWN"}]}`, http.StatusNotFound)
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	listing, err := NewHTTPClient(srv.URL, Auth{Mode: "none"}).ResolveTags(context.Background(), "engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Dropped) != 1 || listing.Dropped[0].Vanished {
+		t.Fatalf("an unreadable tag list must not produce a Vanished drop, got %+v", listing.Dropped)
+	}
+	if !errors.Is(listing.Dropped[0].Err, ErrUnreachable) {
+		t.Fatalf("want ErrUnreachable, got %v", listing.Dropped[0].Err)
 	}
 }
 

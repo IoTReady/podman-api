@@ -378,20 +378,23 @@ func (h *Handler) classifyAll(ctx context.Context, jc *jobs.JobContext, repos []
 			jc.Step("classify:"+repo, "ABORTED: "+err.Error())
 			return nil, nil, fmt.Errorf("list tags for %s (aborting before any delete): %w", repo, err)
 		}
-		// A drop whose cause is ErrNotFound is the ONE benign kind: the
-		// registry was asked (with an Accept set that cannot be unsatisfied —
-		// imgregistry HEADs as a last resort) and answered that the tag does
-		// not exist. A tag that no longer exists protects nothing, so its
-		// absence from the listing is the correct view, not a hole in one.
+		// A drop marked Vanished is the ONE benign kind: after resolution
+		// failed, imgregistry re-read /v2/<repo>/tags/list and the tag was no
+		// longer in it. A tag that no longer exists protects nothing, so its
+		// absence from this listing is the correct view, not a hole in one.
 		// Aborting on it would cost a whole fleet-wide run plus an hour of
-		// scheduler backoff every time CI deletes a tag mid-run. Every other
-		// cause still aborts: imgregistry never collapses ErrNotFound into
-		// ErrUnreachable, so this distinction is free and exact.
+		// scheduler backoff every time CI deletes a tag mid-run.
+		//
+		// The test is the Vanished FLAG, never errors.Is(d.Err, ErrNotFound).
+		// A manifest 404 is content-negotiated and cannot mean "absent" (see
+		// imgregistry.DroppedTag), so reading the decision out of the error
+		// would make it hostage to how some future edit wraps a cause.
+		// Every other drop still aborts.
 		if len(listing.Dropped) > 0 {
 			var hard []imgregistry.DroppedTag
 			var vanished []string
 			for _, d := range listing.Dropped {
-				if errors.Is(d.Err, imgregistry.ErrNotFound) {
+				if d.Vanished {
 					vanished = append(vanished, d.Tag)
 					continue
 				}
@@ -461,8 +464,8 @@ func (h *Handler) classifyAll(ctx context.Context, jc *jobs.JobContext, repos []
 }
 
 // describeDrops explains an aborted run to an operator. It is only ever handed
-// the drops that are NOT ErrNotFound — a tag the registry says is gone is
-// benign and recorded separately (see classifyAll).
+// the drops NOT marked Vanished — a tag the registry's own tag list no longer
+// contains is benign and recorded separately (see classifyAll).
 //
 // A dropped tag is the client failing to resolve a manifest and carrying on
 // (client.go: the `if r.err != nil` arm of ResolveTags' grouping pass), which

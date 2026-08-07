@@ -1160,7 +1160,7 @@ func TestRun_ConcurrentlyDeletedTagDoesNotAbort(t *testing.T) {
 		catalogs: [][]string{{"engine"}},
 		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
 		dropped: map[string][]imgregistry.DroppedTag{
-			"engine": {{Tag: "feat-gone", Err: fmt.Errorf("manifest engine/feat-gone: %w", imgregistry.ErrNotFound)}},
+			"engine": {{Tag: "feat-gone", Vanished: true, Err: fmt.Errorf("%w: engine/feat-gone is no longer in the repo's tag list", imgregistry.ErrNotFound)}},
 		},
 	}
 	h := newHandler(t, reg)
@@ -1176,6 +1176,36 @@ func TestRun_ConcurrentlyDeletedTagDoesNotAbort(t *testing.T) {
 	wantStepContaining(t, job, "feat-gone")
 }
 
+// The structural guard on the benign-drop rule. A drop's ERROR is not the
+// evidence — imgregistry's manifest endpoints are content-negotiated and
+// answer 404 MANIFEST_UNKNOWN for a manifest whose media type they cannot
+// serve, so an ErrNotFound-wrapping drop can perfectly well describe a tag
+// that exists. Only Vanished (set from a re-read of the tag list) may excuse a
+// drop. This kills the mutation `d.Vanished` -> `errors.Is(d.Err,
+// imgregistry.ErrNotFound)`, which is exactly the reading a reviewer would
+// wave through and which proceeds to delete the image the dropped tag points
+// at.
+func TestRun_NotFoundDropThatDidNotVanishStillAborts(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine"}},
+		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
+		dropped: map[string][]imgregistry.DroppedTag{
+			// Not-found-shaped, but the tag is still in the registry's tag
+			// list, so imgregistry left Vanished false.
+			"engine": {{Tag: "latest", Err: fmt.Errorf("manifest engine/latest: %w", imgregistry.ErrNotFound)}},
+		},
+	}
+	h := newHandler(t, reg)
+	_, job, err := runJob(t, h, Payload{Policy: testPolicy()})
+	if !errors.Is(err, ErrUnsafeToPrune) {
+		t.Fatalf("a drop that did not vanish must abort whatever its error says, got %v", err)
+	}
+	wantNoDeletes(t, reg)
+	if !strings.Contains(stepText(job), "ABORTED") {
+		t.Fatalf("the abort must be recorded; steps were:\n%s", stepText(job))
+	}
+}
+
 // The converse, and the reason the split is by error KIND rather than by
 // "were there any resolvable tags": one benign drop alongside one unreadable
 // manifest must still abort. A handler that proceeded because SOME drop was
@@ -1186,7 +1216,7 @@ func TestRun_BenignDropAlongsideAnUnreadableOneStillAborts(t *testing.T) {
 		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
 		dropped: map[string][]imgregistry.DroppedTag{
 			"engine": {
-				{Tag: "feat-gone", Err: fmt.Errorf("manifest engine/feat-gone: %w", imgregistry.ErrNotFound)},
+				{Tag: "feat-gone", Vanished: true, Err: fmt.Errorf("%w: engine/feat-gone is no longer in the repo's tag list", imgregistry.ErrNotFound)},
 				{Tag: "latest", Err: fmt.Errorf("manifest engine/latest: %w", imgregistry.ErrUnreachable)},
 			},
 		},

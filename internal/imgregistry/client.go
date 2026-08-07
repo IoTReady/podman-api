@@ -64,6 +64,25 @@ type TagGroup struct {
 // DroppedTag is one tag that a listing could not resolve, and why.
 type DroppedTag struct {
 	Tag string
+
+	// Vanished is true ONLY when, after resolution failed, a fresh read of
+	// /v2/<repo>/tags/list no longer listed Tag. That is the registry's one
+	// exact statement about a tag's existence, and the ONLY basis on which a
+	// caller may treat a drop as benign.
+	//
+	// It is a field rather than a sentinel wrapped into Err on purpose. A 404
+	// from GET/HEAD /manifests/<ref> is content-negotiated: distribution
+	// answers 404 MANIFEST_UNKNOWN when its stored media type matches no entry
+	// in the request's Accept set, byte-identical to "this tag does not
+	// exist". So no manifest error, however classified, can carry this
+	// meaning — and if the decision were read back out of Err via
+	// errors.Is(..., ErrNotFound), any future edit that wrapped a manifest
+	// error's cause with %w instead of %v would silently reclassify an
+	// unreadable tag as a deleted one. That mistake ends in deleting a live
+	// image, and it would leave every test green. The flag cannot be set by
+	// accident: exactly one code path assigns it, from the tags/list read.
+	Vanished bool
+
 	Err error
 }
 
@@ -273,6 +292,16 @@ func (c *HTTPClient) Manifest(ctx context.Context, repo, ref string) (Manifest, 
 	}
 
 	m := Manifest{Digest: resp.Header.Get("Docker-Content-Digest")}
+	if m.Digest == "" {
+		// Symmetrical with manifestDigest's guard. A 200 with no
+		// Docker-Content-Digest is not an answer we can use: it would group
+		// this tag under the empty string, and a caller that deletes would
+		// then hold a candidate whose "digest" is "" — eligible to reach
+		// Delete(repo, ""). Every conforming registry sets the header; the
+		// guard costs nothing and closes the direction that ends in a request
+		// nobody meant to make.
+		return Manifest{}, fmt.Errorf("manifest %s/%s: no Docker-Content-Digest header: %w", repo, ref, ErrUnreachable)
+	}
 	if body.Manifests != nil {
 		// Multi-arch manifest list/index: there is no single config blob to
 		// inspect here (each platform entry has its own), so record the tag
@@ -292,28 +321,42 @@ func (c *HTTPClient) Manifest(ctx context.Context, repo, ref string) (Manifest, 
 }
 
 // manifestDigest resolves ref to its content digest and NOTHING else, using
-// HEAD with `Accept: */*`.
+// HEAD with the SAME explicit manifestAccept string the GET path sends.
 //
-// It exists as the last resort before a tag is written off as unresolvable.
-// The full Manifest GET negotiates a media type and decodes a body, and both
-// can fail on a manifest that is perfectly present: distribution answers 404
-// MANIFEST_UNKNOWN when its stored media type is outside the Accept set, and
-// a body this client cannot decode is ErrUnreachable. Neither says the tag is
-// absent. `Accept: */*` cannot be unsatisfiable, and Docker-Content-Digest is
-// all that protecting a digest from deletion requires — so a tag resolved
-// this way is protected, at the cost of a zero Created (which callers that
-// act on age already treat as unknown).
+// It exists as the last resort before a tag is written off as unresolvable:
+// the full Manifest GET also decodes a body, and a body this client cannot
+// decode is an error about the body, not about the tag. HEAD skips that
+// entirely, and Docker-Content-Digest is all that protecting a digest from
+// deletion requires — so a tag resolved this way is protected, at the cost of
+// a zero Created (which callers that act on age already treat as unknown).
 //
-// The error classification is the caller's real answer about existence:
-// ErrNotFound here means the registry was asked with the broadest possible
-// Accept and still said no.
+// Sending `Accept: */*` here — the obvious way to write "give me whatever you
+// have" — is WRONG, and measurably so. distribution's manifest handler parses
+// Accept by exact media-type string into its supported set; `*/*` matches
+// nothing, so the wildcard is NARROWER than the explicit list, not broader.
+// Measured against real registries (an ordinary image pushed --format oci):
+//
+//	2.8.3  HEAD /v2/probe/manifests/oci  Accept: */*             -> 404
+//	2.8.3  HEAD /v2/probe/manifests/oci  Accept: manifestAccept  -> 200 sha256:4ecaff1a…
+//	3.1.1  HEAD /v2/probe/manifests/oci  Accept: */*             -> 404
+//
+// Worse, on 2.8.x a schema2 manifest requested with an Accept set that omits
+// schema2 is DOWN-CONVERTED to schema1 and answered with the converted
+// manifest's Docker-Content-Digest — a digest that exists nowhere in storage:
+//
+//	2.8.3  HEAD .../manifests/v2  Accept: */*             -> sha256:05853901…  (fabricated)
+//	2.8.3  HEAD .../manifests/v2  Accept: manifestAccept  -> sha256:7c76b20c…  (real)
+//
+// A fabricated digest groups a tag away from its real one, so the real digest
+// loses that tag's protection and becomes a delete candidate. Never widen
+// this to a wildcard.
 func (c *HTTPClient) manifestDigest(ctx context.Context, repo, ref string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodHead,
 		fmt.Sprintf("%s/v2/%s/manifests/%s", c.BaseURL, repo, ref), nil)
 	if err != nil {
 		return "", err
 	}
-	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Accept", manifestAccept)
 	if c.Auth.Mode == "basic" {
 		req.SetBasicAuth(c.Auth.Username, c.Auth.Password)
 	}
@@ -418,27 +461,46 @@ func (c *HTTPClient) ResolveTags(ctx context.Context, repo string) (TagListing, 
 	var dropped []DroppedTag
 	for _, r := range resolutions {
 		if r.err != nil {
-			// Before writing a tag off, ask for its digest alone (HEAD,
-			// `Accept: */*`). The full GET can fail on a manifest that is
-			// present — an unnegotiable media type reads as 404
-			// MANIFEST_UNKNOWN — and for a caller that only needs to know
-			// which digests are reachable by tag, the digest IS the answer.
-			// Without this, one legacy schema1 tag anywhere in the catalog
-			// reports as a drop and wedges pruning for the entire fleet.
-			// Drops are rare, so this runs serially here rather than adding a
-			// second concurrent phase.
+			// Before writing a tag off, ask for its digest alone (HEAD, same
+			// Accept). The full GET also decodes a body, and a body this
+			// client cannot decode says nothing about whether the tag exists.
+			// For a caller that only needs to know which digests are reachable
+			// by tag, the digest IS the answer. Drops are rare, so this runs
+			// serially here rather than adding a second concurrent phase.
 			if d, herr := c.manifestDigest(ctx, repo, r.tag); herr == nil {
 				r.manifest = Manifest{Digest: d} // no config blob: Created stays zero
 			} else {
-				// The HEAD error, not the GET one, is what is recorded: HEAD
-				// asked with an Accept set that cannot be unsatisfied, so its
-				// ErrNotFound/ErrUnreachable verdict is the trustworthy one.
-				// Recording the GET's ErrNotFound here would tell a caller
-				// "this tag is gone" about a tag we simply could not read.
-				dropped = append(dropped, DroppedTag{
-					Tag: r.tag,
-					Err: fmt.Errorf("resolve %s/%s (%v); digest-only HEAD: %w", repo, r.tag, r.err, herr),
-				})
+				// Neither the GET's nor the HEAD's status can establish
+				// absence. Both are content-negotiated requests, and
+				// distribution answers a negotiation it cannot satisfy with
+				// the same 404 MANIFEST_UNKNOWN it uses for a tag that was
+				// never there. Deriving "gone" from either is how a live image
+				// gets deleted.
+				//
+				// So ask the one endpoint that negotiates nothing. The tag
+				// list is the registry's exact statement of which tags exist;
+				// re-read it, and call the tag vanished ONLY if it is no
+				// longer in it. One extra call per drop, and drops are rare.
+				//
+				// Fail closed in both other directions: a tag still listed, or
+				// a listing we could not read, is an unresolvable tag, not a
+				// gone one.
+				vanished := false
+				var derr error
+				listed, lerr := c.tagStillListed(ctx, repo, r.tag)
+				switch {
+				case lerr != nil:
+					derr = fmt.Errorf("%w: could not re-read the tag list to tell whether %s/%s still exists: %w",
+						ErrUnreachable, repo, r.tag, lerr)
+				case listed:
+					derr = fmt.Errorf("%w: %s/%s is still listed but its manifest could not be read (GET: %v; digest-only HEAD: %v)",
+						ErrUnreachable, repo, r.tag, r.err, herr)
+				default:
+					vanished = true
+					derr = fmt.Errorf("%w: %s/%s is no longer in the repo's tag list (GET: %v; digest-only HEAD: %v)",
+						ErrNotFound, repo, r.tag, r.err, herr)
+				}
+				dropped = append(dropped, DroppedTag{Tag: r.tag, Vanished: vanished, Err: derr})
 				continue
 			}
 		}
@@ -516,6 +578,30 @@ func (c *HTTPClient) TagCount(ctx context.Context, repo string) (int, error) {
 		return 0, err
 	}
 	return len(tags), nil
+}
+
+// tagStillListed re-reads /v2/<repo>/tags/list and reports whether tag is
+// still in it.
+//
+// This is the ONLY absence signal this package trusts. /v2/<repo>/tags/list
+// negotiates no media type: it is a JSON array of names, identical for a
+// schema1 manifest, an OCI image, an OCI artifact and a multi-arch index. A
+// manifest endpoint's 404 conflates "no such tag" with "no representation you
+// asked for"; this endpoint cannot.
+//
+// An error is returned as an error, never as absence — a tag list we could not
+// read is not evidence that a tag is gone.
+func (c *HTTPClient) tagStillListed(ctx context.Context, repo, tag string) (bool, error) {
+	tags, err := c.listTags(ctx, repo)
+	if err != nil {
+		return false, err
+	}
+	for _, t := range tags {
+		if t == tag {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (c *HTTPClient) listTags(ctx context.Context, repo string) ([]string, error) {
