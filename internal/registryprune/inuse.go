@@ -118,25 +118,76 @@ type Config struct {
 // InspectContainerData.Image carries when ImageDigest is empty).
 var bareImageIDRe = regexp.MustCompile(`^[a-f0-9]{64}$`)
 
-// bareManifestDigestRe matches a bare content digest whose ALGORITHM is one
-// podman can actually emit. imgregistry.IsDigestRef is deliberately not enough
-// on its own here: its pattern accepts any lowercase-alphanumeric run as the
-// algorithm, so an unqualified "<repo>:<40-hex git sha>" — a common tagging
-// convention — matches it and would be claimed as a digest before the ref was
-// ever parsed, protecting a junk key that matches nothing while the manifest
-// the instance actually needs went unprotected and got deleted.
+// digestAlgoHexLen maps every algorithm go-digest registers (algorithm.go:34 —
+// SHA256, SHA384, SHA512) to the exact hex length its own validator requires.
+// These are the only algorithms InspectContainerData.ImageDigest
+// (image.Digest().String()) can carry, so this is the complete set of bare
+// digests we are willing to trust without parsing.
 //
-// InspectContainerData.ImageDigest is image.Digest().String(), which always
-// carries a registered algorithm, so narrowing to sha256/sha512 loses nothing
-// real and closes the ambiguity in the safe direction: an unrecognised
-// algorithm falls through to ordinary parsing, where an unresolvable ref
-// aborts rather than being silently trusted.
-var bareManifestDigestRe = regexp.MustCompile(`^sha(?:256|512):[a-f0-9]{32,}$`)
+// imgregistry.IsDigestRef is deliberately not enough on its own here: its
+// pattern accepts any lowercase-alphanumeric run as the algorithm and any hex
+// run of 32 or more, so an unqualified "<repo>:<40-hex git sha>" — a common
+// tagging convention — matches it and would be claimed as a digest before the
+// ref was ever parsed, protecting a junk key that matches nothing while the
+// manifest the instance actually needs went unprotected and got deleted.
+var digestAlgoHexLen = map[string]int{"sha256": 64, "sha384": 96, "sha512": 128}
 
-// isBareManifestDigest reports whether ref is a bare digest (no repository)
-// that we are willing to trust as a manifest digest without parsing.
-func isBareManifestDigest(ref string) bool {
-	return bareManifestDigestRe.MatchString(ref) && imgregistry.IsDigestRef(ref)
+// digestShapedRe matches "<algorithm>:<hex>" with no repository path, i.e. the
+// shape a bare digest has. Whether it IS a digest depends on the algorithm and
+// hex length; see classifyBareDigest.
+var digestShapedRe = regexp.MustCompile(`^([a-z0-9]+(?:[+._-][a-z0-9]+)*):([a-f0-9]{32,})$`)
+
+// bareDigestKind is what classifyBareDigest concluded about a reference.
+type bareDigestKind int
+
+const (
+	// notBareDigest: the ref is not digest-shaped, or its hex run is not a
+	// length any digest algorithm produces — an unqualified "<repo>:<40-hex git
+	// sha>" lands here and is resolved through the registry like any other tag.
+	notBareDigest bareDigestKind = iota
+	// trustedBareDigest: a registered algorithm at its own required length.
+	trustedBareDigest
+	// suspectBareDigest: canonically digest-shaped (the hex run is exactly the
+	// length of one of the registered algorithms) but the algorithm/length pair
+	// is not one podman can emit. This MUST be an error, not a fall-through:
+	// ordinary parsing turns "sha384:<96 hex>" into repository name "sha384",
+	// which misses the catalog and is then marked Covered AND Foreign — a
+	// silent skip that the non-digest fatal check cannot see either. Probed on
+	// the pre-fix code: sha384/v1/md5 refs all returned err=nil, Valid=true,
+	// and appeared only as a ForeignSkipped entry.
+	suspectBareDigest
+)
+
+// canonicalDigestHexLen reports whether n is the hex length of some registered
+// digest algorithm.
+func canonicalDigestHexLen(n int) bool {
+	for _, want := range digestAlgoHexLen {
+		if n == want {
+			return true
+		}
+	}
+	return false
+}
+
+// classifyBareDigest decides how to treat a reference with no repository path.
+func classifyBareDigest(ref string) bareDigestKind {
+	m := digestShapedRe.FindStringSubmatch(ref)
+	if m == nil || !imgregistry.IsDigestRef(ref) {
+		return notBareDigest
+	}
+	algo, hex := m[1], m[2]
+	if want, ok := digestAlgoHexLen[algo]; ok {
+		if len(hex) == want {
+			return trustedBareDigest
+		}
+		// A registered algorithm at the wrong length is a corrupt digest, never
+		// a repository called "sha256".
+		return suspectBareDigest
+	}
+	if canonicalDigestHexLen(len(hex)) {
+		return suspectBareDigest
+	}
+	return notBareDigest
 }
 
 // publicRegistryHosts are registry hosts that are, by construction, never ours.
@@ -462,10 +513,16 @@ func resolveRef(ctx context.Context, reg ManifestResolver, known map[string]stru
 	// so it would be discarded as foreign and the observed half would protect
 	// nothing at all.
 	//
-	// Gated on a KNOWN digest algorithm, not on digest-shape alone — see
-	// bareManifestDigestRe.
-	if isBareManifestDigest(strings.ToLower(ref)) {
+	// Gated on a KNOWN digest algorithm at its own length, not on digest-shape
+	// alone — see digestAlgoHexLen.
+	switch classifyBareDigest(strings.ToLower(ref)) {
+	case trustedBareDigest:
 		return refOutcome{Digest: strings.ToLower(ref), Covered: true}, nil
+	case suspectBareDigest:
+		// Never fall through to splitRef: it would become a bogus repository
+		// name, miss the catalog, and be skipped as foreign with no error.
+		return refOutcome{}, fmt.Errorf(
+			"reference %q is digest-shaped but is not a digest any registered algorithm (sha256/sha384/sha512) produces", ref)
 	}
 
 	name, tag, digest := splitRef(ref)

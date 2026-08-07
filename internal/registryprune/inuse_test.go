@@ -1280,3 +1280,135 @@ func TestBuildInUseSet_PrivateWrongHostStillTripsTheMatchRule(t *testing.T) {
 		t.Fatalf("want the no-match rule, got %v", err)
 	}
 }
+
+// --- review round 5 ---------------------------------------------------------
+
+// N1: the bare-digest gate must agree with its own safety claim. sha384 IS a
+// registered go-digest algorithm (algorithm.go:34, alongside SHA256/SHA512),
+// so excluding it lost something real; and an unrecognised algorithm did NOT
+// "fall through to an abort" — probed on the pre-fix code, "sha384:<96 hex>",
+// "v1:<64 hex>" and "md5:<64 hex>" each returned err=nil, Valid=true, and
+// showed up only as a ForeignSkipped entry, because splitRef turned the
+// algorithm into a repository name that missed the catalog and was then marked
+// Covered AND Foreign — invisible to the non-digest fatal check too. Silent
+// under-protection.
+func TestBuildInUseSet_BareDigestAlgorithmGate(t *testing.T) {
+	sha384 := "sha384:" + strings.Repeat("cd", 48) // registered, 96 hex
+	sha512 := "sha512:" + strings.Repeat("ef", 64) // registered, 128 hex
+	for _, tc := range []struct {
+		name, ref string
+		// wantProtected is the digest the ref itself must contribute, "" when
+		// the ref must abort the run instead.
+		wantProtected string
+		wantErrMsg    string
+	}{
+		{name: "sha384_is_registered_and_trusted", ref: sha384, wantProtected: sha384},
+		{name: "sha512_is_registered_and_trusted", ref: sha512, wantProtected: sha512},
+		{name: "sha256_wrong_length_is_corrupt", ref: "sha256:" + strings.Repeat("ab", 48),
+			wantErrMsg: "digest-shaped but is not a digest"},
+		{name: "unregistered_algo_at_digest_length", ref: "md5:" + strings.Repeat("bb", 32),
+			wantErrMsg: "digest-shaped but is not a digest"},
+		{name: "unregistered_algo_v1", ref: "v1:" + strings.Repeat("aa", 32),
+			wantErrMsg: "digest-shaped but is not a digest"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// One ordinary digest-pinned container, so the fleet-wide-zero rule
+			// can never be what produces (or hides) the result.
+			inv := &fakeInv{hosts: map[string]invEntry{
+				"engine-1": {obs: []instance.Observed{obs("engine", "acme", digB)}, fresh: freshOK()},
+			}}
+			specs := &fakeSpecs{
+				keys:  map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+				specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{"image": tc.ref}}},
+			}
+			reg := &fakeReg{catalog: []string{"engine"}}
+			set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, baseCfg())
+			if tc.wantErrMsg != "" {
+				mustAbort(t, set, err)
+				if !strings.Contains(err.Error(), tc.wantErrMsg) {
+					t.Fatalf("want %q, got %v", tc.wantErrMsg, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			hasDigest(t, set, tc.wantProtected)
+			for _, f := range set.ForeignSkipped {
+				if f == tc.ref {
+					t.Fatalf("a registered-algorithm digest was skipped as foreign: %v", set.ForeignSkipped)
+				}
+			}
+		})
+	}
+}
+
+// The gate must NOT swallow an unqualified "<repo>:<40-hex git sha>": 40 is not
+// the hex length of any registered algorithm, so it stays a tag. This is the
+// round-4 Critical, re-pinned against the round-5 rewrite of the gate.
+func TestBuildInUseSet_GitShaTagSurvivesTheAlgorithmGate(t *testing.T) {
+	const ref = "engine:9b2c3d4e5f60718293a4b5c6d7e8f90123456789"
+	inv := &fakeInv{hosts: map[string]invEntry{"engine-1": {fresh: freshOK()}}}
+	specs := &fakeSpecs{
+		keys:  map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+		specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{"image": ref}}},
+	}
+	reg := &fakeReg{catalog: []string{"engine"}, manifests: map[string]string{ref: digA}}
+	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, baseCfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	hasDigest(t, set, digA)
+	if reg.calls != 1 {
+		t.Fatalf("want the tag resolved through the registry, got %d Manifest calls", reg.calls)
+	}
+}
+
+// N2: three fail-closed guards that behave correctly but had no test behind
+// them — all three survived the mutation battery. The third is load-bearing:
+// without it a spec pinning ".../engine@<junk>" puts the junk string in the
+// protected set with Covered=true while the real manifest goes unprotected and
+// nothing errors — a #64-shaped false negative.
+func TestBuildInUseSet_MalformedDigestGuards(t *testing.T) {
+	for _, tc := range []struct {
+		name, specImage string
+		manifests       map[string]string
+		wantErrMsg      string
+	}{
+		{
+			name:       "registry_returns_no_digest",
+			specImage:  testRegistryHost + "/engine:v9",
+			manifests:  map[string]string{"engine:v9": ""},
+			wantErrMsg: "registry returned no digest",
+		},
+		{
+			name:       "registry_returns_malformed_digest",
+			specImage:  testRegistryHost + "/engine:v9",
+			manifests:  map[string]string{"engine:v9": "not-a-digest"},
+			wantErrMsg: "registry returned a malformed digest",
+		},
+		{
+			name:       "pinned_ref_carries_junk_after_at",
+			specImage:  testRegistryHost + "/engine@junkjunkjunk",
+			wantErrMsg: "malformed digest in reference",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// A digest-pinned container keeps the fleet-wide count non-zero, so
+			// only the guard under test can produce the abort.
+			inv := &fakeInv{hosts: map[string]invEntry{
+				"engine-1": {obs: []instance.Observed{obs("engine", "acme", digB)}, fresh: freshOK()},
+			}}
+			specs := &fakeSpecs{
+				keys:  map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+				specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{"image": tc.specImage}}},
+			}
+			reg := &fakeReg{catalog: []string{"engine"}, manifests: tc.manifests}
+			set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, baseCfg())
+			mustAbort(t, set, err)
+			if !strings.Contains(err.Error(), tc.wantErrMsg) {
+				t.Fatalf("want %q, got %v", tc.wantErrMsg, err)
+			}
+		})
+	}
+}
