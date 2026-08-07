@@ -125,6 +125,58 @@ func TestSchedulerBacksOffAfterFailure(t *testing.T) {
 	}
 }
 
+// Cancel backoff: an operator cancelling a run (e.g. to stop a Stage B prune
+// that has the fleet's only registry stopped) must not have the ticker
+// re-enqueue it within the minute-granularity tick, same as a failure.
+func TestSchedulerBacksOffAfterCancel(t *testing.T) {
+	mem := store.NewMemory()
+	ctx := context.Background()
+	args, _ := json.Marshal(Payload{Policy: DefaultPolicy()})
+	j, _ := mem.Enqueue(ctx, JobKind, args, "")
+	mem.ClaimNext(ctx)
+	if err := mem.Finish(ctx, j.ID, store.JobCanceled, "operator cancel"); err != nil {
+		t.Fatal(err)
+	}
+	done, _ := mem.GetJob(ctx, j.ID)
+
+	s := newScheduler(mem, done.Finished.Add(time.Minute))
+	s.tick(ctx)
+	if got := len(queuedRuns(t, mem)); got != 0 {
+		t.Fatalf("must back off right after a cancel, got %d", got)
+	}
+
+	s.Now = func() time.Time { return done.Finished.Add(failureBackoff + time.Minute) }
+	s.tick(ctx)
+	if got := len(queuedRuns(t, mem)); got != 1 {
+		t.Fatalf("must retry once the backoff has elapsed, got %d", got)
+	}
+}
+
+// A reconciling job (the state a running job passes through on a control-plane
+// restart, before the reconciler resolves it) must still count as in-flight,
+// or a second run gets enqueued alongside it.
+func TestSchedulerDedupsReconcilingRun(t *testing.T) {
+	mem := store.NewMemory()
+	ctx := context.Background()
+	now := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
+	args, _ := json.Marshal(Payload{Policy: DefaultPolicy()})
+	if _, err := mem.Enqueue(ctx, JobKind, args, ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := mem.ClaimNext(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := mem.MarkReconciling(ctx, []string{JobKind}); err != nil || n != 1 {
+		t.Fatalf("MarkReconciling: n=%d err=%v", n, err)
+	}
+	s := newScheduler(mem, now)
+	s.tick(ctx)
+	all, _ := mem.ListJobs(ctx, store.JobFilter{Kind: JobKind})
+	if len(all) != 1 {
+		t.Fatalf("a reconciling run must suppress a second enqueue, got %d jobs", len(all))
+	}
+}
+
 // Start runs an immediate first pass before the ticker's first fire.
 func TestSchedulerStartRunsImmediateFirstPass(t *testing.T) {
 	mem := store.NewMemory()
