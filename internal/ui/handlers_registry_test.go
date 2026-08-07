@@ -25,6 +25,17 @@ type fakeRegistryUI struct {
 }
 
 func (f *fakeRegistryUI) Catalog(ctx context.Context) ([]string, error) { return f.catalog, nil }
+
+// ResolveTags is the drop-reporting surface; this fake never drops a tag, so
+// Tags and ResolveTags agree by construction.
+func (f *fakeRegistryUI) ResolveTags(ctx context.Context, repo string) (imgregistry.TagListing, error) {
+	groups, err := f.Tags(ctx, repo)
+	if err != nil {
+		return imgregistry.TagListing{}, err
+	}
+	return imgregistry.TagListing{Groups: groups}, nil
+}
+
 func (f *fakeRegistryUI) Tags(ctx context.Context, repo string) ([]imgregistry.TagGroup, error) {
 	if f.tagsErr != nil {
 		return nil, f.tagsErr

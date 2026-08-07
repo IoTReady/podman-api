@@ -61,12 +61,39 @@ type TagGroup struct {
 	Size    int64
 }
 
+// DroppedTag is one tag that a listing could not resolve, and why.
+type DroppedTag struct {
+	Tag string
+	Err error
+}
+
+// TagListing is a repo's resolved tag groups PLUS the tags that could not be
+// resolved and are therefore absent from those groups.
+//
+// The two travel together on purpose. Resolution drops a tag whose manifest
+// fetch failed and carries on (one exotic media type must not hide a whole
+// repo behind a single error), which is right for browsing and catastrophic
+// for anything that deletes: a dropped "latest" leaves its bare-hex alias
+// alone in its group, reclassifying it from "this is latest's own digest"
+// to "orphan". A caller that must not reason from a partial view checks
+// Dropped; a caller that just wants to render a list ignores it, or uses
+// Tags. Crucially, Dropped is derived from the SAME resolution pass as
+// Groups, so no two calls, layers or caches can disagree about whether a
+// given listing was complete.
+type TagListing struct {
+	Groups  []TagGroup
+	Dropped []DroppedTag
+}
+
 // Client is the surface this package exposes: read-only browsing plus the
 // one mutating call, Delete, that a prune job needs to reclaim registry
 // storage.
 type Client interface {
 	Catalog(ctx context.Context) ([]string, error)
 	Tags(ctx context.Context, repo string) ([]TagGroup, error)
+	// ResolveTags is Tags plus the evidence of what it could not resolve.
+	// Prefer it over Tags anywhere a partial listing would be acted on.
+	ResolveTags(ctx context.Context, repo string) (TagListing, error)
 	TagCount(ctx context.Context, repo string) (int, error)
 	Manifest(ctx context.Context, repo, ref string) (Manifest, error)
 
@@ -283,16 +310,31 @@ type digestGroup struct {
 	configDigest string
 }
 
-// Tags lists every tag in repo, resolves each to its manifest digest, and
-// groups tags that share a digest into one TagGroup. Each unique digest's
+// Tags is ResolveTags' groups-only view, for callers that only render a
+// listing. Anything that DELETES must use ResolveTags and check Dropped.
+func (c *HTTPClient) Tags(ctx context.Context, repo string) ([]TagGroup, error) {
+	listing, err := c.ResolveTags(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	return listing.Groups, nil
+}
+
+// ResolveTags lists every tag in repo, resolves each to its manifest digest,
+// and groups tags that share a digest into one TagGroup. Each unique digest's
 // config blob is fetched once (not once per tag) for its Created timestamp.
 // Manifest and blob-created lookups both run with bounded concurrency
 // (tagResolveConcurrency), not sequentially. Groups are sorted
 // newest-Created-first.
-func (c *HTTPClient) Tags(ctx context.Context, repo string) ([]TagGroup, error) {
+//
+// A tag whose manifest cannot be resolved is skipped rather than failing the
+// whole call — and reported in TagListing.Dropped, so a caller that cannot
+// act on a partial view can tell "this repo has one tag" from "this repo has
+// two tags and we could only see one".
+func (c *HTTPClient) ResolveTags(ctx context.Context, repo string) (TagListing, error) {
 	tagNames, err := c.listTags(ctx, repo)
 	if err != nil {
-		return nil, err
+		return TagListing{}, err
 	}
 
 	// Phase 1: resolve every tag's manifest concurrently. Each goroutine
@@ -320,13 +362,15 @@ func (c *HTTPClient) Tags(ctx context.Context, repo string) ([]TagGroup, error) 
 	// group matches tagNames' order.
 	byDigest := map[string]*digestGroup{}
 	var order []string
+	var dropped []DroppedTag
 	for _, r := range resolutions {
 		if r.err != nil {
 			// One tag this client cannot resolve (an unsupported media type,
 			// a transient blip) must not hide every other tag in the repo
-			// behind a single error — skip it and keep going. No logger is
-			// wired into this package; this comment is the record of the
-			// trade-off (see the design finding this fixes).
+			// behind a single error — skip it and keep going. It is RECORDED
+			// rather than merely skipped: a caller that deletes cannot be
+			// allowed to mistake a degraded listing for a small repo.
+			dropped = append(dropped, DroppedTag{Tag: r.tag, Err: r.err})
 			continue
 		}
 		dg, ok := byDigest[r.manifest.Digest]
@@ -379,7 +423,7 @@ func (c *HTTPClient) Tags(ctx context.Context, repo string) ([]TagGroup, error) 
 	sort.Slice(groups, func(i, j int) bool {
 		return groups[i].Created.After(groups[j].Created)
 	})
-	return groups, nil
+	return TagListing{Groups: groups, Dropped: dropped}, nil
 }
 
 // TagCount returns how many tags repo has, without resolving any of them.

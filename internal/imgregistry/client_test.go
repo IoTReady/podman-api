@@ -642,3 +642,74 @@ func TestHTTPClient_Delete_PathTraversalRejectedWithoutRequest(t *testing.T) {
 		t.Fatalf("server received %d requests, want 0 — an invalid repo name must never reach the wire", n)
 	}
 }
+
+// A dropped tag must be REPORTED, not merely skipped. Tags() returning only
+// the survivors with a nil error is indistinguishable, to any caller, from a
+// repo that genuinely has fewer tags — and a prune job reasoning from that
+// partial view deletes manifests that a dropped protected tag would have
+// saved. ResolveTags is the same call plus the evidence.
+func TestHTTPClient_ResolveTags_ReportsDroppedTags(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/engine/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"name":"engine","tags":["good","bad"]}`))
+	})
+	mux.HandleFunc("/v2/engine/manifests/good", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Docker-Content-Digest", "sha256:gooddigest")
+		w.Write([]byte(`{"config":{"digest":"sha256:goodcfg","size":10},"layers":[]}`))
+	})
+	mux.HandleFunc("/v2/engine/manifests/bad", func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	mux.HandleFunc("/v2/engine/blobs/sha256:goodcfg", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"created":"2026-01-01T00:00:00Z"}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, Auth{Mode: "none"})
+	listing, err := c.ResolveTags(context.Background(), "engine")
+	if err != nil {
+		t.Fatalf("ResolveTags: %v (one bad tag must not abort the call)", err)
+	}
+	if len(listing.Groups) != 1 || listing.Groups[0].Tags[0] != "good" {
+		t.Fatalf("expected the one resolvable group, got %+v", listing.Groups)
+	}
+	if len(listing.Dropped) != 1 || listing.Dropped[0].Tag != "bad" {
+		t.Fatalf("expected the dropped tag reported, got %+v", listing.Dropped)
+	}
+	if listing.Dropped[0].Err == nil {
+		t.Fatal("a dropped tag must carry why it was dropped")
+	}
+	// And the old surface still behaves exactly as before for callers that
+	// do not care.
+	groups, err := c.Tags(context.Background(), "engine")
+	if err != nil || len(groups) != 1 {
+		t.Fatalf("Tags must stay the groups-only view: %v %+v", err, groups)
+	}
+}
+
+// The complete case: nothing dropped, so nothing reported. Without this, an
+// implementation that reported every tag as dropped would pass the test above.
+func TestHTTPClient_ResolveTags_ReportsNoDropsWhenComplete(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v2/engine/tags/list", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"name":"engine","tags":["good"]}`))
+	})
+	mux.HandleFunc("/v2/engine/manifests/good", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Docker-Content-Digest", "sha256:gooddigest")
+		w.Write([]byte(`{"config":{"digest":"sha256:goodcfg","size":10},"layers":[]}`))
+	})
+	mux.HandleFunc("/v2/engine/blobs/sha256:goodcfg", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"created":"2026-01-01T00:00:00Z"}`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	listing, err := NewHTTPClient(srv.URL, Auth{Mode: "none"}).ResolveTags(context.Background(), "engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listing.Dropped) != 0 {
+		t.Fatalf("a complete listing must report no drops, got %+v", listing.Dropped)
+	}
+}

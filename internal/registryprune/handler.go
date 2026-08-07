@@ -233,7 +233,15 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 	// need to be fresh, not the repo set. Re-listing would reopen the TOCTOU
 	// that freezing it closed (a repo pushed mid-run being classified against
 	// a protection pass that never saw it).
-	fresh, err := h.inUseSet(ctx, repos)
+	//
+	// Skipped on a dry run: it deletes nothing, so a second full fleet walk
+	// plus registry manifest resolutions would buy no safety at all.
+	fresh := inUse
+	if p.DryRun {
+		jc.Step("in-use:recheck", "skipped: dry run deletes nothing")
+		return h.finish(ctx, jc, kept, inUse, fresh, protected, inCatalog, p)
+	}
+	fresh, err = h.inUseSet(ctx, repos)
 	recordSetDiagnostics(jc, fresh)
 	if err != nil {
 		h.metric().RunDone("aborted")
@@ -247,6 +255,13 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 	}
 	jc.Step("in-use:recheck", fmt.Sprintf("%d digest(s) protected fleet-wide at delete time", fresh.Len()))
 
+	return h.finish(ctx, jc, kept, inUse, fresh, protected, inCatalog, p)
+}
+
+// finish is steps (6) and (7): delete, then Stage B. Split out only so the
+// dry-run path can reach it without re-deriving the in-use set.
+func (h *Handler) finish(ctx context.Context, jc *jobs.JobContext, kept []repoPlan, inUse, fresh InUseSet,
+	protected map[string]struct{}, inCatalog map[string]struct{}, p Payload) error {
 	// (6) Delete.
 	deleted, delErr := h.deletePass(ctx, jc, kept, inUse, fresh, protected, inCatalog, p)
 	if delErr != nil {
@@ -317,20 +332,24 @@ func (h *Handler) classifyAll(ctx context.Context, jc *jobs.JobContext, repos []
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
-		want, err := h.Registry.TagCount(ctx, repo)
-		if err != nil {
-			jc.Step("classify:"+repo, "ABORTED: "+err.Error())
-			return nil, nil, fmt.Errorf("count tags for %s (aborting before any delete): %w", repo, err)
-		}
-		groups, err := h.Registry.Tags(ctx, repo)
+		// ONE call, to ONE client, returning the groups and the evidence of
+		// what could not be resolved together. There is deliberately no
+		// second observation to compare against: any two calls — even to the
+		// same client — can disagree because the world changed, and no
+		// comparison of counts can separate "the client degraded" from "a tag
+		// was pushed or deleted". Dropped comes from the same resolution pass
+		// as Groups, so that distinction is carried, not inferred.
+		listing, err := h.Registry.ResolveTags(ctx, repo)
 		if err != nil {
 			jc.Step("classify:"+repo, "ABORTED: "+err.Error())
 			return nil, nil, fmt.Errorf("list tags for %s (aborting before any delete): %w", repo, err)
 		}
-		if err := checkListingComplete(repo, want, groups); err != nil {
+		if len(listing.Dropped) > 0 {
+			err := fmt.Errorf("%w: %s", ErrUnsafeToPrune, describeDrops(repo, listing.Dropped))
 			jc.Step("classify:"+repo, "ABORTED: "+err.Error())
 			return nil, nil, err
 		}
+		groups := listing.Groups
 		listings[repo] = groups
 		for _, tg := range groups {
 			if nameProtected(repo, tg, pol) {
@@ -382,37 +401,28 @@ func (h *Handler) classifyAll(ctx context.Context, jc *jobs.JobContext, repos []
 	return plan, protected, nil
 }
 
-// checkListingComplete refuses a tag listing that lost tags on the way.
+// describeDrops explains an aborted run to an operator.
 //
-// HTTPClient.Tags resolves every tag's manifest concurrently and SILENTLY DROPS
-// any whose fetch failed, then groups over the survivors and returns err == nil
-// (client.go, phase 2: `if r.err != nil { continue }`). One 5xx under load —
-// ~988 tags on "engine", 16 concurrent GETs, 28 repos — is enough, and the tag
-// it hits is uniformly random, including latest/main/dev/calver. The
-// consequence is not "one tag missing from a report": a dropped "latest"
-// leaves its bare-hex alias alone in its group, reclassifying it from
-// sha-is-latest (kept) to sha-orphan (DELETED), and a dropped protected tag
+// A dropped tag is the client failing to resolve a manifest and carrying on
+// (client.go: the `if r.err != nil` arm of ResolveTags' grouping pass), which
+// is right for browsing a repo and catastrophic for deleting from one. A
+// dropped "latest" leaves its bare-hex alias alone in its group, reclassifying
+// it from sha-is-latest (kept) to sha-orphan (DELETED); a dropped protected tag
 // stops seeding the cross-repo protected-digest set, so shares-protected
-// silently loses that digest in EVERY repo.
+// silently loses that digest in EVERY repo — see
+// TestRun_DigestProtectedByNameInAnotherRepoIsKept for that property under
+// test.
 //
-// Hence an abort of the whole run rather than a tripwire-style per-repo skip:
+// Hence the whole run aborts rather than the repo being skipped tripwire-style:
 // the tripwire's skip-and-proceed is right when the anomaly's blast radius is
 // its own repo, and this one's is not.
-//
-// Only a SHORTFALL aborts. A surplus means a tag was pushed between the count
-// and the listing; that tag is simply not classified, so it cannot be deleted,
-// and treating it as an error would make the job unrunnable against a busy
-// registry.
-func checkListingComplete(repo string, want int, groups []imgregistry.TagGroup) error {
-	got := 0
-	for _, tg := range groups {
-		got += len(tg.Tags)
+func describeDrops(repo string, dropped []imgregistry.DroppedTag) string {
+	names := make([]string, 0, len(dropped))
+	for _, d := range dropped {
+		names = append(names, fmt.Sprintf("%s (%v)", d.Tag, d.Err))
 	}
-	if got < want {
-		return fmt.Errorf("%w: incomplete tag listing for %s: %d of %d tags resolved (imgregistry drops tags whose manifest fetch fails, silently and with a nil error); refusing to classify from a partial view",
-			ErrUnsafeToPrune, repo, got, want)
-	}
-	return nil
+	return fmt.Sprintf("registry listing for %s is incomplete: %d tag(s) could not be resolved and are absent from it: %s; refusing to classify from a partial view",
+		repo, len(dropped), listSample(names))
 }
 
 // nameProtected reports whether any tag in tg is protected by NAME under pol.

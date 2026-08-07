@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -33,10 +34,9 @@ type fakeClient struct {
 	tags     map[string][]imgregistry.TagGroup
 	tagsErr  map[string]error
 	tagCalls []string
-	// tagCount overrides TagCount per repo. Unset means "derive it from tags",
-	// i.e. a complete listing; a value LARGER than the tags actually returned
-	// is the silent-drop this handler must refuse to reason from.
-	tagCount map[string]int
+	// dropped is what ResolveTags reports it could not resolve for a repo —
+	// the real client's silent-skip, made visible.
+	dropped map[string][]imgregistry.DroppedTag
 
 	manifests map[string]string // "repo:ref" -> digest
 
@@ -73,10 +73,16 @@ func (f *fakeClient) tagsFor(repo string) ([]imgregistry.TagGroup, error) {
 	return append([]imgregistry.TagGroup(nil), f.tags[repo]...), nil
 }
 
-func (f *fakeClient) TagCount(ctx context.Context, repo string) (int, error) {
-	if n, ok := f.tagCount[repo]; ok {
-		return n, nil
+func (f *fakeClient) ResolveTags(_ context.Context, repo string) (imgregistry.TagListing, error) {
+	f.tagCalls = append(f.tagCalls, repo)
+	groups, err := f.tagsFor(repo)
+	if err != nil {
+		return imgregistry.TagListing{}, err
 	}
+	return imgregistry.TagListing{Groups: groups, Dropped: f.dropped[repo]}, nil
+}
+
+func (f *fakeClient) TagCount(ctx context.Context, repo string) (int, error) {
 	g, err := f.tagsFor(repo)
 	if err != nil {
 		return 0, err
@@ -620,6 +626,11 @@ func (o *orderingClient) Tags(ctx context.Context, repo string) ([]imgregistry.T
 	return o.inner.Tags(ctx, repo)
 }
 
+func (o *orderingClient) ResolveTags(ctx context.Context, repo string) (imgregistry.TagListing, error) {
+	*o.order = append(*o.order, "tags:"+repo)
+	return o.inner.ResolveTags(ctx, repo)
+}
+
 func (o *orderingClient) TagCount(ctx context.Context, repo string) (int, error) {
 	return o.inner.TagCount(ctx, repo)
 }
@@ -674,24 +685,23 @@ func TestRun_IncompleteTagListingAbortsBeforeAnyDelete(t *testing.T) {
 			"engine": {orphanGroup(digD, "abc1234")},
 			"otp":    {orphanGroup(digE, "beef123")},
 		},
-		tagCount: map[string]int{"engine": 2, "otp": 1},
+		dropped: map[string][]imgregistry.DroppedTag{"engine": {{Tag: "latest", Err: imgregistry.ErrUnreachable}}},
 	}
 	h := newHandler(t, reg)
 	_, job, err := runJob(t, h, Payload{Policy: testPolicy()})
-	if err == nil {
-		t.Fatal("an incomplete tag listing must abort the run")
+	if !errors.Is(err, ErrUnsafeToPrune) {
+		t.Fatalf("an incomplete tag listing must abort the run, got %v", err)
 	}
 	// Aborts the WHOLE run, not just the affected repo: the dropped tag may be
 	// what protects a digest in some other repo.
 	wantNoDeletes(t, reg)
-	wantStepContaining(t, job, "incomplete")
+	wantStepContaining(t, job, "latest")
 }
 
 func TestRun_CompleteTagListingProceeds(t *testing.T) {
 	reg := &fakeClient{
 		catalogs:  [][]string{{"engine"}},
 		tags:      map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
-		tagCount:  map[string]int{"engine": 1},
 		manifests: map[string]string{},
 	}
 	h := newHandler(t, reg)
@@ -715,7 +725,6 @@ func TestRun_FeatTagWithUnknownAgeIsNotDeleted(t *testing.T) {
 		tags: map[string][]imgregistry.TagGroup{
 			"engine": {{Digest: digD, Tags: []string{"feat-brand-new"}}}, // Created zero
 		},
-		tagCount: map[string]int{"engine": 1},
 	}
 	h := newHandler(t, reg)
 	_, job, err := runJob(t, h, Payload{Policy: testPolicy()})
@@ -734,7 +743,6 @@ func TestRun_AgedFeatTagIsStillDeleted(t *testing.T) {
 		tags: map[string][]imgregistry.TagGroup{
 			"engine": {{Digest: digD, Tags: []string{"feat-old"}, Created: fixedNow.AddDate(0, 0, -60)}},
 		},
-		tagCount: map[string]int{"engine": 1},
 	}
 	h := newHandler(t, reg)
 	if _, _, err := runJob(t, h, Payload{Policy: testPolicy()}); err != nil {
@@ -755,7 +763,6 @@ func TestRun_RebuildsInUseSetBeforeDeleting(t *testing.T) {
 	reg := &fakeClient{
 		catalogs: [][]string{{"engine"}},
 		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
-		tagCount: map[string]int{"engine": 1},
 	}
 	h := newHandler(t, reg)
 	calls := 0
@@ -815,7 +822,6 @@ func TestRun_SecondInUseBuildFailureAbortsWithZeroDeletes(t *testing.T) {
 	reg := &fakeClient{
 		catalogs: [][]string{{"engine"}},
 		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
-		tagCount: map[string]int{"engine": 1},
 	}
 	h := newHandler(t, reg)
 	calls := 0
@@ -956,5 +962,198 @@ func TestPayloadRoundTripsThroughJobArgs(t *testing.T) {
 	if got, want := Classify("engine", tg, empty, nil, out.Policy, fixedNow),
 		Classify("engine", tg, empty, nil, in.Policy, fixedNow); got != want {
 		t.Fatalf("classification diverged across the round trip: %s vs %s", got, want)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Review round 3.
+// ---------------------------------------------------------------------------
+
+// The drop signal is about the CLIENT degrading, never about the world
+// changing. A tag pushed or deleted between two observations is normal and must
+// not abort — the count-comparison this replaced could not tell the two apart,
+// and a registry with ordinary tag churn would have stalled pruning
+// indefinitely behind the scheduler's 1h failure backoff.
+func TestRun_ConcurrentTagChurnDoesNotAbort(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine"}},
+		tags: map[string][]imgregistry.TagGroup{
+			// More groups than any earlier observation would have counted, and
+			// fewer than a later one: nothing was dropped, so nothing aborts.
+			"engine": {orphanGroup(digD, "abc1234"), orphanGroup(digE, "beef123")},
+		},
+	}
+	h := newHandler(t, reg)
+	if _, _, err := runJob(t, h, Payload{Policy: testPolicy()}); err != nil {
+		t.Fatalf("ordinary tag churn must not abort the run: %v", err)
+	}
+	if len(reg.deletes) != 2 {
+		t.Fatalf("want both orphans deleted, got %v", reg.deletes)
+	}
+}
+
+// Important B. The cross-repo protected-digest seeding is load-bearing and was
+// untested: digD is reachable via "latest" in otp and only via a bare-hex tag
+// in engine. Without the seeding, engine's group classifies sha-orphan and the
+// digest — which "latest" still points at — is deleted out from under it.
+// This is the property that justifies C-1's abort-the-whole-run choice.
+func TestRun_DigestProtectedByNameInAnotherRepoIsKept(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine", "otp"}},
+		tags: map[string][]imgregistry.TagGroup{
+			"engine": {orphanGroup(digD, "abc1234")},
+			"otp":    {{Digest: digD, Tags: []string{"latest"}, Created: fixedNow}},
+		},
+	}
+	h := newHandler(t, reg)
+	_, job, err := runJob(t, h, Payload{Policy: testPolicy()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNoDeletes(t, reg)
+	wantStepContaining(t, job, string(ClassSharesProtected))
+}
+
+// Minor 9. A dry run deletes nothing, so re-deriving the in-use set costs a
+// full fleet walk plus registry manifest resolutions for no safety at all.
+func TestRun_DryRunDoesNotRebuildInUseSet(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine"}},
+		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
+	}
+	h := newHandler(t, reg)
+	calls := 0
+	h.buildSet = func(context.Context) (InUseSet, error) {
+		calls++
+		return InUseSet{Valid: true, Digests: map[string]struct{}{digA: {}}}, nil
+	}
+	if _, _, err := runJob(t, h, Payload{Policy: testPolicy(), DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("a dry run must not re-derive the in-use set, got %d builds", calls)
+	}
+	wantNoDeletes(t, reg)
+}
+
+// Minor 8. The two Valid gates were mutually masking: removing either alone
+// left the suite green, because every path that reaches one also reaches the
+// other. These two pin them independently — each drives ONE build to an
+// invalid set and leaves the other valid.
+func TestRun_FirstValidGateIsPinnedIndependently(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine"}},
+		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
+	}
+	h := newHandler(t, reg)
+	calls := 0
+	h.buildSet = func(context.Context) (InUseSet, error) {
+		calls++
+		if calls == 1 {
+			return InUseSet{Valid: false, Digests: nil}, nil // only the FIRST is bad
+		}
+		return InUseSet{Valid: true, Digests: map[string]struct{}{digA: {}}}, nil
+	}
+	if _, _, err := runJob(t, h, Payload{Policy: testPolicy()}); err == nil {
+		t.Fatal("an invalid first in-use set must fail the run on its own")
+	}
+	wantNoDeletes(t, reg)
+}
+
+func TestRun_SecondValidGateIsPinnedIndependently(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine"}},
+		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
+	}
+	h := newHandler(t, reg)
+	calls := 0
+	h.buildSet = func(context.Context) (InUseSet, error) {
+		calls++
+		if calls == 1 {
+			return InUseSet{Valid: true, Digests: map[string]struct{}{digA: {}}}, nil
+		}
+		return InUseSet{Valid: false, Digests: nil}, nil // only the SECOND is bad
+	}
+	if _, _, err := runJob(t, h, Payload{Policy: testPolicy()}); err == nil {
+		t.Fatal("an invalid re-derived in-use set must fail the run on its own")
+	}
+	wantNoDeletes(t, reg)
+}
+
+// mutableRegistry is a minimal inner Client whose tag list can change between
+// calls, and which counts TagCount calls. It exists for the CachingClient
+// hazard below.
+type mutableRegistry struct {
+	mu            sync.Mutex
+	groups        []imgregistry.TagGroup
+	tagCountCalls int
+}
+
+var _ imgregistry.Client = (*mutableRegistry)(nil)
+
+func (m *mutableRegistry) Catalog(context.Context) ([]string, error) { return []string{"engine"}, nil }
+
+func (m *mutableRegistry) ResolveTags(_ context.Context, _ string) (imgregistry.TagListing, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return imgregistry.TagListing{Groups: append([]imgregistry.TagGroup(nil), m.groups...)}, nil
+}
+
+func (m *mutableRegistry) Tags(ctx context.Context, repo string) ([]imgregistry.TagGroup, error) {
+	l, err := m.ResolveTags(ctx, repo)
+	return l.Groups, err
+}
+
+func (m *mutableRegistry) TagCount(_ context.Context, _ string) (int, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tagCountCalls++
+	n := 0
+	for _, g := range m.groups {
+		n += len(g.Tags)
+	}
+	return n, nil
+}
+
+func (m *mutableRegistry) Manifest(context.Context, string, string) (imgregistry.Manifest, error) {
+	return imgregistry.Manifest{}, imgregistry.ErrNotFound
+}
+
+func (m *mutableRegistry) Delete(context.Context, string, string) error { return nil }
+
+func (m *mutableRegistry) push(g imgregistry.TagGroup) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.groups = append(m.groups, g)
+}
+
+// The production wiring hazard, end to end against a REAL CachingClient.
+//
+// server.go builds exactly one registry client and it is a CachingClient:
+// Tags is cached for 5 minutes (and the registry UI warms that cache on every
+// page view) while TagCount is a live pass-through. Any completeness decision
+// made by comparing those two therefore reads a push inside the window as a
+// shortfall — indistinguishable from a silent drop — and aborts every run
+// forever.
+//
+// The property that makes this impossible is structural, not documentary: the
+// completeness evidence (TagListing.Dropped) is produced by the SAME resolution
+// pass as the groups and travels with them through the cache, so there is no
+// second observation to disagree with. This test pins both halves: the run
+// succeeds, and TagCount is never consulted at all.
+func TestRun_CachingClientPushMidWindowDoesNotAbort(t *testing.T) {
+	inner := &mutableRegistry{groups: []imgregistry.TagGroup{orphanGroup(digD, "abc1234")}}
+	cc := imgregistry.NewCachingClient(inner, 5*time.Minute)
+	if _, err := cc.Tags(context.Background(), "engine"); err != nil { // the UI warms it
+		t.Fatal(err)
+	}
+	inner.push(orphanGroup(digE, "beef123")) // CI pushes inside the window
+
+	h := newHandler(t, cc)
+	if _, _, err := runJob(t, h, Payload{Policy: testPolicy()}); err != nil {
+		t.Fatalf("a push inside the cache window must not abort the run: %v", err)
+	}
+	if inner.tagCountCalls != 0 {
+		t.Fatalf("completeness must come from the listing itself, not a second count call (%d made)", inner.tagCountCalls)
 	}
 }

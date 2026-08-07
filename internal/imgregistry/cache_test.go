@@ -17,6 +17,7 @@ type countingClient struct {
 	tagsCalls   atomic.Int32
 	deleteCalls atomic.Int32
 	groups      []TagGroup
+	dropped     []DroppedTag
 	err         error
 	deleteErr   error
 }
@@ -29,11 +30,16 @@ func (c *countingClient) Manifest(ctx context.Context, repo, ref string) (Manife
 	return Manifest{}, nil
 }
 func (c *countingClient) Tags(ctx context.Context, repo string) ([]TagGroup, error) {
+	l, err := c.ResolveTags(ctx, repo)
+	return l.Groups, err
+}
+
+func (c *countingClient) ResolveTags(ctx context.Context, repo string) (TagListing, error) {
 	c.tagsCalls.Add(1)
 	if c.err != nil {
-		return nil, c.err
+		return TagListing{}, c.err
 	}
-	return c.groups, nil
+	return TagListing{Groups: c.groups, Dropped: c.dropped}, nil
 }
 func (c *countingClient) Delete(ctx context.Context, repo, digest string) error {
 	c.deleteCalls.Add(1)
@@ -185,5 +191,59 @@ func TestCachingClient_Delete_InvalidatesTagsCache(t *testing.T) {
 	}
 	if n := inner.tagsCalls.Load(); n != 2 {
 		t.Fatalf("inner Tags called %d times, want 2 (Delete must invalidate the cached Tags entry)", n)
+	}
+}
+
+// The cache must carry the drop evidence with the groups it came from. If it
+// cached only the groups, a degraded listing would be served for the rest of
+// the TTL as if it were complete — the exact silent-partial-view the drop
+// signal exists to make impossible.
+func TestCachingClient_ResolveTags_CachesDroppedTagsWithTheGroups(t *testing.T) {
+	inner := &countingClient{
+		groups:  []TagGroup{{Digest: "sha256:a", Tags: []string{"v1"}}},
+		dropped: []DroppedTag{{Tag: "latest", Err: ErrUnreachable}},
+	}
+	cc := NewCachingClient(inner, time.Minute)
+
+	first, err := cc.ResolveTags(context.Background(), "engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Dropped) != 1 {
+		t.Fatalf("want the drop reported, got %+v", first.Dropped)
+	}
+	second, err := cc.ResolveTags(context.Background(), "engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.tagsCalls.Load(); n != 1 {
+		t.Fatalf("second ResolveTags should be served from cache, inner called %d times", n)
+	}
+	if len(second.Dropped) != 1 || second.Dropped[0].Tag != "latest" {
+		t.Fatalf("a cached listing must keep its drop evidence, got %+v", second.Dropped)
+	}
+}
+
+// Tags and ResolveTags must share one cache entry, so a repo warmed by the UI's
+// Tags call cannot then serve a ResolveTags caller a listing with the drop
+// evidence stripped.
+func TestCachingClient_TagsAndResolveTagsShareOneEntry(t *testing.T) {
+	inner := &countingClient{
+		groups:  []TagGroup{{Digest: "sha256:a", Tags: []string{"v1"}}},
+		dropped: []DroppedTag{{Tag: "latest", Err: ErrUnreachable}},
+	}
+	cc := NewCachingClient(inner, time.Minute)
+	if _, err := cc.Tags(context.Background(), "engine"); err != nil { // UI warms it
+		t.Fatal(err)
+	}
+	listing, err := cc.ResolveTags(context.Background(), "engine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := inner.tagsCalls.Load(); n != 1 {
+		t.Fatalf("want one inner call shared by both surfaces, got %d", n)
+	}
+	if len(listing.Dropped) != 1 {
+		t.Fatalf("a UI-warmed entry must still carry its drops, got %+v", listing.Dropped)
 	}
 }
