@@ -100,6 +100,16 @@ func registryPruneFlags(fs *flag.FlagSet) *registryPruneConfig {
 // compiler refuses any wrapper at all, so the property holds for decorators
 // nobody has written yet. The cache buys the prune nothing regardless: it walks
 // every repo once per run, on an interval, and pays the ~21s cold cost either way.
+//
+// What this does NOT close is the hazard itself, only the cache as a source of
+// it. A run still lists each repo once and deletes minutes later: classification
+// alone is ~21s x ~28 repos, so the residual window between a repo's listing and
+// its delete pass is LONGER than the 5-minute TTL removed above. A digest
+// classified sha-orphan at listing time and re-tagged as a release before the
+// delete pass is still deleted. This is inherited from registry-gc.sh, which has
+// the same shape, and it is accepted rather than fixed: the blast radius is a
+// dangling tag whose manifest can be re-pushed, not unrecoverable data. A real
+// fix means re-resolving each candidate immediately before deleting it.
 func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg *imgregistry.HTTPClient,
 	svc *instance.Service, specs registryprune.SpecSource, pod registryprune.PodRunner,
 	metrics registryprune.Metrics) (*registryprune.Handler, error) {

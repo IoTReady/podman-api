@@ -14,13 +14,30 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 )
 
-// fakeRunner is a hand-written PodRunner. It records the exact call ORDER, not
-// just the calls, because the property this stage exists to protect ("the
-// registry is running again afterwards") is an ordering claim.
+// podCall is one recorded PodRunner call: what was done, and to WHAT.
+//
+// The target is not bookkeeping. Order proves "the registry is running again
+// afterwards"; the target proves it is the REGISTRY that was stopped and
+// started and the GC POD that was force-removed. Swapping either pair passes
+// every ordering assertion while destroying the fleet's only registry
+// (PodRemove aimed at RegistryPod) or garbage-collecting against a live one
+// (PodStop aimed at the GC pod).
+type podCall struct {
+	verb string // "stop", "play", "wait", "remove", "start", "exec"
+	// target is the pod name the call was aimed at — or, for "exec", the
+	// container name. PlayKube names its pod inside the manifest, so "play"
+	// records "" and is asserted through r.yamls instead.
+	target string
+}
+
+// fakeRunner is a hand-written PodRunner. It records the exact call ORDER and
+// each call's TARGET, because the property this stage exists to protect ("the
+// registry is running again afterwards") is an ordering claim whose catastrophic
+// failure modes are all mis-targeting.
 type fakeRunner struct {
 	mu sync.Mutex
 
-	calls []string // ordered: "stop", "play", "wait", "remove", "start", "exec"
+	calls []podCall
 	yamls []string
 
 	stopErr error
@@ -46,19 +63,19 @@ type fakeRunner struct {
 	execErr error
 }
 
-func (f *fakeRunner) record(name string) {
+func (f *fakeRunner) record(name, target string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, name)
+	f.calls = append(f.calls, podCall{verb: name, target: target})
 }
 
-func (f *fakeRunner) PodStop(_ context.Context, _, _ string) error {
-	f.record("stop")
+func (f *fakeRunner) PodStop(_ context.Context, _, name string) error {
+	f.record("stop", name)
 	return f.stopErr
 }
 
-func (f *fakeRunner) PodStart(ctx context.Context, _, _ string) error {
-	f.record("start")
+func (f *fakeRunner) PodStart(ctx context.Context, _, name string) error {
+	f.record("start", name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.startCtxDone = append(f.startCtxDone, ctx.Err() != nil)
@@ -73,7 +90,7 @@ func (f *fakeRunner) PodStart(ctx context.Context, _, _ string) error {
 }
 
 func (f *fakeRunner) PlayKube(_ context.Context, _, raw string, _ bool, _ ...string) error {
-	f.record("play")
+	f.record("play", "")
 	f.mu.Lock()
 	f.yamls = append(f.yamls, raw)
 	f.mu.Unlock()
@@ -83,18 +100,18 @@ func (f *fakeRunner) PlayKube(_ context.Context, _, raw string, _ bool, _ ...str
 	return f.playErr
 }
 
-func (f *fakeRunner) WaitForPodCompletion(_ context.Context, _, _ string, _ time.Duration) (int, error) {
-	f.record("wait")
+func (f *fakeRunner) WaitForPodCompletion(_ context.Context, _, podName string, _ time.Duration) (int, error) {
+	f.record("wait", podName)
 	return f.waitCode, f.waitErr
 }
 
-func (f *fakeRunner) PodRemove(_ context.Context, _, _ string, _ bool) error {
-	f.record("remove")
+func (f *fakeRunner) PodRemove(_ context.Context, _, name string, _ bool) error {
+	f.record("remove", name)
 	return nil
 }
 
-func (f *fakeRunner) ContainerExec(_ context.Context, _, _ string, cmd []string) (podman.ExecResult, error) {
-	f.record("exec")
+func (f *fakeRunner) ContainerExec(_ context.Context, _, container string, cmd []string) (podman.ExecResult, error) {
+	f.record("exec", container)
 	f.mu.Lock()
 	f.execCmds = append(f.execCmds, cmd)
 	f.mu.Unlock()
@@ -114,7 +131,11 @@ func (f *fakeRunner) ContainerExec(_ context.Context, _, _ string, cmd []string)
 func (f *fakeRunner) callsJoined() string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return strings.Join(f.calls, ",")
+	verbs := make([]string, len(f.calls))
+	for i, c := range f.calls {
+		verbs[i] = c.verb
+	}
+	return strings.Join(verbs, ",")
 }
 
 func (f *fakeRunner) count(name string) int {
@@ -122,11 +143,50 @@ func (f *fakeRunner) count(name string) int {
 	defer f.mu.Unlock()
 	n := 0
 	for _, c := range f.calls {
-		if c == name {
+		if c.verb == name {
 			n++
 		}
 	}
 	return n
+}
+
+func (f *fakeRunner) recorded() []podCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]podCall(nil), f.calls...)
+}
+
+// wantPodTargets asserts that every recorded call was aimed at the right pod.
+//
+// Three mis-targetings pass every ordering assertion in this file and are each
+// catastrophic, so they are asserted explicitly rather than left implied:
+//
+//	PodRemove(…, RegistryPod, force) — force-removes the fleet's ONLY registry
+//	  pod after every successful GC. Destroyed, not stopped; no reconciler in the
+//	  core rebuilds it.
+//	PodStart(…, podName())          — the registry is never restarted, while the
+//	  job still records "registry restarted".
+//	PodStop(…, podName())           — garbage-collect runs against a LIVE
+//	  registry: the blob-corruption race this whole stage is shaped around.
+func wantPodTargets(t *testing.T, r *fakeRunner, g *BlobGC) {
+	t.Helper()
+	for i, c := range r.recorded() {
+		var want string
+		switch c.verb {
+		case "stop", "start":
+			want = g.RegistryPod
+		case "wait", "remove":
+			want = g.podName()
+		case "exec":
+			want = g.RegistryContainer
+		default: // "play" names its pod in the manifest, asserted via r.yamls
+			continue
+		}
+		if c.target != want {
+			t.Fatalf("call %d: %s targeted %q, want %q (registry pod %q, GC pod %q)",
+				i, c.verb, c.target, want, g.RegistryPod, g.podName())
+		}
+	}
 }
 
 // blobGCVerify is a real podman.Client assertion: the concrete client must
@@ -177,7 +237,9 @@ func noRetryDelay(t *testing.T) {
 
 func TestBlobGC_RestartsRegistryWhenGCExitsNonZero(t *testing.T) {
 	r := &fakeRunner{waitCode: 3}
-	job, err := runBlobGC(t, testBlobGC(r), Payload{})
+	g := testBlobGC(r)
+	job, err := runBlobGC(t, g, Payload{})
+	wantPodTargets(t, r, g)
 	if err == nil {
 		t.Fatal("expected a job failure for a non-zero GC exit, got nil")
 	}
@@ -249,7 +311,12 @@ func TestBlobGC_RestartsRegistryOnPanic(t *testing.T) {
 // because GC against a live registry is the blob-corruption race.
 func TestBlobGC_StopFailureAbortsGCButStillStarts(t *testing.T) {
 	r := &fakeRunner{stopErr: errors.New("boom")}
-	_, err := runBlobGC(t, testBlobGC(r), Payload{})
+	g := testBlobGC(r)
+	_, err := runBlobGC(t, g, Payload{})
+	// The stop must have been aimed at the REGISTRY: a stop aimed at the GC pod
+	// would "succeed" against a registry still serving, which is the exact
+	// blob-corruption race this stage exists to prevent.
+	wantPodTargets(t, r, g)
 	if err == nil {
 		t.Fatal("a failed stop must fail the job")
 	}
@@ -351,7 +418,9 @@ func TestBlobGC_RejectsRegistryPodNamedLikeTheDefaultGCPod(t *testing.T) {
 // claiming coverage it does not have.
 func TestBlobGC_TearsDownTheGCPodEvenWhenPlayFails(t *testing.T) {
 	r := &fakeRunner{playErr: errors.New("play refused")}
-	_, err := runBlobGC(t, testBlobGC(r), Payload{})
+	g := testBlobGC(r)
+	_, err := runBlobGC(t, g, Payload{})
+	wantPodTargets(t, r, g)
 	if err == nil {
 		t.Fatal("a failed play must fail the job")
 	}
@@ -408,9 +477,13 @@ func TestHandlerDryRunPlaysNoGCPod(t *testing.T) {
 
 func TestBlobGC_ManifestShape(t *testing.T) {
 	r := &fakeRunner{}
-	if _, err := runBlobGC(t, testBlobGC(r), Payload{}); err != nil {
+	g := testBlobGC(r)
+	if _, err := runBlobGC(t, g, Payload{}); err != nil {
 		t.Fatalf("unexpected failure: %v", err)
 	}
+	// The full success path — the one that ends in a force-remove — must have
+	// aimed every call at the right pod.
+	wantPodTargets(t, r, g)
 	if len(r.yamls) != 1 {
 		t.Fatalf("expected exactly one PlayKube, got %d", len(r.yamls))
 	}
@@ -419,6 +492,10 @@ func TestBlobGC_ManifestShape(t *testing.T) {
 	// in the test: a manifest that marshals restartPolicy under the wrong key,
 	// or drops it, would leave the GC pod restarting forever.
 	for _, want := range []string{
+		// The pod played must be the GC pod. Named here as well as guarded by
+		// validate(), because replace=true over the registry's own name is the
+		// destroy-the-registry path.
+		"name: " + g.podName(),
 		"restartPolicy: Never",
 		"image: registry:2",
 		"mountPath: /var/lib/registry",
@@ -502,10 +579,12 @@ func TestBlobGC_RecordsBeforeAndAfterSize(t *testing.T) {
 		{ExitCode: 0, Output: "2048\t/var/lib/registry\n"},
 		{ExitCode: 0, Output: "1024\t/var/lib/registry\n"},
 	}}
-	job, err := runBlobGC(t, testBlobGC(r), Payload{})
+	g := testBlobGC(r)
+	job, err := runBlobGC(t, g, Payload{})
 	if err != nil {
 		t.Fatalf("unexpected failure: %v", err)
 	}
+	wantPodTargets(t, r, g)
 	txt := stepText(job)
 	if !strings.Contains(txt, "2097152") || !strings.Contains(txt, "1048576") {
 		t.Fatalf("before/after sizes not recorded in bytes:\n%s", txt)

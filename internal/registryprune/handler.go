@@ -290,10 +290,10 @@ func (h *Handler) finish(ctx context.Context, jc *jobs.JobContext, kept []repoPl
 	// itself on DryRun/SkipBlobGC too, so the "no pod is ever played on a dry
 	// run" property does not depend on this call site.
 	if h.BlobGC != nil {
-		// Reclaim, NOT Run: Run discards the Result, and the Result is the
-		// only data path the bytes-reclaimed metric has. Wiring this call site
-		// to the error-only wrapper leaves that metric permanently at zero
-		// while everything still looks correct.
+		// The Result is the only data path the bytes-reclaimed metric has.
+		// Wrapping this call in an error-only helper that discards it leaves
+		// that metric permanently at zero while everything still looks
+		// correct — an earlier BlobGC.Run did exactly that and was deleted.
 		res, err := h.BlobGC.Reclaim(ctx, jc, p)
 		// Recorded before the error check, deliberately: the deferred restart
 		// in Reclaim fills the after-size in even on a failing run, and bytes

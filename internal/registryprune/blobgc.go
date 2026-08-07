@@ -191,13 +191,6 @@ func (g *BlobGC) validate() error {
 	return nil
 }
 
-// Run is the error-only entry point the job handler calls. Callers that need
-// the measured byte counts (the bytes-reclaimed metric) should call Reclaim.
-func (g *BlobGC) Run(ctx context.Context, jc *jobs.JobContext, p Payload) error {
-	_, err := g.Reclaim(ctx, jc, p)
-	return err
-}
-
 // Reclaim performs Stage B. It is a no-op (and never touches the registry) on
 // a dry run or when the payload sets SkipBlobGC.
 //

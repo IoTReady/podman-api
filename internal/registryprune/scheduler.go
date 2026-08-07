@@ -208,9 +208,9 @@ func (s *Scheduler) tick(ctx context.Context) {
 	log.Printf("registryprune: enqueued a registry prune run")
 }
 
-// scanJobs reports whether a run is queued or running, and the most recent
-// succeeded/failed finish times. On a store error it reports in-flight — fail
-// safe toward not enqueuing.
+// scanJobs reports whether a run is still active, and the most recent
+// succeeded/failed finish times (a cancel counts as a failure — see below). On a
+// store error it reports in-flight — fail safe toward not enqueuing.
 func (s *Scheduler) scanJobs(ctx context.Context) (inflight bool, lastSuccess, lastFailure time.Time) {
 	jobs, err := s.Store.ListJobs(ctx, store.JobFilter{Kind: JobKind, Limit: activeScanLimit})
 	if err != nil {
@@ -218,14 +218,25 @@ func (s *Scheduler) scanJobs(ctx context.Context) (inflight bool, lastSuccess, l
 		return true, time.Time{}, time.Time{}
 	}
 	for _, j := range jobs {
-		switch j.State {
-		case store.JobQueued, store.JobRunning:
+		// store.JobState.Active(), not a hand-rolled queued/running pair: its
+		// own doc says so, and a state added later (reconciling is already one)
+		// would otherwise be read as terminal and let a second run start
+		// alongside the first.
+		if j.State.Active() {
 			inflight = true
+			continue
+		}
+		switch j.State {
 		case store.JobSucceeded:
 			if j.Finished.After(lastSuccess) {
 				lastSuccess = j.Finished
 			}
-		case store.JobFailed:
+		case store.JobFailed, store.JobCanceled:
+			// A cancel counts as a failure for backoff purposes. It is the
+			// operator saying "stop", and without it the run sets no backoff at
+			// all and the ticker re-enqueues within the interval — an operator
+			// who cancels a Stage B run to stop it stopping the registry gets
+			// the registry stopped again a minute later.
 			if j.Finished.After(lastFailure) {
 				lastFailure = j.Finished
 			}

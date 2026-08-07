@@ -332,12 +332,13 @@ func RunWithFlags(opts ...Option) error {
 		log.Printf("prune scheduler enabled (interval %s, disk threshold %d%%, scopes %v)", *pruneInterval, *pruneThreshold, def.Scope)
 	}
 
-	// The scheduler is the ONLY thing that enqueues a registry prune. There is
-	// deliberately no "run now" route or button: the scheduler's in-flight scan
-	// is the single mechanism preventing two concurrent runs, and a manual
-	// enqueue would bypass it — two runs each classifying from a listing the
-	// other is mutating is exactly the shape of the #64 incident. If a manual
-	// trigger is ever added it needs its own concurrency guard first.
+	// Two things enqueue a registry prune, and BOTH go through the scheduler:
+	// its own ticker and POST /registry/prune (wired to regPruneSched below, not
+	// to the job store). That is deliberate — the scheduler's in-flight scan plus
+	// its enqueueSem are the single mechanism preventing two concurrent runs, and
+	// two runs each classifying from a listing the other is mutating is exactly
+	// the shape of the #64 incident. Any further trigger must enqueue through the
+	// scheduler too; nothing may reach the job store directly.
 	if regPruneHandler != nil {
 		regPruneSched = buildRegistryPruneScheduler(*regPruneCfg, db)
 		regPruneSched.Start(runnerCtx)

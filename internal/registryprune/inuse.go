@@ -461,15 +461,6 @@ func isImageParam(name string) bool {
 	return n == "image" || strings.HasSuffix(n, "_image")
 }
 
-// resolveRef turns one image reference into the manifest digest it must
-// protect.
-//
-// It returns "" (protect nothing, no error) only when the reference provably
-// belongs somewhere this run cannot delete from: another registry, or a
-// repository ours does not host. Every other failure is an error, and every
-// error aborts the run — a ref quietly skipped is exactly the false negative
-// this package exists to prevent.
-//
 // refOutcome is what one image reference resolved to.
 type refOutcome struct {
 	// Digest is the manifest digest to protect, or "" when there is nothing
@@ -490,6 +481,14 @@ type refOutcome struct {
 	HostMatched bool
 }
 
+// resolveRef turns one image reference into the manifest digest it must
+// protect.
+//
+// It returns "" (protect nothing, no error) only when the reference provably
+// belongs somewhere this run cannot delete from: another registry, or a
+// repository ours does not host. Every other failure is an error, and every
+// error aborts the run — a ref quietly skipped is exactly the false negative
+// this package exists to prevent.
 func resolveRef(ctx context.Context, reg ManifestResolver, known map[string]struct{}, registryHosts []string, ref string) (refOutcome, error) {
 	var out refOutcome
 	ref = strings.TrimSpace(ref)
@@ -663,6 +662,15 @@ func looksLikeRegistryHost(s string) bool {
 	return s == "localhost" || strings.ContainsAny(s, ".:")
 }
 
+// ValidateRegistryHost reports whether raw is a spelling BuildInUseSet will
+// accept, so a caller can fail at startup instead of discovering it a whole
+// interval later. It is the same check BuildInUseSet applies; nothing here is
+// a second, looser opinion.
+func ValidateRegistryHost(raw string) error {
+	_, err := normalizeRegistryHost(raw)
+	return err
+}
+
 // normalizeRegistryHost canonicalises one configured spelling of our registry
 // into the bare host[:port] form that appears in an image reference, and
 // rejects anything that is not one.
@@ -674,15 +682,6 @@ func looksLikeRegistryHost(s string) bool {
 // as foreign. The fleet-wide-zero rule does not catch it, because
 // digest-pinned containers still populate the set, so the run proceeds and
 // deletes every manifest that was only reachable through a tag.
-// ValidateRegistryHost reports whether raw is a spelling BuildInUseSet will
-// accept, so a caller can fail at startup instead of discovering it a whole
-// interval later. It is the same check BuildInUseSet applies; nothing here is
-// a second, looser opinion.
-func ValidateRegistryHost(raw string) error {
-	_, err := normalizeRegistryHost(raw)
-	return err
-}
-
 func normalizeRegistryHost(raw string) (string, error) {
 	h := strings.ToLower(strings.TrimSpace(raw))
 	if i := strings.Index(h, "://"); i != -1 {

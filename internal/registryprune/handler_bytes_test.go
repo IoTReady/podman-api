@@ -42,9 +42,9 @@ func bytesHandler(t *testing.T, r *fakeRunner) (*Handler, *bytesMetrics) {
 	return h, m
 }
 
-// The whole point of Result: BlobGC.Run discards it, so wiring the call site to
-// Run leaves the bytes-reclaimed metric with NO data path at all. This test is
-// the one that fails if someone switches it back.
+// The whole point of Result: it is the ONLY data path the bytes-reclaimed metric
+// has — re-parsing a formatted job step is not one. This test is what fails if
+// the handler is ever rewired to an error-only wrapper that discards the Result.
 func TestRun_ReportsBytesReclaimedAsAMetric(t *testing.T) {
 	r := &fakeRunner{execOut: []podman.ExecResult{
 		{Output: "3000\t/var/lib/registry"},

@@ -236,6 +236,15 @@ func Classify(repo string, tg imgregistry.TagGroup, inUse InUseSet, protectedDig
 		// long-standing behaviour for feature-branch cleanup and is NOT a
 		// bug — do not "fix" it to fail closed without re-checking the
 		// script and this comment first.
+		//
+		// Do NOT read this as "those tags get deleted", either: the handler
+		// fails them closed one layer up. A ClassFeatStale whose Created is
+		// zero is pulled back out of the candidate list and recorded as
+		// age-unknown rather than deleted (handler.go, the ageUnknown branch),
+		// because a zero Created is indistinguishable from a transient blob-GET
+		// failure and the blast radius is per-DIGEST. Classification is the
+		// honest answer to "what is this tag"; whether to act on it is the
+		// handler's call.
 		if tg.Created.IsZero() || now.Sub(tg.Created) > retention {
 			return ClassFeatStale
 		}

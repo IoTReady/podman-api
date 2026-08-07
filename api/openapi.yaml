@@ -267,10 +267,28 @@ components:
         name: {type: string}
         image:
           type: string
-          description: resolved digest, e.g. "docker.io/library/postgres@sha256:..."
-        image_tag: {type: string}
+          description: >-
+            A BARE manifest digest with no repository, e.g. "sha256:42283567cae4...";
+            NOT the "repo@sha256:..." shape. Measured 34/34 across non-infra
+            containers (podman 5.8.2). When podman reports no digest this falls back
+            to the container's image ID — a bare 64-hex string that is not a manifest
+            digest at all, so a consumer resolving against a registry must
+            distinguish the two. Empty for an infra container (see is_infra).
+        image_tag:
+          type: string
+          description: >-
+            The full reference: "host/repo:tag" or "host/repo@sha256:...".
         status: {type: string}
         started_at: {type: string, format: date-time}
+        is_infra:
+          type: boolean
+          description: >-
+            True for the pod's infra container, identified by the pod's own infra
+            ID. It reports no image at all, so a consumer reasoning about images
+            must tell it apart from an app container whose image could not be
+            determined. The name is not a safe test: containers are named
+            <pod>-<containerName>, so a template declaring a container called
+            "infra" produces the same suffix. Omitted when false.
         ports:
           type: array
           items: {$ref: '#/components/schemas/PortMapping'}
