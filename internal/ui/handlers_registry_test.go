@@ -25,6 +25,17 @@ type fakeRegistryUI struct {
 }
 
 func (f *fakeRegistryUI) Catalog(ctx context.Context) ([]string, error) { return f.catalog, nil }
+
+// ResolveTags is the drop-reporting surface; this fake never drops a tag, so
+// Tags and ResolveTags agree by construction.
+func (f *fakeRegistryUI) ResolveTags(ctx context.Context, repo string) (imgregistry.TagListing, error) {
+	groups, err := f.Tags(ctx, repo)
+	if err != nil {
+		return imgregistry.TagListing{}, err
+	}
+	return imgregistry.TagListing{Groups: groups}, nil
+}
+
 func (f *fakeRegistryUI) Tags(ctx context.Context, repo string) ([]imgregistry.TagGroup, error) {
 	if f.tagsErr != nil {
 		return nil, f.tagsErr
@@ -52,6 +63,12 @@ func (f *fakeRegistryUI) Manifest(ctx context.Context, repo, ref string) (imgreg
 		return imgregistry.Manifest{}, fmt.Errorf("manifest %s/%s: not found: %w", repo, ref, imgregistry.ErrNotFound)
 	}
 	return m, nil
+}
+
+// Delete is unused by internal/ui's routes (no delete route exists yet) but
+// required to satisfy imgregistry.Client.
+func (f *fakeRegistryUI) Delete(ctx context.Context, repo, digest string) error {
+	return nil
 }
 
 // uiWithRegistry mirrors uiWithService (handlers_hosts_test.go) but also

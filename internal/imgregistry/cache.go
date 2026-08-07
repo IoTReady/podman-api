@@ -16,15 +16,31 @@ import (
 // would linger in the UI.
 const TagsCacheTTL = 5 * time.Minute
 
-// tagsCacheEntry is one repo's cached Tags() result.
+// tagsCacheEntry is one repo's cached listing. It stores the whole
+// TagListing, drop evidence included: caching only the groups would serve a
+// degraded listing for the rest of the TTL as if it were complete, which is
+// exactly the silent partial view TagListing.Dropped exists to prevent. Tags
+// and ResolveTags share this one entry, so a repo warmed by the UI cannot
+// then hand a pruning caller a listing with its evidence stripped.
 type tagsCacheEntry struct {
-	groups  []TagGroup
+	listing TagListing
 	expires time.Time
 }
 
-// CachingClient wraps a Client and caches its Tags() results for ttl, since
-// Tags is the one call expensive enough to matter — for the fleet's "engine"
-// repo, ~1000 manifest GETs plus 737 config-blob GETs, ~21s on a cold cache.
+// cloneListing deep-copies the slices so nothing outside this type can mutate
+// a cached listing through an alias.
+func cloneListing(l TagListing) TagListing {
+	return TagListing{
+		Groups:  append([]TagGroup(nil), l.Groups...),
+		Dropped: append([]DroppedTag(nil), l.Dropped...),
+	}
+}
+
+// CachingClient wraps a Client and caches its ResolveTags() listings for ttl,
+// since resolving a repo's tags is the one call expensive enough to matter —
+// for the fleet's "engine" repo, ~1000 manifest GETs plus 737 config-blob
+// GETs, ~21s on a cold cache. Tags() is served from that same entry, so the
+// two can never disagree about a repo.
 // The list page (internal/ui/handlers_registry.go) fires this once per
 // catalog repo, concurrently, on every single page view — without a cache
 // that's the full per-repo cost paid ~26 times on every visit. With it, only
@@ -42,9 +58,9 @@ type tagsCacheEntry struct {
 // list call), and Manifest is one lookup for one digest — caching it would
 // buy little while adding another thing that could go stale.
 //
-// Only a successful Tags() result is cached (see Tags below) — a transient
-// registry blip must not poison every viewer's list page for the rest of the
-// TTL.
+// Only a successful ResolveTags() listing is cached (see ResolveTags below) —
+// a transient registry blip must not poison every viewer's list page for the
+// rest of the TTL.
 type CachingClient struct {
 	inner Client
 	ttl   time.Duration
@@ -76,30 +92,55 @@ func (c *CachingClient) Manifest(ctx context.Context, repo, ref string) (Manifes
 	return c.inner.Manifest(ctx, repo, ref)
 }
 
+// Delete delegates to the inner Client and, only on success, invalidates
+// repo's cached Tags() entry — a stale listing after a delete would let a
+// subsequent run reason from a tag that no longer exists on the registry. A
+// failed delete leaves the cache untouched, since nothing was actually
+// removed.
+func (c *CachingClient) Delete(ctx context.Context, repo, digest string) error {
+	if err := c.inner.Delete(ctx, repo, digest); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	delete(c.cache, repo)
+	c.mu.Unlock()
+	return nil
+}
+
 // Tags returns repo's cached TagGroups if present and not yet expired,
 // otherwise resolves them via the inner Client and, only on success, stores
 // the result. Safe for concurrent use — the list page fans this out across
 // ~26 goroutines on a single page load.
 func (c *CachingClient) Tags(ctx context.Context, repo string) ([]TagGroup, error) {
+	listing, err := c.ResolveTags(ctx, repo)
+	if err != nil {
+		return nil, err
+	}
+	return listing.Groups, nil
+}
+
+// ResolveTags returns repo's cached listing if present and not yet expired,
+// otherwise resolves it via the inner Client and, only on success, stores the
+// result. Safe for concurrent use — the list page fans this out across ~26
+// goroutines on a single page load.
+func (c *CachingClient) ResolveTags(ctx context.Context, repo string) (TagListing, error) {
 	c.mu.RLock()
 	entry, ok := c.cache[repo]
 	c.mu.RUnlock()
 	if ok && time.Now().Before(entry.expires) {
-		return append([]TagGroup(nil), entry.groups...), nil
+		return cloneListing(entry.listing), nil
 	}
 
-	groups, err := c.inner.Tags(ctx, repo)
+	listing, err := c.inner.ResolveTags(ctx, repo)
 	if err != nil {
 		// Never cache an error: a transient registry blip must not wedge
 		// every viewer's page at "unreachable" for the rest of the TTL.
-		return nil, err
+		return TagListing{}, err
 	}
 
-	stored := append([]TagGroup(nil), groups...)
+	stored := cloneListing(listing)
 	c.mu.Lock()
-	c.cache[repo] = tagsCacheEntry{groups: stored, expires: time.Now().Add(c.ttl)}
+	c.cache[repo] = tagsCacheEntry{listing: stored, expires: time.Now().Add(c.ttl)}
 	c.mu.Unlock()
-	// Return the caller's own copy too, so nothing outside this type can
-	// ever mutate the cached slice's backing array through an alias.
-	return append([]TagGroup(nil), stored...), nil
+	return cloneListing(stored), nil
 }

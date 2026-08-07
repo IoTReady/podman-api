@@ -35,6 +35,16 @@ type fakeRegistry struct {
 
 func (f *fakeRegistry) Catalog(ctx context.Context) ([]string, error) { return f.catalog, nil }
 
+// ResolveTags is the drop-reporting surface; this fake never drops a tag, so
+// Tags and ResolveTags agree by construction.
+func (f *fakeRegistry) ResolveTags(ctx context.Context, repo string) (imgregistry.TagListing, error) {
+	groups, err := f.Tags(ctx, repo)
+	if err != nil {
+		return imgregistry.TagListing{}, err
+	}
+	return imgregistry.TagListing{Groups: groups}, nil
+}
+
 func (f *fakeRegistry) Tags(ctx context.Context, repo string) ([]imgregistry.TagGroup, error) {
 	groups, ok := f.tags[repo]
 	if !ok {
@@ -72,6 +82,12 @@ func (f *fakeRegistry) Manifest(ctx context.Context, repo, ref string) (imgregis
 		return imgregistry.Manifest{}, fmt.Errorf("manifest %s/%s: not found: %w", repo, ref, imgregistry.ErrNotFound)
 	}
 	return m, nil
+}
+
+// Delete is unused by internal/api's routes (no delete route exists yet) but
+// required to satisfy imgregistry.Client.
+func (f *fakeRegistry) Delete(ctx context.Context, repo, digest string) error {
+	return nil
 }
 
 // newRegistryTestServer mirrors newTestServer/newSrvFull (instances_test.go)

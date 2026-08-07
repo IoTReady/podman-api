@@ -99,6 +99,26 @@ func TestEnrichContainer_Health(t *testing.T) {
 	})
 }
 
+func TestEnrichContainer_ExitCode(t *testing.T) {
+	t.Run("exited container reports its code", func(t *testing.T) {
+		var c Container
+		enrichContainer(&c, &define.InspectContainerData{
+			State: &define.InspectContainerState{Running: false, ExitCode: 3},
+		})
+		assert.Equal(t, 3, c.ExitCode)
+		assert.True(t, c.Exited)
+	})
+
+	t.Run("running container is not exited", func(t *testing.T) {
+		var c Container
+		enrichContainer(&c, &define.InspectContainerData{
+			State: &define.InspectContainerState{Running: true, ExitCode: 0},
+		})
+		assert.Equal(t, 0, c.ExitCode)
+		assert.False(t, c.Exited)
+	})
+}
+
 func TestPodFromInspect(t *testing.T) {
 	created := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	rep := &entities.PodInspectReport{InspectPodData: &define.InspectPodData{
@@ -180,4 +200,40 @@ func TestPodFromList(t *testing.T) {
 	assert.Equal(t, created, got.Created)
 	require.Len(t, got.Containers, 1)
 	assert.Equal(t, Container{ID: "c1", Name: "cache", Status: "running"}, got.Containers[0])
+}
+
+// The pod's own infra-container ID is the only reliable way to tell an infra
+// container from an app container: `podman kube play` names containers
+// <pod>-<containerName>, so a template that declares a container called
+// "infra" is indistinguishable by name, and an inspect failure leaves an app
+// container looking just as image-less as an infra one.
+func TestPodFromInspect_CarriesInfraContainerID(t *testing.T) {
+	rep := &entities.PodInspectReport{InspectPodData: &define.InspectPodData{
+		ID: "pod1", Name: "p", State: "Running", InfraContainerID: "c2",
+		Containers: []define.InspectPodContainerInfo{
+			{ID: "c1", Name: "db", State: "running"},
+			{ID: "c2", Name: "1fd9c02bf4f0-infra", State: "running"},
+		},
+	}}
+	got := podFromInspect(rep)
+	assert.Equal(t, "c2", got.InfraID)
+}
+
+func TestPodFromList_CarriesInfraContainerID(t *testing.T) {
+	rep := &entities.ListPodsReport{
+		Id: "pod9", Name: "p", Status: "Running", InfraId: "c7",
+		Containers: []*entities.ListPodContainer{
+			{Id: "c7", Names: "1fd9c02bf4f0-infra", Status: "running"},
+			{Id: "c8", Names: "cache", Status: "running"},
+		},
+	}
+	got := podFromList(rep)
+	assert.Equal(t, "c7", got.InfraID)
+}
+
+// A pod with no infra container (--infra=false) leaves it empty rather than
+// nominating some container as infra.
+func TestPodFromList_NoInfraLeavesIDEmpty(t *testing.T) {
+	rep := &entities.ListPodsReport{Id: "pod9", Name: "p", Status: "Running"}
+	assert.Empty(t, podFromList(rep).InfraID)
 }

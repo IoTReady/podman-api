@@ -41,6 +41,14 @@ type ObservedContainer struct {
 	StartedAt    time.Time             `json:"started_at,omitempty"`
 	RestartCount int                   `json:"restart_count"`
 	Ports        []ObservedPortMapping `json:"ports,omitempty"`
+	// IsInfra marks the pod's infra container, identified by the pod's own
+	// InfraID. It reports no image, image digest or image name at all, so a
+	// consumer reasoning about images (e.g. registry GC deciding what is in
+	// use) must be able to tell it apart from an app container whose image
+	// genuinely could not be determined. Name is not a safe test: `podman kube
+	// play` names containers <pod>-<containerName>, so a template declaring a
+	// container called "infra" produces the same suffix.
+	IsInfra bool `json:"is_infra,omitempty"`
 }
 
 type ObservedPortMapping struct {
@@ -92,6 +100,7 @@ func Normalize(p podman.Pod, template, slug string, vols []podman.Volume, secret
 			Name: c.Name, Image: c.Image, ImageTag: c.ImageTag,
 			Status: c.Status, Health: c.Health,
 			StartedAt: c.StartedAt, RestartCount: c.RestartCount,
+			IsInfra: p.InfraID != "" && c.ID == p.InfraID,
 		}
 		for _, port := range c.Ports {
 			oc.Ports = append(oc.Ports, ObservedPortMapping{

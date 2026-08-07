@@ -10,13 +10,29 @@ type Pod struct {
 	Created    time.Time
 	Containers []Container
 	Labels     map[string]string
+	// InfraID is the ID of the pod's infra container, empty when the pod has
+	// none. It is the only reliable way to tell an infra container from an app
+	// container: names collide (`podman kube play` names containers
+	// <pod>-<containerName>) and an infra container reports no image at all,
+	// which is indistinguishable from an app container whose inspect failed.
+	InfraID string
 }
 
 type Container struct {
-	ID       string
-	Name     string
-	Image    string // resolved digest, e.g. "docker.io/library/postgres@sha256:..."
-	ImageTag string // human-readable tag, e.g. "docker.io/library/postgres:16"
+	ID   string
+	Name string
+	// Image is InspectContainerData.ImageDigest, which is
+	// image.Digest().String(): a BARE digest with no repository, e.g.
+	// "sha256:42283567cae4…". It is NOT the "repo@sha256:…" shape — measured
+	// across 34 non-infra containers on engine-1 (podman 5.8.2, 2026-08-07),
+	// 34/34. When podman has no digest, enrichContainer falls back to
+	// InspectContainerData.Image, a bare 64-hex image ID that is not a manifest
+	// digest at all; a consumer that must resolve against a registry has to
+	// distinguish the two.
+	Image string
+	// ImageTag is InspectContainerData.ImageName, the full reference:
+	// "host/repo:tag" (18/34 in the same survey) or "host/repo@sha256:…" (16/34).
+	ImageTag string
 	Status   string
 	// Health is the container's healthcheck status: "" when the container
 	// declares no healthcheck, otherwise "healthy" / "unhealthy" / "starting".
@@ -32,6 +48,14 @@ type Container struct {
 	RestartCount      int
 	Ports             []PortMapping
 	Env               map[string]string
+	// ExitCode is the container's last exit code, as libpod reports it. It is
+	// meaningful only when Exited is true; a running container has ExitCode 0
+	// (never populated) alongside Exited false.
+	ExitCode int
+	// Exited reports whether the container has stopped running (libpod's
+	// State.Running == false). Distinguishes "never ran" / "still running"
+	// from "ran and produced ExitCode".
+	Exited bool
 }
 
 type PortMapping struct {

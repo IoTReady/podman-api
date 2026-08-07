@@ -361,6 +361,122 @@ func (r *Real) PlayKube(ctx context.Context, id, raw string, replace bool, netwo
 	return err
 }
 
+// waitPollInterval bounds how often WaitForPodCompletion re-inspects the pod
+// while waiting for its containers to exit.
+var waitPollInterval = 2 * time.Second
+
+// WaitForPodCompletion polls the named pod's containers until every one has
+// exited or timeout elapses. It returns the first non-zero exit code found
+// (in container order), else 0. Timing out returns ErrWaitTimeout, never a
+// zero exit code — a caller must not be able to mistake "gave up waiting"
+// for "ran and exited 0".
+//
+// The caller's timeout, not the fixed opCtxFor callTimeout, bounds the wait:
+// opCtxFor's 10-minute cap is meant for a single libpod call, but a blob GC
+// over a large registry can legitimately run far longer. This method builds
+// its own context off the verified connection instead of going through
+// opCtxFor, so a 30-minute caller timeout is honoured rather than silently
+// truncated to 10 minutes.
+func (r *Real) WaitForPodCompletion(ctx context.Context, id, podName string, timeout time.Duration) (int, error) {
+	base, err := r.ctxFor(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	if err := r.ensureVerified(base, id); err != nil {
+		return 0, err
+	}
+	c, cancel := context.WithTimeout(base, timeout)
+	stop := context.AfterFunc(ctx, cancel)
+	defer func() { stop(); cancel() }()
+
+	return waitForCompletion(c, podName,
+		func(ctx context.Context, name string) ([]string, error) {
+			rep, err := pods.Inspect(ctx, name, &pods.InspectOptions{})
+			if err != nil {
+				return nil, err
+			}
+			ids := make([]string, len(rep.Containers))
+			for i, ci := range rep.Containers {
+				ids[i] = ci.ID
+			}
+			return ids, nil
+		},
+		func(ctx context.Context, cid string) (running bool, exitCode int, err error) {
+			full, err := containers.Inspect(ctx, cid, &containers.InspectOptions{})
+			if err != nil {
+				return false, 0, err
+			}
+			if full.State == nil {
+				return false, 0, nil
+			}
+			return full.State.Running, int(full.State.ExitCode), nil
+		},
+	)
+}
+
+// waitForCompletion is the polling core of WaitForPodCompletion, decoupled
+// from libpod bindings behind two small closures so its timeout/error
+// handling can be unit-tested without a live podman connection. ctx's own
+// deadline is authoritative for the whole wait (the caller is expected to
+// have derived it from their own timeout, not a fixed per-call cap).
+func waitForCompletion(
+	ctx context.Context,
+	podName string,
+	inspectPod func(ctx context.Context, name string) ([]string, error),
+	inspectContainer func(ctx context.Context, id string) (running bool, exitCode int, err error),
+) (int, error) {
+	for {
+		ids, err := inspectPod(ctx, podName)
+		if err != nil {
+			if isNotFound(err) {
+				return 0, ErrNotFound
+			}
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return 0, ErrWaitTimeout
+			}
+			return 0, err
+		}
+
+		allExited := true
+		exitCode := 0
+		for _, cid := range ids {
+			running, code, err := inspectContainer(ctx, cid)
+			if err != nil {
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					return 0, ErrWaitTimeout
+				}
+				// A container libpod just listed in the pod but can no
+				// longer inspect is ambiguous, never success: it may have
+				// crash-exited and been reaped, been removed by an external
+				// `podman rm`, or raced kube-play teardown. None of those
+				// mean the workload finished cleanly, so fail closed rather
+				// than silently reporting exit 0 for a container we never
+				// actually observed exiting (isNotFound included).
+				return 0, fmt.Errorf("podman: inspecting container %s while waiting for pod %s completion: %w", cid, podName, err)
+			}
+			if running {
+				allExited = false
+				continue
+			}
+			if code != 0 && exitCode == 0 {
+				exitCode = code
+			}
+		}
+		if allExited {
+			return exitCode, nil
+		}
+
+		select {
+		case <-ctx.Done():
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return 0, ErrWaitTimeout
+			}
+			return 0, ctx.Err()
+		case <-time.After(waitPollInterval):
+		}
+	}
+}
+
 func (r *Real) PodInspect(ctx context.Context, id, name string) (Pod, error) {
 	c, cancel, err := r.opCtxFor(ctx, id)
 	if err != nil {
@@ -398,6 +514,10 @@ func enrichContainer(c *Container, ins *define.InspectContainerData) {
 	}
 	if ins.State != nil && ins.State.Health != nil {
 		c.Health = ins.State.Health.Status
+	}
+	if ins.State != nil {
+		c.Exited = !ins.State.Running
+		c.ExitCode = int(ins.State.ExitCode)
 	}
 	if ins.Config != nil && ins.Config.Healthcheck != nil {
 		c.HealthStartPeriod = ins.Config.Healthcheck.StartPeriod
@@ -768,10 +888,11 @@ func mapNotFound(err error) error {
 
 func podFromInspect(p *entities.PodInspectReport) Pod {
 	out := Pod{
-		ID:     p.ID,
-		Name:   p.Name,
-		Status: p.State,
-		Labels: p.Labels,
+		ID:      p.ID,
+		Name:    p.Name,
+		Status:  p.State,
+		Labels:  p.Labels,
+		InfraID: p.InfraContainerID,
 	}
 	if !p.Created.IsZero() {
 		out.Created = p.Created
@@ -788,10 +909,11 @@ func podFromInspect(p *entities.PodInspectReport) Pod {
 
 func podFromList(p *entities.ListPodsReport) Pod {
 	out := Pod{
-		ID:     p.Id,
-		Name:   p.Name,
-		Status: p.Status,
-		Labels: p.Labels,
+		ID:      p.Id,
+		Name:    p.Name,
+		Status:  p.Status,
+		Labels:  p.Labels,
+		InfraID: p.InfraId,
 	}
 	if !p.Created.IsZero() {
 		out.Created = p.Created

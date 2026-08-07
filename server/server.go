@@ -35,6 +35,7 @@ import (
 	"github.com/iotready/podman-api/internal/obs"
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/prune"
+	"github.com/iotready/podman-api/internal/registryprune"
 	"github.com/iotready/podman-api/internal/store"
 	"github.com/iotready/podman-api/internal/ui"
 	"github.com/iotready/podman-api/templates"
@@ -109,6 +110,10 @@ func RunWithFlags(opts ...Option) error {
 		registryUsername = fs.String("registry-username", "", "registry basic-auth username (only used when -registry-auth=basic)")
 		registryPassword = fs.String("registry-password", "", "registry basic-auth password (only used when -registry-auth=basic); prefer the REGISTRY_PASSWORD env var instead — unlike every other secret input here (-operator-file, -keys-file, -spec-key-file are file-based for the same reason), a flag value is visible in /proc/<pid>/cmdline and a systemd ExecStart")
 	)
+	// Declared apart from the block above only because there are enough of them
+	// to be worth a struct; every one of them defaults to off. See
+	// server/registryprune.go.
+	regPruneCfg := registryPruneFlags(fs)
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return err
 	}
@@ -198,6 +203,7 @@ func RunWithFlags(opts ...Option) error {
 	var jobStore store.JobStore
 	var canceller api.JobCanceller
 	var pruneSched *prune.Scheduler
+	var regPruneSched *registryprune.Scheduler
 	var ingressCtl *ingress.CaddyController
 
 	if *ingressEnabled {
@@ -230,9 +236,68 @@ func RunWithFlags(opts ...Option) error {
 		log.Printf("ingress enabled (network %s, caddy admin %s, reconcile interval %s)", *ingressNetwork, *ingressAdminAddr, *ingressInterval)
 	}
 	jobStore = db
+
+	// Built here, before the job registry, because the registry-prune handler
+	// consumes it. registryBase is kept alongside the client: the prune's
+	// ref-matching MUST derive from the same string the client talks to, and
+	// re-deriving it anywhere else is how every tag-pinned image in the fleet
+	// quietly stops being protected.
+	var registryClient imgregistry.Client
+	// registryPruneClient is the UNCACHED client. classifyAll builds the delete
+	// plan and the cross-repo protected-digest set from ResolveTags; a listing up
+	// to TagsCacheTTL old — warmed by anything that browsed the repo, including a
+	// UI page load — can miss a protected tag pushed minutes ago and let its
+	// manifest be deleted. See buildRegistryPrune's doc comment.
+	// Typed CONCRETELY, not as imgregistry.Client: buildRegistryPrune's
+	// parameter type is what makes "the prune never sees a cached listing" a
+	// compile-time property rather than a convention or a runtime check.
+	var registryPruneClient *imgregistry.HTTPClient
+	var registryBase string
+	if strings.TrimSpace(*registryAddress) != "" {
+		auth := imgregistry.Auth{Mode: strings.TrimSpace(*registryAuth)}
+		switch auth.Mode {
+		case "none":
+		case "basic":
+			auth.Username = *registryUsername
+			auth.Password = resolveRegistryPassword(*registryPassword, os.Getenv)
+		default:
+			return fmt.Errorf("registry: invalid -registry-auth %q (must be none or basic)", *registryAuth)
+		}
+		registryBase = *registryAddress
+		if !strings.Contains(registryBase, "://") {
+			registryBase = "http://" + registryBase
+		}
+		// Wrap in the TTL-caching decorator so both the API and UI share one
+		// cache: Tags() resolves every tag's manifest (and every unique
+		// digest's config blob), ~21s cold for the fleet's "engine" repo, and
+		// the UI's list page fires it once per catalog repo on every single
+		// page view. See imgregistry.CachingClient's doc comment.
+		httpRegistry := imgregistry.NewHTTPClient(registryBase, auth)
+		registryPruneClient = httpRegistry
+		registryClient = imgregistry.NewCachingClient(httpRegistry, imgregistry.TagsCacheTTL)
+	}
+
 	pruneMetrics := obs.NewPruneMetrics(prometheus.DefaultRegisterer)
 	jobMetrics := obs.NewJobMetrics(prometheus.DefaultRegisterer)
-	registry, reconcilers := buildJobRegistry(svc, client, db, *evacConc, pruneMetrics, jobMetrics)
+
+	// Absent unless explicitly enabled AND a registry client exists: nil
+	// handler means no job kind, no scheduler, no behaviour.
+	//
+	// The collectors are registered only once the handler exists, not on the
+	// flag alone: if they were registered on -registry-prune-enabled and the
+	// build then returned nil for a missing registry client, the presence of
+	// podman_api_registry_prune_* series would suggest a running feature that
+	// is in fact off.
+	var regPruneMetrics registryprune.Metrics
+	if regPruneCfg.Enabled && registryPruneClient != nil {
+		regPruneMetrics = obs.NewRegistryPruneMetrics(prometheus.DefaultRegisterer)
+	}
+	regPruneHandler, err := buildRegistryPrune(*regPruneCfg, registryBase, registryPruneClient, svc, db, client, regPruneMetrics)
+	if err != nil {
+		return err
+	}
+
+	registry, reconcilers := buildJobRegistry(svc, client, db, *evacConc, pruneMetrics, jobMetrics, regPruneHandler)
 	workers := *jobWorkers
 	if workers <= 0 {
 		workers = jobs.DefaultWorkers
@@ -265,6 +330,32 @@ func RunWithFlags(opts ...Option) error {
 			return policies
 		})
 		log.Printf("prune scheduler enabled (interval %s, disk threshold %d%%, scopes %v)", *pruneInterval, *pruneThreshold, def.Scope)
+	}
+
+	// Two things enqueue a registry prune, and BOTH go through the scheduler:
+	// its own ticker and POST /registry/prune (wired to regPruneSched below, not
+	// to the job store). That is deliberate — the scheduler's in-flight scan plus
+	// its enqueueSem are the single mechanism preventing two concurrent runs, and
+	// two runs each classifying from a listing the other is mutating is exactly
+	// the shape of the #64 incident. Any further trigger must enqueue through the
+	// scheduler too; nothing may reach the job store directly.
+	if regPruneHandler != nil {
+		regPruneSched = buildRegistryPruneScheduler(*regPruneCfg, db)
+		regPruneSched.Start(runnerCtx)
+		mode := "DRY RUN (deletes nothing)"
+		if !regPruneCfg.DryRun {
+			mode = "DELETING"
+		}
+		blob := "blob GC off (manifests unlinked, blobs left recoverable)"
+		if regPruneHandler.BlobGC != nil {
+			blob = fmt.Sprintf("blob GC on %s: pod %s stops %s", regPruneCfg.Host, regPruneHandler.BlobGC.PodName, regPruneCfg.RegistryPod)
+		}
+		cadence := fmt.Sprintf("interval %s", regPruneCfg.Interval)
+		if regPruneCfg.Interval <= 0 {
+			cadence = "no scheduled runs (interval <=0); POST /registry/prune only"
+		}
+		log.Printf("registry prune enabled (%s, %s, max deletes/repo %d, %s; on-demand: POST /registry/prune)",
+			cadence, mode, regPruneCfg.MaxDeletesPerRepo, blob)
 	}
 
 	var invPoller *inventory.Poller
@@ -362,30 +453,15 @@ func RunWithFlags(opts ...Option) error {
 		return metrics.Middleware()(audit(h))
 	}
 
-	var registryClient imgregistry.Client
-	if strings.TrimSpace(*registryAddress) != "" {
-		auth := imgregistry.Auth{Mode: strings.TrimSpace(*registryAuth)}
-		switch auth.Mode {
-		case "none":
-		case "basic":
-			auth.Username = *registryUsername
-			auth.Password = resolveRegistryPassword(*registryPassword, os.Getenv)
-		default:
-			return fmt.Errorf("registry: invalid -registry-auth %q (must be none or basic)", *registryAuth)
-		}
-		base := *registryAddress
-		if !strings.Contains(base, "://") {
-			base = "http://" + base
-		}
-		// Wrap in the TTL-caching decorator so both the API and UI share one
-		// cache: Tags() resolves every tag's manifest (and every unique
-		// digest's config blob), ~21s cold for the fleet's "engine" repo, and
-		// the UI's list page fires it once per catalog repo on every single
-		// page view. See imgregistry.CachingClient's doc comment.
-		registryClient = imgregistry.NewCachingClient(imgregistry.NewHTTPClient(base, auth), imgregistry.TagsCacheTTL)
+	// The UI and browse routes get the CACHED client; the prune got the uncached
+	// one above. POST /registry/prune is wired to the scheduler, not the job
+	// store, so the on-demand trigger reuses the same in-flight guard the ticker
+	// does rather than walking past it.
+	routerOpts := []api.RouterOption{}
+	if regPruneSched != nil {
+		routerOpts = append(routerOpts, api.WithRegistryPruner(regPruneSched))
 	}
-
-	router := api.NewRouter(svc, jobStore, keyStore, combined, nil, canceller, Version, registryClient)
+	router := api.NewRouter(svc, jobStore, keyStore, combined, nil, canceller, Version, registryClient, routerOpts...)
 
 	var opHolder atomic.Pointer[config.Operator]
 	var uiApp *ui.UI
@@ -484,6 +560,9 @@ func RunWithFlags(opts ...Option) error {
 		cancelRunner()
 		if pruneSched != nil {
 			pruneSched.Wait()
+		}
+		if regPruneSched != nil {
+			regPruneSched.Wait()
 		}
 		if invPoller != nil {
 			invPoller.Wait()
@@ -624,7 +703,11 @@ func statsBudgetWarning(interval, timeout, statsTimeout time.Duration, statsEnab
 		timeout, eff, timeout+eff, interval)
 }
 
-func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics) (jobs.Registry, jobs.Reconcilers) {
+// buildJobRegistry assembles the job kind -> handler table. regPrune is nil
+// unless the registry prune feature is enabled, and a nil handler must leave
+// the kind ABSENT rather than registered-and-broken — a registered nil would
+// be a typed-nil interface that panics on the first tick.
+func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics, regPrune *registryprune.Handler) (jobs.Registry, jobs.Reconcilers) {
 	reg := jobs.Registry{
 		"migrate":      &migrate.Handler{Svc: svc, Metrics: jobMetrics},
 		"evacuate":     &evacuate.Handler{Svc: svc, Jobs: db, Concurrency: evacConc, Metrics: jobMetrics},
@@ -633,6 +716,13 @@ func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, 
 		"restore":      &backuppkg.RestoreHandler{Svc: svc},
 		"pitr-restore": &backuppkg.PITRRestoreHandler{Svc: svc},
 	}
+	if regPrune != nil {
+		reg[registryprune.JobKind] = regPrune
+	}
+	// No registry-prune reconciler, deliberately: a run interrupted by a
+	// restart has already persisted whatever it deleted, and re-driving it
+	// from a half-finished state is strictly worse than letting the scheduler
+	// start a clean run from a fresh catalog — same call as "prune".
 	recs := jobs.Reconcilers{
 		"migrate": &migrate.Reconciler{Svc: svc},
 		"backup":  &backuppkg.Reconciler{Svc: svc},
