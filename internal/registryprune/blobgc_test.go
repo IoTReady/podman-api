@@ -23,10 +23,19 @@ type fakeRunner struct {
 	calls []string // ordered: "stop", "play", "wait", "remove", "start", "exec"
 	yamls []string
 
-	stopErr   error
-	startErr  error
+	stopErr error
+	// startErrs is popped one per PodStart call, the last entry repeating.
+	// Lets a test drive a restart that fails once and then succeeds.
+	startErrs []error
 	playErr   error
 	playPanic bool
+
+	// startCtxDone records, per PodStart call, whether the context it was
+	// handed was already cancelled. The restart must survive a cancelled job
+	// context; nothing else proves it does.
+	startCtxDone []bool
+	// execCmds records the argv of every ContainerExec.
+	execCmds [][]string
 
 	waitCode int
 	waitErr  error
@@ -48,9 +57,19 @@ func (f *fakeRunner) PodStop(_ context.Context, _, _ string) error {
 	return f.stopErr
 }
 
-func (f *fakeRunner) PodStart(_ context.Context, _, _ string) error {
+func (f *fakeRunner) PodStart(ctx context.Context, _, _ string) error {
 	f.record("start")
-	return f.startErr
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.startCtxDone = append(f.startCtxDone, ctx.Err() != nil)
+	if len(f.startErrs) == 0 {
+		return nil
+	}
+	err := f.startErrs[0]
+	if len(f.startErrs) > 1 {
+		f.startErrs = f.startErrs[1:]
+	}
+	return err
 }
 
 func (f *fakeRunner) PlayKube(_ context.Context, _, raw string, _ bool, _ ...string) error {
@@ -74,8 +93,11 @@ func (f *fakeRunner) PodRemove(_ context.Context, _, _ string, _ bool) error {
 	return nil
 }
 
-func (f *fakeRunner) ContainerExec(_ context.Context, _, _ string, _ []string) (podman.ExecResult, error) {
+func (f *fakeRunner) ContainerExec(_ context.Context, _, _ string, cmd []string) (podman.ExecResult, error) {
 	f.record("exec")
+	f.mu.Lock()
+	f.execCmds = append(f.execCmds, cmd)
+	f.mu.Unlock()
 	if f.execErr != nil {
 		return podman.ExecResult{}, f.execErr
 	}
@@ -123,18 +145,32 @@ func testBlobGC(r *fakeRunner) *BlobGC {
 
 func runBlobGC(t *testing.T, g *BlobGC, p Payload) (store.Job, error) {
 	t.Helper()
+	job, _, err := runBlobGCCtx(t, context.Background(), g, p)
+	return job, err
+}
+
+func runBlobGCCtx(t *testing.T, ctx context.Context, g *BlobGC, p Payload) (store.Job, Result, error) {
+	t.Helper()
 	mem := store.NewMemory()
 	j, err := mem.Enqueue(context.Background(), JobKind, []byte(`{}`), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	jc := jobs.NewJobContext(mem, j.ID)
-	runErr := g.Run(context.Background(), jc, p)
+	res, runErr := g.Reclaim(ctx, jc, p)
 	got, err := mem.GetJob(context.Background(), j.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return got, runErr
+	return got, res, runErr
+}
+
+// noRetryDelay collapses the restart backoff so retry tests do not sleep.
+func noRetryDelay(t *testing.T) {
+	t.Helper()
+	prev := restartRetryDelay
+	restartRetryDelay = 0
+	t.Cleanup(func() { restartRetryDelay = prev })
 }
 
 // --- the safety property: the registry comes back --------------------------
@@ -226,12 +262,105 @@ func TestBlobGC_StopFailureAbortsGCButStillStarts(t *testing.T) {
 }
 
 func TestBlobGC_RestartFailureFailsTheJob(t *testing.T) {
-	r := &fakeRunner{startErr: errors.New("start refused")}
+	r := &fakeRunner{startErrs: []error{errors.New("start refused")}}
+	noRetryDelay(t)
 	job, err := runBlobGC(t, testBlobGC(r), Payload{})
 	if err == nil {
 		t.Fatal("a registry that did not come back must fail the job loudly")
 	}
 	wantStepContaining(t, job, "REGISTRY DID NOT RESTART")
+	if r.count("start") != restartAttempts {
+		t.Fatalf("want %d restart attempts before giving up, got %d", restartAttempts, r.count("start"))
+	}
+}
+
+// One transient PodStart failure must not leave the registry down until the
+// scheduler's next run: failureBackoff is an hour, and the retry is the only
+// thing between a flaky start and an hour-long registry outage.
+func TestBlobGC_RestartIsRetriedAfterATransientFailure(t *testing.T) {
+	noRetryDelay(t)
+	r := &fakeRunner{startErrs: []error{errors.New("transient"), nil}}
+	job, err := runBlobGC(t, testBlobGC(r), Payload{})
+	if err != nil {
+		t.Fatalf("a restart that succeeded on retry must not fail the job: %v", err)
+	}
+	if r.count("start") != 2 {
+		t.Fatalf("want the restart retried once, got %d attempt(s)", r.count("start"))
+	}
+	wantStepContaining(t, job, "registry restarted")
+}
+
+// The job context being cancelled (job cancelled, deadline blown) must not take
+// the registry down with it: the restart runs on a context derived with
+// WithoutCancel.
+func TestBlobGC_RestartsRegistryWhenJobContextIsCancelled(t *testing.T) {
+	r := &fakeRunner{waitErr: context.Canceled}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := runBlobGCCtx(t, ctx, testBlobGC(r), Payload{})
+	if err == nil {
+		t.Fatal("a cancelled run must still fail the job")
+	}
+	if r.count("start") != 1 {
+		t.Fatalf("registry was NOT restarted under a cancelled context; calls: %s", r.callsJoined())
+	}
+	for i, done := range r.startCtxDone {
+		if done {
+			t.Fatalf("PodStart attempt %d was handed an already-cancelled context; "+
+				"the restart would fail exactly when it matters most", i)
+		}
+	}
+}
+
+// --- the GC pod name must never be the registry's own ----------------------
+
+// Playing the GC pod over the registry's own pod name would replace it and then
+// force-remove it in the teardown — the fleet's only registry DESTROYED, not
+// merely down, with no reconciler in the core to rebuild it. validate() runs
+// before anything is stopped, so this is caught with nothing touched.
+func TestBlobGC_RejectsGCPodNameEqualToRegistryPod(t *testing.T) {
+	r := &fakeRunner{}
+	g := testBlobGC(r)
+	g.PodName = g.RegistryPod
+	_, err := runBlobGC(t, g, Payload{})
+	if err == nil {
+		t.Fatal("a GC pod named after the registry pod must be refused")
+	}
+	if got := r.callsJoined(); got != "" {
+		t.Fatalf("nothing may be touched when the names collide, got calls: %s", got)
+	}
+}
+
+// The same collision reached through the DEFAULT pod name rather than an
+// explicit one — a registry instance that happens to be named registry-blob-gc.
+func TestBlobGC_RejectsRegistryPodNamedLikeTheDefaultGCPod(t *testing.T) {
+	r := &fakeRunner{}
+	g := testBlobGC(r)
+	g.RegistryPod = defaultGCPodName
+	_, err := runBlobGC(t, g, Payload{})
+	if err == nil {
+		t.Fatal("the default GC pod name colliding with the registry pod must be refused")
+	}
+	if got := r.callsJoined(); got != "" {
+		t.Fatalf("nothing may be touched when the names collide, got calls: %s", got)
+	}
+}
+
+// A PlayKube that fails can still have created the pod, so the teardown must
+// cover the failure path too — otherwise the "best-effort teardown" comment is
+// claiming coverage it does not have.
+func TestBlobGC_TearsDownTheGCPodEvenWhenPlayFails(t *testing.T) {
+	r := &fakeRunner{playErr: errors.New("play refused")}
+	_, err := runBlobGC(t, testBlobGC(r), Payload{})
+	if err == nil {
+		t.Fatal("a failed play must fail the job")
+	}
+	if r.count("remove") != 1 {
+		t.Fatalf("GC pod was not torn down after a failed play; calls: %s", r.callsJoined())
+	}
+	if r.count("start") != 1 {
+		t.Fatalf("registry was NOT restarted after a failed play; calls: %s", r.callsJoined())
+	}
 }
 
 // --- gating ----------------------------------------------------------------
@@ -314,6 +443,16 @@ func TestBlobGC_ManifestShape(t *testing.T) {
 	if strings.Contains(y, "restartPolicy: Always") {
 		t.Fatalf("restartPolicy is wrong:\n%s", y)
 	}
+	// hostPath type MUST be Directory, never DirectoryOrCreate: a typo'd or
+	// unmounted storage path has to fail loudly. DirectoryOrCreate would
+	// create an empty directory and garbage-collect it perfectly, reporting a
+	// clean run over a registry it never touched.
+	if !strings.Contains(y, "type: Directory\n") {
+		t.Fatalf("hostPath type must be exactly Directory:\n%s", y)
+	}
+	if strings.Contains(y, "DirectoryOrCreate") {
+		t.Fatalf("hostPath type must not create the storage path:\n%s", y)
+	}
 }
 
 func TestBlobGC_ManifestUsesConfiguredPaths(t *testing.T) {
@@ -373,6 +512,61 @@ func TestBlobGC_RecordsBeforeAndAfterSize(t *testing.T) {
 	}
 	if !strings.Contains(txt, "1048576 byte(s) reclaimed") {
 		t.Fatalf("reclaimed bytes not recorded:\n%s", txt)
+	}
+}
+
+// The byte counts must leave this stage as DATA. Task 7 needs a
+// bytes-reclaimed metric, and re-parsing a formatted job step is not a data
+// path.
+func TestBlobGC_ReturnsMeasuredBytesAsData(t *testing.T) {
+	r := &fakeRunner{execOut: []podman.ExecResult{
+		{ExitCode: 0, Output: "2048\t/var/lib/registry\n"},
+		{ExitCode: 0, Output: "1024\t/var/lib/registry\n"},
+	}}
+	_, res, err := runBlobGCCtx(t, context.Background(), testBlobGC(r), Payload{})
+	if err != nil {
+		t.Fatalf("unexpected failure: %v", err)
+	}
+	if !res.Measured {
+		t.Fatal("Measured must be true when both sizes were read")
+	}
+	if res.Before != 2097152 || res.After != 1048576 || res.Reclaimed != 1048576 {
+		t.Fatalf("got %+v, want Before=2097152 After=1048576 Reclaimed=1048576", res)
+	}
+}
+
+func TestBlobGC_ResultIsNotMeasuredWhenSizingFails(t *testing.T) {
+	r := &fakeRunner{execErr: errors.New("no such container")}
+	_, res, err := runBlobGCCtx(t, context.Background(), testBlobGC(r), Payload{})
+	if err != nil {
+		t.Fatalf("unexpected failure: %v", err)
+	}
+	if res.Measured || res.Reclaimed != 0 {
+		t.Fatalf("an unmeasured run must not report bytes reclaimed: %+v", res)
+	}
+}
+
+// SizePath is the path inside the REGISTRY container; MountPath is the GC
+// pod's. They coincide only by default. If sizing followed MountPath, the first
+// deployment that changed it would measure a path that does not exist in the
+// registry container and go permanently "unavailable" with no error.
+func TestBlobGC_SizingUsesSizePathNotTheGCPodMountPath(t *testing.T) {
+	r := &fakeRunner{execOut: []podman.ExecResult{{ExitCode: 0, Output: "1\t/x\n"}}}
+	g := testBlobGC(r)
+	g.MountPath = "/var/lib/registry-gcside"
+	g.SizePath = "/registry-data"
+	if _, err := runBlobGC(t, g, Payload{}); err != nil {
+		t.Fatalf("unexpected failure: %v", err)
+	}
+	if len(r.execCmds) == 0 {
+		t.Fatal("no exec was issued")
+	}
+	got := strings.Join(r.execCmds[0], " ")
+	if !strings.Contains(got, "/registry-data") {
+		t.Fatalf("sizing did not use SizePath, ran: %s", got)
+	}
+	if strings.Contains(got, "/var/lib/registry-gcside") {
+		t.Fatalf("sizing followed the GC pod's mount path, ran: %s", got)
 	}
 }
 

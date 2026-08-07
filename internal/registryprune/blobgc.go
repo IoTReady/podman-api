@@ -38,7 +38,39 @@ const (
 	// the registry back: the one outcome this stage must never produce is a
 	// fleet with no registry.
 	restartGrace = 2 * time.Minute
+	// restartAttempts is how many times PodStart is tried before the stage
+	// gives up and fails the job. More than one because the alternative to a
+	// retry is bleak: the scheduler's failureBackoff is an hour, and it is
+	// only a whole prune run that would incidentally try again, so a single
+	// transient start failure would mean an hour-long registry outage.
+	restartAttempts = 3
+	// sizeTimeout bounds one `du` exec. Sizing gets its own context rather
+	// than sharing the restart grace: `du` over a hundreds-of-GB registry can
+	// legitimately take minutes, and it must never be the reason the restart
+	// or the GC pod teardown runs out of time.
+	sizeTimeout = 3 * time.Minute
 )
+
+// restartRetryDelay is the pause between restart attempts. A var, not a const,
+// so tests can collapse it.
+var restartRetryDelay = 2 * time.Second
+
+// Result is Stage B's measured outcome, returned as data rather than only as
+// formatted job steps: the bytes-reclaimed metric has no other data path, and
+// re-parsing a step string is not one.
+//
+// Reclaimed is a FLOOR, not a measurement. The "after" size is read once the
+// registry is serving pushes again, so anything written in between counts
+// against the reclaim; a negative difference is clamped to zero.
+type Result struct {
+	Before    int64
+	After     int64
+	Reclaimed int64
+	// Measured is true only when BOTH sizes were read. A false Measured means
+	// the byte fields say nothing — they must not be reported as zero bytes
+	// reclaimed.
+	Measured bool
+}
 
 // BlobGC is Stage B: reclaiming the blobs that Stage A's manifest deletions
 // only unlinked.
@@ -63,18 +95,38 @@ type BlobGC struct {
 	// mounted into the GC pod. Must be absolute.
 	StoragePath string
 
-	// MountPath, ConfigPath, Image, PodName and Timeout all default; see the
-	// default* constants.
-	MountPath  string
+	// MountPath is where StoragePath is mounted inside the GC POD. It is not
+	// where the registry container mounts it — see SizePath, which is measured
+	// in a different container and is deliberately a separate field. The two
+	// coincide only because both default to /var/lib/registry.
+	MountPath string
+	// SizePath is the storage directory as seen inside the REGISTRY container
+	// (its `rootdirectory`), used only for `du`. Defaults to
+	// /var/lib/registry — NOT to MountPath, which would silently re-couple
+	// the two and make sizing measure a path that does not exist in the
+	// registry container the moment MountPath is configured.
+	SizePath string
+
+	// ConfigPath, Image, PodName and Timeout all default; see the default*
+	// constants.
 	ConfigPath string
 	Image      string
-	PodName    string
-	Timeout    time.Duration
+	// PodName is the one-shot GC pod's name. It must NOT be the registry's own
+	// pod name; see validate.
+	PodName string
+	Timeout time.Duration
 }
 
 func (g *BlobGC) mountPath() string {
 	if g.MountPath != "" {
 		return g.MountPath
+	}
+	return defaultMountPath
+}
+
+func (g *BlobGC) sizePath() string {
+	if g.SizePath != "" {
+		return g.SizePath
 	}
 	return defaultMountPath
 }
@@ -120,33 +172,50 @@ func (g *BlobGC) validate() error {
 	if g.StoragePath == "" || !strings.HasPrefix(g.StoragePath, "/") {
 		return fmt.Errorf("blob GC storage path %q must be an absolute host path", g.StoragePath)
 	}
+	// The whole-registry-destroyed guard. The GC pod is played with
+	// replace=true and force-removed afterwards, so pointing it at the
+	// registry's own pod name would replace the registry instance and then
+	// DELETE it — gone, not down, with no reconciler in the core to rebuild
+	// it. A copy-paste between two Task 7 flag defaults is all it would take.
+	if g.podName() == g.RegistryPod {
+		return fmt.Errorf("blob GC pod name %q is the registry's own pod name: "+
+			"playing it would replace and then destroy the registry instance", g.podName())
+	}
 	return nil
 }
 
-// Run performs Stage B. It is a no-op (and never touches the registry) on a
-// dry run or when the payload sets SkipBlobGC.
+// Run is the error-only entry point the job handler calls. Callers that need
+// the measured byte counts (the bytes-reclaimed metric) should call Reclaim.
+func (g *BlobGC) Run(ctx context.Context, jc *jobs.JobContext, p Payload) error {
+	_, err := g.Reclaim(ctx, jc, p)
+	return err
+}
+
+// Reclaim performs Stage B. It is a no-op (and never touches the registry) on
+// a dry run or when the payload sets SkipBlobGC.
 //
-// The named return is load-bearing: the deferred restart both runs during a
-// panic unwind AND can turn "GC succeeded but the registry did not come back"
-// into a job failure.
-func (g *BlobGC) Run(ctx context.Context, jc *jobs.JobContext, p Payload) (err error) {
+// The named returns are load-bearing: the deferred restart runs during a panic
+// unwind, fills in the after-size, AND can turn "GC succeeded but the registry
+// did not come back" into a job failure.
+func (g *BlobGC) Reclaim(ctx context.Context, jc *jobs.JobContext, p Payload) (res Result, err error) {
 	if p.DryRun {
 		jc.Step("blob-gc", "skipped: dry run (no pod played, registry untouched)")
-		return nil
+		return Result{}, nil
 	}
 	if p.SkipBlobGC {
 		jc.Step("blob-gc", "skipped: skip_blob_gc set; manifests are unlinked but blobs remain recoverable")
-		return nil
+		return Result{}, nil
 	}
 	if verr := g.validate(); verr != nil {
 		// Before anything is stopped. A misconfigured stage must never take
 		// the registry down for a GC it cannot run.
 		jc.Step("blob-gc", "ABORTED: "+verr.Error())
-		return verr
+		return Result{}, verr
 	}
 
 	before, beforeOK := g.storageBytes(ctx)
 	if beforeOK {
+		res.Before = before
 		jc.Step("blob-gc:size-before", fmt.Sprintf("%d byte(s) on disk at %s", before, g.StoragePath))
 	} else {
 		jc.Step("blob-gc:size-before", "size unavailable (GC proceeds; sizing is diagnostic only)")
@@ -166,7 +235,7 @@ func (g *BlobGC) Run(ctx context.Context, jc *jobs.JobContext, p Payload) (err e
 		// can sit between an aborted GC and the registry coming back. That is
 		// also why the GC pod's removal lives here rather than in its own
 		// defer: a later-registered defer would run first.
-		serr := g.Podman.PodStart(rctx, g.HostID, g.RegistryPod)
+		serr := g.startRegistry(rctx, jc)
 		if played {
 			// Best-effort teardown of the exited one-shot pod. A leftover pod
 			// is not a failure (PlayKube replaces), so this never changes the
@@ -177,22 +246,40 @@ func (g *BlobGC) Run(ctx context.Context, jc *jobs.JobContext, p Payload) (err e
 			}
 		}
 		if serr != nil {
-			jc.Step("blob-gc:registry-start", "REGISTRY DID NOT RESTART: "+serr.Error())
-			log.Printf("registryprune: REGISTRY DID NOT RESTART on %s/%s: %v", g.HostID, g.RegistryPod, serr)
+			jc.Step("blob-gc:registry-start", fmt.Sprintf(
+				"REGISTRY DID NOT RESTART after %d attempt(s): %v", restartAttempts, serr))
+			log.Printf("registryprune: REGISTRY DID NOT RESTART on %s/%s after %d attempts: %v",
+				g.HostID, g.RegistryPod, restartAttempts, serr)
 			if err == nil {
 				err = fmt.Errorf("restart registry %s on %s after blob GC: %w", g.RegistryPod, g.HostID, serr)
 			}
 			return
 		}
+		// PodStart returning nil means libpod ACCEPTED the start, not that the
+		// registry is serving. Nothing here waits for a ready registry; the
+		// claim is "the start was accepted", and an instance that then fails
+		// to come up is the inventory poller's and #220's alerting's business.
 		jc.Step("blob-gc:registry-start", "registry restarted")
-		if after, ok := g.storageBytes(rctx); ok {
+
+		// The after-size gets its own context, not the remainder of the
+		// restart grace: `du` over a large registry can take minutes, and it
+		// must never be able to eat the time the restart and teardown need.
+		sctx, scancel := context.WithTimeout(context.WithoutCancel(ctx), sizeTimeout)
+		defer scancel()
+		if after, ok := g.storageBytes(sctx); ok {
+			res.After = after
 			detail := fmt.Sprintf("%d byte(s) on disk at %s", after, g.StoragePath)
 			if beforeOK {
 				reclaimed := before - after
 				if reclaimed < 0 {
+					// The registry has been serving pushes again since the
+					// restart above, so it can legitimately have grown.
 					reclaimed = 0
 				}
-				detail += fmt.Sprintf("; %d byte(s) reclaimed", reclaimed)
+				res.Reclaimed = reclaimed
+				res.Measured = true
+				detail += fmt.Sprintf("; at least %d byte(s) reclaimed "+
+					"(a floor: the registry is serving pushes again by the time this is read)", reclaimed)
 			}
 			jc.Step("blob-gc:size-after", detail)
 		} else {
@@ -204,19 +291,21 @@ func (g *BlobGC) Run(ctx context.Context, jc *jobs.JobContext, p Payload) (err e
 		// Do NOT proceed: garbage-collect against a live registry is the
 		// blob-corruption race this whole stage is shaped around.
 		jc.Step("blob-gc:registry-stop", "ABORTED: "+serr.Error())
-		return fmt.Errorf("stop registry %s on %s before blob GC: %w", g.RegistryPod, g.HostID, serr)
+		return res, fmt.Errorf("stop registry %s on %s before blob GC: %w", g.RegistryPod, g.HostID, serr)
 	}
 	jc.Step("blob-gc:registry-stop", "registry stopped for garbage collection")
 
 	manifest, merr := g.manifest()
 	if merr != nil {
-		return merr
+		return res, merr
 	}
+	// Set BEFORE the call, not after it: a PlayKube that fails partway can
+	// still have created the pod, and the teardown must cover that.
+	played = true
 	if perr := g.Podman.PlayKube(ctx, g.HostID, manifest, true); perr != nil {
 		jc.Step("blob-gc:play", "FAILED: "+perr.Error())
-		return fmt.Errorf("play blob-GC pod %s on %s: %w", g.podName(), g.HostID, perr)
+		return res, fmt.Errorf("play blob-GC pod %s on %s: %w", g.podName(), g.HostID, perr)
 	}
-	played = true
 	jc.Step("blob-gc:play", fmt.Sprintf("one-shot pod %s started (%s, restartPolicy Never)", g.podName(), g.image()))
 
 	code, werr := g.Podman.WaitForPodCompletion(ctx, g.HostID, g.podName(), g.timeout())
@@ -231,14 +320,49 @@ func (g *BlobGC) Run(ctx context.Context, jc *jobs.JobContext, p Payload) (err e
 		default:
 			jc.Step("blob-gc:wait", "FAILED: "+werr.Error())
 		}
-		return fmt.Errorf("await blob-GC pod %s on %s: %w", g.podName(), g.HostID, werr)
+		return res, fmt.Errorf("await blob-GC pod %s on %s: %w", g.podName(), g.HostID, werr)
 	}
 	if code != 0 {
 		jc.Step("blob-gc:wait", fmt.Sprintf("FAILED: garbage-collect exited %d", code))
-		return fmt.Errorf("blob GC pod %s on %s exited %d", g.podName(), g.HostID, code)
+		return res, fmt.Errorf("blob GC pod %s on %s exited %d", g.podName(), g.HostID, code)
 	}
 	jc.Step("blob-gc:wait", "garbage-collect exited 0")
-	return nil
+	return res, nil
+}
+
+// startRegistry brings the registry back, retrying a failed PodStart.
+//
+// The retry is not politeness. Without it, one transient start failure leaves
+// the registry down until the scheduler's next run — failureBackoff is an hour
+// (scheduler.go), and even that only tries again as a side effect of a whole
+// prune. Attempts are bounded and every one is logged, so a genuinely broken
+// start still fails the job loudly rather than looping.
+//
+// ctx is the restart-grace context, already derived with WithoutCancel, so a
+// cancelled job does not abort the retries. If it does expire mid-backoff the
+// loop stops early and returns the last error.
+func (g *BlobGC) startRegistry(ctx context.Context, jc *jobs.JobContext) error {
+	var last error
+	for attempt := 1; attempt <= restartAttempts; attempt++ {
+		last = g.Podman.PodStart(ctx, g.HostID, g.RegistryPod)
+		if last == nil {
+			if attempt > 1 {
+				jc.Step("blob-gc:registry-start", fmt.Sprintf("registry start succeeded on attempt %d", attempt))
+			}
+			return nil
+		}
+		log.Printf("registryprune: restarting registry %s on %s, attempt %d/%d failed: %v",
+			g.RegistryPod, g.HostID, attempt, restartAttempts, last)
+		if attempt == restartAttempts {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return last
+		case <-time.After(restartRetryDelay):
+		}
+	}
+	return last
 }
 
 // gcPod is the manifest, built as data and marshalled, so a path with YAML
@@ -330,7 +454,7 @@ func (g *BlobGC) storageBytes(ctx context.Context) (int64, bool) {
 		return 0, false
 	}
 	res, err := g.Podman.ContainerExec(ctx, g.HostID, g.RegistryContainer,
-		[]string{"du", "-sk", g.mountPath()})
+		[]string{"du", "-sk", g.sizePath()})
 	if err != nil || res.ExitCode != 0 {
 		return 0, false
 	}
