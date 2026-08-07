@@ -124,6 +124,28 @@ func baseCfg() Config {
 	}
 }
 
+// obsLive builds an instance carrying the container image shapes podman
+// actually produces, measured on engine-1 (podman 5.8.2, 2026-08-07):
+//
+//	ImageDigest = "sha256:<hex>"            <- BARE, no repository
+//	ImageName   = "100.64.0.23:5000/jioworldcentre/web:2026.06.27-218c436"
+//	              or "…/repo@sha256:<hex>"
+//
+// enrichContainer maps ImageDigest->Image and ImageName->ImageTag, so
+// ObservedContainer.Image is a bare digest in production and NEVER the
+// "host/repo@sha256:…" shape these tests used to assume.
+func obsLive(tmpl, slug string, digests ...string) instance.Observed {
+	o := instance.Observed{Template: tmpl, Slug: slug}
+	for i, d := range digests {
+		o.Containers = append(o.Containers, instance.ObservedContainer{
+			Name:     fmt.Sprintf("c%d", i),
+			Image:    d,
+			ImageTag: testRegistryHost + "/engine@" + d,
+		})
+	}
+	return o
+}
+
 func obs(tmpl, slug string, images ...string) instance.Observed {
 	o := instance.Observed{Template: tmpl, Slug: slug}
 	for i, img := range images {
@@ -390,6 +412,9 @@ func TestBuildInUseSet_AbortsWhenMaxSnapshotAgeUnset(t *testing.T) {
 	cfg.MaxSnapshotAge = 0
 	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, &fakeSpecs{}, &fakeReg{catalog: []string{"engine"}}, cfg)
 	mustAbort(t, set, err)
+	if !strings.Contains(err.Error(), "max snapshot age") {
+		t.Fatalf("want the unconfigured-max-age abort, not the staleness one: %v", err)
+	}
 }
 
 func TestBuildInUseSet_AbortsWithNoHosts(t *testing.T) {
@@ -494,7 +519,7 @@ func obsTagged(tmpl, slug, image, tag string) instance.Observed {
 // 404, and abort every run forever — a self-inflicted deadlock.
 func TestBuildInUseSet_ForeignHostQualifiedRefNeverReachesCatalog(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1": {obs: []instance.Observed{obs("engine", "acme", testRegistryHost+"/engine@"+digA)}, fresh: freshOK()},
+		"engine-1": {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
 	}}
 	specs := &fakeSpecs{
 		keys: map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
@@ -533,7 +558,7 @@ func TestBuildInUseSet_OurHostQualifiedRefResolves(t *testing.T) {
 // Without a configured registry host, ours and theirs cannot be told apart.
 func TestBuildInUseSet_AbortsWhenRegistryHostUnset(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1": {obs: []instance.Observed{obs("engine", "acme", testRegistryHost+"/engine@"+digA)}, fresh: freshOK()},
+		"engine-1": {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
 	}}
 	cfg := baseCfg()
 	cfg.RegistryHosts = nil
@@ -556,8 +581,8 @@ func TestBuildInUseSet_AbortOnLaterHostReturnsNoPartialSet(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			inv := &fakeInv{hosts: map[string]invEntry{
-				"engine-1": {obs: []instance.Observed{obs("engine", "acme", testRegistryHost+"/engine@"+digA)}, fresh: freshOK()},
-				"engine-2": {obs: []instance.Observed{obs("engine", "beta", testRegistryHost+"/engine@"+digB)}, fresh: tc.bad},
+				"engine-1": {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
+				"engine-2": {obs: []instance.Observed{obsLive("engine", "beta", digB)}, fresh: tc.bad},
 			}}
 			set, err := BuildInUseSet(context.Background(), hostsOf("engine-1", "engine-2"), inv,
 				&fakeSpecs{}, &fakeReg{catalog: []string{"engine"}}, baseCfg())
@@ -570,8 +595,8 @@ func TestBuildInUseSet_AbortOnLaterHostReturnsNoPartialSet(t *testing.T) {
 // them, from both halves.
 func TestBuildInUseSet_UnionsAcrossHosts(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1":     {obs: []instance.Observed{obs("engine", "acme", testRegistryHost+"/engine@"+digA)}, fresh: freshOK()},
-		"engine-2":     {obs: []instance.Observed{obs("engine", "beta", testRegistryHost+"/engine@"+digB)}, fresh: freshOK()},
+		"engine-1":     {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
+		"engine-2":     {obs: []instance.Observed{obsLive("engine", "beta", digB)}, fresh: freshOK()},
 		"engine-infra": {fresh: freshOK()},
 	}}
 	specs := &fakeSpecs{
@@ -598,7 +623,7 @@ func TestBuildInUseSet_UnionsAcrossHosts(t *testing.T) {
 // inconsistency, not something to walk past.
 func TestBuildInUseSet_AbortsWhenEnumeratedHostIsUnknownToInventory(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1": {obs: []instance.Observed{obs("engine", "acme", testRegistryHost+"/engine@"+digA)}, fresh: freshOK()},
+		"engine-1": {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
 	}}
 	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1", "engine-2"), inv,
 		&fakeSpecs{}, &fakeReg{catalog: []string{"engine"}}, baseCfg())
@@ -646,7 +671,7 @@ func TestBuildInUseSet_AbortsWhenImageIDAndTagBothUnresolvable(t *testing.T) {
 // A digest-form observed image is authoritative: nothing is recorded as a gap.
 func TestBuildInUseSet_DigestObservedRecordsNoGap(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1": {obs: []instance.Observed{obsTagged("engine", "acme", testRegistryHost+"/engine@"+digA, testRegistryHost+"/engine:dev")}, fresh: freshOK()},
+		"engine-1": {obs: []instance.Observed{obsTagged("engine", "acme", digA, testRegistryHost+"/engine:dev")}, fresh: freshOK()},
 	}}
 	reg := &fakeReg{catalog: []string{"engine"}, manifests: map[string]string{"engine:dev": digB}}
 	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, &fakeSpecs{}, reg, baseCfg())
@@ -665,7 +690,7 @@ func TestBuildInUseSet_DigestObservedRecordsNoGap(t *testing.T) {
 // deadlock the job on every rolled instance.
 func TestBuildInUseSet_MissingImageTagToleratedWhenImageIsPinned(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1": {obs: []instance.Observed{obsTagged("engine", "acme", testRegistryHost+"/engine@"+digA, testRegistryHost+"/engine:gone")}, fresh: freshOK()},
+		"engine-1": {obs: []instance.Observed{obsTagged("engine", "acme", digA, testRegistryHost+"/engine:gone")}, fresh: freshOK()},
 	}}
 	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, &fakeSpecs{}, &fakeReg{catalog: []string{"engine"}}, baseCfg())
 	if err != nil {
@@ -677,7 +702,7 @@ func TestBuildInUseSet_MissingImageTagToleratedWhenImageIsPinned(t *testing.T) {
 // But an unreachable registry while resolving an ImageTag is never tolerated.
 func TestBuildInUseSet_AbortsWhenImageTagResolutionIsUnreachable(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1": {obs: []instance.Observed{obsTagged("engine", "acme", testRegistryHost+"/engine@"+digA, testRegistryHost+"/engine:dev")}, fresh: freshOK()},
+		"engine-1": {obs: []instance.Observed{obsTagged("engine", "acme", digA, testRegistryHost+"/engine:dev")}, fresh: freshOK()},
 	}}
 	reg := &fakeReg{catalog: []string{"engine"}, manErr: map[string]error{"engine:dev": fmt.Errorf("nope: %w", imgregistry.ErrUnreachable)}}
 	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, &fakeSpecs{}, reg, baseCfg())
@@ -687,7 +712,7 @@ func TestBuildInUseSet_AbortsWhenImageTagResolutionIsUnreachable(t *testing.T) {
 // MINOR: Has is the accessor Task 5 will call; exercise its normalisation.
 func TestInUseSet_HasNormalisesInput(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1": {obs: []instance.Observed{obs("engine", "acme", testRegistryHost+"/engine@"+digA)}, fresh: freshOK()},
+		"engine-1": {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
 	}}
 	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, &fakeSpecs{}, &fakeReg{catalog: []string{"engine"}}, baseCfg())
 	if err != nil {
@@ -844,7 +869,7 @@ func TestBuildInUseSet_RegistryAliasesAllProtect(t *testing.T) {
 // visible in the job output instead of silent.
 func TestBuildInUseSet_ForeignSkipsAreRecorded(t *testing.T) {
 	inv := &fakeInv{hosts: map[string]invEntry{
-		"engine-1": {obs: []instance.Observed{obs("engine", "acme", testRegistryHost+"/engine@"+digA)}, fresh: freshOK()},
+		"engine-1": {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
 	}}
 	specs := &fakeSpecs{
 		keys: map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
@@ -869,14 +894,13 @@ func TestBuildInUseSet_ForeignSkipsAreRecorded(t *testing.T) {
 
 // Every pod carries an infra container, and on podman 5.8.2 it reports NO
 // image, image digest or image name at all (verified live on engine-1/2/infra,
-// 2026-08-07: 78 of 78 infra containers, versus 123 of 123 app containers all
-// carrying a digest). Treating that as an unresolvable image would abort every
-// run on every real host, so it is recognised and skipped — on two signals at
-// once, so a real container can never be mistaken for one.
+// 2026-08-07: 78 of 78 infra containers). Treating that as an unresolvable
+// image would abort every run on every real host, so it is skipped — keyed off
+// the pod's own InfraID, which is the only unambiguous signal.
 func TestBuildInUseSet_SkipsPodInfraContainers(t *testing.T) {
 	o := instance.Observed{Template: "engine", Slug: "acme", Containers: []instance.ObservedContainer{
-		{Name: "1fd9c02bf4f0-infra"},
-		{Name: "engine", Image: testRegistryHost + "/engine@" + digA},
+		{Name: "1fd9c02bf4f0-infra", IsInfra: true},
+		{Name: "engine", Image: digA, ImageTag: testRegistryHost + "/engine@" + digA},
 	}}
 	inv := &fakeInv{hosts: map[string]invEntry{"engine-1": {obs: []instance.Observed{o}, fresh: freshOK()}}}
 	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, &fakeSpecs{}, &fakeReg{catalog: []string{"engine"}}, baseCfg())
@@ -889,12 +913,15 @@ func TestBuildInUseSet_SkipsPodInfraContainers(t *testing.T) {
 	}
 }
 
-// The infra carve-out needs BOTH signals: a container named "-infra" that does
-// carry an image is a normal container, and one with no image whose name is
-// not "-infra" is still an abort (covered by AbortsOnObservedContainerWithNoImage).
+// A container is infra only when the POD says so. A name suffix is not a
+// signal: `podman kube play` names containers <pod>-<containerName>, so a
+// template declaring a container called "infra" is named identically.
 func TestBuildInUseSet_InfraNamedContainerWithAnImageIsNotSkipped(t *testing.T) {
 	o := instance.Observed{Template: "engine", Slug: "acme", Containers: []instance.ObservedContainer{
-		{Name: "my-infra", Image: testRegistryHost + "/engine@" + digB},
+		// Named like an infra container, and NOT flagged as one: a template
+		// declaring a container "infra" under `podman kube play` produces
+		// exactly this name.
+		{Name: "my-infra", Image: digB, ImageTag: testRegistryHost + "/engine@" + digB},
 	}}
 	inv := &fakeInv{hosts: map[string]invEntry{"engine-1": {obs: []instance.Observed{o}, fresh: freshOK()}}}
 	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, &fakeSpecs{}, &fakeReg{catalog: []string{"engine"}}, baseCfg())
@@ -902,4 +929,170 @@ func TestBuildInUseSet_InfraNamedContainerWithAnImageIsNotSkipped(t *testing.T) 
 		t.Fatalf("unexpected error: %v", err)
 	}
 	hasDigest(t, set, digB)
+}
+
+// --- review round 3 ---------------------------------------------------------
+
+// CRITICAL: podman reports ImageDigest as a BARE "sha256:<hex>" with no
+// repository (image.Digest().String(), libpod/container_inspect.go), and
+// enrichContainer copies it straight into ObservedContainer.Image. Parsing it
+// as a reference yields repo "sha256", which is in no catalog, so the running
+// container's own manifest was being discarded as "foreign" — the observed
+// half protecting nothing at all. This is the exact end-to-end shape probed on
+// engine-1: a bare digest, plus a tag that has since MOVED to another digest.
+func TestBuildInUseSet_BareDigestObservedImageIsProtected(t *testing.T) {
+	inv := &fakeInv{hosts: map[string]invEntry{
+		"engine-1": {obs: []instance.Observed{obsTagged("engine", "acme", digA, testRegistryHost+"/engine:dev")}, fresh: freshOK()},
+	}}
+	reg := &fakeReg{catalog: []string{"engine"}, manifests: map[string]string{"engine:dev": digB}}
+
+	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, &fakeSpecs{}, reg, baseCfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	hasDigest(t, set, digA) // the manifest this container is ACTUALLY running
+	hasDigest(t, set, digB) // and the one its tag now points at
+	if len(set.NonDigestObserved) != 0 {
+		t.Fatalf("a bare digest is a manifest digest, not a gap: %v", set.NonDigestObserved)
+	}
+	if len(set.ForeignSkipped) != 0 {
+		t.Fatalf("a bare digest belongs to no registry and must not be recorded as foreign: %v", set.ForeignSkipped)
+	}
+	if reg.calls != 1 {
+		t.Fatalf("a bare digest needs no registry round-trip, want 1 call (the tag), got %d", reg.calls)
+	}
+}
+
+// A well-formed but WRONG registry host — stale after a registry move, or a
+// typo — makes every one of our refs foreign. One digest-pinned container is
+// enough to defeat the fleet-wide-zero rule, so the class is closed with its
+// own rule: if any ref was host-qualified and none matched, abort.
+func TestBuildInUseSet_AbortsWhenNoQualifiedRefMatchesRegistryHost(t *testing.T) {
+	inv := &fakeInv{hosts: map[string]invEntry{
+		"engine-1": {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
+	}}
+	specs := &fakeSpecs{
+		keys:  map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+		specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{"image": testRegistryHost + "/engine:v9"}}},
+	}
+	cfg := baseCfg()
+	cfg.RegistryHosts = []string{"reg2.example:5000"} // well-formed, and wrong
+	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs,
+		&fakeReg{catalog: []string{"engine"}, manifests: map[string]string{"engine:v9": digB}}, cfg)
+	mustAbort(t, set, err)
+	if !strings.Contains(err.Error(), "no host-qualified") {
+		t.Fatalf("want the no-match rule, got %v", err)
+	}
+}
+
+// A fleet whose refs are all unqualified is not evidence of a wrong host, so
+// the rule above must not fire when there was nothing to match.
+func TestBuildInUseSet_NoQualifiedRefsAtAllDoesNotTripTheMatchRule(t *testing.T) {
+	inv := &fakeInv{hosts: map[string]invEntry{"engine-1": {fresh: freshOK()}}}
+	specs := &fakeSpecs{
+		keys:  map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+		specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{"image": "engine:v9"}}},
+	}
+	reg := &fakeReg{catalog: []string{"engine"}, manifests: map[string]string{"engine:v9": digA}}
+	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, baseCfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	hasDigest(t, set, digA)
+}
+
+// A registry host that is syntactically clean but could never appear as the
+// host component of a reference is rejected: looksLikeRegistryHost is the
+// property matching actually depends on, so anything failing it silently
+// classifies every ref as foreign.
+func TestBuildInUseSet_RejectsRegistryHostThatCannotAppearInARef(t *testing.T) {
+	for _, spelling := range []string{
+		"myreg",                 // no ".", no ":", not localhost
+		"user@reg.example:5000", // userinfo
+		"reg.example:5000?x=1",  // query
+		"reg.example:5000#frag", // fragment
+	} {
+		t.Run(spelling, func(t *testing.T) {
+			inv, specs, reg := tagOnlyFleet()
+			cfg := baseCfg()
+			cfg.RegistryHosts = []string{spelling}
+			set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, cfg)
+			mustAbort(t, set, err)
+			if !strings.Contains(err.Error(), "registry host") {
+				t.Fatalf("want a registry-host config error, got %v", err)
+			}
+		})
+	}
+}
+
+// "localhost" is a legitimate registry host component.
+func TestBuildInUseSet_AcceptsLocalhostRegistryHost(t *testing.T) {
+	inv := &fakeInv{hosts: map[string]invEntry{"engine-1": {fresh: freshOK()}}}
+	specs := &fakeSpecs{
+		keys:  map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+		specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{"image": "localhost/engine:v9"}}},
+	}
+	reg := &fakeReg{catalog: []string{"engine"}, manifests: map[string]string{"engine:v9": digA}}
+	cfg := baseCfg()
+	cfg.RegistryHosts = []string{"localhost"}
+	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs, reg, cfg)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	hasDigest(t, set, digA)
+}
+
+// MINOR (a): a bare registry host with no repository path is not addressable
+// and must abort, not be skipped as foreign — the surviving mutation.
+func TestBuildInUseSet_AbortsOnBareRegistryHostRef(t *testing.T) {
+	inv := &fakeInv{hosts: map[string]invEntry{
+		"engine-1": {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
+	}}
+	specs := &fakeSpecs{
+		keys:  map[string][]store.SpecKey{"engine-1": {{Template: "engine", Slug: "acme"}}},
+		specs: map[string]store.Spec{"engine-1/engine/acme": {Parameters: map[string]any{"image": "docker.io"}}},
+	}
+	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, specs,
+		&fakeReg{catalog: []string{"engine"}}, baseCfg())
+	mustAbort(t, set, err)
+	if !strings.Contains(err.Error(), "repository") {
+		t.Fatalf("want a cannot-derive-a-repository abort, got %v", err)
+	}
+}
+
+// MINOR (c): an aborted result must not look like a usable empty set to a
+// caller that logs the error and carries on — Has() would answer false for
+// every digest in the registry.
+func TestInUseSet_ValidOnlyOnSuccess(t *testing.T) {
+	inv := &fakeInv{hosts: map[string]invEntry{
+		"engine-1": {obs: []instance.Observed{obsLive("engine", "acme", digA)}, fresh: freshOK()},
+	}}
+	ok, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, &fakeSpecs{}, &fakeReg{catalog: []string{"engine"}}, baseCfg())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !ok.Valid {
+		t.Fatal("a successful set must be Valid")
+	}
+	bad, err := BuildInUseSet(context.Background(), hostsOf(), &fakeInv{}, &fakeSpecs{}, &fakeReg{}, baseCfg())
+	if err == nil {
+		t.Fatal("want an abort")
+	}
+	if bad.Valid {
+		t.Fatal("an aborted set must not be Valid")
+	}
+}
+
+// The infra skip keys off the pod's InfraID. An app container that merely
+// looks like one — named "*-infra", and image-less because its inspect failed
+// (PodList swallows that error) — must still abort.
+func TestBuildInUseSet_AbortsOnImagelessAppContainerNamedInfra(t *testing.T) {
+	o := instance.Observed{Template: "engine", Slug: "acme", Containers: []instance.ObservedContainer{
+		{Name: "1fd9c02bf4f0-infra", IsInfra: true},
+		{Name: "engine-acme-infra"}, // declared "infra" in the template; inspect failed
+		{Name: "engine", Image: digA, ImageTag: testRegistryHost + "/engine@" + digA},
+	}}
+	inv := &fakeInv{hosts: map[string]invEntry{"engine-1": {obs: []instance.Observed{o}, fresh: freshOK()}}}
+	set, err := BuildInUseSet(context.Background(), hostsOf("engine-1"), inv, &fakeSpecs{}, &fakeReg{catalog: []string{"engine"}}, baseCfg())
+	mustAbort(t, set, err)
 }

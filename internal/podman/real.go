@@ -888,10 +888,11 @@ func mapNotFound(err error) error {
 
 func podFromInspect(p *entities.PodInspectReport) Pod {
 	out := Pod{
-		ID:     p.ID,
-		Name:   p.Name,
-		Status: p.State,
-		Labels: p.Labels,
+		ID:      p.ID,
+		Name:    p.Name,
+		Status:  p.State,
+		Labels:  p.Labels,
+		InfraID: p.InfraContainerID,
 	}
 	if !p.Created.IsZero() {
 		out.Created = p.Created
@@ -908,10 +909,11 @@ func podFromInspect(p *entities.PodInspectReport) Pod {
 
 func podFromList(p *entities.ListPodsReport) Pod {
 	out := Pod{
-		ID:     p.Id,
-		Name:   p.Name,
-		Status: p.Status,
-		Labels: p.Labels,
+		ID:      p.Id,
+		Name:    p.Name,
+		Status:  p.Status,
+		Labels:  p.Labels,
+		InfraID: p.InfraId,
 	}
 	if !p.Created.IsZero() {
 		out.Created = p.Created

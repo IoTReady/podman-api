@@ -197,3 +197,33 @@ func TestPublicParameters_EmptyIsNil(t *testing.T) {
 	m := render.Meta{Parameters: []render.ParamDef{{Name: "tok", Secret: true}}}
 	assert.Nil(t, PublicParameters(m, map[string]any{"tok": "x"}, nil))
 }
+
+// The pod's InfraID is what marks a container as infra — not its name, and not
+// the fact that it reports no image. Both of those are ambiguous.
+func TestNormalize_MarksInfraContainerByID(t *testing.T) {
+	p := podman.Pod{
+		ID: "p1", Name: "engine-acme", Status: "Running", InfraID: "c1",
+		Containers: []podman.Container{
+			{ID: "c1", Name: "1fd9c02bf4f0-infra", Status: "running"},
+			{ID: "c2", Name: "engine-acme-infra", Status: "running",
+				Image: "sha256:aaaa", ImageTag: "reg.example:5000/engine:v1"},
+		},
+	}
+	got := Normalize(p, "engine", "acme", nil, nil, nil)
+	if !got.Containers[0].IsInfra {
+		t.Fatal("the container matching the pod's InfraID must be marked infra")
+	}
+	if got.Containers[1].IsInfra {
+		t.Fatal("an app container merely NAMED *-infra must not be marked infra")
+	}
+}
+
+// A pod with no infra container marks nothing, rather than matching every
+// container with an empty ID.
+func TestNormalize_NoInfraIDMarksNothing(t *testing.T) {
+	p := podman.Pod{ID: "p1", Status: "Running", Containers: []podman.Container{{Name: "app"}}}
+	got := Normalize(p, "engine", "acme", nil, nil, nil)
+	if got.Containers[0].IsInfra {
+		t.Fatal("no InfraID must mean no container is infra")
+	}
+}

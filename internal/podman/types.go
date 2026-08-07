@@ -10,6 +10,12 @@ type Pod struct {
 	Created    time.Time
 	Containers []Container
 	Labels     map[string]string
+	// InfraID is the ID of the pod's infra container, empty when the pod has
+	// none. It is the only reliable way to tell an infra container from an app
+	// container: names collide (`podman kube play` names containers
+	// <pod>-<containerName>) and an infra container reports no image at all,
+	// which is indistinguishable from an app container whose inspect failed.
+	InfraID string
 }
 
 type Container struct {
