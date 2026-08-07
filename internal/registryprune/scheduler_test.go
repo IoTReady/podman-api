@@ -3,6 +3,7 @@ package registryprune
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -153,5 +154,39 @@ func TestSchedulerZeroIntervalIsInert(t *testing.T) {
 	s.tick(context.Background())
 	if got := len(queuedRuns(t, mem)); got != 0 {
 		t.Fatalf("Interval<=0 must not enqueue, got %d", got)
+	}
+}
+
+// errListStore fails ListJobs and counts Enqueue calls.
+type errListStore struct {
+	store.JobStore
+	enqueued int
+}
+
+func (e *errListStore) ListJobs(context.Context, store.JobFilter) ([]store.Job, error) {
+	return nil, errors.New("store unavailable")
+}
+
+func (e *errListStore) Enqueue(ctx context.Context, kind string, args json.RawMessage, parentID string) (store.Job, error) {
+	e.enqueued++
+	return e.JobStore.Enqueue(ctx, kind, args, parentID)
+}
+
+// s6. A store error must be read as "a run may already be in flight", not as
+// "nothing is running". Without the fail-safe, a store outage enqueues a fresh
+// run on EVERY tick — one a minute — and the queue drains into concurrent
+// prunes the moment the store recovers.
+func TestSchedulerStoreErrorAssumesInFlight(t *testing.T) {
+	st := &errListStore{JobStore: store.NewMemory()}
+	s := &Scheduler{
+		Store:    st,
+		Interval: 24 * time.Hour,
+		Payload:  func() Payload { return Payload{Policy: DefaultPolicy()} },
+		Now:      func() time.Time { return time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC) },
+	}
+	s.tick(context.Background())
+	s.tick(context.Background())
+	if st.enqueued != 0 {
+		t.Fatalf("a store error must suppress enqueue, got %d", st.enqueued)
 	}
 }

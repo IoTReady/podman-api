@@ -33,6 +33,10 @@ type fakeClient struct {
 	tags     map[string][]imgregistry.TagGroup
 	tagsErr  map[string]error
 	tagCalls []string
+	// tagCount overrides TagCount per repo. Unset means "derive it from tags",
+	// i.e. a complete listing; a value LARGER than the tags actually returned
+	// is the silent-drop this handler must refuse to reason from.
+	tagCount map[string]int
 
 	manifests map[string]string // "repo:ref" -> digest
 
@@ -59,6 +63,10 @@ func (f *fakeClient) Catalog(context.Context) ([]string, error) {
 
 func (f *fakeClient) Tags(_ context.Context, repo string) ([]imgregistry.TagGroup, error) {
 	f.tagCalls = append(f.tagCalls, repo)
+	return f.tagsFor(repo)
+}
+
+func (f *fakeClient) tagsFor(repo string) ([]imgregistry.TagGroup, error) {
 	if err, ok := f.tagsErr[repo]; ok {
 		return nil, err
 	}
@@ -66,7 +74,10 @@ func (f *fakeClient) Tags(_ context.Context, repo string) ([]imgregistry.TagGrou
 }
 
 func (f *fakeClient) TagCount(ctx context.Context, repo string) (int, error) {
-	g, err := f.Tags(ctx, repo)
+	if n, ok := f.tagCount[repo]; ok {
+		return n, nil
+	}
+	g, err := f.tagsFor(repo)
 	if err != nil {
 		return 0, err
 	}
@@ -391,7 +402,7 @@ func TestDeletePass_BackstopRefusesInUseDigest(t *testing.T) {
 	j, _ := mem.Enqueue(context.Background(), JobKind, nil, "")
 	jc := jobs.NewJobContext(mem, j.ID)
 
-	n, err := h.deletePass(context.Background(), jc, plan, inUse, map[string]struct{}{},
+	n, err := h.deletePass(context.Background(), jc, plan, inUse, inUse, map[string]struct{}{},
 		map[string]struct{}{"engine": {}}, Payload{Policy: testPolicy()})
 	if err != nil {
 		t.Fatalf("the backstop must skip, not fail: %v", err)
@@ -413,7 +424,7 @@ func TestDeletePass_BackstopRefusesProtectedDigest(t *testing.T) {
 	j, _ := mem.Enqueue(context.Background(), JobKind, nil, "")
 	jc := jobs.NewJobContext(mem, j.ID)
 
-	n, err := h.deletePass(context.Background(), jc, plan, inUse,
+	n, err := h.deletePass(context.Background(), jc, plan, inUse, inUse,
 		map[string]struct{}{digD: {}}, map[string]struct{}{"engine": {}}, Payload{Policy: testPolicy()})
 	if err != nil || n != 0 {
 		t.Fatalf("want 0 deletions and no error, got n=%d err=%v", n, err)
@@ -433,7 +444,7 @@ func TestDeletePass_RefusesRepoOutsideProtectionCatalog(t *testing.T) {
 	j, _ := mem.Enqueue(context.Background(), JobKind, nil, "")
 	jc := jobs.NewJobContext(mem, j.ID)
 
-	n, err := h.deletePass(context.Background(), jc, plan, inUse, map[string]struct{}{},
+	n, err := h.deletePass(context.Background(), jc, plan, inUse, inUse, map[string]struct{}{},
 		map[string]struct{}{"engine": {}}, Payload{Policy: testPolicy()})
 	if err != nil || n != 0 {
 		t.Fatalf("want 0 deletions and no error, got n=%d err=%v", n, err)
@@ -453,7 +464,7 @@ func TestDeletePass_DedupsRepoDigest(t *testing.T) {
 	j, _ := mem.Enqueue(context.Background(), JobKind, nil, "")
 	jc := jobs.NewJobContext(mem, j.ID)
 
-	n, err := h.deletePass(context.Background(), jc, plan, inUse, map[string]struct{}{},
+	n, err := h.deletePass(context.Background(), jc, plan, inUse, inUse, map[string]struct{}{},
 		map[string]struct{}{"engine": {}}, Payload{Policy: testPolicy()})
 	if err != nil {
 		t.Fatal(err)
@@ -641,4 +652,309 @@ func (m *fakeMetrics) ManifestsDeleted(repo string, n int) {
 
 func (m *fakeMetrics) RepoSkipped(repo string, candidates int) {
 	m.skipped = append(m.skipped, repo)
+}
+
+// ---------------------------------------------------------------------------
+// Review round 2 — the handler must not trust what imgregistry.Tags returns.
+// ---------------------------------------------------------------------------
+
+// C-1. HTTPClient.Tags resolves every tag concurrently and SILENTLY DROPS any
+// whose manifest fetch failed (client.go: `if r.err != nil { continue }`),
+// returning err == nil over the survivors. A blip on "latest"'s manifest fetch
+// removes it from its group, and its bare-hex alias — which would have been
+// sha-is-latest and kept — becomes its own group and classifies sha-orphan.
+// A dropped protected tag also stops seeding the cross-repo protected set, so
+// the loss is not confined to its own repo.
+func TestRun_IncompleteTagListingAbortsBeforeAnyDelete(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine", "otp"}},
+		tags: map[string][]imgregistry.TagGroup{
+			// "latest" was dropped by a 500 on its manifest fetch; only its
+			// bare-hex alias survived, now looking like an orphan.
+			"engine": {orphanGroup(digD, "abc1234")},
+			"otp":    {orphanGroup(digE, "beef123")},
+		},
+		tagCount: map[string]int{"engine": 2, "otp": 1},
+	}
+	h := newHandler(t, reg)
+	_, job, err := runJob(t, h, Payload{Policy: testPolicy()})
+	if err == nil {
+		t.Fatal("an incomplete tag listing must abort the run")
+	}
+	// Aborts the WHOLE run, not just the affected repo: the dropped tag may be
+	// what protects a digest in some other repo.
+	wantNoDeletes(t, reg)
+	wantStepContaining(t, job, "incomplete")
+}
+
+func TestRun_CompleteTagListingProceeds(t *testing.T) {
+	reg := &fakeClient{
+		catalogs:  [][]string{{"engine"}},
+		tags:      map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
+		tagCount:  map[string]int{"engine": 1},
+		manifests: map[string]string{},
+	}
+	h := newHandler(t, reg)
+	if _, _, err := runJob(t, h, Payload{Policy: testPolicy()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(reg.deletes) != 1 {
+		t.Fatalf("a complete listing must still prune, got %v", reg.deletes)
+	}
+}
+
+// C-2. imgregistry leaves TagGroup.Created zero both when there is genuinely no
+// config blob (a multi-arch index) and when the blob fetch FAILED. policy.go
+// treats zero Created on a feat-* tag as stale — a deliberate port of
+// registry-gc.sh, justified by the index case. The handler cannot tell the two
+// apart, so it refuses to act on either: a feat-* tag created seconds ago whose
+// blob GET returned 500 would otherwise be deleted.
+func TestRun_FeatTagWithUnknownAgeIsNotDeleted(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine"}},
+		tags: map[string][]imgregistry.TagGroup{
+			"engine": {{Digest: digD, Tags: []string{"feat-brand-new"}}}, // Created zero
+		},
+		tagCount: map[string]int{"engine": 1},
+	}
+	h := newHandler(t, reg)
+	_, job, err := runJob(t, h, Payload{Policy: testPolicy()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantNoDeletes(t, reg)
+	wantStepContaining(t, job, "age-unknown")
+}
+
+// The control: an aged feat-* tag with a KNOWN creation time is still deleted.
+// Without this, the C-2 fix could have been "never delete feat-* at all".
+func TestRun_AgedFeatTagIsStillDeleted(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine"}},
+		tags: map[string][]imgregistry.TagGroup{
+			"engine": {{Digest: digD, Tags: []string{"feat-old"}, Created: fixedNow.AddDate(0, 0, -60)}},
+		},
+		tagCount: map[string]int{"engine": 1},
+	}
+	h := newHandler(t, reg)
+	if _, _, err := runJob(t, h, Payload{Policy: testPolicy()}); err != nil {
+		t.Fatal(err)
+	}
+	if len(reg.deletes) != 1 {
+		t.Fatalf("an aged feat-* tag must still be deleted, got %v", reg.deletes)
+	}
+}
+
+// I-1. The backstop re-read the SAME in-memory set built minutes earlier, so it
+// defended only against a bug in classification, not against the fleet changing
+// during the run (Tags on "engine" alone measures ~21s cold, times 28 repos).
+// A deploy landing inside that window pushes an image whose CI tag is bare hex:
+// absent from the snapshot, its spec not yet in the store — sha-orphan, deleted,
+// and the instance can never be rebuilt. That is #64 exactly.
+func TestRun_RebuildsInUseSetBeforeDeleting(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine"}},
+		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
+		tagCount: map[string]int{"engine": 1},
+	}
+	h := newHandler(t, reg)
+	calls := 0
+	h.buildSet = func(context.Context) (InUseSet, error) {
+		calls++
+		if calls == 1 {
+			return InUseSet{Valid: true, Digests: map[string]struct{}{digA: {}}}, nil
+		}
+		// A deploy landed while the catalog was being classified.
+		return InUseSet{Valid: true, Digests: map[string]struct{}{digA: {}, digD: {}}}, nil
+	}
+	_, job, err := runJob(t, h, Payload{Policy: testPolicy()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("the in-use set must be rebuilt before deleting, got %d builds", calls)
+	}
+	wantNoDeletes(t, reg)
+	wantStepContaining(t, job, "backstop")
+}
+
+// The converse, at the delete pass itself: a candidate must be absent from
+// BOTH snapshots. Neither one alone is authoritative — the first predates the
+// classification pass, the second postdates it, and an instance can appear or
+// disappear on either side of that window.
+func TestDeletePass_ProtectedByEitherSnapshot(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		old, fresh InUseSet
+	}{
+		{"only the pre-classification snapshot knows it",
+			InUseSet{Valid: true, Digests: map[string]struct{}{digD: {}}},
+			InUseSet{Valid: true, Digests: map[string]struct{}{digA: {}}}},
+		{"only the pre-delete snapshot knows it",
+			InUseSet{Valid: true, Digests: map[string]struct{}{digA: {}}},
+			InUseSet{Valid: true, Digests: map[string]struct{}{digD: {}}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			reg := &fakeClient{catalogs: [][]string{{"engine"}}}
+			h := &Handler{Registry: reg, Config: baseCfg()}
+			plan := []repoPlan{{repo: "engine", candidates: []candidate{{digest: digD, class: ClassShaOrphan}}}}
+			mem := store.NewMemory()
+			j, _ := mem.Enqueue(context.Background(), JobKind, nil, "")
+			jc := jobs.NewJobContext(mem, j.ID)
+			n, err := h.deletePass(context.Background(), jc, plan, tc.old, tc.fresh,
+				map[string]struct{}{}, map[string]struct{}{"engine": {}}, Payload{Policy: testPolicy()})
+			if err != nil || n != 0 {
+				t.Fatalf("want 0 deletions and no error, got n=%d err=%v", n, err)
+			}
+			wantNoDeletes(t, reg)
+		})
+	}
+}
+
+func TestRun_SecondInUseBuildFailureAbortsWithZeroDeletes(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"engine"}},
+		tags:     map[string][]imgregistry.TagGroup{"engine": {orphanGroup(digD, "abc1234")}},
+		tagCount: map[string]int{"engine": 1},
+	}
+	h := newHandler(t, reg)
+	calls := 0
+	h.buildSet = func(context.Context) (InUseSet, error) {
+		calls++
+		if calls == 1 {
+			return InUseSet{Valid: true, Digests: map[string]struct{}{digA: {}}}, nil
+		}
+		return InUseSet{}, fmt.Errorf("%w: host went unreachable mid-run", ErrUnsafeToPrune)
+	}
+	_, _, err := runJob(t, h, Payload{Policy: testPolicy()})
+	if !errors.Is(err, ErrUnsafeToPrune) {
+		t.Fatalf("want ErrUnsafeToPrune, got %v", err)
+	}
+	wantNoDeletes(t, reg)
+}
+
+// I-2. A nil catalog set must refuse EVERYTHING (a nil map lookup returns
+// ok==false, which is fail-closed). The `if inCatalog != nil` wrapper inverted
+// that: nil disabled the refusal and every repo passed.
+func TestDeletePass_NilCatalogRefusesEverything(t *testing.T) {
+	reg := &fakeClient{catalogs: [][]string{{"engine"}}}
+	h := &Handler{Registry: reg, Config: baseCfg()}
+	inUse := InUseSet{Valid: true, Digests: map[string]struct{}{digA: {}}}
+	plan := []repoPlan{{repo: "engine", candidates: []candidate{{digest: digD, class: ClassShaOrphan}}}}
+	mem := store.NewMemory()
+	j, _ := mem.Enqueue(context.Background(), JobKind, nil, "")
+	jc := jobs.NewJobContext(mem, j.ID)
+
+	n, err := h.deletePass(context.Background(), jc, plan, inUse, inUse, map[string]struct{}{}, nil, Payload{Policy: testPolicy()})
+	if err != nil || n != 0 {
+		t.Fatalf("a nil catalog set must refuse everything, got n=%d err=%v", n, err)
+	}
+	wantNoDeletes(t, reg)
+}
+
+// Minor. A malformed payload must still record a run outcome — #220's alerting
+// is built on that metric, and a job that fails without one is invisible.
+func TestRun_MalformedPayloadRecordsRunOutcome(t *testing.T) {
+	reg := &fakeClient{catalogs: [][]string{{"engine"}}}
+	h := newHandler(t, reg)
+	m := &fakeMetrics{}
+	h.Metrics = m
+	mem := store.NewMemory()
+	j, _ := mem.Enqueue(context.Background(), JobKind, json.RawMessage(`{"policy":`), "")
+	if err := h.Run(context.Background(), j, jobs.NewJobContext(mem, j.ID)); err == nil {
+		t.Fatal("a malformed payload must fail the job")
+	}
+	if len(m.results) != 1 {
+		t.Fatalf("want exactly one run outcome recorded, got %v", m.results)
+	}
+}
+
+// Minor. The "registry is down, stop hammering it" break keyed on firstErr, so
+// an earlier unrelated failure pinned firstErr and a LATER outage no longer
+// stopped the per-repo loop.
+func TestDeletePass_LaterUnreachableStopsTheLoop(t *testing.T) {
+	reg := &fakeClient{
+		catalogs: [][]string{{"a", "b", "c"}},
+		deleteErr: map[string]error{
+			"a@" + digD: errors.New("some other failure"),
+			"b@" + digE: imgregistry.ErrUnreachable,
+		},
+	}
+	h := &Handler{Registry: reg, Config: baseCfg()}
+	inUse := InUseSet{Valid: true, Digests: map[string]struct{}{digA: {}}}
+	plan := []repoPlan{
+		{repo: "a", candidates: []candidate{{digest: digD, class: ClassShaOrphan}}},
+		{repo: "b", candidates: []candidate{{digest: digE, class: ClassShaOrphan}}},
+		{repo: "c", candidates: []candidate{{digest: digF, class: ClassShaOrphan}}},
+	}
+	mem := store.NewMemory()
+	j, _ := mem.Enqueue(context.Background(), JobKind, nil, "")
+	jc := jobs.NewJobContext(mem, j.ID)
+	inCat := map[string]struct{}{"a": {}, "b": {}, "c": {}}
+
+	if _, err := h.deletePass(context.Background(), jc, plan, inUse, inUse,
+		map[string]struct{}{}, inCat, Payload{Policy: testPolicy()}); err == nil {
+		t.Fatal("want an error")
+	}
+	if len(reg.deletes) != 2 {
+		t.Fatalf("an unreachable registry must stop the loop before repo c; attempted %v", reg.deletes)
+	}
+}
+
+// m12. The err and !Valid abort paths must be distinguishable in the job record.
+// They were not: every error path also returns Valid==false, so deleting the err
+// check left the suite green.
+func TestRun_AbortStepNamesTheUnderlyingReason(t *testing.T) {
+	reg := &fakeClient{catalogs: [][]string{{"engine"}}}
+	h := newHandler(t, reg)
+	h.Inventory = &fakeInv{hosts: map[string]invEntry{
+		"engine-1": {obs: nil, fresh: instance.Freshness{Reachable: false, HasData: true, FetchedAt: fixedNow}},
+	}}
+	_, job, err := runJob(t, h, Payload{Policy: testPolicy()})
+	if !errors.Is(err, ErrUnsafeToPrune) {
+		t.Fatalf("want ErrUnsafeToPrune, got %v", err)
+	}
+	// The specific cause, not the generic "not valid" the Valid gate records.
+	wantStepContaining(t, job, "unreachable")
+	if strings.Contains(stepText(job), "in-use set is not valid") {
+		t.Fatalf("the error path must record its own reason, not the Valid gate's:\n%s", stepText(job))
+	}
+}
+
+// The Policy inside a Payload survives the job-args round trip. This rests on
+// regexp.Regexp's stdlib MarshalText/UnmarshalText (Go 1.21+) — nothing in this
+// package declares it, so a future Policy field that is not JSON-safe would
+// regress silently, exactly where it cannot be seen: a nil CalVer reclassifies
+// every calendar-versioned release tag as unclassified.
+func TestPayloadRoundTripsThroughJobArgs(t *testing.T) {
+	in := Payload{Policy: DefaultPolicy(), DryRun: true, SkipBlobGC: true}
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out Payload
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Policy.CalVer == nil || !out.Policy.CalVer.MatchString("2026.08.07") {
+		t.Fatalf("CalVer did not survive the round trip: %#v", out.Policy.CalVer)
+	}
+	extra, ok := out.Policy.ExtraPerRepo["otp"]
+	if !ok || extra == nil || !extra.MatchString("runtime-base") {
+		t.Fatalf("ExtraPerRepo did not survive the round trip: %#v", out.Policy.ExtraPerRepo)
+	}
+	if len(out.Policy.ProtectedExact) != len(in.Policy.ProtectedExact) ||
+		out.Policy.RetentionDays != in.Policy.RetentionDays ||
+		out.Policy.MaxDeletesPerRepo != in.Policy.MaxDeletesPerRepo ||
+		out.Policy.DeleteUnrecognised != in.Policy.DeleteUnrecognised ||
+		out.DryRun != in.DryRun || out.SkipBlobGC != in.SkipBlobGC {
+		t.Fatalf("payload did not round trip: %#v -> %#v", in, out)
+	}
+	// And the classification it drives is byte-identical either way.
+	tg := imgregistry.TagGroup{Digest: digD, Tags: []string{"2026.08.07"}, Created: fixedNow}
+	empty := InUseSet{Valid: true, Digests: map[string]struct{}{}}
+	if got, want := Classify("engine", tg, empty, nil, out.Policy, fixedNow),
+		Classify("engine", tg, empty, nil, in.Policy, fixedNow); got != want {
+		t.Fatalf("classification diverged across the round trip: %s vs %s", got, want)
+	}
 }

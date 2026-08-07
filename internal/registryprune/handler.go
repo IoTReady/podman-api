@@ -150,6 +150,10 @@ func validatePolicy(p Policy) error {
 func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) error {
 	var p Payload
 	if err := json.Unmarshal(job.Args, &p); err != nil {
+		// Record an outcome even here: #220's alerting is built on this
+		// metric, and a job that fails without one is invisible.
+		h.metric().RunDone("aborted")
+		jc.Step("payload", "ABORTED: "+err.Error())
 		return fmt.Errorf("decode registry-prune args: %w", err)
 	}
 	if err := validatePolicy(p.Policy); err != nil {
@@ -171,7 +175,7 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 	for _, r := range repos {
 		inCatalog[r] = struct{}{}
 	}
-	jc.Step("catalog", fmt.Sprintf("%d repositor(y|ies) listed once for this run", len(repos)))
+	jc.Step("catalog", fmt.Sprintf("%d repositories listed once for this run", len(repos)))
 
 	// (2) The in-use set, from that same listing.
 	inUse, err := h.inUseSet(ctx, repos)
@@ -217,8 +221,34 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 		kept = append(kept, rp)
 	}
 
-	// (5) Delete.
-	deleted, delErr := h.deletePass(ctx, jc, kept, inUse, protected, inCatalog, p)
+	// (5) Re-derive the in-use set immediately before deleting. The first
+	// snapshot is minutes old by now — Tags on the fleet's "engine" repo alone
+	// measures ~21s cold, times 28 repos, on top of BuildInUseSet itself. A
+	// deploy landing inside that window pushes an image whose CI tag is a
+	// 7-12 char bare hex string: absent from the first snapshot, its spec not
+	// yet written when the specs were read, so it classifies sha-orphan. The
+	// instance would run and never be rebuildable — #64 exactly.
+	//
+	// The catalog is deliberately NOT re-listed: it is the fleet's state we
+	// need to be fresh, not the repo set. Re-listing would reopen the TOCTOU
+	// that freezing it closed (a repo pushed mid-run being classified against
+	// a protection pass that never saw it).
+	fresh, err := h.inUseSet(ctx, repos)
+	recordSetDiagnostics(jc, fresh)
+	if err != nil {
+		h.metric().RunDone("aborted")
+		jc.Step("in-use:recheck", "ABORTED: "+err.Error())
+		return err
+	}
+	if !fresh.Valid {
+		h.metric().RunDone("aborted")
+		jc.Step("in-use:recheck", "ABORTED: re-derived in-use set is not valid")
+		return fmt.Errorf("%w: re-derived in-use set is not valid", ErrUnsafeToPrune)
+	}
+	jc.Step("in-use:recheck", fmt.Sprintf("%d digest(s) protected fleet-wide at delete time", fresh.Len()))
+
+	// (6) Delete.
+	deleted, delErr := h.deletePass(ctx, jc, kept, inUse, fresh, protected, inCatalog, p)
 	if delErr != nil {
 		h.metric().RunDone("failed")
 		return delErr
@@ -230,7 +260,7 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 	}
 	jc.Step("summary", fmt.Sprintf("%d manifest(s) deleted", deleted))
 
-	// (6) Stage B: reclaim the blobs those deletions only unlinked. It gates
+	// (7) Stage B: reclaim the blobs those deletions only unlinked. It gates
 	// itself on DryRun/SkipBlobGC too, so the "no pod is ever played on a dry
 	// run" property does not depend on this call site.
 	if h.BlobGC != nil {
@@ -287,10 +317,19 @@ func (h *Handler) classifyAll(ctx context.Context, jc *jobs.JobContext, repos []
 		if err := ctx.Err(); err != nil {
 			return nil, nil, err
 		}
+		want, err := h.Registry.TagCount(ctx, repo)
+		if err != nil {
+			jc.Step("classify:"+repo, "ABORTED: "+err.Error())
+			return nil, nil, fmt.Errorf("count tags for %s (aborting before any delete): %w", repo, err)
+		}
 		groups, err := h.Registry.Tags(ctx, repo)
 		if err != nil {
 			jc.Step("classify:"+repo, "ABORTED: "+err.Error())
 			return nil, nil, fmt.Errorf("list tags for %s (aborting before any delete): %w", repo, err)
+		}
+		if err := checkListingComplete(repo, want, groups); err != nil {
+			jc.Step("classify:"+repo, "ABORTED: "+err.Error())
+			return nil, nil, err
 		}
 		listings[repo] = groups
 		for _, tg := range groups {
@@ -301,6 +340,7 @@ func (h *Handler) classifyAll(ctx context.Context, jc *jobs.JobContext, repos []
 	}
 
 	counts := map[Class]int{}
+	var ageUnknown []string
 	plan := make([]repoPlan, 0, len(repos))
 	for _, repo := range repos {
 		rp := repoPlan{repo: repo}
@@ -311,6 +351,22 @@ func (h *Handler) classifyAll(ctx context.Context, jc *jobs.JobContext, repos []
 			// "latest"'s own hex alias into a delete candidate.
 			c := Classify(repo, tg, inUse, protected, pol, h.now())
 			counts[c]++
+			// C-2. imgregistry leaves Created zero for BOTH "this is a
+			// multi-arch index, there is no config blob" and "the config blob
+			// fetch failed" (client.go: the blobCreated error is swallowed).
+			// policy.go maps zero Created on a feat-* tag to ClassFeatStale —
+			// deletable — a deliberate port of registry-gc.sh justified only
+			// by the index case. Since the two are indistinguishable here, the
+			// handler refuses to act on either: a feat-* tag created seconds
+			// ago whose blob GET returned 500 would otherwise be deleted, and
+			// the blast radius is per-DIGEST, so one failure can condemn every
+			// feat-* tag sharing it. Keeping a genuine multi-arch index
+			// forever is the recoverable direction, and it is recorded rather
+			// than silent.
+			if c == ClassFeatStale && tg.Created.IsZero() {
+				ageUnknown = append(ageUnknown, fmt.Sprintf("%s@%s %v", repo, tg.Digest, tg.Tags))
+				continue
+			}
 			if Deletable(c, pol) {
 				rp.candidates = append(rp.candidates, candidate{digest: tg.Digest, tags: tg.Tags, class: c})
 			}
@@ -318,10 +374,53 @@ func (h *Handler) classifyAll(ctx context.Context, jc *jobs.JobContext, repos []
 		plan = append(plan, rp)
 	}
 	jc.Step("classify", summariseClasses(counts))
+	if len(ageUnknown) > 0 {
+		jc.Step("classify:age-unknown", fmt.Sprintf(
+			"%d digest(s) kept: a feat-* tag whose creation time is unknown (no config blob, or the blob fetch failed — imgregistry cannot distinguish them): %s",
+			len(ageUnknown), listSample(ageUnknown)))
+	}
 	return plan, protected, nil
 }
 
+// checkListingComplete refuses a tag listing that lost tags on the way.
+//
+// HTTPClient.Tags resolves every tag's manifest concurrently and SILENTLY DROPS
+// any whose fetch failed, then groups over the survivors and returns err == nil
+// (client.go, phase 2: `if r.err != nil { continue }`). One 5xx under load —
+// ~988 tags on "engine", 16 concurrent GETs, 28 repos — is enough, and the tag
+// it hits is uniformly random, including latest/main/dev/calver. The
+// consequence is not "one tag missing from a report": a dropped "latest"
+// leaves its bare-hex alias alone in its group, reclassifying it from
+// sha-is-latest (kept) to sha-orphan (DELETED), and a dropped protected tag
+// stops seeding the cross-repo protected-digest set, so shares-protected
+// silently loses that digest in EVERY repo.
+//
+// Hence an abort of the whole run rather than a tripwire-style per-repo skip:
+// the tripwire's skip-and-proceed is right when the anomaly's blast radius is
+// its own repo, and this one's is not.
+//
+// Only a SHORTFALL aborts. A surplus means a tag was pushed between the count
+// and the listing; that tag is simply not classified, so it cannot be deleted,
+// and treating it as an error would make the job unrunnable against a busy
+// registry.
+func checkListingComplete(repo string, want int, groups []imgregistry.TagGroup) error {
+	got := 0
+	for _, tg := range groups {
+		got += len(tg.Tags)
+	}
+	if got < want {
+		return fmt.Errorf("%w: incomplete tag listing for %s: %d of %d tags resolved (imgregistry drops tags whose manifest fetch fails, silently and with a nil error); refusing to classify from a partial view",
+			ErrUnsafeToPrune, repo, got, want)
+	}
+	return nil
+}
+
 // nameProtected reports whether any tag in tg is protected by NAME under pol.
+//
+// It is applied across the WHOLE catalog and the resulting digest set is shared
+// by every repo — intended, not an oversight. Digests are shared between repos
+// (blobs are), so a digest reachable through a protected tag anywhere must be
+// protected everywhere; that is the same conservative keying InUseSet uses.
 // Deliberately excludes the in-use and shares-protected rules: this feeds the
 // cross-repo protected-digest set that Classify consumes, and seeding it from
 // itself would be circular.
@@ -361,14 +460,18 @@ func summariseClasses(counts map[Class]int) string {
 //
 // Returns the number of manifests deleted (or, on a dry run, that would have
 // been deleted).
-func (h *Handler) deletePass(ctx context.Context, jc *jobs.JobContext, plan []repoPlan, inUse InUseSet,
+func (h *Handler) deletePass(ctx context.Context, jc *jobs.JobContext, plan []repoPlan, inUse, fresh InUseSet,
 	protected map[string]struct{}, inCatalog map[string]struct{}, p Payload) (int, error) {
 	total := 0
 	seen := map[string]struct{}{}
 	var firstErr error
+	// registryDown is tracked separately from firstErr: keying the "stop
+	// hammering it" break on firstErr meant an earlier unrelated failure
+	// pinned it, and a LATER outage no longer stopped the loop.
+	registryDown := false
 
 	for _, rp := range plan {
-		if firstErr != nil && errors.Is(firstErr, imgregistry.ErrUnreachable) {
+		if registryDown {
 			break // registry is down; further deletes can only pile up failures
 		}
 		var wouldDelete []string
@@ -392,13 +495,19 @@ func (h *Handler) deletePass(ctx context.Context, jc *jobs.JobContext, plan []re
 			// the in-use pass, so nothing there is known to be safe. By
 			// construction the plan is built from that same listing; this is
 			// the assertion that keeps it true.
-			if inCatalog != nil {
-				if _, ok := inCatalog[rp.repo]; !ok {
-					jc.Step("backstop:"+rp.repo, "REFUSED: repository is not in this run's catalog listing")
-					continue
-				}
+			//
+			// Deliberately NOT guarded by `if inCatalog != nil`: a nil map
+			// lookup returns ok==false, so a nil set refuses everything, which
+			// is the fail-closed direction. The guard inverted that — nil
+			// disabled the refusal and every repo passed.
+			if _, ok := inCatalog[rp.repo]; !ok {
+				jc.Step("backstop:"+rp.repo, "REFUSED: repository is not in this run's catalog listing")
+				continue
 			}
-			if inUse.Has(c.digest) {
+			// Both snapshots, because neither alone is authoritative: inUse
+			// predates the classification pass and fresh postdates it, and an
+			// instance can appear or disappear on either side of that window.
+			if inUse.Has(c.digest) || fresh.Has(c.digest) {
 				jc.Step("backstop:"+rp.repo, fmt.Sprintf("REFUSED %s: in use (classified %s)", c.digest, c.class))
 				continue
 			}
@@ -427,6 +536,7 @@ func (h *Handler) deletePass(ctx context.Context, jc *jobs.JobContext, plan []re
 					firstErr = fmt.Errorf("delete %s@%s: %w", rp.repo, c.digest, err)
 				}
 				if errors.Is(err, imgregistry.ErrUnreachable) {
+					registryDown = true
 					break
 				}
 				continue
