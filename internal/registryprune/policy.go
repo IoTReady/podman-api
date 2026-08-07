@@ -92,10 +92,16 @@ func DefaultPolicy() Policy {
 	}
 }
 
-// bareHexTagRe matches a tag that looks like a raw (short or full) content
-// hash rather than a deliberately chosen name — a git SHA or similar,
-// 7-64 lowercase hex characters.
-var bareHexTagRe = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
+// bareHexTagRe is SHA_ONLY_PATTERN, read verbatim from registry-gc.sh:
+// 7-12 lowercase hex characters. This range is deliberately narrow, not a
+// rounding of "looks like a hash" — a 40-char git full-SHA tag (13+ hex
+// chars, a common CI convention) does NOT match, so it falls through to
+// ClassUnclassified (kept by default) exactly as the script has kept it for
+// months. Widening this to admit longer hex strings would make
+// ClassShaOrphan — one of only two unconditionally deletable classes —
+// unconditionally delete tags the production script protects. Do not widen
+// it without re-reading registry-gc.sh's SHA_ONLY_PATTERN first.
+var bareHexTagRe = regexp.MustCompile(`^[0-9a-f]{7,12}$`)
 
 func isBareHexTag(tag string) bool { return bareHexTagRe.MatchString(tag) }
 
@@ -167,6 +173,18 @@ func hasFeatTag(tags []string) bool {
 // across repos, so protection must be too), the policy, and the current
 // time (a parameter, not time.Now, so this stays a pure function callers
 // can test exhaustively).
+//
+// PRECONDITION — the caller MUST invoke this once per digest, i.e. once per
+// imgregistry.Tags() entry (a TagGroup already carries every tag sharing
+// that digest), and never once per individual tag. ClassShaIsLatest depends
+// on this: it fires only because a bare-hex tag sharing digest with the
+// repo's own "latest" arrives in tg.Tags alongside "latest" itself. A caller
+// that flattens tags and calls Classify per-tag will never observe that
+// combination — "latest" and its hex alias would be classified separately —
+// so ClassShaIsLatest becomes permanently unreachable. That is not unsafe
+// (the hex tag still falls through to ClassProtected and stays kept), but it
+// is a silent behaviour loss: fix the call site, not this function, if that
+// happens.
 //
 // Precedence, first match wins:
 //

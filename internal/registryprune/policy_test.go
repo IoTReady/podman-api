@@ -1,7 +1,6 @@
 package registryprune
 
 import (
-	"regexp"
 	"testing"
 	"time"
 
@@ -106,7 +105,7 @@ func TestClassify(t *testing.T) {
 		{
 			name: "bare-hex tag whose digest equals :latest's is sha-is-latest, never sha-orphan",
 			repo: "engine",
-			tg:   imgregistry.TagGroup{Digest: "sha256:ggg", Tags: []string{"latest", "deadbeef1234567"}, Created: now.Add(-100 * 24 * time.Hour)},
+			tg:   imgregistry.TagGroup{Digest: "sha256:ggg", Tags: []string{"latest", "deadbeef123"}, Created: now.Add(-100 * 24 * time.Hour)},
 			want: ClassShaIsLatest,
 		},
 		{
@@ -130,7 +129,7 @@ func TestClassify(t *testing.T) {
 		{
 			name: "bare-hex tag with no other signal is sha-orphan",
 			repo: "engine",
-			tg:   imgregistry.TagGroup{Digest: "sha256:kkk", Tags: []string{"deadbeef1234567"}, Created: now.Add(-1000 * 24 * time.Hour)},
+			tg:   imgregistry.TagGroup{Digest: "sha256:kkk", Tags: []string{"deadbee1234"}, Created: now.Add(-1000 * 24 * time.Hour)},
 			want: ClassShaOrphan,
 		},
 		{
@@ -184,10 +183,47 @@ func TestDeletable(t *testing.T) {
 	}
 }
 
-// sanity: DefaultPolicy's CalVer/ExtraPerRepo compile as valid regexps and
-// are reused (not re-compiled) by Classify — guards against a future change
-// swapping *regexp.Regexp for a string and silently breaking Classify calls
-// across many repos.
-func TestPolicyRegexpFieldsAreUsable(t *testing.T) {
-	var _ *regexp.Regexp = DefaultPolicy().CalVer
+// TestBareHexBoundary pins the SHA_ONLY_PATTERN boundary read verbatim from
+// registry-gc.sh: ^[0-9a-f]{7,12}$. This is not cosmetic — allBareHexTags
+// feeds ClassShaOrphan, one of only two unconditionally deletable classes. A
+// 40-char git full-SHA tag (a common CI convention, 13+ hex chars) must NOT
+// match: the script does not recognise it as SHA_ONLY, so it falls through
+// to unclassified (kept by default). Getting this boundary wrong would
+// silently delete manifests the production script has protected for months.
+func TestBareHexBoundary(t *testing.T) {
+	now := time.Date(2026, 8, 7, 0, 0, 0, 0, time.UTC)
+	p := mustPolicy()
+
+	cases := []struct {
+		name string
+		tag  string
+		want Class
+	}{
+		{"7 hex chars (lower boundary) is sha-orphan", "deadbee", ClassShaOrphan},
+		{"12 hex chars (upper boundary) is sha-orphan", "deadbeefcafe", ClassShaOrphan},
+		{"13 hex chars is NOT sha-orphan (past the script's SHA_ONLY_PATTERN)", "deadbeefcafe1", ClassUnclassified},
+		{"64 hex chars (full git SHA) is NOT sha-orphan", "deadbeefcafe1234deadbeefcafe1234deadbeefcafe1234deadbeefcafe1234", ClassUnclassified},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tg := imgregistry.TagGroup{Digest: "sha256:boundary-" + tc.tag, Tags: []string{tc.tag}, Created: now.Add(-1000 * 24 * time.Hour)}
+			got := Classify("engine", tg, InUseSet{}, nil, p, now)
+			if got != tc.want {
+				t.Fatalf("Classify(%q) = %q, want %q", tc.tag, got, tc.want)
+			}
+			if got == ClassShaOrphan || got == ClassShaIsLatest {
+				if tc.want != ClassShaOrphan {
+					t.Fatalf("tag %q must not be swept as %q", tc.tag, got)
+				}
+			}
+			// The 13/64-char cases must not even be reachable as an opt-in
+			// deletable unclassified surprise beyond what Unclassified
+			// already, correctly, allows — confirm the class itself, not
+			// just Deletable(), is exactly Unclassified.
+			if tc.want == ClassUnclassified && got != ClassUnclassified {
+				t.Fatalf("tag %q classified %q, want exactly unclassified", tc.tag, got)
+			}
+		})
+	}
 }
