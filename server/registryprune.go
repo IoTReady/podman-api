@@ -82,7 +82,7 @@ func registryPruneFlags(fs *flag.FlagSet) *registryPruneConfig {
 // in a way that could only misbehave — those fail startup rather than being
 // discovered a tick later, or worse, not discovered at all.
 func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg imgregistry.Client,
-	svc *instance.Service, db store.DB, pod registryprune.PodRunner,
+	svc *instance.Service, specs registryprune.SpecSource, pod registryprune.PodRunner,
 	metrics registryprune.Metrics) (*registryprune.Handler, error) {
 
 	if !cfg.Enabled {
@@ -96,11 +96,43 @@ func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg imgreg
 		log.Printf("WARNING: -registry-prune-enabled is set but no registry client exists (-registry-address is empty); registry prune is disabled")
 		return nil, nil
 	}
+	// A CACHED client must never reach this handler, and the refusal lives here
+	// rather than in a wiring convention because a convention is exactly what
+	// would rot. classifyAll builds BOTH the delete plan and the cross-repo
+	// protected-digest set from ResolveTags; CachingClient's TTL is 5 minutes
+	// and its entries are warmed by anything that lists a repo, including an
+	// operator loading the UI's registry page, which fans out over the whole
+	// catalog. Reason it through with a concrete digest: D is tagged only
+	// "feat-x", 31 days old, so it classifies feat-stale and is deletable.
+	// Someone re-tags D as the release "2026.08.07" and pushes it three minutes
+	// ago. A cached listing still reports [feat-x]; nameProtected never sees the
+	// CalVer tag, and D enters the plan. The pre-delete backstop cannot rescue
+	// it either — nothing has deployed the release yet, so it is in no in-use
+	// set. The manifest behind a just-cut release tag is deleted and the tag
+	// left dangling. The cache buys the prune nothing anyway: it walks every
+	// repo once per run, on a 24h interval, and pays the ~21s cold cost either
+	// way.
+	if _, cached := reg.(*imgregistry.CachingClient); cached {
+		return nil, fmt.Errorf("registry prune: refusing a caching registry client — " +
+			"tag listings up to imgregistry.TagsCacheTTL old would let a just-pushed protected tag " +
+			"go unseen and its manifest be deleted; pass the uncached *imgregistry.HTTPClient")
+	}
 	if cfg.MaxDeletesPerRepo <= 0 {
 		return nil, fmt.Errorf("registry prune: -registry-prune-max-deletes-per-repo must be positive (it is the per-repo tripwire), got %d", cfg.MaxDeletesPerRepo)
 	}
 	if cfg.MaxSnapshotAge <= 0 {
 		return nil, fmt.Errorf("registry prune: -registry-prune-max-snapshot-age must be positive, got %s", cfg.MaxSnapshotAge)
+	}
+
+	// Validated at STARTUP, not on the first run. A malformed spelling can never
+	// compare equal to the host component of any of our refs, so BuildInUseSet
+	// aborts every run with ErrUnsafeToPrune — fail-closed, but invisible for up
+	// to a whole interval unless someone opens the job page.
+	hosts := registryPruneHosts(registryBase, cfg.ExtraHosts)
+	for _, rh := range hosts {
+		if verr := registryprune.ValidateRegistryHost(rh); verr != nil {
+			return nil, fmt.Errorf("registry prune: registry host %q (from -registry-address/-registry-prune-extra-hosts): %w", rh, verr)
+		}
 	}
 
 	h := &registryprune.Handler{
@@ -112,7 +144,7 @@ func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg imgreg
 		// silently un-protects every digest pinned only there.
 		Hosts:     svc,
 		Inventory: svc,
-		Specs:     db,
+		Specs:     specs,
 		Metrics:   metrics,
 		Config: registryprune.Config{
 			// Derived from the SAME base URL the imgregistry client was
@@ -120,12 +152,12 @@ func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg imgreg
 			// compare equal to our own refs classifies every one of them as
 			// foreign and un-protects every tag-pinned image fleet-wide.
 			// registryprune normalises the "http://host:port" shape itself.
-			RegistryHosts:  registryPruneHosts(registryBase, cfg.ExtraHosts),
+			RegistryHosts:  hosts,
 			MaxSnapshotAge: cfg.MaxSnapshotAge,
 		},
 	}
 
-	if cfg.RegistryPod != "" {
+	if registryPruneBlobGCEnabled(cfg) {
 		if pod == nil {
 			return nil, fmt.Errorf("registry prune: blob GC needs a podman client")
 		}
@@ -135,7 +167,7 @@ func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg imgreg
 		if !strings.HasPrefix(cfg.StoragePath, "/") {
 			return nil, fmt.Errorf("registry prune: -registry-prune-storage-path %q must be an absolute host path when -registry-prune-registry-pod is set", cfg.StoragePath)
 		}
-		gcPod := cfg.GCPod
+		gcPod := strings.TrimSpace(cfg.GCPod)
 		if gcPod == "" {
 			gcPod = defaultGCPodName
 		}
@@ -144,13 +176,19 @@ func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg imgreg
 		// force-removed afterwards; if the two names coincide the registry
 		// instance is destroyed, not stopped, and nothing in the core rebuilds
 		// it. Refusing to boot is the cheap end of that trade.
-		if gcPod == cfg.RegistryPod {
-			return nil, fmt.Errorf("registry prune: -registry-prune-gc-pod %q is the registry's own pod name: playing it would replace and then destroy the registry instance", gcPod)
+		//
+		// EqualFold + TrimSpace, not ==: podman pod names are matched
+		// case-insensitively enough in practice that " Registry-Main" reaching
+		// this guard as "not equal" would be a reasoning step nobody should
+		// have to take, and the trims are free.
+		regPod := strings.TrimSpace(cfg.RegistryPod)
+		if strings.EqualFold(gcPod, regPod) {
+			return nil, fmt.Errorf("registry prune: -registry-prune-gc-pod %q is the registry's own pod name %q: playing it would replace and then destroy the registry instance", gcPod, regPod)
 		}
 		h.BlobGC = &registryprune.BlobGC{
 			Podman:            pod,
 			HostID:            cfg.Host,
-			RegistryPod:       cfg.RegistryPod,
+			RegistryPod:       regPod,
 			RegistryContainer: cfg.RegistryContainer,
 			StoragePath:       cfg.StoragePath,
 			SizePath:          cfg.SizePath,
@@ -158,6 +196,26 @@ func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg imgreg
 		}
 	}
 	return h, nil
+}
+
+// registryPruneBlobGCEnabled reports whether Stage B is configured. Defined
+// once so buildRegistryPrune (which builds the BlobGC) and registryPrunePayload
+// (which sets SkipBlobGC) can never disagree about whether Stage B exists.
+func registryPruneBlobGCEnabled(cfg registryPruneConfig) bool {
+	return strings.TrimSpace(cfg.RegistryPod) != ""
+}
+
+// buildRegistryPruneScheduler wires the ticker. Separate from the handler so
+// the interval's pass-through is testable: an Interval that silently arrives as
+// zero makes Scheduler.tick return immediately, and the feature logs itself as
+// enabled while never running.
+func buildRegistryPruneScheduler(cfg registryPruneConfig, db store.JobStore) *registryprune.Scheduler {
+	return &registryprune.Scheduler{
+		Store:    db,
+		Interval: cfg.Interval,
+		Now:      time.Now,
+		Payload:  func() registryprune.Payload { return registryPrunePayload(cfg) },
+	}
 }
 
 // registryPruneHosts is every spelling of our registry, leading with the base
@@ -172,8 +230,13 @@ func registryPruneHosts(base, extra string) []string {
 	return out
 }
 
-// registryPrunePayload is the payload the scheduler enqueues. Evaluated per
-// enqueue so a SIGHUP-reloaded policy would be picked up by the next run.
+// registryPrunePayload is the payload the scheduler enqueues, evaluated once
+// per enqueue.
+//
+// Note that the flag set is NOT re-read on SIGHUP — only hosts/*.yaml and the
+// operator file are reloaded — so re-evaluating per enqueue buys nothing today
+// beyond keeping the policy in one place. Changing -registry-prune-dry-run
+// requires a restart.
 func registryPrunePayload(cfg registryPruneConfig) registryprune.Payload {
 	pol := registryprune.DefaultPolicy()
 	pol.MaxDeletesPerRepo = cfg.MaxDeletesPerRepo
@@ -183,6 +246,6 @@ func registryPrunePayload(cfg registryPruneConfig) registryprune.Payload {
 		// SkipBlobGC is not a separate flag: leaving -registry-prune-registry-pod
 		// empty already leaves Handler.BlobGC nil, which is the same outcome
 		// with one fewer way to be half-configured.
-		SkipBlobGC: cfg.RegistryPod == "",
+		SkipBlobGC: !registryPruneBlobGCEnabled(cfg),
 	}
 }

@@ -58,6 +58,29 @@ func TestRegistryPruneMetricsRecordEveryOutcome(t *testing.T) {
 // A negative value must clamp rather than panic: a counter decrement panics,
 // and taking the whole prune job down over a metric would be worse than the
 // bad number.
+// A plain Counter would export 0 from process start, and with
+// -registry-prune-registry-container empty (the default) nothing ever measures,
+// so the series would sit flat at zero forever — indistinguishable from "blob
+// GC ran and freed nothing". The handler deliberately records nothing on an
+// unmeasured run; the collector has to keep that promise.
+func TestRegistryPruneMetricsReclaimedIsAbsentUntilMeasured(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	m := NewRegistryPruneMetrics(reg)
+	m.RunDone("succeeded") // a full run that measured nothing
+
+	if _, ok := gatherByName(t, reg)["podman_api_registry_prune_reclaimed_bytes_total"]; ok {
+		t.Fatal("reclaimed_bytes_total must be ABSENT until a run measures it, not exported as 0")
+	}
+	m.BytesReclaimed(512)
+	mf, ok := gatherByName(t, reg)["podman_api_registry_prune_reclaimed_bytes_total"]
+	if !ok {
+		t.Fatal("reclaimed_bytes_total must appear once a measurement lands")
+	}
+	if v := sumCounter(mf.Metric); v != 512 {
+		t.Errorf("reclaimed = %v, want 512", v)
+	}
+}
+
 func TestRegistryPruneMetricsClampNegatives(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	m := NewRegistryPruneMetrics(reg)

@@ -275,6 +275,38 @@ times out; `SkipBlobGC` plays no pod; dry-run plays no pod; the generated manife
 
 **Commit:** `feat(server): wire registry prune scheduler and metrics`
 
+#### Notes for #220's runbook (written after Task 7 landed)
+
+- **`-registry-prune-dry-run` defaults to `true`.** Read literally, "every flag
+  defaults to off" would have made DELETING the default. Enabling the feature gets you
+  classification and job steps and nothing else; a real run needs
+  `-registry-prune-dry-run=false` set deliberately. The startup log line says which.
+- **Every run's first job step is `mode`**, spelling out `DRY RUN`,
+  `DELETING (stage A only)` or `DELETING (stage A + B)`. Read it before anything else
+  on the job page.
+- **With blob GC off, a perfectly successful Stage-A run moves no disk at all.** It
+  unlinks manifests; the bytes stay until a registry `garbage-collect` sweeps them. On a
+  dashboard this reads as "the feature isn't doing anything". The evidence a Stage-A run
+  worked is the `delete:<repo>` job steps and
+  `podman_api_registry_prune_manifests_deleted_total`, never a disk graph.
+  Correspondingly `podman_api_registry_prune_reclaimed_bytes_total` is **absent** — not
+  zero — until a run actually measures, which needs both
+  `-registry-prune-registry-pod` and `-registry-prune-registry-container`. An absent
+  series means "blob GC or sizing is off", never "nothing was reclaimed".
+- **Staged rollout uses `POST /registry/prune`** (scope `instances:write`, 202 with a
+  `job_id`, 409 while a run is in flight, 404 when the feature is off). It skips the
+  interval and backoff gates but NOT the in-flight guard. This is not a convenience:
+  the interval gate reads *persisted job history*, so it survives a restart, and
+  without the route each rollout step (dry run → read steps → Stage-A real run →
+  verify → Stage B) would cost a full interval or a hand-edited
+  `-registry-prune-interval`. Setting `-registry-prune-interval=0` gives a
+  manual-only deployment, which is a reasonable way to run the first few passes.
+- **The prune gets the UNCACHED registry client**, and `buildRegistryPrune` refuses a
+  `*imgregistry.CachingClient` at startup. A cached tag listing (TTL 5 min, warmed by
+  any UI registry page load) can omit a protected tag pushed minutes ago; the digest
+  then classifies deletable and the pre-delete backstop cannot save it, because nothing
+  has deployed the new tag yet. Do not "optimise" this back.
+
 ---
 
 ## Not in this plan (deliberately)

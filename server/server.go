@@ -243,6 +243,14 @@ func RunWithFlags(opts ...Option) error {
 	// re-deriving it anywhere else is how every tag-pinned image in the fleet
 	// quietly stops being protected.
 	var registryClient imgregistry.Client
+	// registryPruneClient is the UNCACHED client, and must stay that way.
+	// classifyAll builds the delete plan and the cross-repo protected-digest set
+	// from ResolveTags; a listing up to TagsCacheTTL old — warmed by anything
+	// that browsed the repo, including a UI page load — can miss a protected tag
+	// pushed minutes ago and let its manifest be deleted.
+	// buildRegistryPrune refuses a *imgregistry.CachingClient outright, so this
+	// cannot regress into a wiring convention nobody re-checks.
+	var registryPruneClient imgregistry.Client
 	var registryBase string
 	if strings.TrimSpace(*registryAddress) != "" {
 		auth := imgregistry.Auth{Mode: strings.TrimSpace(*registryAuth)}
@@ -263,7 +271,9 @@ func RunWithFlags(opts ...Option) error {
 		// digest's config blob), ~21s cold for the fleet's "engine" repo, and
 		// the UI's list page fires it once per catalog repo on every single
 		// page view. See imgregistry.CachingClient's doc comment.
-		registryClient = imgregistry.NewCachingClient(imgregistry.NewHTTPClient(registryBase, auth), imgregistry.TagsCacheTTL)
+		httpRegistry := imgregistry.NewHTTPClient(registryBase, auth)
+		registryPruneClient = httpRegistry
+		registryClient = imgregistry.NewCachingClient(httpRegistry, imgregistry.TagsCacheTTL)
 	}
 
 	pruneMetrics := obs.NewPruneMetrics(prometheus.DefaultRegisterer)
@@ -271,11 +281,17 @@ func RunWithFlags(opts ...Option) error {
 
 	// Absent unless explicitly enabled AND a registry client exists: nil
 	// handler means no job kind, no scheduler, no behaviour.
+	//
+	// The collectors are registered only once the handler exists, not on the
+	// flag alone: if they were registered on -registry-prune-enabled and the
+	// build then returned nil for a missing registry client, the presence of
+	// podman_api_registry_prune_* series would suggest a running feature that
+	// is in fact off.
 	var regPruneMetrics registryprune.Metrics
-	if regPruneCfg.Enabled {
+	if regPruneCfg.Enabled && registryPruneClient != nil {
 		regPruneMetrics = obs.NewRegistryPruneMetrics(prometheus.DefaultRegisterer)
 	}
-	regPruneHandler, err := buildRegistryPrune(*regPruneCfg, registryBase, registryClient, svc, db, client, regPruneMetrics)
+	regPruneHandler, err := buildRegistryPrune(*regPruneCfg, registryBase, registryPruneClient, svc, db, client, regPruneMetrics)
 	if err != nil {
 		return err
 	}
@@ -322,12 +338,7 @@ func RunWithFlags(opts ...Option) error {
 	// other is mutating is exactly the shape of the #64 incident. If a manual
 	// trigger is ever added it needs its own concurrency guard first.
 	if regPruneHandler != nil {
-		regPruneSched = &registryprune.Scheduler{
-			Store:    db,
-			Interval: regPruneCfg.Interval,
-			Now:      time.Now,
-			Payload:  func() registryprune.Payload { return registryPrunePayload(*regPruneCfg) },
-		}
+		regPruneSched = buildRegistryPruneScheduler(*regPruneCfg, db)
 		regPruneSched.Start(runnerCtx)
 		mode := "DRY RUN (deletes nothing)"
 		if !regPruneCfg.DryRun {
@@ -337,8 +348,12 @@ func RunWithFlags(opts ...Option) error {
 		if regPruneHandler.BlobGC != nil {
 			blob = fmt.Sprintf("blob GC on %s: pod %s stops %s", regPruneCfg.Host, regPruneHandler.BlobGC.PodName, regPruneCfg.RegistryPod)
 		}
-		log.Printf("registry prune scheduler enabled (interval %s, %s, max deletes/repo %d, %s)",
-			regPruneCfg.Interval, mode, regPruneCfg.MaxDeletesPerRepo, blob)
+		cadence := fmt.Sprintf("interval %s", regPruneCfg.Interval)
+		if regPruneCfg.Interval <= 0 {
+			cadence = "no scheduled runs (interval <=0); POST /registry/prune only"
+		}
+		log.Printf("registry prune enabled (%s, %s, max deletes/repo %d, %s; on-demand: POST /registry/prune)",
+			cadence, mode, regPruneCfg.MaxDeletesPerRepo, blob)
 	}
 
 	var invPoller *inventory.Poller
@@ -436,7 +451,15 @@ func RunWithFlags(opts ...Option) error {
 		return metrics.Middleware()(audit(h))
 	}
 
-	router := api.NewRouter(svc, jobStore, keyStore, combined, nil, canceller, Version, registryClient)
+	// The UI and browse routes get the CACHED client; the prune got the uncached
+	// one above. POST /registry/prune is wired to the scheduler, not the job
+	// store, so the on-demand trigger reuses the same in-flight guard the ticker
+	// does rather than walking past it.
+	routerOpts := []api.RouterOption{}
+	if regPruneSched != nil {
+		routerOpts = append(routerOpts, api.WithRegistryPruner(regPruneSched))
+	}
+	router := api.NewRouter(svc, jobStore, keyStore, combined, nil, canceller, Version, registryClient, routerOpts...)
 
 	var opHolder atomic.Pointer[config.Operator]
 	var uiApp *ui.UI

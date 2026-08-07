@@ -10,9 +10,18 @@ import "github.com/prometheus/client_golang/prometheus"
 // There is no "host" label anywhere here, unlike PruneMetrics: there is exactly
 // one container registry, so every series is fleet-global.
 type RegistryPruneMetrics struct {
-	runs      *prometheus.CounterVec
-	deleted   *prometheus.CounterVec
-	reclaimed prometheus.Counter
+	runs    *prometheus.CounterVec
+	deleted *prometheus.CounterVec
+	// reclaimed is a CounterVec with NO labels, not a plain Counter. A plain
+	// Counter is exported the moment it is registered, so it would read 0 from
+	// process start — which is exactly the confusion the handler goes out of its
+	// way to avoid by not calling BytesReclaimed on an unmeasured run. With
+	// -registry-prune-registry-container empty (the default) nothing ever
+	// measures, and a plain Counter would sit flat at zero forever, indis-
+	// tinguishable from "GC ran and freed nothing". A label-less Vec has no
+	// child until first use, so the series is ABSENT until a real measurement
+	// lands.
+	reclaimed *prometheus.CounterVec
 	skipped   *prometheus.CounterVec
 	// candidates is a gauge, not a counter: the useful question about a
 	// tripwire skip is "how far over the threshold was it", which is a level,
@@ -32,10 +41,10 @@ func NewRegistryPruneMetrics(reg prometheus.Registerer) *RegistryPruneMetrics {
 			Name: "podman_api_registry_prune_manifests_deleted_total",
 			Help: "Registry manifests deleted by repository.",
 		}, []string{"repo"}),
-		reclaimed: prometheus.NewCounter(prometheus.CounterOpts{
+		reclaimed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "podman_api_registry_prune_reclaimed_bytes_total",
-			Help: "Bytes reclaimed by registry blob garbage collection. A floor, not a measurement: the registry is serving pushes again by the time the after-size is read.",
-		}),
+			Help: "Bytes reclaimed by registry blob garbage collection. A floor, not a measurement: the registry is serving pushes again by the time the after-size is read. ABSENT until a run measures it — an absent series means blob GC is off or sizing is unconfigured, never that nothing was reclaimed.",
+		}, []string{}),
 		skipped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "podman_api_registry_prune_repos_skipped_total",
 			Help: "Count of repositories skipped by the per-repo delete tripwire.",
@@ -70,7 +79,7 @@ func (m *RegistryPruneMetrics) BytesReclaimed(bytes int64) {
 	if bytes < 0 {
 		bytes = 0
 	}
-	m.reclaimed.Add(float64(bytes))
+	m.reclaimed.WithLabelValues().Add(float64(bytes))
 }
 
 // RepoSkipped records a repo skipped by the per-repo tripwire. This is the

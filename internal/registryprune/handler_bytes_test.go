@@ -2,6 +2,7 @@ package registryprune
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/iotready/podman-api/internal/imgregistry"
@@ -74,5 +75,46 @@ func TestRun_UnmeasuredBlobGCRecordsNoBytes(t *testing.T) {
 	}
 	if len(m.bytes) != 0 {
 		t.Fatalf("want no bytes-reclaimed sample, got %v", m.bytes)
+	}
+}
+
+// "Is this run going to delete things" is the question an operator opens the
+// job page to answer. It must be the FIRST step, not inferred from the absence
+// of "delete:*" rows further down.
+func TestRun_ModeIsTheFirstStep(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload Payload
+		blobGC  bool
+		want    string
+	}{
+		{"dry run", Payload{Policy: testPolicy(), DryRun: true}, true, "DRY RUN"},
+		{"stage A only", Payload{Policy: testPolicy(), SkipBlobGC: true}, false, "DELETING (stage A only)"},
+		{"stage A + B", Payload{Policy: testPolicy()}, true, "DELETING (stage A + B)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &fakeRunner{execOut: []podman.ExecResult{
+				{Output: "3000\t/var/lib/registry"},
+				{Output: "1000\t/var/lib/registry"},
+			}}
+			h, _ := bytesHandler(t, r)
+			if !tc.blobGC {
+				h.BlobGC = nil
+			}
+			_, job, err := runJob(t, h, tc.payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(job.Steps) == 0 {
+				t.Fatal("no steps recorded")
+			}
+			first := job.Steps[0]
+			if first.Step != "mode" {
+				t.Fatalf("first step is %q, want \"mode\"", first.Step)
+			}
+			if !strings.Contains(first.Detail, tc.want) {
+				t.Fatalf("mode step = %q, want it to contain %q", first.Detail, tc.want)
+			}
+		})
 	}
 }

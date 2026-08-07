@@ -674,6 +674,15 @@ func looksLikeRegistryHost(s string) bool {
 // as foreign. The fleet-wide-zero rule does not catch it, because
 // digest-pinned containers still populate the set, so the run proceeds and
 // deletes every manifest that was only reachable through a tag.
+// ValidateRegistryHost reports whether raw is a spelling BuildInUseSet will
+// accept, so a caller can fail at startup instead of discovering it a whole
+// interval later. It is the same check BuildInUseSet applies; nothing here is
+// a second, looser opinion.
+func ValidateRegistryHost(raw string) error {
+	_, err := normalizeRegistryHost(raw)
+	return err
+}
+
 func normalizeRegistryHost(raw string) (string, error) {
 	h := strings.ToLower(strings.TrimSpace(raw))
 	if i := strings.Index(h, "://"); i != -1 {

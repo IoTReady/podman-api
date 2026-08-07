@@ -16,9 +16,13 @@ import (
 // canceller is an optional JobCanceller for the POST /jobs/{id}/cancel route; pass nil when the job runner is not wired.
 // version is the server's release string (e.g. "v1.0.16", "dev"); included in the /mcp discovery document.
 // registryClient is an optional imgregistry.Client for the GET /registry/... routes; pass nil to disable registry browsing (routes return 404).
-func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, audit func(http.Handler) http.Handler, metricsHandler http.Handler, canceller JobCanceller, version string, registryClient imgregistry.Client) http.Handler {
+// opts carry the optional dependencies added after this signature settled; see RouterOption.
+func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, audit func(http.Handler) http.Handler, metricsHandler http.Handler, canceller JobCanceller, version string, registryClient imgregistry.Client, opts ...RouterOption) http.Handler {
 	mux := http.NewServeMux()
 	h := &handlers{svc: svc, jobs: jobs, canceller: canceller, registry: registryClient}
+	for _, o := range opts {
+		o(h)
+	}
 
 	if audit == nil {
 		audit = func(h http.Handler) http.Handler { return h }
@@ -71,6 +75,12 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 	// a "?manifest=<ref>" query parameter instead (see getRepoOrManifest).
 	mux.Handle("GET /registry/repos", guard("instances:read", http.HandlerFunc(h.listRepos)))
 	mux.Handle("GET /registry/repos/{repo...}", guard("instances:read", http.HandlerFunc(h.getRepoOrManifest)))
+
+	// On-demand registry prune. Write-scoped because it enqueues a job that
+	// deletes manifests (unless the server is configured dry-run), and 404 when
+	// the feature is not wired — the same "absent, not disabled" shape as the
+	// browse routes above.
+	mux.Handle("POST /registry/prune", guard("instances:write", http.HandlerFunc(h.enqueueRegistryPrune)))
 
 	// Host secrets.
 	mux.Handle("GET /hosts/{host}/secrets", guard("secrets:read", http.HandlerFunc(h.listSecrets)))
@@ -141,4 +151,17 @@ type handlers struct {
 	jobs      store.JobStore
 	canceller JobCanceller
 	registry  imgregistry.Client
+	pruner    RegistryPruner
+}
+
+// RouterOption supplies an optional dependency to NewRouter. Options exist
+// because NewRouter's positional signature already has eight parameters and is
+// called from ~26 places; a new optional dependency should not touch every one
+// of them.
+type RouterOption func(*handlers)
+
+// WithRegistryPruner enables POST /registry/prune. Without it the route 404s,
+// exactly as the browse routes do without a registry client.
+func WithRegistryPruner(p RegistryPruner) RouterOption {
+	return func(h *handlers) { h.pruner = p }
 }

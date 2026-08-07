@@ -167,6 +167,11 @@ func (h *Handler) Run(ctx context.Context, job store.Job, jc *jobs.JobContext) e
 		jc.Step("policy", "ABORTED: "+err.Error())
 		return fmt.Errorf("registry-prune policy: %w", err)
 	}
+	// FIRST step, deliberately: "is this run going to delete things" is the one
+	// question an operator opens the job page to answer, and it belongs at the
+	// top rather than inferred from the absence of "delete:*" steps twenty rows
+	// down.
+	jc.Step("mode", h.describeMode(p))
 
 	// (1) One catalog listing for the whole run.
 	repos, err := h.Registry.Catalog(ctx)
@@ -303,6 +308,18 @@ func (h *Handler) finish(ctx context.Context, jc *jobs.JobContext, kept []repoPl
 	}
 	h.metric().RunDone("succeeded")
 	return nil
+}
+
+// describeMode spells out what this run will and will not do.
+func (h *Handler) describeMode(p Payload) string {
+	if p.DryRun {
+		return "DRY RUN — classifies and reports; deletes NOTHING and plays no GC pod"
+	}
+	if p.SkipBlobGC || h.BlobGC == nil {
+		return "DELETING (stage A only) — manifests are unlinked; blob GC is off, so no disk is reclaimed " +
+			"and the blobs stay recoverable until a later GC"
+	}
+	return "DELETING (stage A + B) — manifests are unlinked, then the registry is STOPPED for blob garbage collection and restarted"
 }
 
 // inUseSet builds the fleet-wide protected digest set from the frozen catalog.

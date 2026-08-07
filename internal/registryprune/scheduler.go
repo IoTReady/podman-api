@@ -3,6 +3,8 @@ package registryprune
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -36,13 +38,25 @@ type Scheduler struct {
 	// Interval is the run cadence. Zero or negative disables the scheduler
 	// entirely (it never enqueues), rather than meaning "every tick".
 	Interval time.Duration
-	// Payload is evaluated at enqueue time so a SIGHUP reload is picked up by
-	// the next run rather than the next restart.
+	// Payload is evaluated once per enqueue. (The server does not re-parse
+	// flags on SIGHUP — only hosts and the operator file are reloaded — so this
+	// is a seam for a future reload, not one today.)
 	Payload func() Payload
 	Now     func() time.Time
 
 	wg sync.WaitGroup
+	// enqueueMu makes the in-flight check and the enqueue that follows it one
+	// atomic step. Without it two callers — a tick and an on-demand POST, or
+	// two POSTs — can both pass scanJobs before either has written a row, and
+	// the concurrency guard this whole design leans on evaporates under exactly
+	// the load it exists for.
+	enqueueMu sync.Mutex
 }
+
+// ErrRunInFlight is returned by EnqueueNow when a run is already queued or
+// running. Two concurrent runs would each classify the whole catalog from a
+// listing the other is mutating.
+var ErrRunInFlight = errors.New("a registry prune run is already queued or running")
 
 // Start launches the ticker loop until ctx is cancelled. An immediate first
 // pass runs before the ticker, so a control plane that has been down past its
@@ -85,11 +99,52 @@ func (s *Scheduler) now() time.Time {
 	return time.Now()
 }
 
+// EnqueueNow enqueues a run immediately, bypassing the interval and backoff
+// gates but NOT the in-flight check. It is the on-demand trigger behind
+// POST /registry/prune.
+//
+// Skipping the interval gate is the entire point. That gate is backed by
+// PERSISTED job history — the newest succeeded run being younger than Interval
+// returns early — so it survives a restart, and without this method the only
+// way to get a second run inside 24h is to edit -registry-prune-interval and
+// restart, which is precisely the knob nobody should be improvising with on the
+// day of the first real delete. #220's rollout is a sequence of on-demand runs
+// (dry run, read the steps, Stage-A-only real run, verify, then Stage B) and
+// each step must not cost a day.
+//
+// The in-flight check is NOT skipped, and is taken under the same lock the
+// ticker uses: a manual enqueue that raced past it would put two runs on the
+// same catalog, each reasoning from a listing the other is mutating.
+func (s *Scheduler) EnqueueNow(ctx context.Context) (store.Job, error) {
+	if s.Payload == nil || s.Store == nil {
+		return store.Job{}, errors.New("registry prune scheduler is not configured")
+	}
+	s.enqueueMu.Lock()
+	defer s.enqueueMu.Unlock()
+	if inflight, _, _ := s.scanJobs(ctx); inflight {
+		return store.Job{}, ErrRunInFlight
+	}
+	args, err := json.Marshal(s.Payload())
+	if err != nil {
+		return store.Job{}, fmt.Errorf("marshal registry-prune payload: %w", err)
+	}
+	job, err := s.Store.Enqueue(ctx, JobKind, args, "")
+	if err != nil {
+		return store.Job{}, fmt.Errorf("enqueue registry-prune: %w", err)
+	}
+	log.Printf("registryprune: enqueued an on-demand registry prune run (job %s)", job.ID)
+	return job, nil
+}
+
 // tick enqueues a run if one is due and none is in flight.
 func (s *Scheduler) tick(ctx context.Context) {
 	if s.Interval <= 0 || s.Payload == nil {
 		return
 	}
+	// Same lock as EnqueueNow, so the scan and the enqueue below cannot
+	// interleave with an on-demand trigger.
+	s.enqueueMu.Lock()
+	defer s.enqueueMu.Unlock()
 	inflight, lastSuccess, lastFailure := s.scanJobs(ctx)
 	if inflight {
 		// A registry prune classifies the whole catalog; a second concurrent
