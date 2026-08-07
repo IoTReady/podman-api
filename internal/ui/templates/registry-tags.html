@@ -1,21 +1,25 @@
 {{define "registry-tags"}}
-<h2>{{.Repo}}</h2>
-<p class="subtitle"><a href="/ui/registry" hx-get="/ui/registry" hx-target="#main" hx-push-url="true">&larr; All repositories</a></p>
-<div class="card"><div class="card-b">
-  <table class="table">
+<div class="phead">
+  <div>
+    <h1>{{.Repo}}</h1>
+    <div class="sub"><a href="/ui/registry" hx-get="/ui/registry" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover">&larr; All repositories</a></div>
+  </div>
+</div>
+<div class="card">
+  <table class="tbl">
     <thead><tr><th>Tags</th><th>Digest</th><th>Created</th><th>Size</th></tr></thead>
     <tbody>
     {{range .Groups}}
       <tr>
-        <td>{{range $i, $t := .Tags}}{{if $i}}, {{end}}<code>{{$t}}</code>{{end}}</td>
-        <td><a href="/ui/registry/{{$.Repo}}?manifest={{.Digest}}" hx-get="/ui/registry/{{$.Repo}}?manifest={{.Digest}}" hx-target="#main" hx-push-url="true"><code>{{.Digest}}</code></a></td>
-        <td>{{.Created.Format "2006-01-02 15:04"}}</td>
-        <td>{{formatBytes .Size}}</td>
+        <td data-label="Tags">{{range $i, $t := .Tags}}{{if $i}}, {{end}}<code>{{$t}}</code>{{end}}</td>
+        <td data-label="Digest" class="idcell"><a href="/ui/registry/{{$.Repo}}?manifest={{.Digest}}" hx-get="/ui/registry/{{$.Repo}}?manifest={{.Digest}}" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover"><code>{{.Digest}}</code></a></td>
+        <td data-label="Created">{{.Created.Format "2006-01-02 15:04"}}</td>
+        <td data-label="Size">{{formatBytes .Size}}</td>
       </tr>
     {{else}}
-      <tr><td colspan="4" class="subtitle">No tags found.</td></tr>
+      <tr><td colspan="4" class="sub">No tags found.</td></tr>
     {{end}}
     </tbody>
   </table>
-</div></div>
+</div>
 {{end}}

@@ -1,6 +1,10 @@
 {{define "registry-manifest"}}
-<h2>{{.Repo}}</h2>
-<p class="subtitle"><a href="/ui/registry/{{.Repo}}" hx-get="/ui/registry/{{.Repo}}" hx-target="#main" hx-push-url="true">&larr; {{.Repo}} tags</a></p>
+<div class="phead">
+  <div>
+    <h1>{{.Repo}}</h1>
+    <div class="sub"><a href="/ui/registry/{{.Repo}}" hx-get="/ui/registry/{{.Repo}}" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover">&larr; {{.Repo}} tags</a></div>
+  </div>
+</div>
 <div class="card"><div class="card-b">
   <div class="field">
     <label>Pull reference</label>
@@ -8,7 +12,8 @@
   </div>
   <div class="field">
     <label>Digest</label>
-    <code>{{if .Manifest.Digest}}{{.Manifest.Digest}}{{else}}{{.Ref}} <span class="subtitle">(registry did not return a Docker-Content-Digest header; showing the requested reference instead)</span>{{end}}</code>
+    <code>{{if .Manifest.Digest}}{{.Manifest.Digest}}{{else}}{{.Ref}}{{end}}</code>
+    {{if not .Manifest.Digest}}<div class="detail">The registry did not return a Docker-Content-Digest header, so this is the reference that was requested rather than a resolved content digest.</div>{{end}}
   </div>
   {{if .Manifest.ConfigDigest}}
   <div class="field">
@@ -21,16 +26,19 @@
     {{formatBytes .Manifest.Size}}
   </div>
 </div></div>
-<div class="card"><div class="card-b">
-  <table class="table">
+<div class="card">
+  <table class="tbl">
     <thead><tr><th>Layer</th><th>Size</th></tr></thead>
     <tbody>
     {{range .Manifest.Layers}}
-      <tr><td><code>{{.Digest}}</code></td><td>{{formatBytes .Size}}</td></tr>
+      <tr>
+        <td data-label="Layer" class="idcell"><code>{{.Digest}}</code></td>
+        <td data-label="Size">{{formatBytes .Size}}</td>
+      </tr>
     {{else}}
-      <tr><td colspan="2" class="subtitle">No layers — this is a multi-arch manifest list; each platform entry has its own layers.</td></tr>
+      <tr><td colspan="2" class="sub">No layers — this is a multi-arch manifest list; each platform entry has its own layers.</td></tr>
     {{end}}
     </tbody>
   </table>
-</div></div>
+</div>
 {{end}}

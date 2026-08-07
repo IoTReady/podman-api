@@ -417,3 +417,64 @@ func extractHref(t *testing.T, body, marker string) string {
 		idx = start + end
 	}
 }
+
+// TestUI_RegistryNavItem_HasIconAndActiveState guards the sidebar link's
+// parity with its neighbours (Jobs, Tokens): an icon, and the active-state
+// highlight that depends on the handler setting ActivePage. Both were missing
+// when the page first shipped, and neither is visible from any other test —
+// the registry page tests assert on #main content, not the surrounding nav.
+func TestUI_RegistryNavItem_HasIconAndActiveState(t *testing.T) {
+	u := uiWithRegistry(t, &fakeRegistryUI{catalog: []string{"engine"}})
+	body := authedGet(t, u, "/ui/registry").Body.String()
+
+	nav := body[strings.Index(body, `href="/ui/registry"`):]
+	if end := strings.Index(nav, "</a>"); end != -1 {
+		nav = nav[:end]
+	}
+	if !strings.Contains(nav, `class="ico"`) {
+		t.Errorf("registry nav link has no icon, unlike every other nav item: %s", nav)
+	}
+	if !strings.Contains(nav, `class="active"`) {
+		t.Errorf("registry nav link is not highlighted while on a registry page: %s", nav)
+	}
+	if !strings.Contains(nav, `preload="mouseover"`) {
+		t.Errorf("registry nav link lacks preload, unlike its neighbours: %s", nav)
+	}
+}
+
+// TestUI_RegistryPages_UseTheRealTableClass is a regression test for the
+// defect that made these pages look unstyled: they were written against
+// class="table", which has no rules in app.css at all, while every other
+// page uses class="tbl" (padding, borders, header styling, and the
+// responsive card-stacking mode keyed off data-label).
+func TestUI_RegistryPages_UseTheRealTableClass(t *testing.T) {
+	created := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	u := uiWithRegistry(t, &fakeRegistryUI{
+		catalog: []string{"engine"},
+		tags: []imgregistry.TagGroup{
+			{Digest: manifestDigestA, Tags: []string{"latest"}, Created: created, Size: 10},
+		},
+		manifests: map[string]imgregistry.Manifest{
+			"engine/" + manifestDigestA: {
+				Digest: manifestDigestA,
+				Layers: []imgregistry.Layer{{Digest: "sha256:layer", Size: 10}},
+			},
+		},
+	})
+	for _, path := range []string{
+		"/ui/registry",
+		"/ui/registry/engine",
+		"/ui/registry/engine?manifest=" + manifestDigestA,
+	} {
+		body := authedGet(t, u, path).Body.String()
+		if !strings.Contains(body, `class="tbl"`) {
+			t.Errorf("%s: expected the styled table class, got none: %s", path, body)
+		}
+		if strings.Contains(body, `class="table"`) {
+			t.Errorf("%s: uses class=\"table\", which has no CSS rules", path)
+		}
+		if !strings.Contains(body, "data-label=") {
+			t.Errorf("%s: table cells lack data-label, breaking the responsive layout", path)
+		}
+	}
+}
