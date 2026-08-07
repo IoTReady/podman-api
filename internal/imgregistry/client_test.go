@@ -534,3 +534,111 @@ func TestHTTPClient_TagCount_PaginatesLikeListTags(t *testing.T) {
 		t.Fatalf("TagCount = %d, want 3 (2 on page 1 + 1 on page 2)", n)
 	}
 }
+
+// TestHTTPClient_Delete_Success asserts the DELETE method, the exact
+// manifest path, and that a 202 (the v2 spec's documented success status) is
+// treated as success.
+func TestHTTPClient_Delete_Success(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotPath = r.URL.Path
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, Auth{Mode: "none"})
+	if err := c.Delete(context.Background(), "engine", digest); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if gotMethod != http.MethodDelete {
+		t.Fatalf("method = %q, want DELETE", gotMethod)
+	}
+	wantPath := "/v2/engine/manifests/" + digest
+	if gotPath != wantPath {
+		t.Fatalf("path = %q, want %q", gotPath, wantPath)
+	}
+}
+
+// TestHTTPClient_Delete_NotFoundIsErrNotFound mirrors the Manifest/Catalog
+// ErrNotFound-vs-ErrUnreachable split for Delete's own error path.
+func TestHTTPClient_Delete_NotFoundIsErrNotFound(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not found", http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, Auth{Mode: "none"})
+	err := c.Delete(context.Background(), "engine", digest)
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("expected errors.Is(err, ErrNotFound), got %v", err)
+	}
+	if errors.Is(err, ErrUnreachable) {
+		t.Fatalf("a genuine 404 must not also match ErrUnreachable: %v", err)
+	}
+}
+
+// TestHTTPClient_Delete_ServerErrorIsErrUnreachable is the other half: a
+// non-404 non-2xx must read as ErrUnreachable, explicitly not ErrNotFound —
+// a prune job must never treat "registry unreachable" as "already gone."
+func TestHTTPClient_Delete_ServerErrorIsErrUnreachable(t *testing.T) {
+	digest := "sha256:" + strings.Repeat("a", 64)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, Auth{Mode: "none"})
+	err := c.Delete(context.Background(), "engine", digest)
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("expected errors.Is(err, ErrUnreachable), got %v", err)
+	}
+	if errors.Is(err, ErrNotFound) {
+		t.Fatalf("a 500 must not also match ErrNotFound: %v", err)
+	}
+}
+
+// TestHTTPClient_Delete_TagFormRejectedWithoutRequest is the load-bearing
+// safety check: deleting by tag would remove the manifest for every tag
+// sharing that digest, so a tag-form ref must be rejected before any HTTP
+// request is even constructed.
+func TestHTTPClient_Delete_TagFormRejectedWithoutRequest(t *testing.T) {
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, Auth{Mode: "none"})
+	err := c.Delete(context.Background(), "engine", "v1.2.3")
+	if err == nil {
+		t.Fatal("expected an error for a tag-form ref")
+	}
+	if n := atomic.LoadInt32(&requests); n != 0 {
+		t.Fatalf("server received %d requests, want 0 — a tag-form ref must never reach the wire", n)
+	}
+}
+
+// TestHTTPClient_Delete_PathTraversalRejectedWithoutRequest covers a
+// path-traversal repo name, which is neither a valid repo component nor
+// digest-form and must be rejected the same way.
+func TestHTTPClient_Delete_PathTraversalRejectedWithoutRequest(t *testing.T) {
+	var requests int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requests, 1)
+		w.WriteHeader(http.StatusAccepted)
+	}))
+	defer srv.Close()
+
+	c := NewHTTPClient(srv.URL, Auth{Mode: "none"})
+	err := c.Delete(context.Background(), "../../foo", "sha256:"+strings.Repeat("a", 64))
+	if err == nil {
+		t.Fatal("expected an error for a path-traversal repo name")
+	}
+	if n := atomic.LoadInt32(&requests); n != 0 {
+		t.Fatalf("server received %d requests, want 0 — an invalid repo name must never reach the wire", n)
+	}
+}

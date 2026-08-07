@@ -61,12 +61,19 @@ type TagGroup struct {
 	Size    int64
 }
 
-// Client is the read-only surface this package exposes.
+// Client is the surface this package exposes: read-only browsing plus the
+// one mutating call, Delete, that a prune job needs to reclaim registry
+// storage.
 type Client interface {
 	Catalog(ctx context.Context) ([]string, error)
 	Tags(ctx context.Context, repo string) ([]TagGroup, error)
 	TagCount(ctx context.Context, repo string) (int, error)
 	Manifest(ctx context.Context, repo, ref string) (Manifest, error)
+
+	// Delete removes the manifest at repo/digest. digest must be
+	// digest-form (sha256:...), never a tag: deleting by tag would remove
+	// the manifest for every tag that currently shares that digest.
+	Delete(ctx context.Context, repo, digest string) error
 }
 
 // HTTPClient implements Client against a real Registry v2 server.
@@ -417,6 +424,43 @@ func (c *HTTPClient) listTags(ctx context.Context, repo string) ([]string, error
 		path = nextLinkPath(link)
 	}
 	return all, nil
+}
+
+// Delete issues Registry v2 DELETE /v2/<repo>/manifests/<digest>. digest
+// must be digest-form (validated by ValidRef + IsDigestRef); a tag-form or
+// otherwise invalid ref is rejected before any request is constructed —
+// deleting by tag would remove the manifest for every tag sharing that
+// digest. Success is any 2xx (the spec documents 202); a genuine 404 is
+// ErrNotFound, anything else non-2xx or a transport failure is
+// ErrUnreachable — the two must never collapse into each other.
+func (c *HTTPClient) Delete(ctx context.Context, repo, digest string) error {
+	if !ValidRepoName(repo) {
+		return fmt.Errorf("delete %s/%s: invalid repo name", repo, digest)
+	}
+	if !ValidRef(digest) || !IsDigestRef(digest) {
+		return fmt.Errorf("delete %s/%s: ref must be digest-form (sha256:...), not a tag", repo, digest)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete,
+		fmt.Sprintf("%s/v2/%s/manifests/%s", c.BaseURL, repo, digest), nil)
+	if err != nil {
+		return err
+	}
+	if c.Auth.Mode == "basic" {
+		req.SetBasicAuth(c.Auth.Username, c.Auth.Password)
+	}
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return fmt.Errorf("registry delete %s/%s: %w: %w", repo, digest, ErrUnreachable, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return fmt.Errorf("delete %s/%s: not found: %w", repo, digest, ErrNotFound)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("registry delete %s/%s: status %d: %w", repo, digest, resp.StatusCode, ErrUnreachable)
+	}
+	return nil
 }
 
 func (c *HTTPClient) blobCreated(ctx context.Context, repo, digest string) (time.Time, error) {

@@ -54,6 +54,12 @@ func (f *fakeRegistryUI) Manifest(ctx context.Context, repo, ref string) (imgreg
 	return m, nil
 }
 
+// Delete is unused by internal/ui's routes (no delete route exists yet) but
+// required to satisfy imgregistry.Client.
+func (f *fakeRegistryUI) Delete(ctx context.Context, repo, digest string) error {
+	return nil
+}
+
 // uiWithRegistry mirrors uiWithService (handlers_hosts_test.go) but also
 // wires an imgregistry.Client, since the shared helper takes no such option.
 func uiWithRegistry(t *testing.T, reg imgregistry.Client) *UI {

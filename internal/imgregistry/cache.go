@@ -76,6 +76,21 @@ func (c *CachingClient) Manifest(ctx context.Context, repo, ref string) (Manifes
 	return c.inner.Manifest(ctx, repo, ref)
 }
 
+// Delete delegates to the inner Client and, only on success, invalidates
+// repo's cached Tags() entry — a stale listing after a delete would let a
+// subsequent run reason from a tag that no longer exists on the registry. A
+// failed delete leaves the cache untouched, since nothing was actually
+// removed.
+func (c *CachingClient) Delete(ctx context.Context, repo, digest string) error {
+	if err := c.inner.Delete(ctx, repo, digest); err != nil {
+		return err
+	}
+	c.mu.Lock()
+	delete(c.cache, repo)
+	c.mu.Unlock()
+	return nil
+}
+
 // Tags returns repo's cached TagGroups if present and not yet expired,
 // otherwise resolves them via the inner Client and, only on success, stores
 // the result. Safe for concurrent use — the list page fans this out across

@@ -54,3 +54,11 @@ func ValidRef(ref string) bool {
 	}
 	return tagRe.MatchString(ref) || digestRe.MatchString(ref)
 }
+
+// IsDigestRef reports whether ref is digest-form (matches digestRe) rather
+// than a tag. Delete requires this on top of ValidRef: a tag-form ref must
+// never reach the registry's delete endpoint, since deleting by tag removes
+// the manifest for every tag that currently shares that digest.
+func IsDigestRef(ref string) bool {
+	return digestRe.MatchString(ref)
+}

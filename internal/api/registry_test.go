@@ -74,6 +74,12 @@ func (f *fakeRegistry) Manifest(ctx context.Context, repo, ref string) (imgregis
 	return m, nil
 }
 
+// Delete is unused by internal/api's routes (no delete route exists yet) but
+// required to satisfy imgregistry.Client.
+func (f *fakeRegistry) Delete(ctx context.Context, repo, digest string) error {
+	return nil
+}
+
 // newRegistryTestServer mirrors newTestServer/newSrvFull (instances_test.go)
 // but wires a registry client, which those shared helpers' fixed NewRouter
 // call does not accept an option for.
