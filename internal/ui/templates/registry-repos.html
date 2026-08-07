@@ -1,19 +1,20 @@
 {{define "registry-repos"}}
-<h2>Registry</h2>
-<div class="card"><div class="card-b">
-  <table class="table">
-    <thead><tr><th>Repository</th><th>Tags</th><th title="Sum of each unique image's own uncompressed size — layers shared between images are counted once per image, not deduplicated, so this is not the repo's actual on-disk footprint.">Size (per-image, uncompressed) / last pushed</th></tr></thead>
+<div class="phead"><div><h1>Registry</h1><div class="sub">Images available to deploy on this fleet.</div></div></div>
+<div class="card">
+  <table class="tbl">
+    <thead><tr><th>Repository</th><th>Tags</th><th>Size / last pushed</th></tr></thead>
     <tbody>
     {{range .Repos}}
       <tr>
-        <td><a href="/ui/registry/{{.Name}}" hx-get="/ui/registry/{{.Name}}" hx-target="#main" hx-push-url="true">{{.Name}}</a></td>
-        <td>{{if .CountOK}}{{.TagCount}}{{else}}<span class="subtitle">?</span>{{end}}</td>
-        <td hx-get="/ui/registry/{{.Name}}?stats=1" hx-trigger="load" hx-swap="innerHTML"><span class="subtitle">loading…</span></td>
+        <td data-label="Repository"><a href="/ui/registry/{{.Name}}" hx-get="/ui/registry/{{.Name}}" hx-target="#main" hx-push-url="true" hx-disabled-elt="this" preload="mouseover">{{.Name}}</a></td>
+        <td data-label="Tags">{{if .CountOK}}{{.TagCount}}{{else}}<span class="sub" title="could not resolve this repo's tag count">?</span>{{end}}</td>
+        <td data-label="Size / last pushed" hx-get="/ui/registry/{{.Name}}?stats=1" hx-trigger="load" hx-swap="innerHTML"><span class="sub">loading…</span></td>
       </tr>
     {{else}}
-      <tr><td colspan="3" class="subtitle">No repositories found.</td></tr>
+      <tr><td colspan="3" class="sub">No repositories found.</td></tr>
     {{end}}
     </tbody>
   </table>
-</div></div>
+</div>
+{{if .Repos}}<p class="detail">Size is the sum of each image's own uncompressed size. Layers shared between images are counted once per image rather than deduplicated, so this is not the repository's on-disk footprint.</p>{{end}}
 {{end}}

@@ -69,7 +69,8 @@ func (u *UI) registryRepos(w http.ResponseWriter, r *http.Request) {
 	wg.Wait()
 
 	u.render(w, r, http.StatusOK, "registry-repos", u.pageData(map[string]any{
-		"Repos": summaries,
+		"ActivePage": "registry",
+		"Repos":      summaries,
 	}))
 }
 
@@ -103,9 +104,10 @@ func (u *UI) registryTags(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		u.render(w, r, http.StatusOK, "registry-manifest", u.pageData(map[string]any{
-			"Repo":     repo,
-			"Ref":      ref,
-			"Manifest": m,
+			"ActivePage": "registry",
+			"Repo":       repo,
+			"Ref":        ref,
+			"Manifest":   m,
 		}))
 		return
 	}
@@ -169,7 +171,8 @@ func (u *UI) registryTags(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u.render(w, r, http.StatusOK, "registry-tags", u.pageData(map[string]any{
-		"Repo":   repo,
-		"Groups": groups,
+		"ActivePage": "registry",
+		"Repo":       repo,
+		"Groups":     groups,
 	}))
 }
