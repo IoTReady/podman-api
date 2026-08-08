@@ -338,8 +338,21 @@ func RunWithFlags(opts ...Option) error {
 		if jobVolumeWorkersSet {
 			return fmt.Errorf("-job-volume-workers (%d) must be less than -job-workers (%d), else no workers are left for other job kinds", *jobVolumeWorkers, workers)
 		}
-		log.Printf("job-volume-workers: default %d does not fit within -job-workers=%d, disabling the volume-transfer worker reservation (pass -job-volume-workers explicitly to override)", *jobVolumeWorkers, workers)
-		effectiveJobVolumeWorkers = 0
+		// Left at its default and it doesn't fit -job-workers. Rather than
+		// dropping straight to 0 (fully disabling the reservation and
+		// reproducing the exact starvation risk #238 fixes, with only a log
+		// line as a signal), clamp down to the largest reservation that still
+		// fits: workers-1, which guarantees the general pool always keeps at
+		// least 1 worker — the same reasoning the explicit-value hard-error
+		// above already uses. Only fall back to fully disabling (0) when
+		// there's truly no room for any reservation (workers <= 1).
+		if workers > 1 {
+			log.Printf("job-volume-workers: default %d does not fit within -job-workers=%d, clamping the volume-transfer worker reservation down to %d (pass -job-volume-workers explicitly to override)", *jobVolumeWorkers, workers, workers-1)
+			effectiveJobVolumeWorkers = workers - 1
+		} else {
+			log.Printf("job-volume-workers: default %d does not fit within -job-workers=%d, disabling the volume-transfer worker reservation entirely (no room for any reservation; pass -job-volume-workers explicitly to override)", *jobVolumeWorkers, workers)
+			effectiveJobVolumeWorkers = 0
+		}
 	}
 	runner := jobs.NewRunner(db, registry, workers)
 	runner.Metrics = jobMetrics
@@ -834,6 +847,14 @@ func statsBudgetWarning(interval, timeout, statsTimeout, bootTimeout time.Durati
 // unless the registry prune feature is enabled, and a nil handler must leave
 // the kind ABSENT rather than registered-and-broken — a registered nil would
 // be a typed-nil interface that panics on the first tick.
+//
+// When registering a NEW job kind here, consider whether it belongs in
+// jobs.VolumeTransferKinds (internal/jobs/runner.go): any handler that
+// streams a large volume (calls VolumeExport/VolumeImport/CopyVolume) or
+// fans out child work in-process on its own claimed worker (like evacuate
+// does) is a candidate for the reserved volume-transfer worker pool (#238).
+// There's no mechanical way to detect this from the handler's shape, so it
+// has to be a conscious decision every time a kind is added here.
 func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics, regPrune *registryprune.Handler) (jobs.Registry, jobs.Reconcilers) {
 	reg := jobs.Registry{
 		"migrate":      &migrate.Handler{Svc: svc, Metrics: jobMetrics},

@@ -71,8 +71,16 @@ type Fake struct {
 	// PullErr, if non-nil, makes ImagePull return this error for matching refs.
 	// Key is image ref; the empty key matches any ref.
 	PullErr map[string]error
-	// PullCalls records every (host, image) pair passed to ImagePull.
-	PullCalls []struct{ Host, Image string }
+	// PullCalls records every (host, image) pair passed to ImagePull, along
+	// with the deadline (if any) on the context ImagePull was actually called
+	// with. Deadline/HasDeadline let a test assert how tightly the caller
+	// bounded the pull (e.g. applyImagePullTimeout in internal/instance)
+	// independent of any package-level ImagePull timeout override.
+	PullCalls []struct {
+		Host, Image string
+		Deadline    time.Time
+		HasDeadline bool
+	}
 	// PlayCalls records every PlayKube invocation (host, replace, networks).
 	PlayCalls []PlayCall
 	// PodListErr, if non-nil, makes PodList return this error.
@@ -578,10 +586,15 @@ func (f *Fake) ContainerLogs(_ context.Context, _, _ string, _ podman.LogOptions
 	return ch, nil
 }
 
-func (f *Fake) ImagePull(_ context.Context, host, ref string) error {
+func (f *Fake) ImagePull(ctx context.Context, host, ref string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.PullCalls = append(f.PullCalls, struct{ Host, Image string }{host, ref})
+	deadline, hasDeadline := ctx.Deadline()
+	f.PullCalls = append(f.PullCalls, struct {
+		Host, Image string
+		Deadline    time.Time
+		HasDeadline bool
+	}{host, ref, deadline, hasDeadline})
 	if err, ok := f.PullErr[ref]; ok {
 		return err
 	}

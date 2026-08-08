@@ -303,6 +303,18 @@ func instanceSecretName(tmpl, slug, name string) string {
 	return extension.InstanceSecretName(tmpl, slug, name)
 }
 
+// applyImagePullTimeout bounds the image pull inside applyLocked
+// (Apply/UpgradeImage), independent of the -image-pull-timeout flag
+// (podman.SetImagePullTimeout). Apply/UpgradeImage hold the real instance's
+// lock (and hostLock for domain-carrying requests) across this call — the
+// extended -image-pull-timeout budget (2h default) is meant for the migrate
+// preflight path, which runs under a separate migrate-serialization lock
+// keyed on a sentinel pseudo-host, not the real instance/host lock (#238).
+// Applying the extended budget here too would let one slow pull block every
+// other request against the instance (and the host's domain checks) for up
+// to 2h instead of the pre-#238 10-minute worst case.
+const applyImagePullTimeout = 10 * time.Minute
+
 // Apply creates or replaces an instance. If opts.Replace is false and the pod
 // exists, returns ErrInstanceExists. Unless opts.SkipPull is set, every container
 // image referenced in the rendered Pod spec is pulled before the manifest is
@@ -481,7 +493,10 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 	if !opts.SkipPull {
 		for _, img := range containerImages(yaml) {
 			log.Printf("apply: pull image %s on %s", img, host)
-			if err := s.client.ImagePull(ctx, host, img); err != nil {
+			pullCtx, cancel := context.WithTimeout(ctx, applyImagePullTimeout)
+			err := s.client.ImagePull(pullCtx, host, img)
+			cancel()
+			if err != nil {
 				return fmt.Errorf("%w: %s: %v", ErrImagePull, img, err)
 			}
 		}

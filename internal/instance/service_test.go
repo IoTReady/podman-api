@@ -433,6 +433,33 @@ func TestService_Apply_PrePullsImages(t *testing.T) {
 	assert.Equal(t, "docker.io/library/postgres:16", f.PullCalls[0].Image)
 }
 
+func TestService_Apply_PullBoundedByApplyImagePullTimeout(t *testing.T) {
+	// applyLocked must wrap the pull call in a short, fixed deadline
+	// (applyImagePullTimeout) regardless of any larger -image-pull-timeout
+	// style override, because Apply holds the real instance lock (and
+	// hostLock for domain-carrying requests) across the pull — see the
+	// applyImagePullTimeout doc comment in service.go (#238 review follow-up).
+	svc, f := newSvc(t)
+	before := time.Now()
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	after := time.Now()
+
+	require.Len(t, f.PullCalls, 1)
+	require.True(t, f.PullCalls[0].HasDeadline, "ImagePull must be called with a context carrying a deadline")
+
+	// The deadline must be no later than applyImagePullTimeout past when the
+	// call was made, with a little slack for test scheduling jitter — NOT
+	// bound by some much larger override (e.g. the 2h -image-pull-timeout
+	// default), which would defeat the point of this fix.
+	maxDeadline := before.Add(applyImagePullTimeout + 5*time.Second)
+	assert.Truef(t, f.PullCalls[0].Deadline.Before(maxDeadline) || f.PullCalls[0].Deadline.Equal(maxDeadline),
+		"ImagePull deadline %v exceeds applyImagePullTimeout bound %v", f.PullCalls[0].Deadline, maxDeadline)
+
+	minDeadline := after.Add(applyImagePullTimeout - 5*time.Second)
+	assert.Truef(t, f.PullCalls[0].Deadline.After(minDeadline),
+		"ImagePull deadline %v is suspiciously short relative to applyImagePullTimeout bound %v", f.PullCalls[0].Deadline, minDeadline)
+}
+
 func TestService_Apply_PullFailureMapsToErrImagePull(t *testing.T) {
 	svc, f := newSvc(t)
 	f.PullErr = map[string]error{"": errors.New("manifest unknown")}
