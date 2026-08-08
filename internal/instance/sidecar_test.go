@@ -280,6 +280,109 @@ func TestReconcileOneSpec_RestoreIntentNil(t *testing.T) {
 	assert.Nil(t, inj.gotRestore, "reconcile must never replay a restore intent")
 }
 
+// portRequiringInjector wraps recordingInjector and also implements
+// extension.HostPortRequirer, so it can drive the fail-fast host-port-conflict
+// preflight in Apply.
+type portRequiringInjector struct {
+	recordingInjector
+	ports    []extension.PortSpec
+	portsErr error
+}
+
+func (p *portRequiringInjector) RequiredHostPorts(_ map[string]any) ([]extension.PortSpec, error) {
+	if p.portsErr != nil {
+		return nil, p.portsErr
+	}
+	return p.ports, nil
+}
+
+// An injector implementing HostPortRequirer with no conflicting port lets
+// Apply proceed normally.
+func TestService_Apply_HostPortRequirer_NoConflict(t *testing.T) {
+	svc, f := newSvc(t)
+	inj := &portRequiringInjector{
+		recordingInjector: recordingInjector{out: injectedPod},
+		ports:             []extension.PortSpec{{Port: 500, Protocol: "udp"}},
+	}
+	svc.SetSidecarInjector(inj)
+
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	require.Len(t, f.PlayCalls, 1)
+}
+
+// When a required host port is already bound on the target host (by another
+// pod's container — standing in for a native/host-level process or another
+// instance), Apply is rejected with ErrPortConflict BEFORE any host mutation:
+// no pull, no secret, no PlayKube, no persisted spec. This is the fail-fast
+// fix for #130 (rootless IPSEC sidecar silently hanging in CONNECTING when
+// pasta's host-side bind collides with a port another process already owns).
+func TestService_Apply_HostPortRequirer_Conflict_AbortsBeforeMutation(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+	f.AddPod("h1", podman.Pod{Name: "native-or-other", Status: "Running",
+		Containers: []podman.Container{{Name: "c", Ports: []podman.PortMapping{{HostPort: 500, Protocol: "udp"}}}}})
+	inj := &portRequiringInjector{
+		recordingInjector: recordingInjector{out: injectedPod},
+		ports:             []extension.PortSpec{{Port: 500, Protocol: "udp"}},
+	}
+	svc.SetSidecarInjector(inj)
+
+	err := svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true})
+	require.ErrorIs(t, err, ErrPortConflict)
+	assert.Contains(t, err.Error(), "udp/500")
+
+	assert.Empty(t, f.PlayCalls, "PlayKube must not be called on a required-port conflict")
+	_, secErr := f.SecretInspect(ctx, "h1", "postgres-demo-password")
+	assert.ErrorIs(t, secErr, podman.ErrNotFound, "no secret should be written on a required-port conflict")
+	_, specErr := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.Error(t, specErr, "no spec should be persisted on a required-port conflict")
+}
+
+// A TCP port request does not collide with an in-use UDP port of the same
+// number — protocol is part of the match, not just the port number.
+func TestService_Apply_HostPortRequirer_ProtocolDistinguishesConflict(t *testing.T) {
+	svc, f := newSvc(t)
+	f.AddPod("h1", podman.Pod{Name: "other", Status: "Running",
+		Containers: []podman.Container{{Name: "c", Ports: []podman.PortMapping{{HostPort: 500, Protocol: "udp"}}}}})
+	inj := &portRequiringInjector{
+		recordingInjector: recordingInjector{out: injectedPod},
+		ports:             []extension.PortSpec{{Port: 500, Protocol: "tcp"}},
+	}
+	svc.SetSidecarInjector(inj)
+
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	require.Len(t, f.PlayCalls, 1)
+}
+
+// An injector that only implements SidecarInjector (not HostPortRequirer) —
+// every existing commercial injector, before this change adopts it — is
+// unaffected: no ports are checked, Apply proceeds exactly as before.
+func TestService_Apply_InjectorWithoutHostPortRequirer_Unaffected(t *testing.T) {
+	svc, f := newSvc(t)
+	inj := &recordingInjector{out: injectedPod}
+	svc.SetSidecarInjector(inj)
+
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	require.Len(t, f.PlayCalls, 1)
+}
+
+// A RequiredHostPorts error aborts Apply before any host mutation, wrapped
+// with context, mirroring the InjectSidecars error-handling contract above.
+func TestService_Apply_HostPortRequirer_Error_Aborts(t *testing.T) {
+	svc, f := newSvc(t)
+	inj := &portRequiringInjector{
+		recordingInjector: recordingInjector{out: injectedPod},
+		portsErr:          errors.New("boom"),
+	}
+	svc.SetSidecarInjector(inj)
+
+	err := svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sidecar required host ports")
+	assert.Contains(t, err.Error(), "boom")
+	assert.Empty(t, f.PlayCalls)
+}
+
 // instanceSecretName delegates to extension.InstanceSecretName so there is a
 // single source of truth for the per-instance secret namespacing convention.
 func TestInstanceSecretName_Delegates(t *testing.T) {

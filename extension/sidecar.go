@@ -99,3 +99,38 @@ type RestoreIntent struct {
 type SidecarInjector interface {
 	InjectSidecars(ctx context.Context, renderedYAML string, meta TemplateMeta, params map[string]any, slug string, restore *RestoreIntent) (SidecarInjection, error)
 }
+
+// PortSpec names a single host-level port a sidecar needs to bind exclusively,
+// for a reason the pod spec's own hostPort mappings cannot express — e.g. a
+// rootless IPSEC sidecar whose IKE traffic is translated through pasta's
+// host-side socket on the compiled-in port (UDP 500/4500), with no `ports:`
+// entry in the rendered YAML for the core's own hostPort accounting to see.
+type PortSpec struct {
+	// Port is the host-level port number.
+	Port int
+	// Protocol is "tcp" or "udp", matching podman's PortMapping.Protocol.
+	Protocol string
+}
+
+// HostPortRequirer is an optional extension a SidecarInjector may also
+// implement to declare host ports its injected sidecar(s) need exclusively,
+// beyond whatever the rendered pod spec's own hostPort mappings already
+// express. It exists so Apply can fail fast, before PlayKube, when a required
+// port is already bound on the target host — instead of the pod starting
+// silently with a sidecar that can never establish (the failure mode is
+// invisible to the sidecar itself: a rootless pod's traffic is translated
+// through the host's own network stack one layer below the sidecar's own
+// process, so a colliding bind there produces no error the sidecar can see or
+// log).
+//
+// The core type-asserts a registered SidecarInjector against this interface;
+// an injector that has no such requirement (the common case) simply does not
+// implement it, and Apply's behavior is unchanged.
+type HostPortRequirer interface {
+	// RequiredHostPorts returns the host ports this instance's sidecar(s)
+	// would need exclusively, given its resolved render parameters. Called
+	// after InjectSidecars, before the pod is applied to the host. An empty
+	// result means this instance's configuration needs no dedicated host
+	// port (e.g. no "vpn" parameter present) — not an error.
+	RequiredHostPorts(params map[string]any) ([]PortSpec, error)
+}

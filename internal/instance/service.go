@@ -8,6 +8,7 @@ import (
 	"log"
 	"maps"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -465,6 +466,35 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 		yaml = inj.YAML
 		for _, sec := range inj.Secrets {
 			injectorSecrets = append(injectorSecrets, store.InjectorSecret{Name: sec.Name, Key: sec.Key, Value: sec.Value})
+		}
+	}
+	// A registered injector may also declare host ports its sidecar(s) need
+	// exclusively (extension.HostPortRequirer) — ports the rendered pod YAML
+	// itself never expresses as a hostPort (e.g. a rootless IPSEC sidecar's
+	// IKE traffic, translated through pasta's host-side socket beneath the
+	// sidecar's own process). Check those BEFORE any host mutation: a pod
+	// whose sidecar can never establish because the port is already held by
+	// another process on this host (native or another instance) is a fail
+	// silently-forever bug, not a fail-fast one, without this check.
+	if reqPorts, ok := s.sidecar.(extension.HostPortRequirer); ok {
+		want, err := reqPorts.RequiredHostPorts(req.Parameters)
+		if err != nil {
+			return fmt.Errorf("sidecar required host ports: %w", err)
+		}
+		if len(want) > 0 {
+			used, err := s.client.UsedHostPorts(ctx, host)
+			if err != nil {
+				return fmt.Errorf("ports in use: %w", err)
+			}
+			busy := make(map[string]bool, len(used))
+			for _, p := range used {
+				busy[p.Protocol+"/"+strconv.Itoa(p.HostPort)] = true
+			}
+			for _, p := range want {
+				if busy[p.Protocol+"/"+strconv.Itoa(p.Port)] {
+					return fmt.Errorf("%w: %s/%d", ErrPortConflict, p.Protocol, p.Port)
+				}
+			}
 		}
 	}
 	// Reject injector-declared secrets on a key-less store BEFORE any host
