@@ -515,8 +515,8 @@ spec:
 			"PullCalls[%d] deadline %v exceeds applyImagePullTimeout bound %v", i, call.Deadline, maxDeadline)
 		assert.Truef(t, call.Deadline.After(minDeadline),
 			"PullCalls[%d] deadline %v is suspiciously short relative to applyImagePullTimeout bound %v", i, call.Deadline, minDeadline)
-		assert.WithinDurationf(t, first, call.Deadline, time.Millisecond,
-			"PullCalls[%d] deadline %v must match PullCalls[0] deadline %v — the timeout must be shared across the whole pre-pull loop, not reset per image", i, call.Deadline, first)
+		assert.Truef(t, first.Equal(call.Deadline),
+			"PullCalls[%d] deadline %v must be exactly equal to PullCalls[0] deadline %v — the timeout must be shared across the whole pre-pull loop, not reset per image", i, call.Deadline, first)
 	}
 }
 
