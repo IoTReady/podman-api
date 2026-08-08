@@ -154,6 +154,92 @@ func TestSQLite_ClaimNext_NoDoubleClaim(t *testing.T) {
 	}
 }
 
+func TestSQLite_ClaimNextMatching_OnlyMatchingKind(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+	mig, _ := s.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	_, _ = s.Enqueue(ctx, "prune", json.RawMessage(`{}`), "")
+
+	c, ok, err := s.ClaimNextMatching(ctx, []string{"migrate", "backup"})
+	if err != nil || !ok || c.ID != mig.ID || c.State != JobRunning {
+		t.Fatalf("claim: %+v ok=%v err=%v", c, ok, err)
+	}
+	if _, ok, _ := s.ClaimNextMatching(ctx, []string{"migrate", "backup"}); ok {
+		t.Fatal("no more matching jobs to claim")
+	}
+}
+
+func TestSQLite_ClaimNextMatching_LeavesNonMatchingQueued(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+	prune, _ := s.Enqueue(ctx, "prune", json.RawMessage(`{}`), "")
+
+	if _, ok, _ := s.ClaimNextMatching(ctx, []string{"migrate", "backup"}); ok {
+		t.Fatal("prune job should not match migrate/backup filter")
+	}
+	got, err := s.GetJob(ctx, prune.ID)
+	if err != nil || got.State != JobQueued {
+		t.Fatalf("prune job should still be queued: %+v err=%v", got, err)
+	}
+}
+
+func TestSQLite_ClaimNextMatching_EmptyKindsClaimsNothing(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+	_, _ = s.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+
+	if _, ok, _ := s.ClaimNextMatching(ctx, nil); ok {
+		t.Fatal("empty kinds should claim nothing")
+	}
+}
+
+func TestSQLite_ClaimNextMatching_NoDoubleClaim(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+	const n = 20
+	for i := 0; i < n; i++ {
+		if _, err := s.Enqueue(ctx, "migrate", json.RawMessage(`{}`), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mu sync.Mutex
+	claimed := map[string]int{}
+	errCh := make(chan error, 4)
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				j, ok, err := s.ClaimNextMatching(ctx, []string{"migrate"})
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if !ok {
+					return
+				}
+				mu.Lock()
+				claimed[j.ID]++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("ClaimNextMatching error: %v", err)
+	}
+	if len(claimed) != n {
+		t.Fatalf("claimed %d distinct jobs, want %d", len(claimed), n)
+	}
+	for _, c := range claimed {
+		if c != 1 {
+			t.Fatalf("a job was claimed %d times, want 1", c)
+		}
+	}
+}
+
 func TestSQLite_AppendStep_Finish_FailRunning(t *testing.T) {
 	ctx := context.Background()
 	s := openJobStore(t)

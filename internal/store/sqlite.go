@@ -728,6 +728,48 @@ RETURNING `+jobColumns, now)
 	return j, ok, nil
 }
 
+// ClaimNextMatching is ClaimNext restricted to kinds. Builds the IN (...)
+// clause with one placeholder per kind rather than a single comma-joined
+// string, so kind values never need escaping.
+func (s *SQLite) ClaimNextMatching(ctx context.Context, kinds []string) (Job, bool, error) {
+	if len(kinds) == 0 {
+		return Job{}, false, nil
+	}
+	var (
+		j  Job
+		ok bool
+	)
+	placeholders := strings.Repeat("?,", len(kinds))
+	placeholders = placeholders[:len(placeholders)-1] // trim trailing comma
+	args := make([]any, 0, len(kinds)+1)
+	now := time.Now().UnixNano()
+	args = append(args, now)
+	for _, k := range kinds {
+		args = append(args, k)
+	}
+	err := s.write(ctx, func() error {
+		row := s.db.QueryRowContext(ctx, `
+UPDATE jobs SET state='running', started=?
+WHERE id = (SELECT id FROM jobs WHERE state='queued' AND kind IN (`+placeholders+`) ORDER BY created, id LIMIT 1)
+  AND state='queued'
+RETURNING `+jobColumns, args...)
+		jj, e := scanJob(row)
+		if errors.Is(e, ErrNotFound) {
+			j, ok = Job{}, false
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		j, ok = jj, true
+		return nil
+	})
+	if err != nil {
+		return Job{}, false, err
+	}
+	return j, ok, nil
+}
+
 func (s *SQLite) AppendStep(ctx context.Context, id string, step JobStep) error {
 	// Only the worker running this job appends steps, so there is no concurrent
 	// AppendStep for the same id — a read-modify-write is safe.
