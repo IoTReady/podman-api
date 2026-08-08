@@ -303,9 +303,11 @@ func instanceSecretName(tmpl, slug, name string) string {
 	return extension.InstanceSecretName(tmpl, slug, name)
 }
 
-// applyImagePullTimeout bounds the image pull inside applyLocked
-// (Apply/UpgradeImage), independent of the -image-pull-timeout flag
-// (podman.SetImagePullTimeout). Apply/UpgradeImage hold the real instance's
+// applyImagePullTimeout bounds the ENTIRE pre-pull phase inside applyLocked
+// (Apply/UpgradeImage) — one shared deadline for every image in the rendered
+// pod spec (containers and initContainers), not a fresh budget per image —
+// independent of the -image-pull-timeout flag (podman.SetImagePullTimeout).
+// Apply/UpgradeImage hold the real instance's
 // lock (and hostLock for domain-carrying requests) across this call — the
 // extended -image-pull-timeout budget (2h default) is meant for the migrate
 // preflight path, which runs under a separate migrate-serialization lock
@@ -491,15 +493,15 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 	// no orphan secrets behind; secrets that already exist (rotation case) are
 	// only touched once we know the manifest will play.
 	if !opts.SkipPull {
+		pullCtx, cancel := context.WithTimeout(ctx, applyImagePullTimeout)
 		for _, img := range containerImages(yaml) {
 			log.Printf("apply: pull image %s on %s", img, host)
-			pullCtx, cancel := context.WithTimeout(ctx, applyImagePullTimeout)
-			err := s.client.ImagePull(pullCtx, host, img)
-			cancel()
-			if err != nil {
+			if err := s.client.ImagePull(pullCtx, host, img); err != nil {
+				cancel()
 				return fmt.Errorf("%w: %s: %v", ErrImagePull, img, err)
 			}
 		}
+		cancel()
 	}
 
 	// Snapshot secrets (zeroed below) and parameters before persisting, so the

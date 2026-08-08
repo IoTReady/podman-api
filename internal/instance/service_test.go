@@ -460,6 +460,66 @@ func TestService_Apply_PullBoundedByApplyImagePullTimeout(t *testing.T) {
 		"ImagePull deadline %v is suspiciously short relative to applyImagePullTimeout bound %v", f.PullCalls[0].Deadline, minDeadline)
 }
 
+func TestService_Apply_PullSharesOneDeadlineAcrossMultipleImages(t *testing.T) {
+	// A pod with a main container plus sidecars (multiple containers AND
+	// initContainers) must pull every image under a SINGLE shared
+	// applyImagePullTimeout budget for the whole pre-pull phase, not a fresh
+	// 10-minute deadline per image — otherwise N images would let the pull
+	// phase (and the lock held across it) run for up to N*10min instead of
+	// the documented 10-minute worst case (#238 review follow-up).
+	multiImgTmpl := store.Template{
+		Meta: render.Meta{
+			ID:         "multiimg",
+			Parameters: requiredParams("slug"),
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: multiimg-{{.slug}}
+spec:
+  initContainers:
+    - name: init
+      image: docker.io/library/busybox:init
+  containers:
+    - name: app
+      image: docker.io/library/app:main
+    - name: sidecar
+      image: docker.io/library/sidecar:vpn
+`,
+		Origin: "seed",
+	}
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	f := fake.New()
+	svc, _ := newSvcWith(t, f, hosts, multiImgTmpl)
+
+	before := time.Now()
+	require.NoError(t, svc.Apply(context.Background(), "h1", ApplyRequest{
+		Template: "multiimg", Slug: "demo", Parameters: map[string]any{"slug": "demo"},
+	}, ApplyOptions{Replace: true}))
+	after := time.Now()
+
+	require.Len(t, f.PullCalls, 3, "all three images (init + 2 containers) must be pulled")
+	for i, call := range f.PullCalls {
+		require.Truef(t, call.HasDeadline, "PullCalls[%d] (%s) must carry a deadline", i, call.Image)
+	}
+
+	// Every call's deadline must fall within the applyImagePullTimeout window
+	// measured from before/after the whole Apply call, AND all deadlines must
+	// be (approximately) the same instant — proving one shared context.WithTimeout
+	// wraps the entire loop rather than a fresh one per iteration.
+	maxDeadline := before.Add(applyImagePullTimeout + 5*time.Second)
+	minDeadline := after.Add(applyImagePullTimeout - 5*time.Second)
+	first := f.PullCalls[0].Deadline
+	for i, call := range f.PullCalls {
+		assert.Truef(t, call.Deadline.Before(maxDeadline) || call.Deadline.Equal(maxDeadline),
+			"PullCalls[%d] deadline %v exceeds applyImagePullTimeout bound %v", i, call.Deadline, maxDeadline)
+		assert.Truef(t, call.Deadline.After(minDeadline),
+			"PullCalls[%d] deadline %v is suspiciously short relative to applyImagePullTimeout bound %v", i, call.Deadline, minDeadline)
+		assert.WithinDurationf(t, first, call.Deadline, time.Millisecond,
+			"PullCalls[%d] deadline %v must match PullCalls[0] deadline %v — the timeout must be shared across the whole pre-pull loop, not reset per image", i, call.Deadline, first)
+	}
+}
+
 func TestService_Apply_PullFailureMapsToErrImagePull(t *testing.T) {
 	svc, f := newSvc(t)
 	f.PullErr = map[string]error{"": errors.New("manifest unknown")}
