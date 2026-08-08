@@ -106,6 +106,320 @@ func (s *statsRec) firstRemaining() time.Duration {
 	return s.remaining[0]
 }
 
+// bootRec is a hand-rolled BootConverger fake: per-host uptime/ok/err are set
+// directly by the test, and every ReconcileSpecsOnHost call is recorded so a
+// test can assert it fired exactly once (not once per tick).
+type bootRec struct {
+	mu     sync.Mutex
+	uptime map[string]time.Duration
+	ok     map[string]bool
+	err    map[string]error
+
+	reconciled  []string                 // one entry per ReconcileSpecsOnHost call, in order
+	reconcileDL map[string]time.Duration // host -> time left on the ctx passed to ReconcileSpecsOnHost
+	reconcileHD map[string]bool          // host -> whether that ctx had a deadline at all
+}
+
+func newBootRec() *bootRec {
+	return &bootRec{
+		uptime: map[string]time.Duration{}, ok: map[string]bool{}, err: map[string]error{},
+		reconcileDL: map[string]time.Duration{}, reconcileHD: map[string]bool{},
+	}
+}
+
+func (b *bootRec) HostUptime(_ context.Context, host string) (time.Duration, bool, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.uptime[host], b.ok[host], b.err[host]
+}
+
+func (b *bootRec) ReconcileSpecsOnHost(ctx context.Context, host string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.reconciled = append(b.reconciled, host)
+	if dl, ok := ctx.Deadline(); ok {
+		b.reconcileHD[host] = true
+		b.reconcileDL[host] = time.Until(dl)
+	} else {
+		b.reconcileHD[host] = false
+	}
+}
+
+// reconcileRemaining reports the time left on the context most recently
+// passed to ReconcileSpecsOnHost for host, and whether that context had a
+// deadline at all.
+func (b *bootRec) reconcileRemaining(host string) (time.Duration, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.reconcileDL[host], b.reconcileHD[host]
+}
+
+func (b *bootRec) reconcileCount(host string) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n := 0
+	for _, h := range b.reconciled {
+		if h == host {
+			n++
+		}
+	}
+	return n
+}
+
+func (b *bootRec) setUptime(host string, d time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.uptime[host] = d
+	b.ok[host] = true
+	b.err[host] = nil
+}
+
+func (b *bootRec) setUnknown(host string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.ok[host] = false
+	b.err[host] = nil
+}
+
+func (b *bootRec) setErr(host string, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.err[host] = err
+}
+
+// freshPoller returns a Poller with every state map pre-initialised, so tests
+// can drive tick() directly (bypassing Start's ticker goroutine) without
+// nil-map panics.
+func freshPoller(svc Refresher, boot BootConverger) *Poller {
+	return &Poller{
+		Svc: svc, Boot: boot, Interval: time.Hour, Timeout: time.Second,
+		state: map[string]bool{}, statsState: map[string]bool{}, bootUptime: map[string]time.Duration{},
+	}
+}
+
+// A host observed for the first time must not reconcile: the daemon's own
+// startup boot-converge (server.go) already covers "podman-api just
+// started". Triggering here too on the very first tick would just repeat it
+// for every host, every time podman-api boots.
+func TestPollerBootWatch_FirstObservationDoesNotReconcile(t *testing.T) {
+	f := newFakeRefresher()
+	b := newBootRec()
+	b.setUptime("h1", 10000*time.Second)
+	p := freshPoller(f, b)
+
+	p.tick(context.Background(), []string{"h1"})
+
+	if n := b.reconcileCount("h1"); n != 0 {
+		t.Fatalf("first observation reconciled %d times, want 0", n)
+	}
+}
+
+// Uptime advancing between ticks, however much elapses, must never look like
+// a reboot — this is the ordinary "host stayed up" case, by far the most
+// common tick outcome in production.
+func TestPollerBootWatch_StableUptimeNeverReconciles(t *testing.T) {
+	f := newFakeRefresher()
+	b := newBootRec()
+	p := freshPoller(f, b)
+
+	uptime := 10000 * time.Second
+	b.setUptime("h1", uptime)
+	for i := 0; i < 5; i++ {
+		p.tick(context.Background(), []string{"h1"})
+		uptime += 30 * time.Second
+		b.setUptime("h1", uptime)
+	}
+	p.tick(context.Background(), []string{"h1"})
+
+	if n := b.reconcileCount("h1"); n != 0 {
+		t.Fatalf("stable uptime reconciled %d times, want 0", n)
+	}
+}
+
+// The core behavior: a host's uptime dropping between polls (it rebooted)
+// must trigger exactly one ReconcileSpecsOnHost for that host — not zero
+// (the gap #231 exists to close), and not once per tick after that (which
+// would turn ReconcileSpecsOnHost's per-instance tolerant skip-logging into a
+// permanent flood).
+func TestPollerBootWatch_UptimeResetReconcilesOnce(t *testing.T) {
+	f := newFakeRefresher()
+	b := newBootRec()
+	p := freshPoller(f, b)
+
+	// Tick 1: establish a baseline uptime (no reboot detected — first seen).
+	b.setUptime("h1", 10000*time.Second)
+	p.tick(context.Background(), []string{"h1"})
+
+	// The host reboots between polls: uptime drops near zero.
+	b.setUptime("h1", 5*time.Second)
+	p.tick(context.Background(), []string{"h1"})
+
+	if n := b.reconcileCount("h1"); n != 1 {
+		t.Fatalf("uptime reset reconciled %d times, want exactly 1", n)
+	}
+
+	// Subsequent ticks with uptime advancing normally from the new boot must
+	// not repeat the reconcile.
+	b.setUptime("h1", 35*time.Second)
+	p.tick(context.Background(), []string{"h1"})
+	b.setUptime("h1", 65*time.Second)
+	p.tick(context.Background(), []string{"h1"})
+
+	if n := b.reconcileCount("h1"); n != 1 {
+		t.Fatalf("after the reboot settled, reconciled %d times, want still exactly 1 (no repeat)", n)
+	}
+}
+
+// #231 review finding #5: detection must depend only on the two raw uptime
+// readings, never on the control-plane's own wall clock. A control-plane NTP
+// step big enough to have spuriously tripped the old boot-instant-vs-now
+// comparison must not affect this at all — checkBoot never calls time.Now (or
+// any Poller.Now hook; there no longer is one) to make its decision, so
+// simulating "the control plane's clock jumped" between ticks (impossible to
+// even express here now — there's no clock parameter left to perturb) can
+// only be demonstrated negatively: uptime advancing normally never
+// reconciles, however it's paced.
+func TestPollerBootWatch_UptimeComparisonIsWallClockIndependent(t *testing.T) {
+	f := newFakeRefresher()
+	b := newBootRec()
+	p := freshPoller(f, b)
+
+	b.setUptime("h1", time.Hour)
+	p.tick(context.Background(), []string{"h1"}) // baseline
+
+	// Uptime advances by a huge amount in one tick (e.g. the poller itself
+	// stalled, or ticks were coalesced) — still not a reboot, since it only
+	// ever increased.
+	b.setUptime("h1", 30*24*time.Hour)
+	p.tick(context.Background(), []string{"h1"})
+
+	if n := b.reconcileCount("h1"); n != 0 {
+		t.Fatalf("uptime advancing by a large amount reconciled %d times, want 0", n)
+	}
+}
+
+// #231 review finding #1: the ReconcileSpecsOnHost call triggered by a
+// detected reboot must run under a context independent of the uptime probe's
+// own short BootTimeout budget — otherwise a real, multi-instance reconcile
+// sweep gets truncated by a deadline sized for one cheap uptime read.
+func TestPollerBootWatch_ReconcileContextIndependentOfBootTimeout(t *testing.T) {
+	f := newFakeRefresher()
+	b := newBootRec()
+	p := freshPoller(f, b)
+	p.BootTimeout = 5 * time.Millisecond // deliberately tiny
+
+	b.setUptime("h1", 10000*time.Second)
+	p.tick(context.Background(), []string{"h1"}) // baseline
+
+	b.setUptime("h1", 5*time.Second) // reboot
+	p.tick(context.Background(), []string{"h1"})
+
+	if n := b.reconcileCount("h1"); n != 1 {
+		t.Fatalf("reconciled %d times, want exactly 1", n)
+	}
+	left, hasDeadline := b.reconcileRemaining("h1")
+	if hasDeadline {
+		t.Fatalf("ReconcileSpecsOnHost got a context with %s left on the probe's "+
+			"5ms BootTimeout deadline; it must run on the tick's own long-lived context instead", left)
+	}
+}
+
+// A host whose podman cannot report uptime at all (ok=false — an old podman,
+// or a parse failure) must never be treated as "just booted": that would
+// reconcile every unreachable/too-old host on every tick.
+func TestPollerBootWatch_UnknownUptimeNeverReconciles(t *testing.T) {
+	f := newFakeRefresher()
+	b := newBootRec()
+	b.setUnknown("h1")
+	p := freshPoller(f, b)
+
+	for i := 0; i < 3; i++ {
+		p.tick(context.Background(), []string{"h1"})
+	}
+
+	if n := b.reconcileCount("h1"); n != 0 {
+		t.Fatalf("unknown uptime reconciled %d times, want 0", n)
+	}
+}
+
+// An error probing uptime (host unreachable) must be skipped silently, same
+// as an unknown uptime — never mistaken for a reboot, and never panic.
+func TestPollerBootWatch_ErrorNeverReconciles(t *testing.T) {
+	f := newFakeRefresher()
+	b := newBootRec()
+	b.setErr("h1", errors.New("unreachable"))
+	p := freshPoller(f, b)
+
+	for i := 0; i < 3; i++ {
+		p.tick(context.Background(), []string{"h1"})
+	}
+
+	if n := b.reconcileCount("h1"); n != 0 {
+		t.Fatalf("errored uptime probe reconciled %d times, want 0", n)
+	}
+}
+
+// A one-off failed probe between two successful ones must not manufacture a
+// false reboot: the missed tick must leave the last-known uptime alone rather
+// than clearing it, so the next successful probe compares against the real
+// baseline, not a blank slate.
+func TestPollerBootWatch_TransientErrorDoesNotResetBaseline(t *testing.T) {
+	f := newFakeRefresher()
+	b := newBootRec()
+	p := freshPoller(f, b)
+
+	b.setUptime("h1", 10000*time.Second)
+	p.tick(context.Background(), []string{"h1"}) // baseline
+
+	b.setErr("h1", errors.New("blip"))
+	p.tick(context.Background(), []string{"h1"}) // transient failure, no probe recorded
+
+	b.setErr("h1", nil)
+	b.setUptime("h1", 10060*time.Second) // consistent with the original baseline, unrelated to the missed tick
+	p.tick(context.Background(), []string{"h1"})
+
+	if n := b.reconcileCount("h1"); n != 0 {
+		t.Fatalf("a transient probe error caused a false reboot detection: reconciled %d times, want 0", n)
+	}
+}
+
+// Boot-reboot detection is opt-in: a nil Boot field must add no calls and no
+// panics, mirroring the existing nil-Stats contract.
+func TestPollerBootWatch_NilBootDisabled(t *testing.T) {
+	f := newFakeRefresher()
+	p := freshPoller(f, nil)
+	p.tick(context.Background(), []string{"h1"})
+	// No assertion beyond "did not panic" — there is nothing to record without
+	// a Boot implementation.
+}
+
+// bootUptime must be pruned for hosts no longer in the active set, exactly
+// like state/statsState, so host churn can't grow it unbounded.
+func TestPollerBootWatch_PrunesStateForRemovedHosts(t *testing.T) {
+	f := newFakeRefresher()
+	b := newBootRec()
+	b.setUptime("a", time.Hour)
+	b.setUptime("b", time.Hour)
+	p := freshPoller(f, b)
+
+	p.tick(context.Background(), []string{"a", "b"})
+	p.mu.Lock()
+	n := len(p.bootUptime)
+	p.mu.Unlock()
+	if n != 2 {
+		t.Fatalf("after first tick bootUptime should hold both hosts, got %d", n)
+	}
+
+	p.tick(context.Background(), []string{"a"})
+	p.mu.Lock()
+	_, hasB := p.bootUptime["b"]
+	n2 := len(p.bootUptime)
+	p.mu.Unlock()
+	if hasB || n2 != 1 {
+		t.Fatalf("bootUptime should hold only {a} after pruning, got %d entries (hasB=%v)", n2, hasB)
+	}
+}
+
 // usageRec records RefreshHostVolumeUsage calls and returns a fixed error.
 type usageRec struct {
 	mu    sync.Mutex

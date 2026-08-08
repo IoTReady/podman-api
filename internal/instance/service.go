@@ -1383,6 +1383,17 @@ func (s *Service) HostLoad(ctx context.Context, host string) (podman.HostInfo, e
 	return s.client.HostInfo(ctx, host)
 }
 
+// HostUptime returns hostID's current kernel uptime (see
+// podman.Client.HostUptime). Used by the inventory poller to detect a host
+// reboot and trigger ReconcileSpecsOnHost for just that host; unlike HostLoad
+// it is not exposed over the API.
+func (s *Service) HostUptime(ctx context.Context, host string) (time.Duration, bool, error) {
+	if _, ok := s.host(host); !ok {
+		return 0, false, ErrUnknownHost
+	}
+	return s.client.HostUptime(ctx, host)
+}
+
 // PortsInUse returns all currently-bound host ports on hostID.
 func (s *Service) PortsInUse(ctx context.Context, host string) ([]podman.PortMapping, error) {
 	if _, ok := s.host(host); !ok {

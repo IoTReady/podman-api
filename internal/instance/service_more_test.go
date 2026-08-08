@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -166,6 +167,24 @@ func TestService_HostLoad_PassesThrough(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, 4, got.CPUs)
 	assert.Equal(t, 75.0, got.MemUsedPct)
+}
+
+// --- HostUptime ---------------------------------------------------------------
+
+func TestService_HostUptime_UnknownHost(t *testing.T) {
+	svc, _ := newSvc(t)
+	_, _, err := svc.HostUptime(context.Background(), "nope")
+	assert.ErrorIs(t, err, ErrUnknownHost)
+}
+
+func TestService_HostUptime_PassesThrough(t *testing.T) {
+	svc, f := newSvc(t)
+	f.HostUptimeVal = 42 * time.Minute
+	f.HostUptimeOK = true
+	got, ok, err := svc.HostUptime(context.Background(), "h1")
+	require.NoError(t, err)
+	assert.True(t, ok)
+	assert.Equal(t, 42*time.Minute, got)
 }
 
 // --- HostCounts -------------------------------------------------------------

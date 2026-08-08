@@ -20,6 +20,32 @@ func TestURIFor_UnknownHost(t *testing.T) {
 	assert.Contains(t, err.Error(), "unknown host")
 }
 
+func TestParseProcUptime(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want time.Duration
+		ok   bool
+	}{
+		{"zero", "0.00 0.00", 0, true},
+		{"typical /proc/uptime line", "12345.67 98765.43\n", 12345*time.Second + 670*time.Millisecond, true},
+		{"integer seconds, no decimal", "100 50", 100 * time.Second, true},
+		{"only one field (no idle column)", "42.50", 42*time.Second + 500*time.Millisecond, true},
+		{"empty", "", 0, false},
+		{"garbage", "not-a-number 0.00", 0, false},
+		{"negative uptime is rejected", "-1.00 0.00", 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, ok := parseProcUptime(c.in)
+			assert.Equal(t, c.ok, ok)
+			if c.ok {
+				assert.Equal(t, c.want, got)
+			}
+		})
+	}
+}
+
 func TestSplitPortKey(t *testing.T) {
 	cases := []struct {
 		key       string

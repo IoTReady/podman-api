@@ -99,6 +99,16 @@ type Client interface {
 
 	// Host
 	HostInfo(ctx context.Context, hostID string) (HostInfo, error)
+	// HostUptime returns hostID's current kernel uptime, read directly from
+	// /proc/uptime (locally, or over a short SSH exec for a remote host —
+	// see hostLoadAvg's dual-path pattern in the Real implementation). ok is
+	// false when that read can't be parsed (host unreachable is a separate,
+	// non-nil err) — callers must treat that as "unknown", never as "just
+	// booted". Deliberately cheaper than HostInfo, which goes through
+	// libpod's `info` endpoint and pays for a full host-info aggregation;
+	// this is meant to be probed on every inventory tick, for every host, to
+	// detect a host reboot.
+	HostUptime(ctx context.Context, hostID string) (uptime time.Duration, ok bool, err error)
 	// Knows reports whether hostID is a registered host this client can reach.
 	// The host set is updated at construction and whenever SetHosts is called
 	// (e.g. after a SIGHUP host-config reload).

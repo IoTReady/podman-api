@@ -20,6 +20,21 @@ import (
 // NewConnectionWithIdentity, so trust can diverge from this path — if the host
 // key is absent from known_hosts, loadavg is silently nil (best-effort).
 func sshReadLoadAvg(ctx context.Context, h config.Host) (string, error) {
+	return sshReadFile(ctx, h, "cat /proc/loadavg")
+}
+
+// sshReadUptime dials the host over SSH and reads /proc/uptime, mirroring
+// sshReadLoadAvg. Used by HostUptime for a remote host, deliberately avoiding
+// libpod's `info` endpoint (see HostUptime's own doc comment for why).
+func sshReadUptime(ctx context.Context, h config.Host) (string, error) {
+	return sshReadFile(ctx, h, "cat /proc/uptime")
+}
+
+// sshReadFile dials the host over SSH and runs cmd, returning its stdout.
+// Shared by sshReadLoadAvg and sshReadUptime: same auth, same known_hosts
+// verification, same ctx-bounded session teardown — only the remote command
+// differs.
+func sshReadFile(ctx context.Context, h config.Host, cmd string) (string, error) {
 	user, addr := splitUserHost(h.Addr)
 	auth := []ssh.AuthMethod{}
 	if h.SSHKey != "" {
@@ -61,7 +76,7 @@ func sshReadLoadAvg(ctx context.Context, h config.Host) (string, error) {
 	}
 	ch := make(chan result, 1)
 	go func() {
-		out, err := sess.Output("cat /proc/loadavg")
+		out, err := sess.Output(cmd)
 		ch <- result{out, err}
 	}()
 	select {

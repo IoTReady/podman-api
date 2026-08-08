@@ -113,6 +113,15 @@ type Fake struct {
 	// HostInfoCalls counts HostInfo invocations (lets a test assert probe throttling).
 	HostInfoCalls int
 
+	// HostUptimeVal is returned by HostUptime when HostUptimeErr is nil.
+	HostUptimeVal time.Duration
+	// HostUptimeOK is HostUptime's second return value (false = uptime unknown).
+	HostUptimeOK bool
+	// HostUptimeErr, if non-nil, makes HostUptime return this error.
+	HostUptimeErr error
+	// HostUptimeCalls counts HostUptime invocations.
+	HostUptimeCalls int
+
 	// ContainerStatsVal is returned by ContainerStats, keyed by host ID.
 	ContainerStatsVal map[string][]podman.ContainerStats
 	// ContainerStatsErr, if non-nil, makes ContainerStats return this error.
@@ -609,6 +618,16 @@ func (f *Fake) HostInfo(_ context.Context, _ string) (podman.HostInfo, error) {
 		return podman.HostInfo{}, f.HostInfoErr
 	}
 	return f.HostInfoVal, nil
+}
+
+func (f *Fake) HostUptime(_ context.Context, _ string) (time.Duration, bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.HostUptimeCalls++
+	if f.HostUptimeErr != nil {
+		return 0, false, f.HostUptimeErr
+	}
+	return f.HostUptimeVal, f.HostUptimeOK, nil
 }
 
 func (f *Fake) ContainerStats(_ context.Context, h string) ([]podman.ContainerStats, error) {

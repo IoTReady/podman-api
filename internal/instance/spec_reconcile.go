@@ -20,11 +20,20 @@ import (
 var errTemplateSkipped = errors.New("template not found — instance skipped")
 
 // ReconcileSpecsOnHost checks every stored instance spec on host against real
-// pod state and re-converges any that are missing (not running). It is called
-// once at daemon startup as a one-shot boot converge, so managed pods survive
-// a host reboot. Errors are logged per-instance and never propagated to the
-// HTTP layer — the method always returns nil (it tolerates any failure by
-// logging and continuing so a partial host outage does not block the rest).
+// pod state and re-converges any that are missing (not running), so managed
+// pods survive a reboot. Errors are logged per-instance and never propagated
+// to the HTTP layer — the method always returns nil (it tolerates any
+// failure by logging and continuing so a partial host outage does not block
+// the rest).
+//
+// It has two callers: a one-shot pass in server.go, 2s after daemon startup
+// (covers podman-api's own restart), and — since #231 —
+// internal/inventory.Poller.checkBoot, which calls this once per host each
+// time that host's kernel uptime resets, covering a managed host rebooting
+// while podman-api keeps running. server.go only wires the poller's Boot
+// field to this service (Boot: svc); it does not call this method itself for
+// that path. Each call here is still a one-shot sweep of the host's specs;
+// nothing inside this method itself loops or schedules anything.
 //
 // Concurrency: per-instance operations are serialized under the existing
 // per-instance lock so this cannot race a concurrent Apply/Delete/Upgrade.
@@ -34,10 +43,14 @@ var errTemplateSkipped = errors.New("template not found — instance skipped")
 //
 // Limitations (by design):
 //   - No image pull: images are expected to be cached from the original deploy.
-//   - One-shot: called once on startup; no periodic drift-correction loop.
 //   - Template-missing instances are skipped with a warning (not reaped).
 //   - Secrets-undecryptable instances are skipped (wrong key file — operator
 //     must restart with the correct -spec-key-file).
+//   - Each call logs its own per-instance skips independently; a caller that
+//     invokes this repeatedly (the poller) must not do so more often than
+//     "once per detected reboot", or a permanent per-instance skip becomes a
+//     permanent log flood. The poller's reboot detector already guarantees
+//     that: see internal/inventory.Poller.checkBoot.
 func (s *Service) ReconcileSpecsOnHost(ctx context.Context, hostID string) {
 	keys, err := s.store.ListSpecKeys(ctx, hostID)
 	if err != nil {

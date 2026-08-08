@@ -35,6 +35,26 @@ type VolumeUsageRefresher interface {
 	RefreshHostVolumeUsage(ctx context.Context, host string) error
 }
 
+// BootConverger detects a host reboot from its kernel uptime and re-converges
+// that host's stored specs when one is detected. Implemented by
+// *instance.Service: HostUptime delegates to podman.Client.HostUptime, and
+// ReconcileSpecsOnHost is the same method server.go already runs once at
+// daemon startup — this just gives it a second trigger, for the case that
+// one-shot boot converge doesn't cover: the host reboots while podman-api
+// keeps running (#231).
+type BootConverger interface {
+	// HostUptime returns hostID's current kernel uptime. ok is false when the
+	// host's podman cannot report it (e.g. too old, or a format this client
+	// doesn't parse) — callers must treat that as "unknown", never as "just
+	// booted".
+	HostUptime(ctx context.Context, hostID string) (uptime time.Duration, ok bool, err error)
+	// ReconcileSpecsOnHost re-creates any stored spec whose pod is missing.
+	// Deliberately tolerant (see the method's own doc comment): it logs and
+	// continues per-instance and never propagates an error, so calling it
+	// speculatively here is safe.
+	ReconcileSpecsOnHost(ctx context.Context, hostID string)
+}
+
 // Poller periodically refreshes every host's inventory into the service cache.
 // It mirrors internal/prune.Scheduler: an immediate first pass so a fresh start
 // warms within one cycle, per-tick panic recovery, a per-host timeout so one
@@ -56,9 +76,35 @@ type Poller struct {
 	// why this is a separate budget rather than a share of Timeout (#212).
 	StatsTimeout time.Duration
 
+	// Boot, when non-nil, probes each host's uptime on every tick and
+	// re-converges stored specs for a host whose uptime resets — i.e. it
+	// rebooted while podman-api kept running (#231). nil disables the check
+	// entirely: no extra calls, same as a nil Stats.
+	Boot BootConverger
+
+	// BootTimeout bounds one host's uptime probe when Boot is set,
+	// independently of Timeout — mirrors StatsTimeout, and for the same
+	// #212 reason: a slow-but-successful refresh must not starve this probe
+	// of its own budget by sharing the refresh's hctx. Zero means
+	// defaultBootTimeout.
+	//
+	// This bounds ONLY the lightweight HostUptime probe. The
+	// ReconcileSpecsOnHost call triggered by a detected reboot deliberately
+	// does NOT share this budget (#231 review finding #1): it is a full sweep
+	// of every stored spec on the host (PodInspect/GetSpec/GetTemplate/render/
+	// PlayKube per instance, plus an ingress reconcile), and a host with more
+	// than a handful of instances would have that recreation loop silently
+	// truncated by a 5s deadline meant for one cheap uptime read. It runs
+	// instead under the tick's own long-lived context (cancelled only on
+	// poller shutdown), the same convention server.go's one-shot startup boot
+	// converge already uses for "let a full per-host reconcile actually
+	// finish".
+	BootTimeout time.Duration
+
 	mu         sync.Mutex
-	state      map[string]bool // host -> last-known reachable, for transition logging
-	statsState map[string]bool // host -> last-known stats-sampler outcome (never reachability)
+	state      map[string]bool          // host -> last-known reachable, for transition logging
+	statsState map[string]bool          // host -> last-known stats-sampler outcome (never reachability)
+	bootUptime map[string]time.Duration // host -> last-observed kernel uptime, for reboot (uptime reset) detection
 	wg         sync.WaitGroup
 }
 
@@ -71,6 +117,9 @@ func (p *Poller) Start(ctx context.Context, hostsFn func() []string) {
 	}
 	if p.statsState == nil {
 		p.statsState = map[string]bool{}
+	}
+	if p.bootUptime == nil {
+		p.bootUptime = map[string]time.Duration{}
 	}
 	p.mu.Unlock()
 
@@ -164,10 +213,123 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 					scancel()
 				}
 			}
+			// Independent of the refresh's own outcome (err above): a reboot
+			// probe is a different, lighter libpod call, and a host that just
+			// failed its container sweep may still answer it (or vice versa).
+			// Own budget for the same #212 reason the stats sampler has one —
+			// but that budget bounds ONLY the uptime probe. If a reboot is
+			// detected, the resulting ReconcileSpecsOnHost call is passed ctx
+			// itself (the tick's own long-lived context, cancelled only on
+			// poller shutdown), never bctx: see BootTimeout's doc comment.
+			if p.Boot != nil {
+				bctx, bcancel := context.WithTimeout(ctx, p.bootTimeout())
+				p.checkBoot(bctx, ctx, host)
+				bcancel()
+			}
 		}(h)
 	}
 	wg.Wait()
 	p.pruneState(hosts)
+}
+
+// defaultBootTimeout bounds one host's uptime probe when BootTimeout is
+// unset. It is a single libpod `info` call — the same cost as one HostInfo
+// sub-call — so this mirrors defaultStatsTimeout rather than being separately
+// tuned.
+const defaultBootTimeout = 5 * time.Second
+
+// EffectiveBootTimeout maps a configured boot-probe timeout to the value the
+// poller will actually spend: anything <= 0 means defaultBootTimeout, never
+// "no timeout" and never "expire instantly". Exported for the same reason
+// EffectiveStatsTimeout is: server's startup budget check
+// (statsBudgetWarning) has to reason about the same effective value the
+// poller uses, not the raw (possibly zero) configured one.
+func EffectiveBootTimeout(d time.Duration) time.Duration {
+	if d <= 0 {
+		return defaultBootTimeout
+	}
+	return d
+}
+
+// bootTimeout is BootTimeout normalised through EffectiveBootTimeout.
+func (p *Poller) bootTimeout() time.Duration { return EffectiveBootTimeout(p.BootTimeout) }
+
+// bootJitterTolerance separates ordinary measurement jitter between
+// consecutive uptime probes from a genuine reboot. It is a fixed constant,
+// deliberately independent of -inventory-refresh-interval: uptime advances in
+// lockstep with wall-clock time between polls (jitter is sub-second), while a
+// real reboot resets uptime near zero, so a rebooted host's newly-observed
+// uptime comes in *lower* than the last one by roughly its entire pre-reboot
+// uptime — at minimum tens of seconds in any realistic case, and usually far
+// more.
+const bootJitterTolerance = 20 * time.Second
+
+// checkBoot probes host's uptime and, if it can be determined, compares it
+// directly against the last uptime observed for this host — never via an
+// absolute wall-clock-derived "boot instant" (#231 review finding #5): a
+// derived boot instant moves with the control-plane's own clock, so an NTP
+// step on podman-api itself would shift every tracked host's computed boot
+// instant by the same delta in the same tick, flagging every host as
+// rebooted simultaneously. Comparing raw uptime durations has no such
+// dependency: a real reboot is visible as uptime dropping, full stop.
+//
+// A drop beyond bootJitterTolerance means the host rebooted since the last
+// successful probe, and triggers exactly one ReconcileSpecsOnHost for this
+// tick — the check then records the new uptime as the baseline, so a stable
+// follow-up tick does not repeat the reconcile.
+//
+// probeCtx bounds only the HostUptime call (see BootTimeout's doc comment).
+// reconcileCtx is used only for the ReconcileSpecsOnHost call, so a real
+// reboot recovery is never truncated by the probe's own short budget.
+func (p *Poller) checkBoot(probeCtx, reconcileCtx context.Context, host string) {
+	uptime, ok, err := p.Boot.HostUptime(probeCtx, host)
+	if err != nil || !ok {
+		// Unreachable, or a podman that can't report uptime: leave the last
+		// known uptime untouched. Clearing it here would forget a real
+		// baseline on one flaky poll and manufacture a false "reboot"
+		// detection out of the next successful one.
+		return
+	}
+
+	p.mu.Lock()
+	prev, seen := p.bootUptime[host]
+	p.mu.Unlock()
+
+	if !seen {
+		// First observation for this host: record the baseline only. The
+		// daemon's own startup boot-converge (server.go) already covers
+		// "podman-api just started" — triggering here too would just repeat
+		// it for every host on every daemon start.
+		p.mu.Lock()
+		p.bootUptime[host] = uptime
+		p.mu.Unlock()
+		return
+	}
+
+	if uptime >= prev-bootJitterTolerance {
+		// The ordinary case: uptime held steady or advanced since the last
+		// probe. No reconcile call happens on this path, so the baseline can
+		// be committed immediately.
+		p.mu.Lock()
+		p.bootUptime[host] = uptime
+		p.mu.Unlock()
+		return
+	}
+
+	log.Printf("inventory: host %s rebooted (uptime reset) — re-converging stored specs", host)
+	p.Boot.ReconcileSpecsOnHost(reconcileCtx, host)
+	// Committed only AFTER the reconcile call returns (#231 review finding
+	// #1): if this attempt were cut short, leaving the stale (pre-reboot)
+	// baseline in place means the NEXT tick recomputes the same "uptime
+	// dropped relative to baseline" condition — uptime keeps climbing from
+	// its new, post-reboot value while the stale baseline stays put — and
+	// retries, rather than the truncated attempt being silently accepted as
+	// done. Combined with reconcileCtx no longer sharing the probe's short
+	// budget, a real reconcile now gets the room to finish in the first
+	// place.
+	p.mu.Lock()
+	p.bootUptime[host] = uptime
+	p.mu.Unlock()
 }
 
 // defaultStatsTimeout bounds one stats sample when StatsTimeout is unset. The
@@ -198,6 +360,18 @@ func (p *Poller) statsTimeout() time.Duration { return EffectiveStatsTimeout(p.S
 
 // pruneState drops transition-log state for hosts no longer in the active set
 // (e.g. removed via SIGHUP), so the map can't grow unbounded over host churn.
+//
+// This deliberately still includes bootUptime: pruning a host's own baseline
+// as soon as it drops out (rather than trying to detect a reboot that
+// happened during its absence from here) is the correct call once server.go's
+// SIGHUP host-reload path treats "reappeared after being removed" the same as
+// "genuinely new" (#231 review findings #3/#4, one consistent mechanism) —
+// server.go now reconciles any host id it hasn't seen in its OWN tracked set
+// on the same reload that adds it back, independent of what this poller
+// still remembers. Two independent "is this host new to me" trackers (this
+// one keyed on probe success, server.go's on the host list) would otherwise
+// have to be kept in permanent agreement for no benefit: whichever fires the
+// reconcile, the gap is closed exactly once.
 func (p *Poller) pruneState(hosts []string) {
 	keep := make(map[string]bool, len(hosts))
 	for _, h := range hosts {
@@ -212,6 +386,11 @@ func (p *Poller) pruneState(hosts []string) {
 	for h := range p.statsState {
 		if !keep[h] {
 			delete(p.statsState, h)
+		}
+	}
+	for h := range p.bootUptime {
+		if !keep[h] {
+			delete(p.bootUptime, h)
 		}
 	}
 	p.mu.Unlock()

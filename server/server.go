@@ -136,6 +136,16 @@ func RunWithFlags(opts ...Option) error {
 	}
 	var hostsHolder atomic.Pointer[[]config.Host]
 	hostsHolder.Store(&hosts)
+	// seenHostIDs tracks every host id podman-api has ever known about in the
+	// CURRENT run, so the SIGHUP reload path below can tell "genuinely new"
+	// and "reappeared after a removal" apart from "already tracked" (#231
+	// review findings #3 and #4 — one consistent mechanism for both). It is
+	// mutated only from the single SIGHUP-handling goroutine below, so no
+	// lock is needed.
+	seenHostIDs := make(map[string]bool, len(hosts))
+	for _, h := range hosts {
+		seenHostIDs[h.ID] = true
+	}
 	keys, fp, err := loadKeys(*keysFile)
 	if err != nil {
 		return fmt.Errorf("keys: %w", err)
@@ -372,15 +382,23 @@ func RunWithFlags(opts ...Option) error {
 		invPoller = &inventory.Poller{
 			Svc: svc, Interval: *inventoryInterval,
 			Timeout: *inventoryTimeout, StatsTimeout: *containerStatsTO,
+			// Detects a host reboot from its kernel uptime and re-converges
+			// that host's stored specs when one is found — the runtime
+			// counterpart to the one-shot startup boot converge below, which
+			// only covers podman-api's own restart, not a managed host's
+			// (#231).
+			Boot: svc,
 		}
 		if *containerStats {
 			invPoller.Stats = svc
 		}
 		// Checked here, not inside the -container-stats block below, so it is
-		// evaluated on the one code path where the two budgets can ever be spent
-		// back to back — a poller-enabled start — regardless of where the
-		// sampler's own wiring lives.
-		if w := statsBudgetWarning(*inventoryInterval, *inventoryTimeout, *containerStatsTO, *containerStats); w != "" {
+		// evaluated on the one code path where all these budgets can ever be
+		// spent back to back — a poller-enabled start — regardless of where the
+		// sampler's own wiring lives. invPoller.BootTimeout is passed (not a
+		// literal 0) so this stays correct if a flag for it is ever added;
+		// today it is always the zero value, i.e. always the 5s default.
+		if w := statsBudgetWarning(*inventoryInterval, *inventoryTimeout, *containerStatsTO, invPoller.BootTimeout, *containerStats); w != "" {
 			log.Printf("WARNING: %s", w)
 		}
 		invPoller.Start(runnerCtx, hostIDs)
@@ -418,6 +436,10 @@ func RunWithFlags(opts ...Option) error {
 		log.Printf("backup scheduler enabled (commercial)")
 	}
 
+	// One-shot boot converge: covers podman-api's own (re)start. It does not
+	// cover a managed host rebooting while podman-api keeps running — that
+	// case is handled at runtime by the inventory poller's Boot field above,
+	// when the poller is enabled (#231).
 	go func() {
 		select {
 		case <-time.After(2 * time.Second):
@@ -536,7 +558,34 @@ func RunWithFlags(opts ...Option) error {
 						draining++
 					}
 				}
+				// A host id this process has not tracked before — either
+				// genuinely new, or previously removed by an earlier SIGHUP and
+				// now re-added — needs a boot-converge pass of its own (#231
+				// review findings #3 and #4). Neither the one-shot startup
+				// converge (only ran once, over the hosts loaded at start) nor
+				// the inventory poller's own reboot detector (its first
+				// observation of any host is deliberately baseline-only, see
+				// inventory.Poller.checkBoot) ever reconciles such a host, so
+				// without this, a host whose pods were already down when it
+				// was (re-)added stays down until it reboots a SECOND time
+				// after being added.
+				var newlySeen []string
+				newlySeen, seenHostIDs = diffNewlySeenHosts(seenHostIDs, newHosts)
 				log.Printf("hosts reloaded: %d entries (%d draining)", len(newHosts), draining)
+				if len(newlySeen) > 0 {
+					log.Printf("hosts reload: boot-converging %d newly-seen host(s): %v", len(newlySeen), newlySeen)
+					go func(ids []string) {
+						var wg sync.WaitGroup
+						for _, id := range ids {
+							wg.Add(1)
+							go func(hostID string) {
+								defer wg.Done()
+								svc.ReconcileSpecsOnHost(runnerCtx, hostID)
+							}(id)
+						}
+						wg.Wait()
+					}(newlySeen)
+				}
 			}
 
 			if *operatorFile != "" {
@@ -658,29 +707,68 @@ func pollerDisabledMetricsWarning(setFlags map[string]bool, containerStats bool,
 		strings.Join(asked, " and "))
 }
 
-// statsBudgetWarning returns the line to log when the per-host inventory and
-// stats budgets together can reach or exceed the poll interval — or "" when
-// there is nothing worth saying.
+// diffNewlySeenHosts compares the host ids this process has tracked so far
+// (seen) against the freshly-reloaded host list (current, from a SIGHUP
+// config.LoadHosts), and returns:
+//   - newlySeen: ids present in current but absent from seen — a host id this
+//     process has never tracked before, in this run. That covers both a
+//     genuinely new host and one removed by an earlier reload and now
+//     re-added: the earlier removal already dropped it from seen (it is
+//     replaced wholesale below, not merged), so it looks identical to "new"
+//     here. That equivalence is deliberate (#231 review findings #3 and #4):
+//     a host that rebooted while absent needs exactly the same boot-converge
+//     pass a truly-new host does, since neither the one-shot startup converge
+//     nor the poller's baseline-only first observation ever covers it.
+//   - nextSeen: the tracked set to carry forward — current's ids, replacing
+//     seen entirely (not merged with it), so a host that drops out of a
+//     later reload is "unseen" again and gets re-converged if it returns.
+func diffNewlySeenHosts(seen map[string]bool, current []config.Host) (newlySeen []string, nextSeen map[string]bool) {
+	nextSeen = make(map[string]bool, len(current))
+	for _, h := range current {
+		nextSeen[h.ID] = true
+		if !seen[h.ID] {
+			newlySeen = append(newlySeen, h.ID)
+		}
+	}
+	return newlySeen, nextSeen
+}
+
+// statsBudgetWarning returns the line to log when the per-host inventory,
+// stats and boot-probe budgets together can reach or exceed the poll
+// interval — or "" when there is nothing worth saying.
 //
 // Until #212 the stats sample shared the refresh's hctx, which held the per-host
 // bound at exactly -inventory-refresh-timeout by construction; the price was
 // permanent starvation of the sampler on a host whose sweep ate that budget.
-// Now the two budgets are independent, so the bound is their sum, and nothing in
-// the type system stops an operator tuning past the interval. This is that
-// missing enforcement — deliberately a warning, not a fatal: a long
+// Now each of the three steps (refresh, stats sample, boot-reboot probe) gets
+// its own budget, so the true per-host bound is their sum, and nothing in the
+// type system stops an operator tuning past the interval. This is that missing
+// enforcement — deliberately a warning, not a fatal: a long
 // -inventory-refresh-timeout is a legitimate choice on a slow fleet, and the
 // consequence (a stretched poll cadence, visible as
 // podman_api_inventory_age_seconds) is degradation, not breakage.
 //
-// Silent when the sampler is off: with -container-stats=false no stats call is
-// ever made, so the second budget cannot be spent and the sum is hypothetical.
-// Silent with the poller off for the same reason — nothing ticks, and
-// pollerDisabledMetricsWarning already explains that case.
-// It reasons about the EFFECTIVE stats budget, not the raw flag: the poller maps
-// a non-positive StatsTimeout to its 5s default (inventory.EffectiveStatsTimeout),
-// so -container-stats-timeout=0 with a 28s refresh timeout and a 30s interval
-// really spends 33s while a raw-value check would compute 28s and stay silent —
-// a hole in exactly the invariant this function exists to police.
+// The boot-probe term is folded in UNCONDITIONALLY once the poller itself is
+// enabled: unlike the stats sampler (gated by -container-stats), server.go
+// wires Boot: svc with no flag to turn it off, so tick() always pays this
+// third budget (#231 review finding #2). With the shipped defaults —
+// Timeout=20s, StatsTimeout=5s, Interval=30s — the old two-term sum (25s) was
+// silently fine while the poller's real per-host cost, 30s including the 5s
+// boot probe, was already AT the interval; this is exactly the hole that let
+// that pass unnoticed.
+//
+// The stats term is silent when the sampler is off: with -container-stats=false
+// no stats call is ever made, so that budget cannot be spent and adding it
+// would be noise. Every term is silent with the poller off, for the same
+// reason — nothing ticks, and pollerDisabledMetricsWarning already explains
+// that case.
+//
+// Both the stats and boot terms reason about their EFFECTIVE timeout, not the
+// raw flag/field: the poller maps a non-positive value to its own default
+// (inventory.EffectiveStatsTimeout / inventory.EffectiveBootTimeout), so e.g.
+// -container-stats-timeout=0 with a 28s refresh timeout and a 30s interval
+// really spends 33s (28+5) while a raw-value check would compute 28s and stay
+// silent — a hole in exactly the invariant this function exists to police.
 //
 // -inventory-refresh-timeout gets no such normalisation because the poller
 // applies none: Poller.Timeout is passed to context.WithTimeout verbatim, where
@@ -688,19 +776,26 @@ func pollerDisabledMetricsWarning(setFlags map[string]bool, containerStats bool,
 // pre-existing sharp edge (a refresh timeout of 0 fails every refresh
 // immediately, loudly and on every host) and squarely outside #212; the honest
 // sum for that case is the one computed here.
-func statsBudgetWarning(interval, timeout, statsTimeout time.Duration, statsEnabled bool) string {
-	if interval <= 0 || !statsEnabled {
+func statsBudgetWarning(interval, timeout, statsTimeout, bootTimeout time.Duration, statsEnabled bool) string {
+	if interval <= 0 {
 		return ""
 	}
-	eff := inventory.EffectiveStatsTimeout(statsTimeout)
-	if timeout+eff < interval {
+	effBoot := inventory.EffectiveBootTimeout(bootTimeout)
+	sum := timeout + effBoot
+	terms := fmt.Sprintf("-inventory-refresh-timeout (%s) + boot-reboot-probe timeout (%s)", timeout, effBoot)
+	if statsEnabled {
+		effStats := inventory.EffectiveStatsTimeout(statsTimeout)
+		sum += effStats
+		terms = fmt.Sprintf("%s + -container-stats-timeout (%s)", terms, effStats)
+	}
+	if sum < interval {
 		return ""
 	}
-	return fmt.Sprintf("-inventory-refresh-timeout (%s) + -container-stats-timeout (%s) = %s, "+
-		"which is not under -inventory-refresh-interval (%s): a slow host can spend a whole "+
-		"interval on one tick and stretch the poll cadence for every host, inflating "+
-		"podman_api_inventory_age_seconds. Lower either timeout or raise the interval",
-		timeout, eff, timeout+eff, interval)
+	return fmt.Sprintf("%s = %s, which is not under -inventory-refresh-interval (%s): "+
+		"a slow host can spend a whole interval on one tick and stretch the poll cadence "+
+		"for every host, inflating podman_api_inventory_age_seconds. Lower a timeout or "+
+		"raise the interval",
+		terms, sum, interval)
 }
 
 // buildJobRegistry assembles the job kind -> handler table. regPrune is nil

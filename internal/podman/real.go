@@ -1207,6 +1207,57 @@ func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
 	return out, nil
 }
 
+// parseProcUptime parses the first field of a /proc/uptime line ("12345.67
+// 98765.43" — uptime seconds, then idle seconds summed across CPUs) into a
+// Duration. ok is false when the line doesn't start with a valid float
+// (empty, or garbage from a failed read) — callers must not mistake that for
+// a genuine zero uptime.
+func parseProcUptime(s string) (time.Duration, bool) {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return 0, false
+	}
+	secs, err := strconv.ParseFloat(fields[0], 64)
+	if err != nil || secs < 0 {
+		return 0, false
+	}
+	return time.Duration(secs * float64(time.Second)), true
+}
+
+// HostUptime returns hostID's current kernel uptime, read directly from
+// /proc/uptime — for a unix (local) host, straight off disk; for an SSH host,
+// via a short-lived `cat /proc/uptime` exec bounded by ctx — mirroring
+// hostLoadAvg's dual-path pattern below rather than going through libpod's
+// `info` endpoint. The inventory poller calls this on every host on every
+// tick to detect a reboot, and `info` (system.Info, the same call HostInfo
+// above makes) pays for a full host-info aggregation — distro, OCI runtime,
+// network backend, CPU utilization, lock manager, etc. — just to read one
+// uptime string; /proc/uptime is the one-line read that's actually needed.
+func (r *Real) HostUptime(ctx context.Context, id string) (time.Duration, bool, error) {
+	r.mu.Lock()
+	h, ok := r.hosts[id]
+	r.mu.Unlock()
+	if !ok {
+		return 0, false, fmt.Errorf("unknown host %q", id)
+	}
+	var raw string
+	var err error
+	if h.Addr == "unix" {
+		var b []byte
+		b, err = os.ReadFile("/proc/uptime")
+		if err == nil {
+			raw = string(b)
+		}
+	} else {
+		raw, err = sshReadUptime(ctx, h)
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	d, ok := parseProcUptime(raw)
+	return d, ok, nil
+}
+
 // hostLoadAvg reads /proc/loadavg for a host, returning the 1/5/15-minute
 // averages, or nil if it cannot be read. For a unix (local) host it reads the
 // daemon's own /proc/loadavg; for an SSH host it execs `cat /proc/loadavg`
