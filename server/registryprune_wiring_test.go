@@ -39,6 +39,10 @@ func fullyConfigured(t *testing.T) *registryPruneConfig {
 		"-registry-prune-gc-pod=blob-gc-one-shot",
 		"-registry-prune-storage-path=/srv/registry",
 		"-registry-prune-size-path=/var/lib/registry/docker",
+		"-registry-prune-gc-image=registry@sha256:deadbeef",
+		"-registry-prune-gc-config-path=/etc/registry/gc-config.yml",
+		"-registry-prune-gc-mount-path=/mnt/registry-storage",
+		"-registry-prune-gc-timeout=45m",
 	)
 }
 
@@ -110,7 +114,7 @@ func TestBuildRegistryPrune_EveryFieldIsCarried(t *testing.T) {
 	pod := fake.New()
 	metrics := obs.NewRegistryPruneMetrics(prometheus.NewRegistry())
 
-	h, err := buildRegistryPrune(cfg, "http://reg.example:5000", testRegistryClient(), svc, db, pod, metrics)
+	h, err := buildRegistryPrune(cfg, "http://reg.example:5000", testRegistryClient(), svc, db, pod, metrics, defaultTestInventoryInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -162,10 +166,21 @@ func TestBuildRegistryPrune_EveryFieldIsCarried(t *testing.T) {
 		// /var/lib/registry and sizes a path that may not exist there.
 		{"SizePath", g.SizePath, "/var/lib/registry/docker"},
 		{"PodName", g.PodName, "blob-gc-one-shot"},
+		// #227: Image, ConfigPath and MountPath were previously hardcoded
+		// defaults with no flag reaching them. A registry image change (a
+		// different base, or the registry:3 line) can move ConfigPath, and
+		// pinning Image by digest is exactly what an operator wants after a
+		// supply-chain scare.
+		{"Image", g.Image, "registry@sha256:deadbeef"},
+		{"ConfigPath", g.ConfigPath, "/etc/registry/gc-config.yml"},
+		{"MountPath", g.MountPath, "/mnt/registry-storage"},
 	} {
 		if c.got != c.want {
 			t.Errorf("BlobGC.%s = %q, want %q", c.name, c.got, c.want)
 		}
+	}
+	if g.Timeout != 45*time.Minute {
+		t.Errorf("BlobGC.Timeout = %s, want 45m", g.Timeout)
 	}
 	if g.Podman == nil {
 		t.Error("BlobGC.Podman is nil: the stage cannot stop the registry")
@@ -182,11 +197,11 @@ func TestBuildRegistryPrune_RejectsAMalformedRegistryHost(t *testing.T) {
 	// Startup, not the first run. Fail-closed either way, but a run that aborts
 	// with ErrUnsafeToPrune is invisible for a whole interval unless someone
 	// opens the job page.
-	if _, err := buildRegistryPrune(*enabledConfig(t), "http://reg.example:5000/v2/", testRegistryClient(), testSvc(), nil, nil, nil); err == nil {
+	if _, err := buildRegistryPrune(*enabledConfig(t), "http://reg.example:5000/v2/", testRegistryClient(), testSvc(), nil, nil, nil, defaultTestInventoryInterval); err == nil {
 		t.Fatal("want an error for a registry base carrying a path")
 	}
 	c := *parsedRegistryPruneFlags(t, "-registry-prune-enabled", "-registry-prune-extra-hosts=not a host")
-	if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, nil, nil); err == nil {
+	if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, nil, nil, defaultTestInventoryInterval); err == nil {
 		t.Fatal("want an error for a malformed extra host")
 	}
 }

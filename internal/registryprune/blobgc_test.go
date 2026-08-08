@@ -51,6 +51,12 @@ type fakeRunner struct {
 	// handed was already cancelled. The restart must survive a cancelled job
 	// context; nothing else proves it does.
 	startCtxDone []bool
+	// startHangsOnFirstCall makes the FIRST PodStart call block until its own
+	// context is done, simulating a hung PodStart that eats its entire
+	// per-attempt budget. Every later call returns immediately. Guarded by
+	// startCalls so only the first call ever hangs.
+	startHangsOnFirstCall bool
+	startCalls            int
 	// execCmds records the argv of every ContainerExec.
 	execCmds [][]string
 
@@ -75,10 +81,22 @@ func (f *fakeRunner) PodStop(_ context.Context, _, name string) error {
 }
 
 func (f *fakeRunner) PodStart(ctx context.Context, _, name string) error {
+	f.mu.Lock()
+	f.startCalls++
+	hang := f.startHangsOnFirstCall && f.startCalls == 1
+	f.mu.Unlock()
+	if hang {
+		// Simulate a PodStart that never returns on its own: only the
+		// context handed to THIS attempt can end it.
+		<-ctx.Done()
+	}
 	f.record("start", name)
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.startCtxDone = append(f.startCtxDone, ctx.Err() != nil)
+	if hang {
+		return ctx.Err()
+	}
 	if len(f.startErrs) == 0 {
 		return nil
 	}
@@ -355,6 +373,34 @@ func TestBlobGC_RestartIsRetriedAfterATransientFailure(t *testing.T) {
 		t.Fatalf("want the restart retried once, got %d attempt(s)", r.count("start"))
 	}
 	wantStepContaining(t, job, "registry restarted")
+}
+
+// #226: the retry budget must be real against a PodStart that HANGS, not just
+// one that returns an error quickly. Before the fix, all restartAttempts
+// shared one context (built once, outside the loop): a first attempt that
+// hangs until that context expires leaves every later attempt an
+// already-expired context, so retries 2 and 3 fail instantly with no chance
+// to succeed. Each attempt must get its OWN fresh, bounded context.
+func TestBlobGC_RestartAttemptGetsItsOwnFreshBudgetAfterAHang(t *testing.T) {
+	prevAttemptTimeout := restartAttemptTimeout
+	restartAttemptTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { restartAttemptTimeout = prevAttemptTimeout })
+	noRetryDelay(t)
+
+	r := &fakeRunner{startHangsOnFirstCall: true}
+	job, err := runBlobGC(t, testBlobGC(r), Payload{})
+	if err != nil {
+		t.Fatalf("attempt 2 should succeed once it is handed a FRESH context rather than "+
+			"attempt 1's already-expired one: %v", err)
+	}
+	if r.count("start") != 2 {
+		t.Fatalf("want exactly 2 restart attempts (hang on 1, success on 2), got %d", r.count("start"))
+	}
+	if len(r.startCtxDone) < 2 || r.startCtxDone[1] {
+		t.Fatalf("attempt 2 was handed an already-expired context (shared with attempt 1's "+
+			"timeout budget) instead of a fresh one: %v", r.startCtxDone)
+	}
+	wantStepContaining(t, job, "registry start succeeded on attempt 2")
 }
 
 // The job context being cancelled (job cancelled, deadline blown) must not take

@@ -34,6 +34,21 @@ type registryPruneConfig struct {
 	GCPod             string
 	StoragePath       string
 	SizePath          string
+
+	// GCImage, GCConfigPath, GCMountPath and GCTimeout all default to empty/
+	// zero, in which case BlobGC applies its own defaults (registry:2,
+	// /etc/docker/registry/config.yml, /var/lib/registry, 30m — see
+	// registryprune.BlobGC's default* constants). They become load-bearing
+	// only when the registry image changes: a different base, or the
+	// registry:3 line, can move ConfigPath, and pinning Image by digest is
+	// exactly what an operator wants after a supply-chain scare (#227).
+	GCImage      string
+	GCConfigPath string
+	// GCMountPath is DELIBERATELY separate from SizePath: see BlobGC.MountPath
+	// vs SizePath's own doc comment. Coincide only by default; must stay able
+	// to diverge.
+	GCMountPath string
+	GCTimeout   time.Duration
 }
 
 // defaultGCPodName is the one-shot blob-GC pod's name. It must never be able to
@@ -71,6 +86,15 @@ func registryPruneFlags(fs *flag.FlagSet) *registryPruneConfig {
 		"absolute path of the registry storage directory ON THE HOST, hostPath-mounted into the GC pod; required when -registry-prune-registry-pod is set")
 	fs.StringVar(&c.SizePath, "registry-prune-size-path", "",
 		"the storage directory as seen INSIDE the registry container (its rootdirectory), used only for du; empty uses /var/lib/registry")
+
+	fs.StringVar(&c.GCImage, "registry-prune-gc-image", "",
+		"container image for the one-shot blob-GC pod (e.g. to pin by digest); empty uses registry:2")
+	fs.StringVar(&c.GCConfigPath, "registry-prune-gc-config-path", "",
+		"path to the registry config.yml as seen INSIDE the GC pod's container; empty uses /etc/docker/registry/config.yml. Moves if the GC image's base changes")
+	fs.StringVar(&c.GCMountPath, "registry-prune-gc-mount-path", "",
+		"where -registry-prune-storage-path is mounted INSIDE the GC pod; empty uses /var/lib/registry. Distinct from -registry-prune-size-path, which is the path inside the REGISTRY container, not the GC pod")
+	fs.DurationVar(&c.GCTimeout, "registry-prune-gc-timeout", 0,
+		"how long to wait for the one-shot blob-GC pod to finish; must be positive if set. Empty/zero uses BlobGC's own 30m default")
 	return c
 }
 
@@ -112,9 +136,12 @@ func registryPruneFlags(fs *flag.FlagSet) *registryPruneConfig {
 // the same shape, and it is accepted rather than fixed: the blast radius is a
 // dangling tag whose manifest can be re-pushed, not unrecoverable data. A real
 // fix means re-resolving each candidate immediately before deleting it.
+// inventoryInterval is -inventory-refresh-interval, passed through so
+// buildRegistryPrune can cross-check it against -registry-prune-max-snapshot-age
+// (#229) — see registrySnapshotAgeBudgetError.
 func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg *imgregistry.HTTPClient,
 	svc *instance.Service, specs registryprune.SpecSource, pod registryprune.PodRunner,
-	metrics registryprune.Metrics) (*registryprune.Handler, error) {
+	metrics registryprune.Metrics, inventoryInterval time.Duration) (*registryprune.Handler, error) {
 
 	if !cfg.Enabled {
 		return nil, nil
@@ -132,6 +159,9 @@ func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg *imgre
 	}
 	if cfg.MaxSnapshotAge <= 0 {
 		return nil, fmt.Errorf("registry prune: -registry-prune-max-snapshot-age must be positive, got %s", cfg.MaxSnapshotAge)
+	}
+	if verr := registrySnapshotAgeBudgetError(cfg.MaxSnapshotAge, inventoryInterval); verr != nil {
+		return nil, verr
 	}
 
 	// Validated at STARTUP, not on the first run. A malformed spelling can never
@@ -177,6 +207,9 @@ func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg *imgre
 		if !strings.HasPrefix(cfg.StoragePath, "/") {
 			return nil, fmt.Errorf("registry prune: -registry-prune-storage-path %q must be an absolute host path when -registry-prune-registry-pod is set", cfg.StoragePath)
 		}
+		if cfg.GCTimeout < 0 {
+			return nil, fmt.Errorf("registry prune: -registry-prune-gc-timeout must be positive (zero uses the 30m default), got %s", cfg.GCTimeout)
+		}
 		gcPod := strings.TrimSpace(cfg.GCPod)
 		if gcPod == "" {
 			gcPod = defaultGCPodName
@@ -201,11 +234,46 @@ func buildRegistryPrune(cfg registryPruneConfig, registryBase string, reg *imgre
 			RegistryPod:       regPod,
 			RegistryContainer: cfg.RegistryContainer,
 			StoragePath:       cfg.StoragePath,
-			SizePath:          cfg.SizePath,
+			SizePath:          strings.TrimSpace(cfg.SizePath),
 			PodName:           gcPod,
+			Image:             strings.TrimSpace(cfg.GCImage),
+			ConfigPath:        strings.TrimSpace(cfg.GCConfigPath),
+			MountPath:         strings.TrimSpace(cfg.GCMountPath),
+			Timeout:           cfg.GCTimeout,
 		}
 	}
 	return h, nil
+}
+
+// registrySnapshotAgeBudgetError fails startup when a prune run can never
+// complete: BuildInUseSet aborts with ErrUnsafeToPrune whenever a host's
+// inventory snapshot is older than -registry-prune-max-snapshot-age, and
+// between two poller ticks a snapshot's age climbs from ~0 up to
+// -inventory-refresh-interval. Set MaxSnapshotAge at or below that interval
+// and every run aborts by construction — the feature reports itself enabled
+// and never once completes, which is exactly the silent-non-execution shape
+// #219 exists to eliminate.
+//
+// Mirrors statsBudgetWarning's cross-check pattern (server.go, #212) but
+// fails the boot rather than only warning: unlike a stretched poll cadence
+// (degradation), an unusable prune schedule is a feature that is silently
+// entirely absent.
+//
+// inventoryInterval <= 0 means the poller is disabled; this check is then
+// silent, because it has nothing meaningful to compare MaxSnapshotAge
+// against — the poller's own cadence does not exist.
+func registrySnapshotAgeBudgetError(maxSnapshotAge, inventoryInterval time.Duration) error {
+	if inventoryInterval <= 0 {
+		return nil
+	}
+	if maxSnapshotAge > inventoryInterval {
+		return nil
+	}
+	return fmt.Errorf("registry prune: -registry-prune-max-snapshot-age (%s) is not greater than "+
+		"-inventory-refresh-interval (%s): a host's snapshot age reaches the interval between "+
+		"refreshes, so every prune run would abort as unsafe (stale snapshot). Raise "+
+		"-registry-prune-max-snapshot-age above -inventory-refresh-interval, or lower the interval",
+		maxSnapshotAge, inventoryInterval)
 }
 
 // registryPruneBlobGCEnabled reports whether Stage B is configured. Defined

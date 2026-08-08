@@ -3,12 +3,20 @@ package server
 import (
 	"flag"
 	"testing"
+	"time"
 
 	"github.com/iotready/podman-api/internal/imgregistry"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/registryprune"
 )
+
+// defaultTestInventoryInterval is the fixture value passed as
+// buildRegistryPrune's inventoryInterval parameter everywhere the interaction
+// with -registry-prune-max-snapshot-age is not itself under test. It matches
+// -inventory-refresh-interval's own default (server.go), and every fixture
+// config here leaves -registry-prune-max-snapshot-age comfortably above it.
+const defaultTestInventoryInterval = 30 * time.Second
 
 func parsedRegistryPruneFlags(t *testing.T, args ...string) *registryPruneConfig {
 	t.Helper()
@@ -39,6 +47,21 @@ func TestRegistryPruneFlags_DefaultsAreOff(t *testing.T) {
 	if c.MaxDeletesPerRepo <= 0 {
 		t.Errorf("-registry-prune-max-deletes-per-repo must default positive (the tripwire), got %d", c.MaxDeletesPerRepo)
 	}
+	// #227: all four default to empty/zero so BlobGC's OWN defaults (registry:2,
+	// /etc/docker/registry/config.yml, /var/lib/registry, 30m) apply unless an
+	// operator overrides them.
+	if c.GCImage != "" {
+		t.Errorf("-registry-prune-gc-image must default to empty, got %q", c.GCImage)
+	}
+	if c.GCConfigPath != "" {
+		t.Errorf("-registry-prune-gc-config-path must default to empty, got %q", c.GCConfigPath)
+	}
+	if c.GCMountPath != "" {
+		t.Errorf("-registry-prune-gc-mount-path must default to empty, got %q", c.GCMountPath)
+	}
+	if c.GCTimeout != 0 {
+		t.Errorf("-registry-prune-gc-timeout must default to zero, got %s", c.GCTimeout)
+	}
 }
 
 // The whole-registry-destroyed guard, at the flag layer. If the two names
@@ -65,7 +88,7 @@ func enabledConfig(t *testing.T) *registryPruneConfig {
 
 func TestBuildRegistryPrune_DisabledByDefault(t *testing.T) {
 	h, err := buildRegistryPrune(*parsedRegistryPruneFlags(t), "http://reg.example:5000",
-		testRegistryClient(), testSvc(), nil, nil, nil)
+		testRegistryClient(), testSvc(), nil, nil, nil, defaultTestInventoryInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -77,7 +100,7 @@ func TestBuildRegistryPrune_DisabledByDefault(t *testing.T) {
 // A nil registry client disables the feature outright, exactly like the
 // registry browser: there is nothing to prune and nothing to talk to.
 func TestBuildRegistryPrune_NilRegistryClientDisables(t *testing.T) {
-	h, err := buildRegistryPrune(*enabledConfig(t), "", nil, testSvc(), nil, nil, nil)
+	h, err := buildRegistryPrune(*enabledConfig(t), "", nil, testSvc(), nil, nil, nil, defaultTestInventoryInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +111,7 @@ func TestBuildRegistryPrune_NilRegistryClientDisables(t *testing.T) {
 
 func TestBuildRegistryPrune_EnabledBuildsAHandler(t *testing.T) {
 	h, err := buildRegistryPrune(*enabledConfig(t), "http://reg.example:5000",
-		testRegistryClient(), testSvc(), nil, nil, nil)
+		testRegistryClient(), testSvc(), nil, nil, nil, defaultTestInventoryInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +128,7 @@ func TestBuildRegistryPrune_EnabledBuildsAHandler(t *testing.T) {
 // un-protects every tag-pinned image in the fleet.
 func TestBuildRegistryPrune_RegistryHostsDeriveFromTheClientBase(t *testing.T) {
 	const base = "http://reg.example:5000"
-	h, err := buildRegistryPrune(*enabledConfig(t), base, testRegistryClient(), testSvc(), nil, nil, nil)
+	h, err := buildRegistryPrune(*enabledConfig(t), base, testRegistryClient(), testSvc(), nil, nil, nil, defaultTestInventoryInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,7 +148,7 @@ func TestBuildRegistryPrune_RejectsGCPodEqualToRegistryPod(t *testing.T) {
 		"-registry-prune-gc-pod=registry-main",
 		"-registry-prune-storage-path=/srv/registry",
 	)
-	if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil); err == nil {
+	if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil, defaultTestInventoryInterval); err == nil {
 		t.Fatal("want an error when the GC pod name is the registry's own pod name")
 	}
 }
@@ -149,7 +172,7 @@ func TestBuildRegistryPrune_CollisionGuardIgnoresCaseAndSurroundingSpace(t *test
 				"-registry-prune-gc-pod="+tc.gcPod,
 				"-registry-prune-storage-path=/srv/registry",
 			)
-			if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil); err == nil {
+			if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil, defaultTestInventoryInterval); err == nil {
 				t.Fatalf("accepted GC pod %q against registry pod %q: playing it would replace and then destroy the registry", tc.gcPod, tc.registryPod)
 			}
 		})
@@ -166,7 +189,7 @@ func TestBuildRegistryPrune_TrimsPodNamesBeforeTheyReachBlobGC(t *testing.T) {
 		"-registry-prune-gc-pod=  blob-gc-one-shot  ",
 		"-registry-prune-storage-path=/srv/registry",
 	)
-	h, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil)
+	h, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil, defaultTestInventoryInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,14 +201,65 @@ func TestBuildRegistryPrune_TrimsPodNamesBeforeTheyReachBlobGC(t *testing.T) {
 	}
 }
 
+// A whitespace-only -registry-prune-gc-image/-gc-config-path/-gc-mount-path
+// is not the empty string BlobGC.image()/configPath()/mountPath() check for a
+// default fallback, so it would otherwise be used verbatim and fail opaquely
+// deep inside the GC pod rather than defaulting the way an actually-empty
+// flag does. Trim here, matching GCPod two lines above in buildRegistryPrune.
+func TestBuildRegistryPrune_TrimsGCImageConfigAndMountPath(t *testing.T) {
+	c := *parsedRegistryPruneFlags(t,
+		"-registry-prune-enabled",
+		"-registry-prune-host=otp-infra-1",
+		"-registry-prune-registry-pod=registry-main",
+		"-registry-prune-storage-path=/srv/registry",
+		"-registry-prune-gc-image=   ",
+		"-registry-prune-gc-config-path=   ",
+		"-registry-prune-gc-mount-path=   ",
+		"-registry-prune-size-path=   ",
+	)
+	h, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil, defaultTestInventoryInterval)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.BlobGC.Image != "" {
+		t.Errorf("Image = %q, want it trimmed to empty so BlobGC.image() falls back to its own default", h.BlobGC.Image)
+	}
+	if h.BlobGC.ConfigPath != "" {
+		t.Errorf("ConfigPath = %q, want it trimmed to empty so BlobGC.configPath() falls back to its own default", h.BlobGC.ConfigPath)
+	}
+	if h.BlobGC.MountPath != "" {
+		t.Errorf("MountPath = %q, want it trimmed to empty so BlobGC.mountPath() falls back to its own default", h.BlobGC.MountPath)
+	}
+	if h.BlobGC.SizePath != "" {
+		t.Errorf("SizePath = %q, want it trimmed to empty so BlobGC.sizePath() falls back to its own default", h.BlobGC.SizePath)
+	}
+}
+
 func TestBuildRegistryPrune_RegistryPodWithoutStoragePathIsRejected(t *testing.T) {
 	c := *parsedRegistryPruneFlags(t,
 		"-registry-prune-enabled",
 		"-registry-prune-host=otp-infra-1",
 		"-registry-prune-registry-pod=registry-main",
 	)
-	if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil); err == nil {
+	if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil, defaultTestInventoryInterval); err == nil {
 		t.Fatal("want an error: a blob GC with no storage path can never run")
+	}
+}
+
+// #227: a negative GC timeout can only misbehave (BlobGC.timeout() treats
+// anything <= 0 as "use the 30m default", so a negative value silently means
+// something other than what was asked for) and is rejected at startup rather
+// than discovered later.
+func TestBuildRegistryPrune_RejectsNegativeGCTimeout(t *testing.T) {
+	c := *parsedRegistryPruneFlags(t,
+		"-registry-prune-enabled",
+		"-registry-prune-host=otp-infra-1",
+		"-registry-prune-registry-pod=registry-main",
+		"-registry-prune-storage-path=/srv/registry",
+		"-registry-prune-gc-timeout=-1m",
+	)
+	if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil, defaultTestInventoryInterval); err == nil {
+		t.Fatal("want an error for a negative -registry-prune-gc-timeout")
 	}
 }
 
@@ -197,7 +271,7 @@ func TestBuildRegistryPrune_BlobGCWiredWhenFullyConfigured(t *testing.T) {
 		"-registry-prune-registry-container=registry-main-registry",
 		"-registry-prune-storage-path=/srv/registry",
 	)
-	h, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil)
+	h, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, fake.New(), nil, defaultTestInventoryInterval)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,6 +280,53 @@ func TestBuildRegistryPrune_BlobGCWiredWhenFullyConfigured(t *testing.T) {
 	}
 	if h.BlobGC.PodName == h.BlobGC.RegistryPod {
 		t.Fatal("GC pod name must never equal the registry pod name")
+	}
+}
+
+// #229: -registry-prune-max-snapshot-age set at or below
+// -inventory-refresh-interval makes every prune run abort on a stale snapshot
+// by construction between refreshes, while the feature reports itself as
+// enabled and never completes a run. That must fail startup, not run silently
+// broken.
+func TestBuildRegistryPrune_RejectsMaxSnapshotAgeAtOrBelowInventoryInterval(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		maxSnapshotAge string
+		interval       time.Duration
+	}{
+		{"equal", "60s", 60 * time.Second},
+		{"below", "30s", 60 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := *parsedRegistryPruneFlags(t,
+				"-registry-prune-enabled",
+				"-registry-prune-max-snapshot-age="+tc.maxSnapshotAge,
+			)
+			if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, nil, nil, tc.interval); err == nil {
+				t.Fatalf("want an error: -registry-prune-max-snapshot-age=%s is not above the %s inventory interval, "+
+					"so every run would abort with a stale snapshot", tc.maxSnapshotAge, tc.interval)
+			}
+		})
+	}
+}
+
+// The inverse: comfortably above the interval must build cleanly.
+func TestBuildRegistryPrune_AcceptsMaxSnapshotAgeAboveInventoryInterval(t *testing.T) {
+	c := *parsedRegistryPruneFlags(t,
+		"-registry-prune-enabled",
+		"-registry-prune-max-snapshot-age=10m",
+	)
+	if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, nil, nil, 30*time.Second); err != nil {
+		t.Fatalf("10m max-snapshot-age against a 30s inventory interval should build cleanly: %v", err)
+	}
+}
+
+// The inventory poller disabled (interval <= 0) is silent: there is nothing
+// for this check to compare MaxSnapshotAge against.
+func TestBuildRegistryPrune_SilentWhenInventoryPollerDisabled(t *testing.T) {
+	c := *parsedRegistryPruneFlags(t, "-registry-prune-enabled")
+	if _, err := buildRegistryPrune(c, "http://reg.example:5000", testRegistryClient(), testSvc(), nil, nil, nil, 0); err != nil {
+		t.Fatalf("an inventory interval of 0 (poller disabled) must not trip the cross-check: %v", err)
 	}
 }
 
@@ -221,7 +342,7 @@ func TestJobRegistry_RegistryPruneAbsentWhenNotWired(t *testing.T) {
 
 func TestJobRegistry_RegistryPruneRegisteredWhenWired(t *testing.T) {
 	h, err := buildRegistryPrune(*enabledConfig(t), "http://reg.example:5000",
-		testRegistryClient(), testSvc(), nil, nil, nil)
+		testRegistryClient(), testSvc(), nil, nil, nil, defaultTestInventoryInterval)
 	if err != nil {
 		t.Fatal(err)
 	}

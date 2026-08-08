@@ -292,7 +292,7 @@ func RunWithFlags(opts ...Option) error {
 	if regPruneCfg.Enabled && registryPruneClient != nil {
 		regPruneMetrics = obs.NewRegistryPruneMetrics(prometheus.DefaultRegisterer)
 	}
-	regPruneHandler, err := buildRegistryPrune(*regPruneCfg, registryBase, registryPruneClient, svc, db, client, regPruneMetrics)
+	regPruneHandler, err := buildRegistryPrune(*regPruneCfg, registryBase, registryPruneClient, svc, db, client, regPruneMetrics, *inventoryInterval)
 	if err != nil {
 		return err
 	}

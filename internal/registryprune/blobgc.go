@@ -33,10 +33,10 @@ const (
 	defaultConfigPath = "/etc/docker/registry/config.yml"
 	defaultMountPath  = "/var/lib/registry"
 	defaultGCTimeout  = 30 * time.Minute
-	// restartGrace bounds the deferred restart's own context. It is derived
-	// from context.WithoutCancel so a cancelled or timed-out job still gets
-	// the registry back: the one outcome this stage must never produce is a
-	// fleet with no registry.
+	// restartGrace bounds the deferred teardown's own context (the best-effort
+	// removal of the exited GC pod). It is derived from context.WithoutCancel
+	// so a cancelled or timed-out job still gets the teardown attempted: the
+	// one outcome this stage must never produce is a fleet with no registry.
 	restartGrace = 2 * time.Minute
 	// restartAttempts is how many times PodStart is tried before the stage
 	// gives up and fails the job. More than one because the alternative to a
@@ -54,6 +54,19 @@ const (
 // restartRetryDelay is the pause between restart attempts. A var, not a const,
 // so tests can collapse it.
 var restartRetryDelay = 2 * time.Second
+
+// restartAttemptTimeout bounds ONE restart attempt's own PodStart call. A var,
+// not a const, so tests can shrink it without sleeping for real minutes.
+//
+// #226: this must be applied PER ATTEMPT, derived fresh via
+// context.WithoutCancel for each of the restartAttempts tries — never shared
+// across attempts. A single context built once and reused for every attempt
+// gives the retry budget away to whichever attempt hangs first: a PodStart
+// that never returns on its own consumes the whole shared deadline, and every
+// later attempt then starts with an already-expired context and fails
+// instantly. The retry loop is only a real retry if each attempt gets its own
+// full budget regardless of how earlier attempts spent theirs.
+var restartAttemptTimeout = 2 * time.Minute
 
 // Result is Stage B's measured outcome, returned as data rather than only as
 // formatted job steps: the bytes-reclaimed metric has no other data path, and
@@ -228,14 +241,25 @@ func (g *BlobGC) Reclaim(ctx context.Context, jc *jobs.JobContext, p Payload) (r
 	// through the restart.
 	played := false
 	defer func() {
-		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restartGrace)
-		defer cancel()
 		// Restarting the registry is the FIRST thing this path does — before
 		// sizing, before tearing the GC pod down — so nothing slow or failing
 		// can sit between an aborted GC and the registry coming back. That is
 		// also why the GC pod's removal lives here rather than in its own
 		// defer: a later-registered defer would run first.
-		serr := g.startRegistry(rctx, jc)
+		//
+		// ctx (the ORIGINAL job context, not a derived one) is passed straight
+		// through: startRegistry derives its own fresh, bounded context PER
+		// ATTEMPT from it (#226), so a cancelled or expired ctx here still
+		// yields a full budget per attempt rather than an already-dead shared
+		// one.
+		serr := g.startRegistry(ctx, jc)
+
+		// Teardown of the GC pod gets its own bounded context, independent of
+		// whatever the restart attempts spent: a hung attempt must not be
+		// able to eat the removal's budget any more than it should be able to
+		// eat a later attempt's.
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restartGrace)
+		defer cancel()
 		if played {
 			// Best-effort teardown of the exited one-shot pod. A leftover pod
 			// is not a failure (PlayKube replaces), so this never changes the
@@ -338,13 +362,21 @@ func (g *BlobGC) Reclaim(ctx context.Context, jc *jobs.JobContext, p Payload) (r
 // prune. Attempts are bounded and every one is logged, so a genuinely broken
 // start still fails the job loudly rather than looping.
 //
-// ctx is the restart-grace context, already derived with WithoutCancel, so a
-// cancelled job does not abort the retries. If it does expire mid-backoff the
-// loop stops early and returns the last error.
+// ctx is the ORIGINAL job context, untouched — deliberately not pre-bounded
+// and not pre-derived with WithoutCancel by the caller. #226: each attempt
+// below derives its OWN fresh context via context.WithTimeout(
+// context.WithoutCancel(ctx), restartAttemptTimeout), the same pattern
+// sizeTimeout already uses for `du`. A cancelled or expired ctx therefore
+// still gives every attempt its full budget, and — the property this fixes —
+// a PodStart that HANGS for the whole of one attempt's budget cannot starve
+// the attempts after it: each gets a clean slate, not whatever the previous
+// attempt left on a shared clock.
 func (g *BlobGC) startRegistry(ctx context.Context, jc *jobs.JobContext) error {
 	var last error
 	for attempt := 1; attempt <= restartAttempts; attempt++ {
-		last = g.Podman.PodStart(ctx, g.HostID, g.RegistryPod)
+		actx, cancel := context.WithTimeout(context.WithoutCancel(ctx), restartAttemptTimeout)
+		last = g.Podman.PodStart(actx, g.HostID, g.RegistryPod)
+		cancel()
 		if last == nil {
 			if attempt > 1 {
 				jc.Step("blob-gc:registry-start", fmt.Sprintf("registry start succeeded on attempt %d", attempt))
@@ -356,11 +388,7 @@ func (g *BlobGC) startRegistry(ctx context.Context, jc *jobs.JobContext) error {
 		if attempt == restartAttempts {
 			break
 		}
-		select {
-		case <-ctx.Done():
-			return last
-		case <-time.After(restartRetryDelay):
-		}
+		time.Sleep(restartRetryDelay)
 	}
 	return last
 }
