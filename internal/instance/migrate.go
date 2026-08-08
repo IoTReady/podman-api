@@ -414,9 +414,16 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 
 	step("apply-dest", req.ToHost)
 	applyStart := time.Now()
+	// AllowMissingSecrets: the source spec is already running (and therefore
+	// already valid), so it may legitimately lack a secret its template
+	// declared optionally after the instance was deployed (e.g. frappe-otp's
+	// vpn-* secrets, only present on VPN-enabled instances). Requiring every
+	// declared secret here — as spec_reconcile.go's boot-time reconcile
+	// deliberately does not — would block migrating any instance that never
+	// needed a secret the template later grew.
 	if err := s.Apply(ctx, req.ToHost, ApplyRequest{
 		Template: req.Template, Slug: req.Slug, Parameters: eff, Secrets: secrets, Domains: domains,
-	}, ApplyOptions{Replace: false}); err != nil {
+	}, ApplyOptions{Replace: false, AllowMissingSecrets: true}); err != nil {
 		return stoppedPaired, fmt.Errorf("apply on dest: %w", err)
 	}
 	step("apply-dest-done", fmt.Sprintf("%s (%s)", req.ToHost, time.Since(applyStart)))

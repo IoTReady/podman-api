@@ -196,14 +196,17 @@ func TestPlanEvacuation_InconclusiveCheck(t *testing.T) {
 func TestPlanEvacuation_InvalidParameters(t *testing.T) {
 	svc, _, mem := newPlanSvc(t)
 	ctx := context.Background()
-	// Contract drift: the stored postgres spec predates a required param/secret
-	// (here it omits the "password" secret). Body rendering tolerates this, so the
-	// live port check passes — but the executor's Apply-time render.Validate would
-	// reject it. The preview must predict that with an invalid_parameters issue.
+	// Contract drift: the stored postgres spec predates a required parameter
+	// (here it omits "user"). Body rendering tolerates this, so the live port
+	// check passes — but the executor's Apply-time render.Validate would
+	// reject it. The preview must predict that with an invalid_parameters
+	// issue. (A missing *secret* is deliberately NOT this kind of drift — see
+	// TestPlanEvacuation_MissingOptionalSecret_StillOK — since Migrate's real
+	// apply tolerates it.)
 	require.NoError(t, mem.PutSpec(ctx, store.Spec{
 		Host: "h1", Template: "postgres", Slug: "db1",
-		Parameters: map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"},
-		// Secrets intentionally omitted.
+		Parameters: map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d"},
+		Secrets:    map[string]string{"password": "p"},
 	}))
 
 	plan, err := svc.PlanEvacuation(ctx, EvacuateRequest{FromHost: "h1", Map: map[string]string{"db1": "h2"}})
@@ -212,7 +215,34 @@ func TestPlanEvacuation_InvalidParameters(t *testing.T) {
 	assert.False(t, plan.Moves[0].OK)
 	require.Len(t, plan.Moves[0].Issues, 1)
 	assert.Equal(t, "invalid_parameters", plan.Moves[0].Issues[0].Code)
-	assert.Contains(t, plan.Moves[0].Issues[0].Message, "password")
+	assert.Contains(t, plan.Moves[0].Issues[0].Message, "user")
+}
+
+// TestPlanEvacuation_MissingOptionalSecret_StillOK proves the preview and the
+// real Migrate() apply agree: an instance missing a secret its template
+// declares but never required it to supply (e.g. frappe-otp's vpn-* secrets
+// on a non-VPN instance) previews as OK, matching migrate.go's
+// AllowMissingSecrets apply.
+func TestPlanEvacuation_MissingOptionalSecret_StillOK(t *testing.T) {
+	f := fake.New()
+	hosts := []config.Host{
+		{ID: "h1", Addr: "unix", Socket: "/x"},
+		{ID: "h2", Addr: "unix", Socket: "/y"},
+	}
+	svc, mem := newSvcWith(t, f, hosts, pgTemplateWithOptionalSecret())
+	ctx := context.Background()
+	require.NoError(t, mem.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "postgres", Slug: "db1",
+		Parameters: map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"},
+		Secrets:    map[string]string{"password": "p"}, // no vpn-psk
+	}))
+	f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
+
+	plan, err := svc.PlanEvacuation(ctx, EvacuateRequest{FromHost: "h1", Map: map[string]string{"db1": "h2"}})
+	require.NoError(t, err)
+	require.Len(t, plan.Moves, 1)
+	assert.True(t, plan.Moves[0].OK)
+	assert.Empty(t, plan.Moves[0].Issues)
 }
 
 func TestPlanEvacuation_StaticValidationErrors(t *testing.T) {

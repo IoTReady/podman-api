@@ -77,12 +77,17 @@ func (s *Service) planMove(ctx context.Context, m MigrateRequest) PlannedMove {
 	eff := mergeParams(spec.Parameters, m.Parameters)
 	eff["slug"] = m.Slug // canonical slug always wins; pod name must match podName()
 	// Predict the executor's Apply-time contract check: Migrate ultimately calls
-	// Apply on the destination, which runs render.Validate. The live port check
-	// below only renders the body (RenderBody fills defaults but does not run the
-	// contract validation), so without this
-	// a spec stored under an old, looser template contract would preview ok=true
-	// yet fail the real evacuate at apply.
-	if err := render.Validate(tmpl.Meta, eff, spec.Secrets); err != nil {
+	// Apply on the destination with AllowMissingSecrets (the source spec is
+	// already running, so it may legitimately lack a secret its template
+	// declared after the instance was deployed — see migratePostStop). Use
+	// the same tolerant validation here, or a spec missing only an
+	// optionally-declared secret would preview as blocked while the real
+	// evacuate succeeds — the two must never disagree. The live port check
+	// below only renders the body (RenderBody fills defaults but does not run
+	// the contract validation), so without this a spec stored under an old,
+	// looser template contract (e.g. an unknown parameter) would preview
+	// ok=true yet fail the real evacuate at apply.
+	if err := render.ValidateAllowMissingSecrets(tmpl.Meta, eff, spec.Secrets); err != nil {
 		pm.Issues = append(pm.Issues, PlanIssue{Code: codeInvalidParameters, Message: err.Error()})
 	}
 	errs, provisionable := s.preflightIssues(ctx, m, tmpl, eff, false)

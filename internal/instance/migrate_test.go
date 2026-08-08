@@ -50,6 +50,15 @@ spec:
 	}
 }
 
+// pgTemplateWithOptionalSecret is pgTemplate plus a second declared
+// per-instance secret that an instance is never required to actually supply —
+// mirroring frappe-otp's vpn-* secrets, which only VPN-enabled instances use.
+func pgTemplateWithOptionalSecret() store.Template {
+	tmpl := pgTemplate()
+	tmpl.Meta.Secrets.PerInstance = append(tmpl.Meta.Secrets.PerInstance, "vpn-psk")
+	return tmpl
+}
+
 func newMigrateSvc(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
 	t.Helper()
 	hosts := []config.Host{
@@ -233,6 +242,36 @@ func TestMigrate_HappyPath(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"load", "preflight", "stop-source", "copy-volume", "copy-volume-done", "verify-volume", "apply-dest", "apply-dest-done", "verify", "commit"}, steps)
+}
+
+// TestMigrate_InstanceMissingOptionalDeclaredSecret_Succeeds reproduces a live
+// failure: migrating an instance whose template later grew an optional
+// per-instance secret (e.g. frappe-otp's vpn-* secrets, added for VPN support)
+// that this particular instance never supplied. The destination apply must
+// not require every declared secret — only the ones the source spec actually
+// has — the same tolerance boot-time reconcile already grants.
+func TestMigrate_InstanceMissingOptionalDeclaredSecret_Succeeds(t *testing.T) {
+	ctx := context.Background()
+	hosts := []config.Host{
+		{ID: "h1", Addr: "unix", Socket: "/x"},
+		{ID: "h2", Addr: "unix", Socket: "/y"},
+	}
+	f := fake.New()
+	svc, mem := newSvcWith(t, f, hosts, pgTemplateWithOptionalSecret())
+	params := map[string]any{"slug": "db1", "image": "x", "port": 5432, "db": "d", "user": "u"}
+
+	require.NoError(t, mem.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "postgres", Slug: "db1",
+		Parameters: params, Secrets: map[string]string{"password": "p"}, // no vpn-psk
+	}))
+	f.AddPod("h1", podman.Pod{Name: "postgres-db1", Status: "Running"})
+
+	err := svc.Migrate(ctx, MigrateRequest{FromHost: "h1", ToHost: "h2", Template: "postgres", Slug: "db1"}, nil)
+	require.NoError(t, err)
+
+	p, err := f.PodInspect(ctx, "h2", "postgres-db1")
+	require.NoError(t, err)
+	assert.Equal(t, "Running", p.Status)
 }
 
 func TestMigrate_AlsoStop(t *testing.T) {
