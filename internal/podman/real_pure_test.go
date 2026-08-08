@@ -20,6 +20,36 @@ func TestURIFor_UnknownHost(t *testing.T) {
 	assert.Contains(t, err.Error(), "unknown host")
 }
 
+// volumeTransferTimeoutOverride is a package var (like callTimeout itself),
+// so these restore it afterwards rather than leaking state into other tests
+// in this package.
+func resetVolumeTransferTimeoutOverride(t *testing.T) {
+	t.Cleanup(func() { volumeTransferTimeoutOverride = 0 })
+}
+
+func TestVolumeTransferTimeout_DefaultsToCallTimeout(t *testing.T) {
+	resetVolumeTransferTimeoutOverride(t)
+
+	assert.Equal(t, callTimeout, volumeTransferTimeout())
+}
+
+func TestVolumeTransferTimeout_SetOverridesDefault(t *testing.T) {
+	resetVolumeTransferTimeoutOverride(t)
+
+	SetVolumeTransferTimeout(2 * time.Hour)
+
+	assert.Equal(t, 2*time.Hour, volumeTransferTimeout())
+}
+
+func TestVolumeTransferTimeout_ZeroIsNoOp(t *testing.T) {
+	resetVolumeTransferTimeoutOverride(t)
+
+	SetVolumeTransferTimeout(2 * time.Hour)
+	SetVolumeTransferTimeout(0)
+
+	assert.Equal(t, 2*time.Hour, volumeTransferTimeout())
+}
+
 func TestParseProcUptime(t *testing.T) {
 	cases := []struct {
 		name string

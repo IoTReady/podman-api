@@ -83,6 +83,8 @@ func RunWithFlags(opts ...Option) error {
 		deployVerifyTimeout  = fs.Duration("deploy-verify-timeout", 30*time.Second, "how long to wait for container healthchecks to pass after deploy or start (0 = disabled)")
 		deployVerifyStable   = fs.Int("deploy-verify-stable-count", 1, "same as -migrate-verify-stable-count but for the deploy/start path; defaults to 1 since apps freshly applied there are less likely to cycle than during migration")
 
+		volumeTransferTimeout = fs.Duration("volume-transfer-timeout", 2*time.Hour, "max duration of a single volume export/import (backup, restore, migrate, rename): must cover the whole streamed transfer of a real volume's contents, not just issuing the request (#223 — a multi-hundred-MB volume over a tailnet link routinely exceeded the general-purpose 10-minute per-call timeout). Must be positive; zero/negative is rejected at startup rather than silently falling back to the 10-minute default")
+
 		pruneEnabled   = fs.Bool("prune-enabled", false, "enable scheduled host-health prune/cleanup")
 		pruneInterval  = fs.Duration("prune-interval", 24*time.Hour, "default interval between scheduled prunes per host")
 		pruneThreshold = fs.Int("prune-disk-threshold", 85, "disk used% high-water that triggers an early prune; 0 disables the threshold trigger")
@@ -153,10 +155,14 @@ func RunWithFlags(opts ...Option) error {
 	keyStore := auth.NewKeyStore(keys)
 	log.Printf("keys loaded: %d entries, fingerprint=%s", len(keys), fp)
 
+	if *volumeTransferTimeout <= 0 {
+		return fmt.Errorf("-volume-transfer-timeout must be positive, got %s", *volumeTransferTimeout)
+	}
 	client, err := podman.NewReal(hosts)
 	if err != nil {
 		return fmt.Errorf("podman: %w", err)
 	}
+	podman.SetVolumeTransferTimeout(*volumeTransferTimeout)
 	if err := client.Preflight(context.Background()); err != nil {
 		return fmt.Errorf("podman: %w", err)
 	}

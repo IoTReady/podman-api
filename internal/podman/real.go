@@ -233,6 +233,14 @@ func (r *Real) ensureVerified(c context.Context, id string) error {
 // the WithTimeout timer and the AfterFunc registration when the operation
 // completes, regardless of success or failure.
 func (r *Real) opCtxFor(parent context.Context, id string) (context.Context, context.CancelFunc, error) {
+	return r.opCtxForTimeout(parent, id, callTimeout)
+}
+
+// opCtxForTimeout is opCtxFor with an explicit deadline instead of the fixed
+// callTimeout, for operations (VolumeExport/VolumeImport) whose data volume,
+// not call count, drives how long they legitimately run. See
+// SetVolumeTransferTimeout.
+func (r *Real) opCtxForTimeout(parent context.Context, id string, timeout time.Duration) (context.Context, context.CancelFunc, error) {
 	c, err := r.ctxFor(parent, id)
 	if err != nil {
 		return nil, nil, err
@@ -240,7 +248,7 @@ func (r *Real) opCtxFor(parent context.Context, id string) (context.Context, con
 	if err := r.ensureVerified(c, id); err != nil {
 		return nil, nil, err
 	}
-	ctx, cancel := context.WithTimeout(c, callTimeout)
+	ctx, cancel := context.WithTimeout(c, timeout)
 	stop := context.AfterFunc(parent, cancel)
 	return ctx, func() { stop(); cancel() }, nil
 }
@@ -254,6 +262,48 @@ var preflightTimeout = 10 * time.Second
 // copy-volume-done and apply-dest) forever. 10 minutes covers large image
 // pulls; tests that need faster failure can override this package var.
 var callTimeout = 10 * time.Minute
+
+// volumeTransferTimeoutOverride bounds VolumeExport/VolumeImport when set
+// (SetVolumeTransferTimeout); zero (the default) falls back to callTimeout.
+// A package var, not a Real field, matching callTimeout/preflightTimeout
+// above and instance.SetDeployVerifyTimeout's shape: a startup-configured
+// knob, set once via the flag-wired setter before Preflight and read only
+// after — same "not mutated concurrently with live use" convention those
+// rely on, no additional locking needed or used elsewhere in this family.
+var volumeTransferTimeoutOverride time.Duration
+
+// SetVolumeTransferTimeout overrides the deadline VolumeExport/VolumeImport
+// derive their context from. No-op for d <= 0, matching
+// instance.SetDeployVerifyTimeout's convention — the caller (server.go)
+// separately rejects a non-positive flag value at startup so that is never a
+// silent fallback in practice.
+//
+// #223: those two stream GB-scale volume contents, not a single quick libpod
+// call, and a Frappe `sites` volume in the hundreds-of-MB-to-low-GB range
+// over a tailnet link routinely crossed callTimeout's 10-minute budget mid-
+// transfer — the export itself was healthy, it just outlived the same cap
+// meant for a single short RPC. This deadline covers the streamed transfer
+// itself; it does NOT extend ensureVerified's host-verification probe, which
+// (as before this change) runs on an undeadlined context — a first call to a
+// newly-added, slow-to-answer host can stall there before this timeout ever
+// engages.
+//
+// Call this once at startup from a configured flag; it is not safe to call
+// concurrently with an in-flight transfer.
+func SetVolumeTransferTimeout(d time.Duration) {
+	if d > 0 {
+		volumeTransferTimeoutOverride = d
+	}
+}
+
+// volumeTransferTimeout resolves the effective deadline for VolumeExport/
+// VolumeImport: the configured override if set, else callTimeout.
+func volumeTransferTimeout() time.Duration {
+	if volumeTransferTimeoutOverride > 0 {
+		return volumeTransferTimeoutOverride
+	}
+	return callTimeout
+}
 
 // Preflight enforces MinPodmanVersion at boot. ALL reachable hosts are checked
 // and any below the floor are collected; the returned error aggregates every
@@ -715,8 +765,13 @@ func (r *Real) VolumeRemove(ctx context.Context, id, name string, force bool) er
 // REST request directly rather than using the high-level volumes.Export binding
 // because that binding copies into an io.Writer, whereas our contract must hand
 // back a live io.ReadCloser for pipe streaming.
+//
+// The connection's context deadline is volumeTransferTimeout, not the shorter
+// callTimeout every other operation uses (#223): the caller streams the
+// response body to completion well after this call returns, so the deadline
+// must cover the whole transfer, not just issuing the request.
 func (r *Real) VolumeExport(ctx context.Context, id, name string) (io.ReadCloser, error) {
-	c, cancel, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxForTimeout(ctx, id, volumeTransferTimeout())
 	if err != nil {
 		return nil, err
 	}
@@ -741,7 +796,7 @@ func (r *Real) VolumeExport(ctx context.Context, id, name string) (io.ReadCloser
 
 // VolumeImport unpacks an uncompressed tar into an existing volume on the host.
 func (r *Real) VolumeImport(ctx context.Context, id, name string, src io.Reader) error {
-	c, cancel, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxForTimeout(ctx, id, volumeTransferTimeout())
 	if err != nil {
 		return err
 	}
