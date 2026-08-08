@@ -84,6 +84,7 @@ func RunWithFlags(opts ...Option) error {
 		deployVerifyStable   = fs.Int("deploy-verify-stable-count", 1, "same as -migrate-verify-stable-count but for the deploy/start path; defaults to 1 since apps freshly applied there are less likely to cycle than during migration")
 
 		volumeTransferTimeout = fs.Duration("volume-transfer-timeout", 2*time.Hour, "max duration of a single volume export/import (backup, restore, migrate, rename): must cover the whole streamed transfer of a real volume's contents, not just issuing the request (#223 — a multi-hundred-MB volume over a tailnet link routinely exceeded the general-purpose 10-minute per-call timeout). Must be positive; zero/negative is rejected at startup rather than silently falling back to the 10-minute default")
+		imagePullTimeout      = fs.Duration("image-pull-timeout", 2*time.Hour, "max duration of a single image pull (e.g. migrate preflight): must cover the whole pulled image, not just issuing the request (#238 — the same shape of large, network-bound transfer that motivated -volume-transfer-timeout for VolumeExport/VolumeImport in #223). Must be positive; zero/negative is rejected at startup rather than silently falling back to the 10-minute default")
 
 		pruneEnabled   = fs.Bool("prune-enabled", false, "enable scheduled host-health prune/cleanup")
 		pruneInterval  = fs.Duration("prune-interval", 24*time.Hour, "default interval between scheduled prunes per host")
@@ -158,11 +159,15 @@ func RunWithFlags(opts ...Option) error {
 	if *volumeTransferTimeout <= 0 {
 		return fmt.Errorf("-volume-transfer-timeout must be positive, got %s", *volumeTransferTimeout)
 	}
+	if *imagePullTimeout <= 0 {
+		return fmt.Errorf("-image-pull-timeout must be positive, got %s", *imagePullTimeout)
+	}
 	client, err := podman.NewReal(hosts)
 	if err != nil {
 		return fmt.Errorf("podman: %w", err)
 	}
 	podman.SetVolumeTransferTimeout(*volumeTransferTimeout)
+	podman.SetImagePullTimeout(*imagePullTimeout)
 	if err := client.Preflight(context.Background()); err != nil {
 		return fmt.Errorf("podman: %w", err)
 	}
