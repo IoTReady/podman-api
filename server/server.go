@@ -65,17 +65,18 @@ func RunWithFlags(opts ...Option) error {
 
 	fs := flag.NewFlagSet("podman-api", flag.ContinueOnError)
 	var (
-		addr          = fs.String("addr", "127.0.0.1:8080", "bind address for the API")
-		metricsAddr   = fs.String("metrics-addr", "", "if set, expose /metrics on this address (e.g. 127.0.0.1:9090); empty means no metrics endpoint")
-		hostsDir      = fs.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
-		keysFile      = fs.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
-		auditLogFile  = fs.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
-		stateDB       = fs.String("state-db", "/var/lib/podman-api/state.db", "SQLite path for the always-on template catalog + desired-state store")
-		specKeyFile   = fs.String("spec-key-file", "", "path to the 32-byte secret encryption key; optional — without it the store runs key-less (templates and no-secret specs work, secret ops are refused)")
-		backupDir     = fs.String("backup-dir", "", "directory for volume backup artifacts; empty derives <state-db dir>/backups")
-		jobsRetention = fs.Duration("jobs-retention", 0, "if >0, prune terminal jobs older than this (e.g. 168h); 0 disables")
-		evacConc      = fs.Int("evacuate-concurrency", 2, "max child migrations an evacuate runs at once (1..32); a request's \"concurrency\" overrides per call")
-		jobWorkers    = fs.Int("job-workers", jobs.DefaultWorkers, "size of the background job worker pool (<=0 uses the built-in default)")
+		addr             = fs.String("addr", "127.0.0.1:8080", "bind address for the API")
+		metricsAddr      = fs.String("metrics-addr", "", "if set, expose /metrics on this address (e.g. 127.0.0.1:9090); empty means no metrics endpoint")
+		hostsDir         = fs.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
+		keysFile         = fs.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
+		auditLogFile     = fs.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
+		stateDB          = fs.String("state-db", "/var/lib/podman-api/state.db", "SQLite path for the always-on template catalog + desired-state store")
+		specKeyFile      = fs.String("spec-key-file", "", "path to the 32-byte secret encryption key; optional — without it the store runs key-less (templates and no-secret specs work, secret ops are refused)")
+		backupDir        = fs.String("backup-dir", "", "directory for volume backup artifacts; empty derives <state-db dir>/backups")
+		jobsRetention    = fs.Duration("jobs-retention", 0, "if >0, prune terminal jobs older than this (e.g. 168h); 0 disables")
+		evacConc         = fs.Int("evacuate-concurrency", 2, "max child migrations an evacuate runs at once (1..32); a request's \"concurrency\" overrides per call")
+		jobWorkers       = fs.Int("job-workers", jobs.DefaultWorkers, "size of the background job worker pool (<=0 uses the built-in default)")
+		jobVolumeWorkers = fs.Int("job-volume-workers", 2, "workers reserved for volume-transfer-heavy job kinds (backup, restore, pitr-restore, migrate, evacuate); the rest of -job-workers serves every other kind. Must be less than -job-workers, else those kinds could starve everything else for up to -volume-transfer-timeout (#238, following up on #54); 0 disables the reservation (single shared pool, pre-#238 behaviour)")
 
 		migrateVerifyTimeout = fs.Duration("migrate-verify-timeout", 180*time.Second, "max wait for a migrated instance to become ready (running + declared healthchecks healthy) before reaping the source")
 		migrateVerifyVolumes = fs.Bool("migrate-verify-volumes", true, "verify each copied volume's content against the source before reaping the source (adds a re-export of source and dest per volume); false disables it")
@@ -323,10 +324,19 @@ func RunWithFlags(opts ...Option) error {
 	if workers <= 0 {
 		workers = jobs.DefaultWorkers
 	}
+	if *jobVolumeWorkers < 0 {
+		return fmt.Errorf("-job-volume-workers must be >= 0, got %d", *jobVolumeWorkers)
+	}
+	if *jobVolumeWorkers >= workers {
+		return fmt.Errorf("-job-volume-workers (%d) must be less than -job-workers (%d), else no workers are left for other job kinds", *jobVolumeWorkers, workers)
+	}
 	runner := jobs.NewRunner(db, registry, workers)
 	runner.Metrics = jobMetrics
 	canceller = runner
 	runner.SetReconcilers(reconcilers)
+	if *jobVolumeWorkers > 0 {
+		runner.SetVolumeTransferPool(jobs.VolumeTransferKinds, *jobVolumeWorkers)
+	}
 	runner.Start(runnerCtx)
 	if *jobsRetention > 0 {
 		runner.StartRetention(runnerCtx, *jobsRetention)

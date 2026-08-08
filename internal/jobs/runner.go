@@ -18,6 +18,19 @@ import (
 // fix (separate orchestration pool) remains a future option (#54).
 const DefaultWorkers = 8
 
+// VolumeTransferKinds are the job kinds whose handlers call
+// VolumeExport/VolumeImport (directly or via CopyVolume) on a worker's own
+// claimed goroutine, and so can legitimately hold that worker for up to
+// -volume-transfer-timeout (2h default): backup and restore stream a
+// volume's contents directly; migrate does so via CopyVolume; evacuate runs
+// its migrate children in-process on the parent's own claimed worker
+// (internal/evacuate/handler.go's runChild), not through the job queue, so
+// it's transitively volume-transfer-heavy for its whole fan-out. Intended
+// for server.go to pass to SetVolumeTransferPool, structurally addressing
+// the worker-pool starvation risk #237's 10min->2h deadline increase
+// created (#238, following up on #54).
+var VolumeTransferKinds = []string{"backup", "restore", "pitr-restore", "migrate", "evacuate"}
+
 // pollInterval is the safety-net wake even without a Notify (e.g. after a
 // restart that left queued jobs).
 const pollInterval = 5 * time.Second
