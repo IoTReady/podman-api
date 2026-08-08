@@ -327,15 +327,26 @@ func RunWithFlags(opts ...Option) error {
 	if *jobVolumeWorkers < 0 {
 		return fmt.Errorf("-job-volume-workers must be >= 0, got %d", *jobVolumeWorkers)
 	}
-	if *jobVolumeWorkers >= workers {
-		return fmt.Errorf("-job-volume-workers (%d) must be less than -job-workers (%d), else no workers are left for other job kinds", *jobVolumeWorkers, workers)
+	jobVolumeWorkersSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "job-volume-workers" {
+			jobVolumeWorkersSet = true
+		}
+	})
+	effectiveJobVolumeWorkers := *jobVolumeWorkers
+	if effectiveJobVolumeWorkers >= workers {
+		if jobVolumeWorkersSet {
+			return fmt.Errorf("-job-volume-workers (%d) must be less than -job-workers (%d), else no workers are left for other job kinds", *jobVolumeWorkers, workers)
+		}
+		log.Printf("job-volume-workers: default %d does not fit within -job-workers=%d, disabling the volume-transfer worker reservation (pass -job-volume-workers explicitly to override)", *jobVolumeWorkers, workers)
+		effectiveJobVolumeWorkers = 0
 	}
 	runner := jobs.NewRunner(db, registry, workers)
 	runner.Metrics = jobMetrics
 	canceller = runner
 	runner.SetReconcilers(reconcilers)
-	if *jobVolumeWorkers > 0 {
-		runner.SetVolumeTransferPool(jobs.VolumeTransferKinds, *jobVolumeWorkers)
+	if effectiveJobVolumeWorkers > 0 {
+		runner.SetVolumeTransferPool(jobs.VolumeTransferKinds, effectiveJobVolumeWorkers)
 	}
 	runner.Start(runnerCtx)
 	if *jobsRetention > 0 {

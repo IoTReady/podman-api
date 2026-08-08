@@ -367,6 +367,55 @@ func TestRunner_VolumeTransferPool_ReservedKindNotBlockedByGeneralKind(t *testin
 	})
 }
 
+func TestRunner_VolumeTransferPool_NotifyWakesBothPools(t *testing.T) {
+	// Regression test for a shared-poke-channel bug: a single Notify() call
+	// is received by exactly one waiting goroutine runner-wide (Go picks one
+	// random waiter among receivers on a channel), so with one poke channel
+	// shared by both pools, a Notify() covering both a reserved-kind and a
+	// general-kind enqueue could wake the wrong pool's worker, stranding the
+	// other job until the 5s poll tick fires. That's well past this test's
+	// waitFor deadline (2s), so this test deterministically fails pre-fix
+	// regardless of which worker the shared channel happens to wake: whoever
+	// it wakes claims its own job fine, but the OTHER kind's job is left
+	// with nobody listening on its behalf. Post-fix, Notify() broadcasts to
+	// a poke channel per pool, so both workers wake and both jobs complete
+	// promptly.
+	m := store.NewMemory()
+	reg := Registry{
+		"migrate": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+			return nil
+		}),
+		"prune": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+			return nil
+		}),
+	}
+	r := NewRunner(m, reg, 2)
+	r.SetVolumeTransferPool([]string{"migrate"}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.Start(ctx)
+
+	// Let both workers finish their initial (empty-queue) claim attempt and
+	// settle into their idle select before either job is enqueued, so the
+	// single Notify() below is what has to deliver both wakeups — not a
+	// lucky race where a worker's own startup claim attempt happens to run
+	// after the jobs already exist.
+	time.Sleep(50 * time.Millisecond)
+
+	mig, _ := m.Enqueue(context.Background(), "migrate", json.RawMessage(`{}`), "")
+	pr, _ := m.Enqueue(context.Background(), "prune", json.RawMessage(`{}`), "")
+	r.Notify()
+
+	waitFor(t, func() bool {
+		got, _ := m.GetJob(context.Background(), mig.ID)
+		return got.State == store.JobSucceeded
+	})
+	waitFor(t, func() bool {
+		got, _ := m.GetJob(context.Background(), pr.ID)
+		return got.State == store.JobSucceeded
+	})
+}
+
 func TestRunner_VolumeTransferPool_NoOpBelowThreshold(t *testing.T) {
 	m := store.NewMemory()
 	reg := Registry{"migrate": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {

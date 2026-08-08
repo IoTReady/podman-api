@@ -99,10 +99,20 @@ type Runner struct {
 	reconcileInterval time.Duration
 	workers           int
 	poke              chan struct{}
-	wg                sync.WaitGroup
-	mu                sync.Mutex
-	inflight          map[string]*inflightJob
-	Metrics           Metrics // optional; nil-safe
+	// pokeVolume/pokeGeneral are the split-pool equivalents of poke, used only
+	// when a volume-transfer sub-pool is configured (SetVolumeTransferPool):
+	// a single shared poke channel wakes exactly one worker runner-wide (Go
+	// delivers a channel send to one random waiter), which under the split
+	// pool could wake a worker in the wrong sub-pool for the job just
+	// enqueued, leaving the correct-pool worker asleep until the next
+	// pollInterval tick. Giving each pool its own channel and having Notify
+	// broadcast to all of them keeps wakeups pool-correct.
+	pokeVolume  chan struct{}
+	pokeGeneral chan struct{}
+	wg          sync.WaitGroup
+	mu          sync.Mutex
+	inflight    map[string]*inflightJob
+	Metrics     Metrics // optional; nil-safe
 
 	// volumeKinds/volumeWorkers configure a dedicated sub-pool reserved for
 	// volume-transfer-heavy job kinds (#238); see SetVolumeTransferPool.
@@ -143,6 +153,8 @@ func NewRunner(js store.JobStore, h Registry, workers int) *Runner {
 		reconcileInterval: defaultReconcileInterval,
 		workers:           workers,
 		poke:              make(chan struct{}, 1),
+		pokeVolume:        make(chan struct{}, 1),
+		pokeGeneral:       make(chan struct{}, 1),
 		inflight:          map[string]*inflightJob{},
 	}
 }
@@ -193,10 +205,20 @@ func (r *Runner) reconcilableKinds() []string {
 // Notify wakes a worker to check for new work; call after an Enqueue. Non-blocking.
 // One Notify is sufficient for a batch of enqueues — a woken worker drains the
 // queue exhaustively before sleeping again.
+//
+// It broadcasts to all three poke channels (poke, pokeVolume, pokeGeneral) so
+// that whichever pool configuration is in effect (unsplit, or split via
+// SetVolumeTransferPool) gets a prompt wakeup rather than racing the
+// pollInterval ticker. In the unsplit case pokeVolume/pokeGeneral are never
+// read by any worker; each is buffer-1, so the first Notify() after a worker
+// last drained it fills the buffer and every subsequent Notify() before that
+// is harmless — not a leak, just a channel that stays "primed" and unread.
 func (r *Runner) Notify() {
-	select {
-	case r.poke <- struct{}{}:
-	default:
+	for _, ch := range []chan struct{}{r.poke, r.pokeVolume, r.pokeGeneral} {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -237,11 +259,11 @@ func (r *Runner) Start(ctx context.Context) {
 	if len(r.volumeKinds) > 0 && r.volumeWorkers > 0 && r.volumeWorkers < r.workers {
 		for i := 0; i < r.volumeWorkers; i++ {
 			r.wg.Add(1)
-			go r.worker(ctx, r.volumeKinds, false)
+			go r.worker(ctx, r.volumeKinds, false, r.pokeVolume)
 		}
 		for i := 0; i < r.workers-r.volumeWorkers; i++ {
 			r.wg.Add(1)
-			go r.worker(ctx, r.volumeKinds, true)
+			go r.worker(ctx, r.volumeKinds, true, r.pokeGeneral)
 		}
 		return
 	}
@@ -250,7 +272,7 @@ func (r *Runner) Start(ctx context.Context) {
 	}
 	for i := 0; i < r.workers; i++ {
 		r.wg.Add(1)
-		go r.worker(ctx, nil, false)
+		go r.worker(ctx, nil, false, r.poke)
 	}
 }
 
@@ -384,8 +406,10 @@ func (r *Runner) reconcileOne(ctx context.Context, job store.Job, rec Reconciler
 // claims any kind (store.ClaimNext); a non-nil claimKinds with exclude ==
 // false restricts to those kinds (store.ClaimNextMatching); exclude == true
 // claims anything NOT in claimKinds (store.ClaimNextExcluding) — see
-// SetVolumeTransferPool.
-func (r *Runner) worker(ctx context.Context, claimKinds []string, exclude bool) {
+// SetVolumeTransferPool. pokeCh is this worker's pool-specific wake channel
+// (r.poke for the unsplit pool, r.pokeVolume/r.pokeGeneral for the split
+// pools) — see Notify.
+func (r *Runner) worker(ctx context.Context, claimKinds []string, exclude bool, pokeCh chan struct{}) {
 	defer r.wg.Done()
 	t := time.NewTicker(pollInterval)
 	defer t.Stop()
@@ -411,7 +435,7 @@ func (r *Runner) worker(ctx context.Context, claimKinds []string, exclude bool) 
 		select {
 		case <-ctx.Done():
 			return
-		case <-r.poke:
+		case <-pokeCh:
 		case <-t.C:
 		}
 	}
