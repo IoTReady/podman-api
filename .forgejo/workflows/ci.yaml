@@ -9,6 +9,12 @@ on:
     branches: [main]
     paths-ignore:
       - 'docs/**'
+  # livereg (below) only runs off these two triggers, never push/pull_request —
+  # it stands up real registry:2.8.3/3.1.1 containers and is weekly-or-on-demand
+  # by design (#228), not a PR gate.
+  schedule:
+    - cron: '0 3 * * 1' # weekly, Monday 03:00 UTC
+  workflow_dispatch: {}
 
 env:
   # The podman v5 bindings transitively pull in the storage graph drivers
@@ -20,6 +26,10 @@ env:
 jobs:
   lint-test-build:
     name: lint, test, build
+    # Keep this off the schedule/workflow_dispatch triggers added for livereg
+    # (below) — those exist solely to run livereg weekly/on-demand, not to
+    # make every job in this workflow do so.
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: self-hosted
     container:
       # Pin a recent Go. The GO_TAGS above exclude the CGO graph drivers so no
@@ -91,6 +101,11 @@ jobs:
 
   integration:
     name: integration (podman-in-podman)
+    # Same reasoning as lint-test-build above: this needs a privileged
+    # self-hosted runner and runs ~2min of nested-podman suites, so it must
+    # not also fire on the schedule/workflow_dispatch triggers that exist for
+    # livereg.
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: self-hosted
     container:
       # Fedora-based image that ships podman, catatonit and netavark and is
@@ -166,3 +181,80 @@ jobs:
         # Explicit -timeout so a nested-podman hang fails clearly instead of
         # blocking on the 10m default; the two suites take ~2min each locally.
         run: go test -tags "$GO_TAGS integration" -timeout=10m ./internal/podman/... ./cmd/podman-api/...
+
+  livereg:
+    name: livereg (imgregistry, real distribution servers)
+    # #228: internal/imgregistry/livereg_test.go pins two `distribution`-server
+    # behaviors (manifestAccept vs. `Accept: */*` content negotiation, and
+    # 2.8.x's fabricated schema1 down-convert digest) that only real registry
+    # containers can disprove — a fake can't regress against them. It is
+    # build-tagged `livereg` so `make test`/the jobs above never run it; this
+    # job exists to keep it from silently rotting while looking green. Weekly
+    # or on-demand, deliberately not a push/pull_request gate: it stands up
+    # two registry containers and pushes real images, which is slower and
+    # noisier than we want on every PR.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: self-hosted
+    container:
+      # Same nested-podman image as the integration job above: we need real
+      # `podman run`/`build`/`push` against loopback registries, not just the
+      # remote libpod client this repo otherwise uses.
+      image: quay.io/podman/stable
+      options: --privileged
+    steps:
+      - name: install go + nodejs
+        run: |
+          dnf -y install golang nodejs git make curl >/dev/null
+          go version
+
+      - name: checkout
+        uses: actions/checkout@v4
+
+      - name: cache go modules + toolchain
+        uses: actions/cache@v4
+        with:
+          # Distinct key namespace: different image/tags than lint-test-build,
+          # same as the integration job's reasoning above.
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: go-livereg-${{ runner.os }}-${{ hashFiles('go.sum') }}
+          restore-keys: |
+            go-livereg-${{ runner.os }}-
+
+      # Recipe below is exactly the header comment of livereg_test.go — keep
+      # the two in sync; the test's port numbers (5999/5998) are hardcoded in
+      # liveRegs in that file, not parameterized here.
+      - name: start registry:2.8.3 and registry:3.1.1
+        run: |
+          podman run -d --name reg283 -p 5999:5000 docker.io/library/registry:2.8.3
+          podman run -d --name reg311 -p 5998:5000 docker.io/library/registry:3.1.1
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:5999/v2/ >/dev/null 2>&1 \
+              && curl -sf http://127.0.0.1:5998/v2/ >/dev/null 2>&1 \
+              && break
+            sleep 1
+          done
+          curl -sf http://127.0.0.1:5999/v2/ >/dev/null
+          curl -sf http://127.0.0.1:5998/v2/ >/dev/null
+
+      - name: build + push the four probe images
+        run: |
+          set -e
+          mkdir -p /tmp/probe && cd /tmp/probe
+          printf 'FROM scratch\nCOPY hello.txt /hello.txt\n' > Dockerfile
+          echo hi > hello.txt
+          podman build -t probe:local .
+          for R in 5999 5998; do
+            podman push --tls-verify=false --format docker localhost/probe:local 127.0.0.1:$R/probe:v2
+            podman push --tls-verify=false --format oci    localhost/probe:local 127.0.0.1:$R/probe:oci
+            podman push --tls-verify=false --format docker localhost/probe:local 127.0.0.1:$R/live:latest
+            podman push --tls-verify=false --format docker localhost/probe:local 127.0.0.1:$R/live:abc1234
+          done
+
+      - name: go test (livereg)
+        run: go test -tags "$GO_TAGS livereg" -run LiveReg -v ./internal/imgregistry/
+
+      - name: stop registries
+        if: always()
+        run: podman rm -f reg283 reg311 || true
