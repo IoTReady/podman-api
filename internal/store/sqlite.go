@@ -697,7 +697,16 @@ func (s *SQLite) ListJobs(ctx context.Context, f JobFilter) ([]Job, error) {
 	return out, rows.Err()
 }
 
-func (s *SQLite) ClaimNext(ctx context.Context) (Job, bool, error) {
+// claimNextWhere is the shared atomic-claim scaffolding for ClaimNext,
+// ClaimNextMatching, and ClaimNextExcluding: it atomically claims the oldest
+// queued job matching an optional extra predicate via
+// `UPDATE jobs SET state='running', started=? WHERE id = (SELECT id FROM
+// jobs WHERE ... ORDER BY created, id LIMIT 1) AND state='queued' RETURNING
+// ...`, retried through s.write the same way every other write is.
+// extraWhere, if non-empty, is ANDed into the inner SELECT (e.g. "kind IN
+// (?,?)" or "kind NOT IN (?,?)"); extraArgs supplies its placeholder values,
+// bound after the started=? timestamp.
+func (s *SQLite) claimNextWhere(ctx context.Context, extraWhere string, extraArgs []any) (Job, bool, error) {
 	var (
 		j  Job
 		ok bool
@@ -705,12 +714,19 @@ func (s *SQLite) ClaimNext(ctx context.Context) (Job, bool, error) {
 	// Stamp once outside the retry closure (consistent with the other writes), so
 	// a write that retries past a transient BUSY records the pre-retry claim time.
 	now := time.Now().UnixNano()
+	args := make([]any, 0, len(extraArgs)+1)
+	args = append(args, now)
+	args = append(args, extraArgs...)
+	where := "state='queued'"
+	if extraWhere != "" {
+		where += " AND " + extraWhere
+	}
 	err := s.write(ctx, func() error {
 		row := s.db.QueryRowContext(ctx, `
 UPDATE jobs SET state='running', started=?
-WHERE id = (SELECT id FROM jobs WHERE state='queued' ORDER BY created, id LIMIT 1)
+WHERE id = (SELECT id FROM jobs WHERE `+where+` ORDER BY created, id LIMIT 1)
   AND state='queued'
-RETURNING `+jobColumns, now)
+RETURNING `+jobColumns, args...)
 		jj, e := scanJob(row)
 		if errors.Is(e, ErrNotFound) {
 			j, ok = Job{}, false
@@ -726,6 +742,48 @@ RETURNING `+jobColumns, now)
 		return Job{}, false, err
 	}
 	return j, ok, nil
+}
+
+// claimKindPlaceholders returns n comma-separated "?" placeholders.
+func claimKindPlaceholders(n int) string {
+	p := strings.Repeat("?,", n)
+	return p[:len(p)-1] // trim trailing comma
+}
+
+// kindArgs converts a []string of kinds into []any for QueryRowContext.
+func kindArgs(kinds []string) []any {
+	args := make([]any, len(kinds))
+	for i, k := range kinds {
+		args[i] = k
+	}
+	return args
+}
+
+// ClaimNext atomically claims and returns the oldest queued job, or
+// (Job{}, false, nil) if none is queued.
+func (s *SQLite) ClaimNext(ctx context.Context) (Job, bool, error) {
+	return s.claimNextWhere(ctx, "", nil)
+}
+
+// ClaimNextMatching is ClaimNext restricted to kinds. Builds the IN (...)
+// clause with one placeholder per kind rather than a single comma-joined
+// string, so kind values never need escaping. Empty kinds claims nothing.
+func (s *SQLite) ClaimNextMatching(ctx context.Context, kinds []string) (Job, bool, error) {
+	if len(kinds) == 0 {
+		return Job{}, false, nil
+	}
+	return s.claimNextWhere(ctx, "kind IN ("+claimKindPlaceholders(len(kinds))+")", kindArgs(kinds))
+}
+
+// ClaimNextExcluding is ClaimNext restricted to jobs whose kind is NOT in
+// kinds — the complement of ClaimNextMatching. Empty kinds falls through to
+// the same unfiltered query ClaimNext uses, matching "exclude nothing" ==
+// "claim anything".
+func (s *SQLite) ClaimNextExcluding(ctx context.Context, kinds []string) (Job, bool, error) {
+	if len(kinds) == 0 {
+		return s.ClaimNext(ctx)
+	}
+	return s.claimNextWhere(ctx, "kind NOT IN ("+claimKindPlaceholders(len(kinds))+")", kindArgs(kinds))
 }
 
 func (s *SQLite) AppendStep(ctx context.Context, id string, step JobStep) error {

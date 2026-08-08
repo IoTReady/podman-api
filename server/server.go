@@ -65,17 +65,18 @@ func RunWithFlags(opts ...Option) error {
 
 	fs := flag.NewFlagSet("podman-api", flag.ContinueOnError)
 	var (
-		addr          = fs.String("addr", "127.0.0.1:8080", "bind address for the API")
-		metricsAddr   = fs.String("metrics-addr", "", "if set, expose /metrics on this address (e.g. 127.0.0.1:9090); empty means no metrics endpoint")
-		hostsDir      = fs.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
-		keysFile      = fs.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
-		auditLogFile  = fs.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
-		stateDB       = fs.String("state-db", "/var/lib/podman-api/state.db", "SQLite path for the always-on template catalog + desired-state store")
-		specKeyFile   = fs.String("spec-key-file", "", "path to the 32-byte secret encryption key; optional — without it the store runs key-less (templates and no-secret specs work, secret ops are refused)")
-		backupDir     = fs.String("backup-dir", "", "directory for volume backup artifacts; empty derives <state-db dir>/backups")
-		jobsRetention = fs.Duration("jobs-retention", 0, "if >0, prune terminal jobs older than this (e.g. 168h); 0 disables")
-		evacConc      = fs.Int("evacuate-concurrency", 2, "max child migrations an evacuate runs at once (1..32); a request's \"concurrency\" overrides per call")
-		jobWorkers    = fs.Int("job-workers", jobs.DefaultWorkers, "size of the background job worker pool (<=0 uses the built-in default)")
+		addr             = fs.String("addr", "127.0.0.1:8080", "bind address for the API")
+		metricsAddr      = fs.String("metrics-addr", "", "if set, expose /metrics on this address (e.g. 127.0.0.1:9090); empty means no metrics endpoint")
+		hostsDir         = fs.String("hosts-dir", "hosts", "directory of hosts/*.yaml files")
+		keysFile         = fs.String("keys-file", "auth/keys.yaml", "path to bearer keys file")
+		auditLogFile     = fs.String("audit-log-file", "", "if set, write audit lines to this path (append) instead of stdout; operational logs still go to stderr")
+		stateDB          = fs.String("state-db", "/var/lib/podman-api/state.db", "SQLite path for the always-on template catalog + desired-state store")
+		specKeyFile      = fs.String("spec-key-file", "", "path to the 32-byte secret encryption key; optional — without it the store runs key-less (templates and no-secret specs work, secret ops are refused)")
+		backupDir        = fs.String("backup-dir", "", "directory for volume backup artifacts; empty derives <state-db dir>/backups")
+		jobsRetention    = fs.Duration("jobs-retention", 0, "if >0, prune terminal jobs older than this (e.g. 168h); 0 disables")
+		evacConc         = fs.Int("evacuate-concurrency", 2, "max child migrations an evacuate runs at once (1..32); a request's \"concurrency\" overrides per call")
+		jobWorkers       = fs.Int("job-workers", jobs.DefaultWorkers, "size of the background job worker pool (<=0 uses the built-in default)")
+		jobVolumeWorkers = fs.Int("job-volume-workers", 2, "hard concurrency ceiling (not a minimum) on volume-transfer-heavy job kinds (backup, restore, pitr-restore, migrate, evacuate): these are the ONLY workers that ever claim those kinds, so at most this many can run at once no matter how large -job-workers is; the rest of -job-workers serves every other kind. If a large fleet-wide backup wave needs more volume-transfer throughput, raise this (and -job-workers correspondingly, since it must stay less than the total). Must be less than -job-workers, else those kinds could starve everything else for up to -volume-transfer-timeout (#238, following up on #54); 0 disables the reservation (single shared pool, pre-#238 behaviour)")
 
 		migrateVerifyTimeout = fs.Duration("migrate-verify-timeout", 180*time.Second, "max wait for a migrated instance to become ready (running + declared healthchecks healthy) before reaping the source")
 		migrateVerifyVolumes = fs.Bool("migrate-verify-volumes", true, "verify each copied volume's content against the source before reaping the source (adds a re-export of source and dest per volume); false disables it")
@@ -84,6 +85,7 @@ func RunWithFlags(opts ...Option) error {
 		deployVerifyStable   = fs.Int("deploy-verify-stable-count", 1, "same as -migrate-verify-stable-count but for the deploy/start path; defaults to 1 since apps freshly applied there are less likely to cycle than during migration")
 
 		volumeTransferTimeout = fs.Duration("volume-transfer-timeout", 2*time.Hour, "max duration of a single volume export/import (backup, restore, migrate, rename): must cover the whole streamed transfer of a real volume's contents, not just issuing the request (#223 — a multi-hundred-MB volume over a tailnet link routinely exceeded the general-purpose 10-minute per-call timeout). Must be positive; zero/negative is rejected at startup rather than silently falling back to the 10-minute default")
+		imagePullTimeout      = fs.Duration("image-pull-timeout", 2*time.Hour, "max duration of a single image pull (e.g. migrate preflight): must cover the whole pulled image, not just issuing the request (#238 — the same shape of large, network-bound transfer that motivated -volume-transfer-timeout for VolumeExport/VolumeImport in #223). Must be positive; zero/negative is rejected at startup rather than silently falling back to the 10-minute default")
 
 		pruneEnabled   = fs.Bool("prune-enabled", false, "enable scheduled host-health prune/cleanup")
 		pruneInterval  = fs.Duration("prune-interval", 24*time.Hour, "default interval between scheduled prunes per host")
@@ -158,11 +160,15 @@ func RunWithFlags(opts ...Option) error {
 	if *volumeTransferTimeout <= 0 {
 		return fmt.Errorf("-volume-transfer-timeout must be positive, got %s", *volumeTransferTimeout)
 	}
+	if *imagePullTimeout <= 0 {
+		return fmt.Errorf("-image-pull-timeout must be positive, got %s", *imagePullTimeout)
+	}
 	client, err := podman.NewReal(hosts)
 	if err != nil {
 		return fmt.Errorf("podman: %w", err)
 	}
 	podman.SetVolumeTransferTimeout(*volumeTransferTimeout)
+	podman.SetImagePullTimeout(*imagePullTimeout)
 	if err := client.Preflight(context.Background()); err != nil {
 		return fmt.Errorf("podman: %w", err)
 	}
@@ -318,10 +324,43 @@ func RunWithFlags(opts ...Option) error {
 	if workers <= 0 {
 		workers = jobs.DefaultWorkers
 	}
+	if *jobVolumeWorkers < 0 {
+		return fmt.Errorf("-job-volume-workers must be >= 0, got %d", *jobVolumeWorkers)
+	}
+	jobVolumeWorkersSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "job-volume-workers" {
+			jobVolumeWorkersSet = true
+		}
+	})
+	effectiveJobVolumeWorkers := *jobVolumeWorkers
+	if effectiveJobVolumeWorkers >= workers {
+		if jobVolumeWorkersSet {
+			return fmt.Errorf("-job-volume-workers (%d) must be less than -job-workers (%d), else no workers are left for other job kinds", *jobVolumeWorkers, workers)
+		}
+		// Left at its default and it doesn't fit -job-workers. Rather than
+		// dropping straight to 0 (fully disabling the reservation and
+		// reproducing the exact starvation risk #238 fixes, with only a log
+		// line as a signal), clamp down to the largest reservation that still
+		// fits: workers-1, which guarantees the general pool always keeps at
+		// least 1 worker — the same reasoning the explicit-value hard-error
+		// above already uses. Only fall back to fully disabling (0) when
+		// there's truly no room for any reservation (workers <= 1).
+		if workers > 1 {
+			log.Printf("job-volume-workers: default %d does not fit within -job-workers=%d, clamping the volume-transfer worker reservation down to %d (pass -job-volume-workers explicitly to override)", *jobVolumeWorkers, workers, workers-1)
+			effectiveJobVolumeWorkers = workers - 1
+		} else {
+			log.Printf("job-volume-workers: default %d does not fit within -job-workers=%d, disabling the volume-transfer worker reservation entirely (no room for any reservation; pass -job-volume-workers explicitly to override)", *jobVolumeWorkers, workers)
+			effectiveJobVolumeWorkers = 0
+		}
+	}
 	runner := jobs.NewRunner(db, registry, workers)
 	runner.Metrics = jobMetrics
 	canceller = runner
 	runner.SetReconcilers(reconcilers)
+	if effectiveJobVolumeWorkers > 0 {
+		runner.SetVolumeTransferPool(jobs.VolumeTransferKinds, effectiveJobVolumeWorkers)
+	}
 	runner.Start(runnerCtx)
 	if *jobsRetention > 0 {
 		runner.StartRetention(runnerCtx, *jobsRetention)
@@ -808,6 +847,14 @@ func statsBudgetWarning(interval, timeout, statsTimeout, bootTimeout time.Durati
 // unless the registry prune feature is enabled, and a nil handler must leave
 // the kind ABSENT rather than registered-and-broken — a registered nil would
 // be a typed-nil interface that panics on the first tick.
+//
+// When registering a NEW job kind here, consider whether it belongs in
+// jobs.VolumeTransferKinds (internal/jobs/runner.go): any handler that
+// streams a large volume (calls VolumeExport/VolumeImport/CopyVolume) or
+// fans out child work in-process on its own claimed worker (like evacuate
+// does) is a candidate for the reserved volume-transfer worker pool (#238).
+// There's no mechanical way to detect this from the handler's shape, so it
+// has to be a conscious decision every time a kind is added here.
 func buildJobRegistry(svc *instance.Service, client podman.Client, db store.DB, evacConc int, pruneMetrics *obs.PruneMetrics, jobMetrics *obs.JobMetrics, regPrune *registryprune.Handler) (jobs.Registry, jobs.Reconcilers) {
 	reg := jobs.Registry{
 		"migrate":      &migrate.Handler{Svc: svc, Metrics: jobMetrics},

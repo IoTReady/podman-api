@@ -239,6 +239,43 @@ func (m *Memory) ClaimNext(_ context.Context) (Job, bool, error) {
 	return Job{}, false, nil
 }
 
+func (m *Memory) ClaimNextMatching(_ context.Context, kinds []string) (Job, bool, error) {
+	if len(kinds) == 0 {
+		return Job{}, false, nil
+	}
+	want := make(map[string]bool, len(kinds))
+	for _, k := range kinds {
+		want[k] = true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.jobs { // oldest first
+		if m.jobs[i].State == JobQueued && want[m.jobs[i].Kind] {
+			m.jobs[i].State = JobRunning
+			m.jobs[i].Started = time.Now()
+			return cloneJob(m.jobs[i]), true, nil
+		}
+	}
+	return Job{}, false, nil
+}
+
+func (m *Memory) ClaimNextExcluding(_ context.Context, kinds []string) (Job, bool, error) {
+	exclude := make(map[string]bool, len(kinds))
+	for _, k := range kinds {
+		exclude[k] = true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for i := range m.jobs { // oldest first
+		if m.jobs[i].State == JobQueued && !exclude[m.jobs[i].Kind] {
+			m.jobs[i].State = JobRunning
+			m.jobs[i].Started = time.Now()
+			return cloneJob(m.jobs[i]), true, nil
+		}
+	}
+	return Job{}, false, nil
+}
+
 func (m *Memory) AppendStep(_ context.Context, id string, step JobStep) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

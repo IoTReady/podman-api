@@ -259,8 +259,9 @@ var preflightTimeout = 10 * time.Second
 
 // callTimeout bounds each individual libpod operation so a hung SSH or
 // libpod call fails rather than blocking a job (e.g. a migrate between
-// copy-volume-done and apply-dest) forever. 10 minutes covers large image
-// pulls; tests that need faster failure can override this package var.
+// copy-volume-done and apply-dest) forever. Large image pulls instead get
+// their own deadline via imagePullTimeout(); tests that need faster failure
+// can override this package var.
 var callTimeout = 10 * time.Minute
 
 // volumeTransferTimeoutOverride bounds VolumeExport/VolumeImport when set
@@ -301,6 +302,37 @@ func SetVolumeTransferTimeout(d time.Duration) {
 func volumeTransferTimeout() time.Duration {
 	if volumeTransferTimeoutOverride > 0 {
 		return volumeTransferTimeoutOverride
+	}
+	return callTimeout
+}
+
+// imagePullTimeoutOverride bounds ImagePull when set (SetImagePullTimeout);
+// zero (the default) falls back to callTimeout. Same package-var,
+// no-op-below-threshold shape as volumeTransferTimeoutOverride above (#238):
+// ImagePull is the same class of large, network-bound transfer that
+// motivated volumeTransferTimeout for VolumeExport/VolumeImport (#223), and
+// was left on the unmodified callTimeout when that fix landed because #223's
+// report was specifically about volume export/import.
+var imagePullTimeoutOverride time.Duration
+
+// SetImagePullTimeout overrides the deadline ImagePull derives its context
+// from. No-op for d <= 0, matching SetVolumeTransferTimeout's convention —
+// the caller (server.go) separately rejects a non-positive flag value at
+// startup so that is never a silent fallback in practice.
+//
+// Call this once at startup from a configured flag; it is not safe to call
+// concurrently with an in-flight pull.
+func SetImagePullTimeout(d time.Duration) {
+	if d > 0 {
+		imagePullTimeoutOverride = d
+	}
+}
+
+// imagePullTimeout resolves the effective deadline for ImagePull: the
+// configured override if set, else callTimeout.
+func imagePullTimeout() time.Duration {
+	if imagePullTimeoutOverride > 0 {
+		return imagePullTimeoutOverride
 	}
 	return callTimeout
 }
@@ -1172,7 +1204,7 @@ func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts Log
 }
 
 func (r *Real) ImagePull(ctx context.Context, id, ref string) error {
-	c, cancel, err := r.opCtxFor(ctx, id)
+	c, cancel, err := r.opCtxForTimeout(ctx, id, imagePullTimeout())
 	if err != nil {
 		return err
 	}

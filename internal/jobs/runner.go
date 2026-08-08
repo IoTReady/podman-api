@@ -18,6 +18,19 @@ import (
 // fix (separate orchestration pool) remains a future option (#54).
 const DefaultWorkers = 8
 
+// VolumeTransferKinds are the job kinds whose handlers call
+// VolumeExport/VolumeImport (directly or via CopyVolume) on a worker's own
+// claimed goroutine, and so can legitimately hold that worker for up to
+// -volume-transfer-timeout (2h default): backup and restore stream a
+// volume's contents directly; migrate does so via CopyVolume; evacuate runs
+// its migrate children in-process on the parent's own claimed worker
+// (internal/evacuate/handler.go's runChild), not through the job queue, so
+// it's transitively volume-transfer-heavy for its whole fan-out. Intended
+// for server.go to pass to SetVolumeTransferPool, structurally addressing
+// the worker-pool starvation risk #237's 10min->2h deadline increase
+// created (#238, following up on #54).
+var VolumeTransferKinds = []string{"backup", "restore", "pitr-restore", "migrate", "evacuate"}
+
 // pollInterval is the safety-net wake even without a Notify (e.g. after a
 // restart that left queued jobs).
 const pollInterval = 5 * time.Second
@@ -86,10 +99,27 @@ type Runner struct {
 	reconcileInterval time.Duration
 	workers           int
 	poke              chan struct{}
-	wg                sync.WaitGroup
-	mu                sync.Mutex
-	inflight          map[string]*inflightJob
-	Metrics           Metrics // optional; nil-safe
+	// pokeVolume/pokeGeneral are the split-pool equivalents of poke, used only
+	// when a volume-transfer sub-pool is configured (SetVolumeTransferPool):
+	// a single shared poke channel wakes exactly one worker runner-wide (Go
+	// delivers a channel send to one random waiter), which under the split
+	// pool could wake a worker in the wrong sub-pool for the job just
+	// enqueued, leaving the correct-pool worker asleep until the next
+	// pollInterval tick. Giving each pool its own channel and having Notify
+	// broadcast to all of them keeps wakeups pool-correct.
+	pokeVolume  chan struct{}
+	pokeGeneral chan struct{}
+	wg          sync.WaitGroup
+	mu          sync.Mutex
+	inflight    map[string]*inflightJob
+	Metrics     Metrics // optional; nil-safe
+
+	// volumeKinds/volumeWorkers configure a dedicated sub-pool reserved for
+	// volume-transfer-heavy job kinds (#238); see SetVolumeTransferPool.
+	// volumeKinds == nil means no split — all workers claim any kind, the
+	// pre-#238 behaviour.
+	volumeKinds   []string
+	volumeWorkers int
 }
 
 // inflightJob tracks a currently-running job so an operator request can cancel
@@ -123,6 +153,8 @@ func NewRunner(js store.JobStore, h Registry, workers int) *Runner {
 		reconcileInterval: defaultReconcileInterval,
 		workers:           workers,
 		poke:              make(chan struct{}, 1),
+		pokeVolume:        make(chan struct{}, 1),
+		pokeGeneral:       make(chan struct{}, 1),
 		inflight:          map[string]*inflightJob{},
 	}
 }
@@ -132,6 +164,31 @@ func NewRunner(js store.JobStore, h Registry, workers int) *Runner {
 // reconciler is moved to reconciling (and later resolved) on restart instead of
 // being failed.
 func (r *Runner) SetReconcilers(rec Reconcilers) { r.reconcilers = rec }
+
+// SetVolumeTransferPool reserves workers of the runner's total pool for the
+// given kinds, claiming ClaimNextMatching(kinds) instead of the shared
+// ClaimNext. The remaining workers claim every other kind, registered or not
+// (so an unregistered kind's jobs still fail fast in run() instead of being
+// stranded queued forever). Call before Start. No-op if kinds is empty or
+// workers <= 0 (matching
+// SetReconcilers/SetVolumeTransferTimeout's convention) — the caller
+// (server.go) separately validates workers < the runner's total worker
+// count at startup.
+//
+// #238: DefaultWorkers' single shared pool means a worker occupied by a
+// VolumeExport/VolumeImport-heavy job (backup/restore/pitr-restore/migrate,
+// or evacuate — which runs its migrate children in-process on its own
+// claimed worker) can now hold that worker for up to
+// -volume-transfer-timeout (2h default, was 10min pre-#237), starving every
+// other job kind behind it. Reserving a small sub-pool for those kinds
+// guarantees the general pool always has free workers regardless.
+func (r *Runner) SetVolumeTransferPool(kinds []string, workers int) {
+	if len(kinds) == 0 || workers <= 0 {
+		return
+	}
+	r.volumeKinds = kinds
+	r.volumeWorkers = workers
+}
 
 // reconcilableKinds returns the kinds that have a registered reconciler.
 func (r *Runner) reconcilableKinds() []string {
@@ -148,10 +205,20 @@ func (r *Runner) reconcilableKinds() []string {
 // Notify wakes a worker to check for new work; call after an Enqueue. Non-blocking.
 // One Notify is sufficient for a batch of enqueues — a woken worker drains the
 // queue exhaustively before sleeping again.
+//
+// It broadcasts to all three poke channels (poke, pokeVolume, pokeGeneral) so
+// that whichever pool configuration is in effect (unsplit, or split via
+// SetVolumeTransferPool) gets a prompt wakeup rather than racing the
+// pollInterval ticker. In the unsplit case pokeVolume/pokeGeneral are never
+// read by any worker; each is buffer-1, so the first Notify() after a worker
+// last drained it fills the buffer and every subsequent Notify() before that
+// is harmless — not a leak, just a channel that stays "primed" and unread.
 func (r *Runner) Notify() {
-	select {
-	case r.poke <- struct{}{}:
-	default:
+	for _, ch := range []chan struct{}{r.poke, r.pokeVolume, r.pokeGeneral} {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -189,9 +256,23 @@ func (r *Runner) Start(ctx context.Context) {
 		r.wg.Add(1)
 		go r.reconcileLoop(ctx)
 	}
+	if len(r.volumeKinds) > 0 && r.volumeWorkers > 0 && r.volumeWorkers < r.workers {
+		for i := 0; i < r.volumeWorkers; i++ {
+			r.wg.Add(1)
+			go r.worker(ctx, r.volumeKinds, false, r.pokeVolume)
+		}
+		for i := 0; i < r.workers-r.volumeWorkers; i++ {
+			r.wg.Add(1)
+			go r.worker(ctx, r.volumeKinds, true, r.pokeGeneral)
+		}
+		return
+	}
+	if len(r.volumeKinds) > 0 {
+		log.Printf("jobs: volume-transfer pool configured (%d kinds, %d workers) but not applied: volumeWorkers must be > 0 and < total workers (%d); falling back to a single shared pool", len(r.volumeKinds), r.volumeWorkers, r.workers)
+	}
 	for i := 0; i < r.workers; i++ {
 		r.wg.Add(1)
-		go r.worker(ctx)
+		go r.worker(ctx, nil, false, r.poke)
 	}
 }
 
@@ -320,7 +401,15 @@ func (r *Runner) reconcileOne(ctx context.Context, job store.Job, rec Reconciler
 	}
 }
 
-func (r *Runner) worker(ctx context.Context) {
+// worker drains claimable jobs matching claimKinds until none remain, then
+// sleeps for a poke or the poll tick. claimKinds == nil and exclude == false
+// claims any kind (store.ClaimNext); a non-nil claimKinds with exclude ==
+// false restricts to those kinds (store.ClaimNextMatching); exclude == true
+// claims anything NOT in claimKinds (store.ClaimNextExcluding) — see
+// SetVolumeTransferPool. pokeCh is this worker's pool-specific wake channel
+// (r.poke for the unsplit pool, r.pokeVolume/r.pokeGeneral for the split
+// pools) — see Notify.
+func (r *Runner) worker(ctx context.Context, claimKinds []string, exclude bool, pokeCh chan struct{}) {
 	defer r.wg.Done()
 	t := time.NewTicker(pollInterval)
 	defer t.Stop()
@@ -330,7 +419,7 @@ func (r *Runner) worker(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			job, ok, err := r.store.ClaimNext(ctx)
+			job, ok, err := r.claim(ctx, claimKinds, exclude)
 			if err != nil {
 				// Back off briefly so a persistent store error can't spin the
 				// worker hot when pokes keep arriving.
@@ -346,9 +435,23 @@ func (r *Runner) worker(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			return
-		case <-r.poke:
+		case <-pokeCh:
 		case <-t.C:
 		}
+	}
+}
+
+// claim dispatches to store.ClaimNext (kinds == nil, exclude == false),
+// store.ClaimNextMatching (kinds set, exclude == false), or
+// store.ClaimNextExcluding (exclude == true).
+func (r *Runner) claim(ctx context.Context, kinds []string, exclude bool) (store.Job, bool, error) {
+	switch {
+	case exclude:
+		return r.store.ClaimNextExcluding(ctx, kinds)
+	case kinds == nil:
+		return r.store.ClaimNext(ctx)
+	default:
+		return r.store.ClaimNextMatching(ctx, kinds)
 	}
 }
 
