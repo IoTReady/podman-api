@@ -1313,6 +1313,89 @@ func (r *Real) HostUptime(ctx context.Context, id string) (time.Duration, bool, 
 	return d, ok, nil
 }
 
+// HostBoundPorts returns every port of protocol ("tcp" or "udp") currently
+// bound on id, read from /proc/net/<protocol> and (best-effort)
+// /proc/net/<protocol>6 — mirroring HostUptime's dual local/SSH path rather
+// than going through libpod, because libpod has no visibility at all into a
+// plain host-level process (see UsedHostPorts, which only sees ports podman
+// itself published). /proc parsing is chosen over shelling out to `ss` (or
+// `netstat`) so this doesn't add an iproute2/net-tools dependency to managed
+// hosts beyond what the rest of this file already assumes (`cat`, used
+// identically by HostUptime/hostLoadAvg above) — /proc/net/{tcp,udp}[6] is
+// present on every Linux kernel with CONFIG_PROC_FS, which podman itself
+// already requires.
+func (r *Real) HostBoundPorts(ctx context.Context, id, protocol string) ([]int, error) {
+	r.mu.Lock()
+	h, ok := r.hosts[id]
+	r.mu.Unlock()
+	if !ok {
+		return nil, fmt.Errorf("unknown host %q", id)
+	}
+	var raw string
+	var err error
+	if h.Addr == "unix" {
+		raw, err = readProcNetPortsLocal(protocol)
+	} else {
+		raw, err = sshReadProcNetPorts(ctx, h, protocol)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return parseProcNetPorts(raw), nil
+}
+
+// readProcNetPortsLocal reads /proc/net/<protocol> (required — its absence is
+// a real error) and appends /proc/net/<protocol>6 (best-effort — a host with
+// IPv6 disabled simply lacks this file, which is not an error condition; see
+// the IPv4-only precedent for a similar host/network gap already documented
+// on vpn.Config.validate's remote_subnet check in podman-api-pro).
+func readProcNetPortsLocal(protocol string) (string, error) {
+	b, err := os.ReadFile("/proc/net/" + protocol)
+	if err != nil {
+		return "", err
+	}
+	out := string(b)
+	if b6, err := os.ReadFile("/proc/net/" + protocol + "6"); err == nil {
+		out += string(b6)
+	}
+	return out, nil
+}
+
+// parseProcNetPorts extracts every locally-bound port number from the
+// concatenated contents of /proc/net/<protocol>[6]. Each data line's second
+// field is "local_address" as hex "ADDR:PORT" (e.g. "00000000:01F4" for
+// 0.0.0.0:500, or 32 hex chars before the colon for an IPv6 "::" address);
+// the port is the last ':'-separated hex token, always 4 hex digits
+// regardless of address family, and needs no endianness handling — the
+// kernel already prints it big-endian (network byte order), unlike the
+// address bytes. The port is returned for EVERY bound entry regardless of
+// state: UDP has no listen/established distinction the way TCP does — an
+// unconnected (recvfrom-style) server socket shows state "07", so filtering
+// by state would silently stop detecting exactly the sockets this exists to
+// catch. A malformed line (short header, non-hex field) is skipped, not fatal
+// — matching parseProcUptime/parseLoadAvg's best-effort posture for lines
+// this parser doesn't expect.
+func parseProcNetPorts(raw string) []int {
+	var out []int
+	for _, line := range strings.Split(raw, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		local := fields[1]
+		colon := strings.LastIndexByte(local, ':')
+		if colon < 0 || colon == len(local)-1 {
+			continue
+		}
+		port, err := strconv.ParseUint(local[colon+1:], 16, 16)
+		if err != nil {
+			continue
+		}
+		out = append(out, int(port))
+	}
+	return out
+}
+
 // hostLoadAvg reads /proc/loadavg for a host, returning the 1/5/15-minute
 // averages, or nil if it cannot be read. For a unix (local) host it reads the
 // daemon's own /proc/loadavg; for an SSH host it execs `cat /proc/loadavg`

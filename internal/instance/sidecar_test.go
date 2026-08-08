@@ -338,6 +338,81 @@ func TestService_Apply_HostPortRequirer_Conflict_AbortsBeforeMutation(t *testing
 	require.Error(t, specErr, "no spec should be persisted on a required-port conflict")
 }
 
+// The actual #130 repro: a host-level, non-podman process (a native
+// strongSwan charon, modeled here via f.AddHostBoundPort rather than
+// f.AddPod) holds the required port. UsedHostPorts alone is blind to this —
+// only the /proc/net-backed HostBoundPorts check catches it. Apply must still
+// be rejected with ErrPortConflict, before any host mutation.
+func TestService_Apply_HostPortRequirer_NativeProcessConflict_AbortsBeforeMutation(t *testing.T) {
+	svc, f, mem := newSvcMem(t)
+	ctx := context.Background()
+	// No podman pod/container owns this port — a plain host-level bind.
+	f.AddHostBoundPort("h1", "udp", 500)
+	inj := &portRequiringInjector{
+		recordingInjector: recordingInjector{out: injectedPod},
+		ports:             []extension.PortSpec{{Port: 500, Protocol: "udp"}},
+	}
+	svc.SetSidecarInjector(inj)
+
+	err := svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true})
+	require.ErrorIs(t, err, ErrPortConflict)
+	assert.Contains(t, err.Error(), "udp/500")
+	assert.Contains(t, err.Error(), "outside podman")
+
+	assert.Empty(t, f.PlayCalls, "PlayKube must not be called on a native host-port conflict")
+	_, secErr := f.SecretInspect(ctx, "h1", "postgres-demo-password")
+	assert.ErrorIs(t, secErr, podman.ErrNotFound, "no secret should be written on a native host-port conflict")
+	_, specErr := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.Error(t, specErr, "no spec should be persisted on a native host-port conflict")
+}
+
+// A host bind on the SAME port number but a DIFFERENT protocol (tcp/udp)
+// must not false-positive: HostBoundPorts is checked per-protocol.
+func TestService_Apply_HostPortRequirer_NativeProcess_ProtocolDistinguishes(t *testing.T) {
+	svc, f := newSvc(t)
+	f.AddHostBoundPort("h1", "tcp", 500) // different protocol than what's required
+	inj := &portRequiringInjector{
+		recordingInjector: recordingInjector{out: injectedPod},
+		ports:             []extension.PortSpec{{Port: 500, Protocol: "udp"}},
+	}
+	svc.SetSidecarInjector(inj)
+
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	require.Len(t, f.PlayCalls, 1)
+}
+
+// A native-process bind on a DIFFERENT host than the one being applied to
+// must not false-positive: HostBoundPorts is checked per-host too.
+func TestService_Apply_HostPortRequirer_NativeProcess_OtherHostUnaffected(t *testing.T) {
+	svc, f := newSvc(t)
+	f.AddHostBoundPort("h-other", "udp", 500)
+	inj := &portRequiringInjector{
+		recordingInjector: recordingInjector{out: injectedPod},
+		ports:             []extension.PortSpec{{Port: 500, Protocol: "udp"}},
+	}
+	svc.SetSidecarInjector(inj)
+
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	require.Len(t, f.PlayCalls, 1)
+}
+
+// The podman-container-owned conflict path (UsedHostPorts) still reports its
+// own distinguishing message, now that a second check exists alongside it.
+func TestService_Apply_HostPortRequirer_Conflict_MessageDistinguishesPodmanOwned(t *testing.T) {
+	svc, f, _ := newSvcMem(t)
+	f.AddPod("h1", podman.Pod{Name: "other-instance", Status: "Running",
+		Containers: []podman.Container{{Name: "c", Ports: []podman.PortMapping{{HostPort: 500, Protocol: "udp"}}}}})
+	inj := &portRequiringInjector{
+		recordingInjector: recordingInjector{out: injectedPod},
+		ports:             []extension.PortSpec{{Port: 500, Protocol: "udp"}},
+	}
+	svc.SetSidecarInjector(inj)
+
+	err := svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true})
+	require.ErrorIs(t, err, ErrPortConflict)
+	assert.Contains(t, err.Error(), "podman-managed container")
+}
+
 // A TCP port request does not collide with an in-use UDP port of the same
 // number — protocol is part of the match, not just the port number.
 func TestService_Apply_HostPortRequirer_ProtocolDistinguishesConflict(t *testing.T) {

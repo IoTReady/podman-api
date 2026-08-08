@@ -76,6 +76,55 @@ func TestParseProcUptime(t *testing.T) {
 	}
 }
 
+// TestParseProcNetPorts pins the /proc/net/udp[6] parsing behind
+// HostBoundPorts (podman-api-pro#130: a native strongSwan charon holding
+// udp/500 and udp/4500 exclusively, invisible to libpod). Fixtures mirror
+// the real evidence in that issue: `ss -lunp` showed charon bound to both
+// 0.0.0.0:500/:4500 (IPv4) and [::]:500/:4500 (IPv6) simultaneously.
+func TestParseProcNetPorts(t *testing.T) {
+	// A real /proc/net/udp snippet: header line, then charon's two IPv4
+	// binds (0x01F4 = 500, 0x1194 = 4500) at state 07 — UDP's "unconnected,
+	// bound" state (there is no LISTEN state for UDP the way TCP has one).
+	const procNetUDP = `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+  135: 00000000:01F4 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 12345 2 0000000000000000 0
+  136: 00000000:1194 00000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 12346 2 0000000000000000 0
+`
+	// The IPv6 counterpart: same two ports, "::" (all-zero) address in the
+	// 32-hex-digit IPv6 form.
+	const procNetUDP6 = `  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+  201: 00000000000000000000000000000000:01F4 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 12347 2 0000000000000000 0
+  202: 00000000000000000000000000000000:1194 00000000000000000000000000000000:0000 07 00000000:00000000 00:00000000 00000000     0        0 12348 2 0000000000000000 0
+`
+	// A connected UDP socket (state 01/ESTABLISHED, e.g. a DNS client socket
+	// that called connect()) must be reported too — filtering by state would
+	// silently stop catching exactly the unconnected server sockets (charon)
+	// this check exists to catch, so parseProcNetPorts intentionally applies
+	// no state filter at all; this line proves that isn't accidentally lost.
+	const procNetUDPConnected = `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops
+   12: 0100007F:C350 0100007F:0035 01 00000000:00000000 00:00000000 00000000     0        0 999 2 0000000000000000 0
+`
+
+	cases := []struct {
+		name string
+		in   string
+		want []int
+	}{
+		{"empty", "", nil},
+		{"header only", "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode ref pointer drops\n", nil},
+		{"issue #130 evidence: charon on udp/500 and udp/4500 (IPv4)", procNetUDP, []int{500, 4500}},
+		{"issue #130 evidence: charon on udp/500 and udp/4500 (IPv6, [::])", procNetUDP6, []int{500, 4500}},
+		{"IPv4 + IPv6 concatenated, as HostBoundPorts feeds it", procNetUDP + procNetUDP6, []int{500, 4500, 500, 4500}},
+		{"connected (non-listening) socket is still reported — no state filter", procNetUDPConnected, []int{50000}},
+		{"malformed line (too few fields) is skipped, not fatal", "  sl  local_address\n  1: 00000000\n", nil},
+		{"malformed port (no colon in local_address) is skipped", "  sl  local_address rem_address   st\n  1: 00000000 00000000:0000 07\n", nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			assert.Equal(t, c.want, parseProcNetPorts(c.in))
+		})
+	}
+}
+
 func TestSplitPortKey(t *testing.T) {
 	cases := []struct {
 		key       string

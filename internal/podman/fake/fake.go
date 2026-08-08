@@ -94,6 +94,11 @@ type Fake struct {
 	ContainerLogsErr error
 	// UsedHostPortsErr, if non-nil, makes UsedHostPorts return this error.
 	UsedHostPortsErr error
+	// HostBoundPortsErr, if non-nil, makes HostBoundPorts return this error.
+	HostBoundPortsErr error
+	// hostBoundPorts backs HostBoundPorts: hostID -> protocol -> bound ports.
+	// Set via AddHostBoundPort; guarded by mu.
+	hostBoundPorts map[string]map[string][]int
 	// PodInspectErr, if non-nil, makes PodInspect return this error (use a
 	// non-ErrNotFound error to exercise the unexpected-backend-error paths).
 	PodInspectErr error
@@ -663,6 +668,38 @@ func (f *Fake) UsedHostPorts(_ context.Context, h string) ([]podman.PortMapping,
 		}
 	}
 	return out, nil
+}
+
+// HostBoundPorts returns the ports a test has registered via AddHostBoundPort
+// for (h, protocol) — standing in for a real /proc/net/<protocol> read.
+// Models a plain host-level bind podman itself has no visibility into (a
+// native systemd service, e.g.), distinct from UsedHostPorts' podman-managed
+// container ports above.
+func (f *Fake) HostBoundPorts(_ context.Context, h, protocol string) ([]int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.HostBoundPortsErr != nil {
+		return nil, f.HostBoundPortsErr
+	}
+	if f.hostBoundPorts == nil {
+		return nil, nil
+	}
+	return f.hostBoundPorts[h][protocol], nil
+}
+
+// AddHostBoundPort registers port as bound on host for protocol ("tcp" or
+// "udp"), for HostBoundPorts to report back — e.g. modeling vedanta's native
+// charon holding udp/500 exclusively, outside podman's own visibility.
+func (f *Fake) AddHostBoundPort(host, protocol string, port int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.hostBoundPorts == nil {
+		f.hostBoundPorts = map[string]map[string][]int{}
+	}
+	if f.hostBoundPorts[host] == nil {
+		f.hostBoundPorts[host] = map[string][]int{}
+	}
+	f.hostBoundPorts[host][protocol] = append(f.hostBoundPorts[host][protocol], port)
 }
 
 // PruneCall records one prune invocation for assertions.
