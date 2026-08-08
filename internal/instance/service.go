@@ -8,6 +8,7 @@ import (
 	"log"
 	"maps"
 	"slices"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -465,6 +466,61 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 		yaml = inj.YAML
 		for _, sec := range inj.Secrets {
 			injectorSecrets = append(injectorSecrets, store.InjectorSecret{Name: sec.Name, Key: sec.Key, Value: sec.Value})
+		}
+	}
+	// A registered injector may also declare host ports its sidecar(s) need
+	// exclusively (extension.HostPortRequirer) — ports the rendered pod YAML
+	// itself never expresses as a hostPort (e.g. a rootless IPSEC sidecar's
+	// IKE traffic, translated through pasta's host-side socket beneath the
+	// sidecar's own process). Check those BEFORE any host mutation: a pod
+	// whose sidecar can never establish because the port is already held by
+	// another process on this host (native or another instance) is a fail
+	// silently-forever bug, not a fail-fast one, without this check.
+	if reqPorts, ok := s.sidecar.(extension.HostPortRequirer); ok {
+		want, err := reqPorts.RequiredHostPorts(req.Parameters)
+		if err != nil {
+			return fmt.Errorf("sidecar required host ports: %w", err)
+		}
+		if len(want) > 0 {
+			used, err := s.client.UsedHostPorts(ctx, host)
+			if err != nil {
+				return fmt.Errorf("ports in use: %w", err)
+			}
+			busy := make(map[string]bool, len(used))
+			for _, p := range used {
+				busy[p.Protocol+"/"+strconv.Itoa(p.HostPort)] = true
+			}
+			// UsedHostPorts only sees ports podman itself published for a
+			// container it manages — it has ZERO visibility into a plain
+			// host-level process (a native systemd service, e.g. strongSwan's
+			// charon holding udp/500+4500 on vedanta, the actual #130 repro).
+			// Cross-check each required protocol's live /proc/net/<proto>[6]
+			// binding too, so a non-podman bind is caught just as reliably.
+			// One HostBoundPorts call per distinct protocol in `want` (at
+			// most 2: tcp/udp), not one per port.
+			hostBound := make(map[string]map[int]bool, 2)
+			for _, p := range want {
+				if _, done := hostBound[p.Protocol]; done {
+					continue
+				}
+				bound, err := s.client.HostBoundPorts(ctx, host, p.Protocol)
+				if err != nil {
+					return fmt.Errorf("host bound ports (%s): %w", p.Protocol, err)
+				}
+				set := make(map[int]bool, len(bound))
+				for _, port := range bound {
+					set[port] = true
+				}
+				hostBound[p.Protocol] = set
+			}
+			for _, p := range want {
+				switch {
+				case busy[p.Protocol+"/"+strconv.Itoa(p.Port)]:
+					return fmt.Errorf("%w: %s/%d (bound by a podman-managed container)", ErrPortConflict, p.Protocol, p.Port)
+				case hostBound[p.Protocol][p.Port]:
+					return fmt.Errorf("%w: %s/%d (bound on the host outside podman)", ErrPortConflict, p.Protocol, p.Port)
+				}
+			}
 		}
 	}
 	// Reject injector-declared secrets on a key-less store BEFORE any host

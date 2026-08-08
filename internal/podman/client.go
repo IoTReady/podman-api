@@ -96,6 +96,14 @@ type Client interface {
 	Ping(ctx context.Context, hostID string) error
 	Version(ctx context.Context, hostID string) (string, error)
 	UsedHostPorts(ctx context.Context, hostID string) ([]PortMapping, error)
+	// HostBoundPorts returns every port of the given protocol ("tcp" or "udp")
+	// currently bound on hostID, read directly from /proc/net/<protocol> (and
+	// its /proc/net/<protocol>6 IPv6 counterpart), not from libpod. Unlike
+	// UsedHostPorts — which only sees ports podman itself published for a
+	// container it manages — this also catches a plain host-level process (a
+	// native systemd service, e.g. strongSwan's charon) holding a port
+	// exclusively, invisible to libpod entirely.
+	HostBoundPorts(ctx context.Context, hostID, protocol string) ([]int, error)
 
 	// Host
 	HostInfo(ctx context.Context, hostID string) (HostInfo, error)

@@ -2,6 +2,7 @@ package podman
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -28,6 +29,19 @@ func sshReadLoadAvg(ctx context.Context, h config.Host) (string, error) {
 // libpod's `info` endpoint (see HostUptime's own doc comment for why).
 func sshReadUptime(ctx context.Context, h config.Host) (string, error) {
 	return sshReadFile(ctx, h, "cat /proc/uptime")
+}
+
+// sshReadProcNetPorts dials the host over SSH and reads /proc/net/<protocol>
+// plus (best-effort) /proc/net/<protocol>6, mirroring sshReadUptime/
+// sshReadLoadAvg. The primary file's absence is a real error: it is NOT
+// covered by the `|| true` below, so a failing first `cat` still fails the
+// whole command (and short-circuits past the second `cat` via `&&`) and
+// sshReadFile surfaces that error. Only the second (IPv6) cat's failure is
+// swallowed — matching readProcNetPortsLocal's "IPv6 file missing is not an
+// error" posture, since a host with IPv6 disabled simply lacks that file.
+func sshReadProcNetPorts(ctx context.Context, h config.Host, protocol string) (string, error) {
+	cmd := fmt.Sprintf("cat /proc/net/%s && (cat /proc/net/%s6 2>/dev/null || true)", protocol, protocol)
+	return sshReadFile(ctx, h, cmd)
 }
 
 // sshReadFile dials the host over SSH and runs cmd, returning its stdout.
