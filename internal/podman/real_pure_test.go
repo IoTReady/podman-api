@@ -50,6 +50,36 @@ func TestVolumeTransferTimeout_ZeroIsNoOp(t *testing.T) {
 	assert.Equal(t, 2*time.Hour, volumeTransferTimeout())
 }
 
+// imagePullTimeoutOverride is a package var (like volumeTransferTimeoutOverride
+// and callTimeout itself), so these restore it afterwards rather than leaking
+// state into other tests in this package.
+func resetImagePullTimeoutOverride(t *testing.T) {
+	t.Cleanup(func() { imagePullTimeoutOverride = 0 })
+}
+
+func TestImagePullTimeout_DefaultsToCallTimeout(t *testing.T) {
+	resetImagePullTimeoutOverride(t)
+
+	assert.Equal(t, callTimeout, imagePullTimeout())
+}
+
+func TestImagePullTimeout_SetOverridesDefault(t *testing.T) {
+	resetImagePullTimeoutOverride(t)
+
+	SetImagePullTimeout(2 * time.Hour)
+
+	assert.Equal(t, 2*time.Hour, imagePullTimeout())
+}
+
+func TestImagePullTimeout_ZeroIsNoOp(t *testing.T) {
+	resetImagePullTimeoutOverride(t)
+
+	SetImagePullTimeout(2 * time.Hour)
+	SetImagePullTimeout(0)
+
+	assert.Equal(t, 2*time.Hour, imagePullTimeout())
+}
+
 func TestParseProcUptime(t *testing.T) {
 	cases := []struct {
 		name string
