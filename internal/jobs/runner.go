@@ -90,6 +90,13 @@ type Runner struct {
 	mu                sync.Mutex
 	inflight          map[string]*inflightJob
 	Metrics           Metrics // optional; nil-safe
+
+	// volumeKinds/volumeWorkers configure a dedicated sub-pool reserved for
+	// volume-transfer-heavy job kinds (#238); see SetVolumeTransferPool.
+	// volumeKinds == nil means no split — all workers claim any kind, the
+	// pre-#238 behaviour.
+	volumeKinds   []string
+	volumeWorkers int
 }
 
 // inflightJob tracks a currently-running job so an operator request can cancel
@@ -132,6 +139,45 @@ func NewRunner(js store.JobStore, h Registry, workers int) *Runner {
 // reconciler is moved to reconciling (and later resolved) on restart instead of
 // being failed.
 func (r *Runner) SetReconcilers(rec Reconcilers) { r.reconcilers = rec }
+
+// SetVolumeTransferPool reserves workers of the runner's total pool for the
+// given kinds, claiming ClaimNextMatching(kinds) instead of the shared
+// ClaimNext. The remaining workers claim every other registered kind. Call
+// before Start. No-op if kinds is empty or workers <= 0 (matching
+// SetReconcilers/SetVolumeTransferTimeout's convention) — the caller
+// (server.go) separately validates workers < the runner's total worker
+// count at startup.
+//
+// #238: DefaultWorkers' single shared pool means a worker occupied by a
+// VolumeExport/VolumeImport-heavy job (backup/restore/pitr-restore/migrate,
+// or evacuate — which runs its migrate children in-process on its own
+// claimed worker) can now hold that worker for up to
+// -volume-transfer-timeout (2h default, was 10min pre-#237), starving every
+// other job kind behind it. Reserving a small sub-pool for those kinds
+// guarantees the general pool always has free workers regardless.
+func (r *Runner) SetVolumeTransferPool(kinds []string, workers int) {
+	if len(kinds) == 0 || workers <= 0 {
+		return
+	}
+	r.volumeKinds = kinds
+	r.volumeWorkers = workers
+}
+
+// generalKinds returns every registered handler kind not in volumeKinds —
+// the claim filter for the non-reserved worker group.
+func (r *Runner) generalKinds() []string {
+	reserved := make(map[string]bool, len(r.volumeKinds))
+	for _, k := range r.volumeKinds {
+		reserved[k] = true
+	}
+	kinds := make([]string, 0, len(r.handlers))
+	for k := range r.handlers {
+		if !reserved[k] {
+			kinds = append(kinds, k)
+		}
+	}
+	return kinds
+}
 
 // reconcilableKinds returns the kinds that have a registered reconciler.
 func (r *Runner) reconcilableKinds() []string {
@@ -189,9 +235,21 @@ func (r *Runner) Start(ctx context.Context) {
 		r.wg.Add(1)
 		go r.reconcileLoop(ctx)
 	}
+	if len(r.volumeKinds) > 0 && r.volumeWorkers > 0 && r.volumeWorkers < r.workers {
+		generalKinds := r.generalKinds()
+		for i := 0; i < r.volumeWorkers; i++ {
+			r.wg.Add(1)
+			go r.worker(ctx, r.volumeKinds)
+		}
+		for i := 0; i < r.workers-r.volumeWorkers; i++ {
+			r.wg.Add(1)
+			go r.worker(ctx, generalKinds)
+		}
+		return
+	}
 	for i := 0; i < r.workers; i++ {
 		r.wg.Add(1)
-		go r.worker(ctx)
+		go r.worker(ctx, nil)
 	}
 }
 
@@ -320,7 +378,11 @@ func (r *Runner) reconcileOne(ctx context.Context, job store.Job, rec Reconciler
 	}
 }
 
-func (r *Runner) worker(ctx context.Context) {
+// worker drains claimable jobs matching claimKinds until none remain, then
+// sleeps for a poke or the poll tick. claimKinds == nil claims any kind
+// (store.ClaimNext); a non-nil slice restricts to those kinds
+// (store.ClaimNextMatching) — see SetVolumeTransferPool.
+func (r *Runner) worker(ctx context.Context, claimKinds []string) {
 	defer r.wg.Done()
 	t := time.NewTicker(pollInterval)
 	defer t.Stop()
@@ -330,7 +392,7 @@ func (r *Runner) worker(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			job, ok, err := r.store.ClaimNext(ctx)
+			job, ok, err := r.claim(ctx, claimKinds)
 			if err != nil {
 				// Back off briefly so a persistent store error can't spin the
 				// worker hot when pokes keep arriving.
@@ -350,6 +412,15 @@ func (r *Runner) worker(ctx context.Context) {
 		case <-t.C:
 		}
 	}
+}
+
+// claim dispatches to store.ClaimNext (kinds == nil) or
+// store.ClaimNextMatching (kinds set).
+func (r *Runner) claim(ctx context.Context, kinds []string) (store.Job, bool, error) {
+	if kinds == nil {
+		return r.store.ClaimNext(ctx)
+	}
+	return r.store.ClaimNextMatching(ctx, kinds)
 }
 
 // finishTimeout bounds the terminal-state write so a slow/contended store can't

@@ -237,3 +237,72 @@ func TestRunnerMetrics(t *testing.T) {
 		t.Errorf("ObserveDuration kind = %q, want %q", m.durationKind, "test")
 	}
 }
+
+func TestRunner_VolumeTransferPool_GeneralKindNotBlockedByReservedKind(t *testing.T) {
+	m := store.NewMemory()
+	blockCh := make(chan struct{})
+	unblock := make(chan struct{})
+	reg := Registry{
+		"migrate": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+			close(blockCh)
+			<-unblock
+			return nil
+		}),
+		"prune": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+			return nil
+		}),
+	}
+	// 2 total workers, 1 reserved for "migrate" — leaves exactly 1 general worker.
+	r := NewRunner(m, reg, 2)
+	r.SetVolumeTransferPool([]string{"migrate"}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.Start(ctx)
+
+	mig, _ := m.Enqueue(context.Background(), "migrate", json.RawMessage(`{}`), "")
+	r.Notify()
+
+	select {
+	case <-blockCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("migrate job never started")
+	}
+
+	// The migrate job is now blocked mid-run, holding its dedicated worker.
+	// A prune job enqueued now must still be claimed and run by the general
+	// worker, proving the reserved pool didn't starve it.
+	pr, _ := m.Enqueue(context.Background(), "prune", json.RawMessage(`{}`), "")
+	r.Notify()
+
+	waitFor(t, func() bool {
+		got, _ := m.GetJob(context.Background(), pr.ID)
+		return got.State == store.JobSucceeded
+	})
+
+	close(unblock)
+	waitFor(t, func() bool {
+		got, _ := m.GetJob(context.Background(), mig.ID)
+		return got.State == store.JobSucceeded
+	})
+}
+
+func TestRunner_VolumeTransferPool_NoOpBelowThreshold(t *testing.T) {
+	m := store.NewMemory()
+	reg := Registry{"migrate": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+		return nil
+	})}
+	r := NewRunner(m, reg, 2)
+	r.SetVolumeTransferPool(nil, 1)                 // no-op: empty kinds
+	r.SetVolumeTransferPool([]string{"migrate"}, 0) // no-op: workers <= 0
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.Start(ctx)
+
+	j, _ := m.Enqueue(context.Background(), "migrate", json.RawMessage(`{}`), "")
+	r.Notify()
+
+	waitFor(t, func() bool {
+		got, _ := m.GetJob(context.Background(), j.ID)
+		return got.State == store.JobSucceeded
+	})
+}
