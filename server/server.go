@@ -435,7 +435,7 @@ func RunWithFlags(opts ...Option) error {
 		wg.Wait()
 	}()
 
-	metrics := obs.New()
+	metrics := obs.New(prometheus.DefaultRegisterer, prometheus.DefaultGatherer)
 
 	auditSink := os.Stdout
 	if *auditLogFile != "" {
