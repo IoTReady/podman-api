@@ -106,6 +106,16 @@ type JobStore interface {
 	// filtered. Used by a dedicated worker pool reserved for specific kinds
 	// (#238). An empty or nil kinds claims nothing (ok=false).
 	ClaimNextMatching(ctx context.Context, kinds []string) (job Job, ok bool, err error)
+	// ClaimNextExcluding is ClaimNext restricted to jobs whose kind is NOT in
+	// kinds — the complement of ClaimNextMatching. Same atomicity and
+	// ordering (oldest queued first), just filtered the other direction.
+	// Used by the general worker pool when a sub-pool is reserved for
+	// specific kinds (#238): the general pool must still claim (and let run()
+	// fail-fast on) any kind that has no registered handler, not silently
+	// skip it — a registry-derived allowlist would leave an unregistered
+	// kind's queued jobs stuck forever with nothing to reap them. Empty or
+	// nil kinds behaves like ClaimNext (nothing excluded).
+	ClaimNextExcluding(ctx context.Context, kinds []string) (job Job, ok bool, err error)
 	AppendStep(ctx context.Context, id string, step JobStep) error
 	// Finish sets the terminal state, finished timestamp, and error (empty for
 	// success). state must be JobSucceeded or JobFailed; passing any other value

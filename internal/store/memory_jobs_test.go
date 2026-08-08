@@ -204,6 +204,55 @@ func TestMemory_ClaimNextMatching_OldestFirst(t *testing.T) {
 	}
 }
 
+func TestMemory_ClaimNextExcluding_LeavesExcludedQueued(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+	mig, _ := m.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+
+	if _, ok, _ := m.ClaimNextExcluding(ctx, []string{"migrate", "backup"}); ok {
+		t.Fatal("excluded kind should not be claimed")
+	}
+	got, err := m.GetJob(ctx, mig.ID)
+	if err != nil || got.State != JobQueued {
+		t.Fatalf("excluded job should still be queued: %+v err=%v", got, err)
+	}
+}
+
+func TestMemory_ClaimNextExcluding_ClaimsNonExcludedKind(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+	_, _ = m.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	prune, _ := m.Enqueue(ctx, "prune", json.RawMessage(`{}`), "")
+
+	c, ok, err := m.ClaimNextExcluding(ctx, []string{"migrate", "backup"})
+	if err != nil || !ok || c.ID != prune.ID || c.State != JobRunning {
+		t.Fatalf("claim: %+v ok=%v err=%v", c, ok, err)
+	}
+}
+
+func TestMemory_ClaimNextExcluding_EmptyKindsClaimsAny(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+	j, _ := m.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+
+	c, ok, err := m.ClaimNextExcluding(ctx, nil)
+	if err != nil || !ok || c.ID != j.ID {
+		t.Fatalf("nil kinds should claim any queued job: %+v ok=%v err=%v", c, ok, err)
+	}
+}
+
+func TestMemory_ClaimNextExcluding_OldestFirst(t *testing.T) {
+	ctx := context.Background()
+	m := NewMemory()
+	first, _ := m.Enqueue(ctx, "prune", json.RawMessage(`{}`), "")
+	_, _ = m.Enqueue(ctx, "prune", json.RawMessage(`{}`), "")
+
+	c, ok, err := m.ClaimNextExcluding(ctx, []string{"migrate"})
+	if err != nil || !ok || c.ID != first.ID {
+		t.Fatalf("expected oldest job first: %+v ok=%v err=%v", c, ok, err)
+	}
+}
+
 func TestMemory_AppendStep_DistinctStepsDoNotCoalesce(t *testing.T) {
 	ctx := context.Background()
 	m := NewMemory()

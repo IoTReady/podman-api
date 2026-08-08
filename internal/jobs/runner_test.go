@@ -286,6 +286,87 @@ func TestRunner_VolumeTransferPool_GeneralKindNotBlockedByReservedKind(t *testin
 	})
 }
 
+func TestRunner_VolumeTransferPool_UnregisteredKindStillReaped(t *testing.T) {
+	// Regression test for the general pool's claim filter: it must claim
+	// "anything not reserved" (ClaimNextExcluding), not a registry-derived
+	// allowlist — otherwise a kind with no registered handler and not in
+	// volumeKinds matches neither pool's claim filter and is never claimed,
+	// leaving it queued forever with nothing to reap it.
+	m := store.NewMemory()
+	reg := Registry{
+		"migrate": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+			return nil
+		}),
+	}
+	r := NewRunner(m, reg, 2)
+	r.SetVolumeTransferPool([]string{"migrate"}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.Start(ctx)
+
+	j, _ := m.Enqueue(context.Background(), "mystery", json.RawMessage(`{}`), "")
+	r.Notify()
+
+	waitFor(t, func() bool {
+		got, _ := m.GetJob(context.Background(), j.ID)
+		return got.State == store.JobFailed
+	})
+	got, _ := m.GetJob(context.Background(), j.ID)
+	if got.Error == "" {
+		t.Fatal("expected a 'no handler' error message")
+	}
+}
+
+func TestRunner_VolumeTransferPool_ReservedKindNotBlockedByGeneralKind(t *testing.T) {
+	// Mirror of TestRunner_VolumeTransferPool_GeneralKindNotBlockedByReservedKind:
+	// a busy general pool must not block a reserved-kind claim.
+	m := store.NewMemory()
+	blockCh := make(chan struct{})
+	unblock := make(chan struct{})
+	reg := Registry{
+		"prune": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+			close(blockCh)
+			<-unblock
+			return nil
+		}),
+		"migrate": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+			return nil
+		}),
+	}
+	// 2 total workers, 1 reserved for "migrate" — leaves exactly 1 general worker.
+	r := NewRunner(m, reg, 2)
+	r.SetVolumeTransferPool([]string{"migrate"}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.Start(ctx)
+
+	pr, _ := m.Enqueue(context.Background(), "prune", json.RawMessage(`{}`), "")
+	r.Notify()
+
+	select {
+	case <-blockCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("prune job never started")
+	}
+
+	// The prune job is now blocked mid-run, holding the general worker. A
+	// migrate job enqueued now must still be claimed and run by the reserved
+	// worker, proving the busy general pool didn't block it.
+	mig, _ := m.Enqueue(context.Background(), "migrate", json.RawMessage(`{}`), "")
+	r.Notify()
+
+	waitFor(t, func() bool {
+		got, _ := m.GetJob(context.Background(), mig.ID)
+		return got.State == store.JobSucceeded
+	})
+
+	close(unblock)
+	waitFor(t, func() bool {
+		got, _ := m.GetJob(context.Background(), pr.ID)
+		return got.State == store.JobSucceeded
+	})
+}
+
 func TestRunner_VolumeTransferPool_NoOpBelowThreshold(t *testing.T) {
 	m := store.NewMemory()
 	reg := Registry{"migrate": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {

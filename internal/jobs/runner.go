@@ -155,8 +155,10 @@ func (r *Runner) SetReconcilers(rec Reconcilers) { r.reconcilers = rec }
 
 // SetVolumeTransferPool reserves workers of the runner's total pool for the
 // given kinds, claiming ClaimNextMatching(kinds) instead of the shared
-// ClaimNext. The remaining workers claim every other registered kind. Call
-// before Start. No-op if kinds is empty or workers <= 0 (matching
+// ClaimNext. The remaining workers claim every other kind, registered or not
+// (so an unregistered kind's jobs still fail fast in run() instead of being
+// stranded queued forever). Call before Start. No-op if kinds is empty or
+// workers <= 0 (matching
 // SetReconcilers/SetVolumeTransferTimeout's convention) — the caller
 // (server.go) separately validates workers < the runner's total worker
 // count at startup.
@@ -174,22 +176,6 @@ func (r *Runner) SetVolumeTransferPool(kinds []string, workers int) {
 	}
 	r.volumeKinds = kinds
 	r.volumeWorkers = workers
-}
-
-// generalKinds returns every registered handler kind not in volumeKinds —
-// the claim filter for the non-reserved worker group.
-func (r *Runner) generalKinds() []string {
-	reserved := make(map[string]bool, len(r.volumeKinds))
-	for _, k := range r.volumeKinds {
-		reserved[k] = true
-	}
-	kinds := make([]string, 0, len(r.handlers))
-	for k := range r.handlers {
-		if !reserved[k] {
-			kinds = append(kinds, k)
-		}
-	}
-	return kinds
 }
 
 // reconcilableKinds returns the kinds that have a registered reconciler.
@@ -249,20 +235,22 @@ func (r *Runner) Start(ctx context.Context) {
 		go r.reconcileLoop(ctx)
 	}
 	if len(r.volumeKinds) > 0 && r.volumeWorkers > 0 && r.volumeWorkers < r.workers {
-		generalKinds := r.generalKinds()
 		for i := 0; i < r.volumeWorkers; i++ {
 			r.wg.Add(1)
-			go r.worker(ctx, r.volumeKinds)
+			go r.worker(ctx, r.volumeKinds, false)
 		}
 		for i := 0; i < r.workers-r.volumeWorkers; i++ {
 			r.wg.Add(1)
-			go r.worker(ctx, generalKinds)
+			go r.worker(ctx, r.volumeKinds, true)
 		}
 		return
 	}
+	if len(r.volumeKinds) > 0 {
+		log.Printf("jobs: volume-transfer pool configured (%d kinds, %d workers) but not applied: volumeWorkers must be > 0 and < total workers (%d); falling back to a single shared pool", len(r.volumeKinds), r.volumeWorkers, r.workers)
+	}
 	for i := 0; i < r.workers; i++ {
 		r.wg.Add(1)
-		go r.worker(ctx, nil)
+		go r.worker(ctx, nil, false)
 	}
 }
 
@@ -392,10 +380,12 @@ func (r *Runner) reconcileOne(ctx context.Context, job store.Job, rec Reconciler
 }
 
 // worker drains claimable jobs matching claimKinds until none remain, then
-// sleeps for a poke or the poll tick. claimKinds == nil claims any kind
-// (store.ClaimNext); a non-nil slice restricts to those kinds
-// (store.ClaimNextMatching) — see SetVolumeTransferPool.
-func (r *Runner) worker(ctx context.Context, claimKinds []string) {
+// sleeps for a poke or the poll tick. claimKinds == nil and exclude == false
+// claims any kind (store.ClaimNext); a non-nil claimKinds with exclude ==
+// false restricts to those kinds (store.ClaimNextMatching); exclude == true
+// claims anything NOT in claimKinds (store.ClaimNextExcluding) — see
+// SetVolumeTransferPool.
+func (r *Runner) worker(ctx context.Context, claimKinds []string, exclude bool) {
 	defer r.wg.Done()
 	t := time.NewTicker(pollInterval)
 	defer t.Stop()
@@ -405,7 +395,7 @@ func (r *Runner) worker(ctx context.Context, claimKinds []string) {
 			if ctx.Err() != nil {
 				return
 			}
-			job, ok, err := r.claim(ctx, claimKinds)
+			job, ok, err := r.claim(ctx, claimKinds, exclude)
 			if err != nil {
 				// Back off briefly so a persistent store error can't spin the
 				// worker hot when pokes keep arriving.
@@ -427,13 +417,18 @@ func (r *Runner) worker(ctx context.Context, claimKinds []string) {
 	}
 }
 
-// claim dispatches to store.ClaimNext (kinds == nil) or
-// store.ClaimNextMatching (kinds set).
-func (r *Runner) claim(ctx context.Context, kinds []string) (store.Job, bool, error) {
-	if kinds == nil {
+// claim dispatches to store.ClaimNext (kinds == nil, exclude == false),
+// store.ClaimNextMatching (kinds set, exclude == false), or
+// store.ClaimNextExcluding (exclude == true).
+func (r *Runner) claim(ctx context.Context, kinds []string, exclude bool) (store.Job, bool, error) {
+	switch {
+	case exclude:
+		return r.store.ClaimNextExcluding(ctx, kinds)
+	case kinds == nil:
 		return r.store.ClaimNext(ctx)
+	default:
+		return r.store.ClaimNextMatching(ctx, kinds)
 	}
-	return r.store.ClaimNextMatching(ctx, kinds)
 }
 
 // finishTimeout bounds the terminal-state write so a slow/contended store can't

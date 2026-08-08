@@ -240,6 +240,102 @@ func TestSQLite_ClaimNextMatching_NoDoubleClaim(t *testing.T) {
 	}
 }
 
+func TestSQLite_ClaimNextExcluding_LeavesExcludedQueued(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+	mig, _ := s.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+
+	if _, ok, _ := s.ClaimNextExcluding(ctx, []string{"migrate", "backup"}); ok {
+		t.Fatal("excluded kind should not be claimed")
+	}
+	got, err := s.GetJob(ctx, mig.ID)
+	if err != nil || got.State != JobQueued {
+		t.Fatalf("excluded job should still be queued: %+v err=%v", got, err)
+	}
+}
+
+func TestSQLite_ClaimNextExcluding_ClaimsNonExcludedKind(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+	_, _ = s.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+	prune, _ := s.Enqueue(ctx, "prune", json.RawMessage(`{}`), "")
+
+	c, ok, err := s.ClaimNextExcluding(ctx, []string{"migrate", "backup"})
+	if err != nil || !ok || c.ID != prune.ID || c.State != JobRunning {
+		t.Fatalf("claim: %+v ok=%v err=%v", c, ok, err)
+	}
+}
+
+func TestSQLite_ClaimNextExcluding_EmptyKindsClaimsAny(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+	j, _ := s.Enqueue(ctx, "migrate", json.RawMessage(`{}`), "")
+
+	c, ok, err := s.ClaimNextExcluding(ctx, nil)
+	if err != nil || !ok || c.ID != j.ID {
+		t.Fatalf("nil kinds should claim any queued job: %+v ok=%v err=%v", c, ok, err)
+	}
+}
+
+func TestSQLite_ClaimNextExcluding_OldestFirst(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+	first, _ := s.Enqueue(ctx, "prune", json.RawMessage(`{}`), "")
+	_, _ = s.Enqueue(ctx, "prune", json.RawMessage(`{}`), "")
+
+	c, ok, err := s.ClaimNextExcluding(ctx, []string{"migrate"})
+	if err != nil || !ok || c.ID != first.ID {
+		t.Fatalf("expected oldest job first: %+v ok=%v err=%v", c, ok, err)
+	}
+}
+
+func TestSQLite_ClaimNextExcluding_NoDoubleClaim(t *testing.T) {
+	ctx := context.Background()
+	s := openJobStore(t)
+	const n = 20
+	for i := 0; i < n; i++ {
+		if _, err := s.Enqueue(ctx, "migrate", json.RawMessage(`{}`), ""); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var mu sync.Mutex
+	claimed := map[string]int{}
+	errCh := make(chan error, 4)
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				j, ok, err := s.ClaimNextExcluding(ctx, []string{"backup"})
+				if err != nil {
+					errCh <- err
+					return
+				}
+				if !ok {
+					return
+				}
+				mu.Lock()
+				claimed[j.ID]++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("ClaimNextExcluding error: %v", err)
+	}
+	if len(claimed) != n {
+		t.Fatalf("claimed %d distinct jobs, want %d", len(claimed), n)
+	}
+	for _, c := range claimed {
+		if c != 1 {
+			t.Fatalf("a job was claimed %d times, want 1", c)
+		}
+	}
+}
+
 func TestSQLite_AppendStep_Finish_FailRunning(t *testing.T) {
 	ctx := context.Background()
 	s := openJobStore(t)

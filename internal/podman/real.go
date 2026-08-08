@@ -259,8 +259,9 @@ var preflightTimeout = 10 * time.Second
 
 // callTimeout bounds each individual libpod operation so a hung SSH or
 // libpod call fails rather than blocking a job (e.g. a migrate between
-// copy-volume-done and apply-dest) forever. 10 minutes covers large image
-// pulls; tests that need faster failure can override this package var.
+// copy-volume-done and apply-dest) forever. Large image pulls instead get
+// their own deadline via imagePullTimeout(); tests that need faster failure
+// can override this package var.
 var callTimeout = 10 * time.Minute
 
 // volumeTransferTimeoutOverride bounds VolumeExport/VolumeImport when set
