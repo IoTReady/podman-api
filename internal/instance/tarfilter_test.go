@@ -1,0 +1,236 @@
+package instance
+
+import (
+	"archive/tar"
+	"bytes"
+	"io"
+	"testing"
+)
+
+// tarEntry is one entry to write into a test archive.
+type tarEntry struct {
+	name string
+	body string
+	typ  byte
+	link string
+}
+
+func makeTar(t *testing.T, entries []tarEntry) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, e := range entries {
+		typ := e.typ
+		if typ == 0 {
+			typ = tar.TypeReg
+		}
+		hdr := &tar.Header{Name: e.name, Typeflag: typ, Mode: 0o644, Linkname: e.link}
+		if typ == tar.TypeReg {
+			hdr.Size = int64(len(e.body))
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if typ == tar.TypeReg {
+			if _, err := tw.Write([]byte(e.body)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func tarNames(t *testing.T, b []byte) []string {
+	t.Helper()
+	var out []string
+	tr := tar.NewReader(bytes.NewReader(b))
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return out
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		out = append(out, hdr.Name)
+		if _, err := io.Copy(io.Discard, tr); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestFilterTar_dropsMatchingContents(t *testing.T) {
+	src := makeTar(t, []tarEntry{
+		{name: "site/private/backups/", typ: tar.TypeDir},
+		{name: "site/private/backups/db.sql.gz", body: "DUMPDUMP"},
+		{name: "site/private/files/a.pdf", body: "PDF"},
+		{name: "site/site_config.json", body: "{}"},
+	})
+	var out bytes.Buffer
+	m, stats, err := filterTar(&out, bytes.NewReader(src), []string{"*/private/backups/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := tarNames(t, out.Bytes())
+	want := []string{"site/private/backups/", "site/private/files/a.pdf", "site/site_config.json"}
+	if len(got) != len(want) {
+		t.Fatalf("entries = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("entries = %v, want %v", got, want)
+		}
+	}
+	if stats.Entries != 1 || stats.Bytes != int64(len("DUMPDUMP")) {
+		t.Fatalf("stats = %+v, want 1 entry / 8 bytes", stats)
+	}
+	if _, ok := m["site/private/backups/db.sql.gz"]; ok {
+		t.Fatal("dropped entry must not appear in the manifest")
+	}
+	if _, ok := m["site/private/files/a.pdf"]; !ok {
+		t.Fatal("surviving entry missing from the manifest")
+	}
+}
+
+func TestFilterTar_noPatternsIsPassThrough(t *testing.T) {
+	src := makeTar(t, []tarEntry{
+		{name: "a.txt", body: "A"},
+		{name: "d/", typ: tar.TypeDir},
+		{name: "d/b.txt", body: "B"},
+	})
+	var out bytes.Buffer
+	_, stats, err := filterTar(&out, bytes.NewReader(src), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.Entries != 0 || stats.Bytes != 0 {
+		t.Fatalf("stats = %+v, want zero", stats)
+	}
+	if len(tarNames(t, out.Bytes())) != 3 {
+		t.Fatalf("entries = %v, want all 3", tarNames(t, out.Bytes()))
+	}
+}
+
+func TestFilterTar_directoryEntryVsContents(t *testing.T) {
+	entries := []tarEntry{
+		{name: "site/private/backups", typ: tar.TypeDir},
+		{name: "site/private/backups/db.sql.gz", body: "D"},
+	}
+	// "dir/**" keeps the directory entry itself.
+	var keep bytes.Buffer
+	if _, _, err := filterTar(&keep, bytes.NewReader(makeTar(t, entries)), []string{"*/private/backups/**"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(tarNames(t, keep.Bytes())); n != 1 {
+		t.Fatalf("dir/** kept %d entries, want 1 (the directory)", n)
+	}
+	// "dir" drops the directory entry too.
+	var drop bytes.Buffer
+	if _, _, err := filterTar(&drop, bytes.NewReader(makeTar(t, entries)), []string{"*/private/backups", "*/private/backups/**"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := len(tarNames(t, drop.Bytes())); n != 0 {
+		t.Fatalf("dir pattern kept %d entries, want 0", n)
+	}
+}
+
+func TestFilterTar_dropsHardlinkToDroppedTarget(t *testing.T) {
+	src := makeTar(t, []tarEntry{
+		{name: "junk/big.bin", body: "BIG"},
+		{name: "keep/link.bin", typ: tar.TypeLink, link: "junk/big.bin"},
+		{name: "keep/real.txt", body: "R"},
+	})
+	var out bytes.Buffer
+	_, stats, err := filterTar(&out, bytes.NewReader(src), []string{"junk/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := tarNames(t, out.Bytes())
+	if len(got) != 1 || got[0] != "keep/real.txt" {
+		t.Fatalf("entries = %v, want only keep/real.txt (link to a dropped target must go too)", got)
+	}
+	if stats.Entries != 2 {
+		t.Fatalf("stats.Entries = %d, want 2 (the file and its link)", stats.Entries)
+	}
+}
+
+func TestFilterTar_symlinkIsNotResolved(t *testing.T) {
+	// A symlink is a name, not a hardlink to an inode — it survives even when
+	// its target was dropped, exactly as it would on the source filesystem.
+	src := makeTar(t, []tarEntry{
+		{name: "junk/big.bin", body: "BIG"},
+		{name: "keep/sym", typ: tar.TypeSymlink, link: "../junk/big.bin"},
+	})
+	var out bytes.Buffer
+	if _, _, err := filterTar(&out, bytes.NewReader(src), []string{"junk/**"}); err != nil {
+		t.Fatal(err)
+	}
+	got := tarNames(t, out.Bytes())
+	if len(got) != 1 || got[0] != "keep/sym" {
+		t.Fatalf("entries = %v, want the symlink kept", got)
+	}
+}
+
+func TestFilterTar_preservesLongNamesAndXattrs(t *testing.T) {
+	long := "site/" + string(bytes.Repeat([]byte("d"), 120)) + "/deep.txt"
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	hdr := &tar.Header{
+		Name: long, Typeflag: tar.TypeReg, Mode: 0o644, Size: 3,
+		Format:     tar.FormatPAX,
+		PAXRecords: map[string]string{"SCHILY.xattr.user.test": "v"},
+	}
+	if err := tw.WriteHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write([]byte("abc")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var out bytes.Buffer
+	if _, _, err := filterTar(&out, bytes.NewReader(buf.Bytes()), []string{"nothing/**"}); err != nil {
+		t.Fatal(err)
+	}
+	tr := tar.NewReader(bytes.NewReader(out.Bytes()))
+	got, err := tr.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Name != long {
+		t.Fatalf("name = %q, want the full %d-char name", got.Name, len(long))
+	}
+	if got.PAXRecords["SCHILY.xattr.user.test"] != "v" {
+		t.Fatalf("xattr lost: %+v", got.PAXRecords)
+	}
+}
+
+func TestFilterTar_manifestMatchesBuildManifestWhenNothingDropped(t *testing.T) {
+	src := makeTar(t, []tarEntry{
+		{name: "a.txt", body: "A"},
+		{name: "d/b.txt", body: "BB"},
+		{name: "s", typ: tar.TypeSymlink, link: "a.txt"},
+	})
+	want, err := buildManifest(bytes.NewReader(src))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := filterTar(io.Discard, bytes.NewReader(src), []string{"nothing/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if k, ok := got.firstDiff(want); !ok {
+		t.Fatalf("manifests differ at %q", k)
+	}
+}
+
+func TestNewDropper_rejectsBadPattern(t *testing.T) {
+	if _, err := newDropper([]string{"[a-"}); err == nil {
+		t.Fatal("want an error for an uncompilable pattern")
+	}
+}
