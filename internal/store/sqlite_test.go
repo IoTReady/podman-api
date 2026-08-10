@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	_ "modernc.org/sqlite"
@@ -290,4 +291,105 @@ func TestSQLite_InjectorSecrets_EncryptedAtRest(t *testing.T) {
 		require.NotContains(t, string(raw), "access-key-id", "plaintext must not appear in the raw DB")
 		require.NotContains(t, string(raw), "litestream-s3-key", "plaintext must not appear in the raw DB")
 	}
+}
+
+func TestSQLiteRenameHost(t *testing.T) {
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	ctx := context.Background()
+
+	require.NoError(t, s.PutSpec(ctx, Spec{Host: "h1", Template: "app", Slug: "a", Parameters: map[string]any{}, Domains: []string{}}))
+	require.NoError(t, s.PutHostSecret(ctx, "h1", "tok", []byte("secret")))
+
+	require.NoError(t, s.RenameHost(ctx, "h1", "h2"))
+
+	_, err := s.GetSpec(ctx, "h1", "app", "a")
+	require.ErrorIs(t, err, ErrNotFound)
+	got, err := s.GetSpec(ctx, "h2", "app", "a")
+	require.NoError(t, err)
+	require.Equal(t, "h2", got.Host)
+
+	_, err = s.GetHostSecret(ctx, "h1", "tok")
+	require.ErrorIs(t, err, ErrNotFound)
+	val, err := s.GetHostSecret(ctx, "h2", "tok")
+	require.NoError(t, err)
+	require.Equal(t, []byte("secret"), val)
+}
+
+func TestSQLiteRenameHostConflict(t *testing.T) {
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	ctx := context.Background()
+
+	require.NoError(t, s.PutSpec(ctx, Spec{Host: "h1", Template: "app", Slug: "a", Parameters: map[string]any{}, Domains: []string{}}))
+	require.NoError(t, s.PutSpec(ctx, Spec{Host: "h2", Template: "app", Slug: "b", Parameters: map[string]any{}, Domains: []string{}}))
+
+	err := s.RenameHost(ctx, "h1", "h2")
+	require.ErrorIs(t, err, ErrHostRenameConflict)
+
+	// h1's row must be untouched.
+	_, err = s.GetSpec(ctx, "h1", "app", "a")
+	require.NoError(t, err)
+}
+
+func TestSQLiteRenameHostHasBackups(t *testing.T) {
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	ctx := context.Background()
+
+	require.NoError(t, s.PutSpec(ctx, Spec{Host: "h1", Template: "app", Slug: "a", Parameters: map[string]any{}, Domains: []string{}}))
+	require.NoError(t, s.CreateBackup(ctx, Backup{ID: "b1", Host: "h1", Template: "app", Slug: "a", State: BackupCreating, Created: time.Now()}))
+
+	err := s.RenameHost(ctx, "h1", "h2")
+	require.ErrorIs(t, err, ErrHostRenameHasBackups)
+
+	_, err = s.GetSpec(ctx, "h1", "app", "a")
+	require.NoError(t, err) // untouched
+}
+
+// A host_secrets row under newID is a conflict even when newID has no specs
+// (final-review finding #5 — SQLite used to surface this as an opaque PK
+// violation, and Memory silently overwrote it).
+func TestSQLiteRenameHostSecretConflict(t *testing.T) {
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	ctx := context.Background()
+
+	require.NoError(t, s.PutSpec(ctx, Spec{Host: "h1", Template: "app", Slug: "a", Parameters: map[string]any{}, Domains: []string{}}))
+	require.NoError(t, s.PutHostSecret(ctx, "h1", "tok", []byte("old-value")))
+	require.NoError(t, s.PutHostSecret(ctx, "h2", "tok", []byte("new-host-value")))
+
+	require.ErrorIs(t, s.RenameHost(ctx, "h1", "h2"), ErrHostRenameConflict)
+
+	val, err := s.GetHostSecret(ctx, "h2", "tok")
+	require.NoError(t, err)
+	require.Equal(t, []byte("new-host-value"), val)
+	val, err = s.GetHostSecret(ctx, "h1", "tok")
+	require.NoError(t, err)
+	require.Equal(t, []byte("old-value"), val)
+}
+
+func TestSQLiteRenameHostTargetHasBackups(t *testing.T) {
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	ctx := context.Background()
+
+	require.NoError(t, s.PutSpec(ctx, Spec{Host: "h1", Template: "app", Slug: "a", Parameters: map[string]any{}, Domains: []string{}}))
+	require.NoError(t, s.CreateBackup(ctx, Backup{ID: "b1", Host: "h2", Template: "app", Slug: "b", State: BackupCreating, Created: time.Now()}))
+
+	require.ErrorIs(t, s.RenameHost(ctx, "h1", "h2"), ErrHostRenameConflict)
+}
+
+func TestSQLiteCheckHostRename(t *testing.T) {
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	ctx := context.Background()
+
+	require.NoError(t, s.PutSpec(ctx, Spec{Host: "h1", Template: "app", Slug: "a", Parameters: map[string]any{}, Domains: []string{}}))
+	require.NoError(t, s.CheckHostRename(ctx, "h1", "h2"))
+
+	require.NoError(t, s.CreateBackup(ctx, Backup{ID: "b1", Host: "h1", Template: "app", Slug: "a", State: BackupCreating, Created: time.Now()}))
+	require.ErrorIs(t, s.CheckHostRename(ctx, "h1", "h2"), ErrHostRenameHasBackups)
+
+	// Read-only: nothing moved.
+	got, err := s.GetSpec(ctx, "h1", "app", "a")
+	require.NoError(t, err)
+	require.Equal(t, "h1", got.Host)
+
+	require.NoError(t, s.PutHostSecret(ctx, "h3", "tok", []byte("v")))
+	require.ErrorIs(t, s.CheckHostRename(ctx, "h1", "h3"), ErrHostRenameConflict)
 }

@@ -2,6 +2,7 @@ package config
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -65,4 +66,103 @@ func TestLoadHostsCaddyAdminAddrAbsent(t *testing.T) {
 	hosts, err := LoadHosts(dir)
 	require.NoError(t, err)
 	require.Equal(t, "", hosts[0].CaddyAdminAddr)
+}
+
+func TestRenameHostFile(t *testing.T) {
+	dir := t.TempDir()
+	content := "id: h1\naddr: unix\nsocket: /run/podman.sock\n# a comment to preserve\nlabels:\n  env: dev\n"
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "h1.yaml"), []byte(content), 0o644))
+
+	path, original, err := RenameHostFile(dir, "h1", "h2")
+	require.NoError(t, err)
+	require.Equal(t, filepath.Join(dir, "h1.yaml"), path)
+	require.Equal(t, []byte(content), original)
+
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "id: h2\naddr: unix\nsocket: /run/podman.sock\n# a comment to preserve\nlabels:\n  env: dev\n", string(got))
+
+	hosts, err := LoadHosts(dir)
+	require.NoError(t, err)
+	require.Len(t, hosts, 1)
+	require.Equal(t, "h2", hosts[0].ID)
+}
+
+func TestRenameHostFileNoMatch(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "h1.yaml"), []byte("id: h1\naddr: unix\nsocket: /x\n"), 0o644))
+
+	_, _, err := RenameHostFile(dir, "does-not-exist", "h2")
+	require.Error(t, err)
+}
+
+func TestRenameHostFileUnexpectedIDLineFormat(t *testing.T) {
+	dir := t.TempDir()
+	// id on the same line as a trailing comment — the exact-line match must
+	// fail closed rather than guess.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "h1.yaml"), []byte("id: h1 # primary\naddr: unix\nsocket: /x\n"), 0o644))
+
+	_, _, err := RenameHostFile(dir, "h1", "h2")
+	require.Error(t, err)
+}
+
+func TestHostsDirRenameHostFile(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "h1.yaml"), []byte("id: h1\naddr: unix\nsocket: /x\n"), 0o644))
+
+	d := HostsDir(dir)
+	path, original, err := d.RenameHostFile("h1", "h2")
+	require.NoError(t, err)
+	require.NotEmpty(t, path)
+	require.Contains(t, string(original), "id: h1")
+}
+
+func TestWriteFileAtomicPreservesMode(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "h1.yaml")
+	require.NoError(t, os.WriteFile(p, []byte("old\n"), 0o600))
+
+	require.NoError(t, WriteFileAtomic(p, []byte("new\n")))
+
+	got, err := os.ReadFile(p)
+	require.NoError(t, err)
+	require.Equal(t, "new\n", string(got))
+	fi, err := os.Stat(p)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), fi.Mode().Perm())
+
+	// No temp file left behind.
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+}
+
+func TestWriteFileAtomicCreatesWithDefaultMode(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "new.yaml")
+	require.NoError(t, WriteFileAtomic(p, []byte("x\n")))
+	fi, err := os.Stat(p)
+	require.NoError(t, err)
+	require.Equal(t, DefaultConfigFileMode, fi.Mode().Perm())
+}
+
+// RenameHostFile's forward write must keep the host file's mode, not flatten
+// it to 0644 (final-review finding #9).
+func TestRenameHostFilePreservesMode(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "h1.yaml")
+	require.NoError(t, os.WriteFile(p, []byte("# a comment\nid: h1\naddr: unix\nsocket: /x\n"), 0o600))
+
+	gotPath, original, err := RenameHostFile(dir, "h1", "h2")
+	require.NoError(t, err)
+	require.Equal(t, p, gotPath)
+	require.Contains(t, string(original), "id: h1")
+
+	fi, err := os.Stat(p)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o600), fi.Mode().Perm())
+
+	raw, err := os.ReadFile(p)
+	require.NoError(t, err)
+	require.Contains(t, string(raw), "id: h2")
+	require.Contains(t, string(raw), "# a comment")
 }

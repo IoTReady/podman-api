@@ -771,6 +771,62 @@ paths:
                 items: {$ref: '#/components/schemas/PortMapping'}
       x-required-scope: hosts:read
 
+  /hosts/{host}/rename:
+    post:
+      tags: [hosts]
+      summary: rename a host's id in the config store
+      description: >-
+        Changes a host's id in the config file and the control-plane state
+        store, and makes the new id live immediately — no restart or SIGHUP.
+        Fails if the new id is already in use, if the host has backups (see
+        409), or when the HostFileRenamer is not wired (501 not_implemented).
+      parameters: [{$ref: '#/components/parameters/HostID'}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [new_id]
+              properties:
+                new_id:
+                  type: string
+                  pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'
+                  description: the new id for the host
+      responses:
+        '200':
+          description: host renamed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  old_id: {type: string}
+                  new_id: {type: string}
+        '400':
+          description: >-
+            invalid request body: new_id is required, new_id must differ from
+            the current host id, or new_id does not match the allowed pattern
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+        '404':
+          description: unknown host
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+        '409':
+          description: >-
+            two distinct refusals share this status; tell them apart by the
+            error code. host_already_exists — new_id is already in use by
+            another host, or the state store already holds specs, host secrets
+            or backups under it. host_has_backups — the host being renamed has
+            backup rows; their blob keys are NOT re-keyed by a rename, so
+            renaming would leave those backups unreachable through the restore
+            route. Delete the backups first, or wait for the blob re-key
+            follow-up.
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+        '501':
+          description: host rename is not configured on this server (HostFileRenamer not wired)
+          content: {application/json: {schema: {$ref: '#/components/schemas/Error'}}}
+      x-required-scope: hosts:write
+
   /templates:
     get:
       tags: [templates]

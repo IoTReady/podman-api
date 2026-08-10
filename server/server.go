@@ -144,8 +144,9 @@ func RunWithFlags(opts ...Option) error {
 	// CURRENT run, so the SIGHUP reload path below can tell "genuinely new"
 	// and "reappeared after a removal" apart from "already tracked" (#231
 	// review findings #3 and #4 — one consistent mechanism for both). It is
-	// mutated only from the single SIGHUP-handling goroutine below, so no
-	// lock is needed.
+	// mutated only inside applyHosts below, which holds hostsApplyMu — the
+	// SIGHUP goroutine is no longer the only caller now that the host-rename
+	// route triggers a reload from an HTTP handler.
 	seenHostIDs := make(map[string]bool, len(hosts))
 	for _, h := range hosts {
 		seenHostIDs[h.ID] = true
@@ -524,10 +525,76 @@ func RunWithFlags(opts ...Option) error {
 	// one above. POST /registry/prune is wired to the scheduler, not the job
 	// store, so the on-demand trigger reuses the same in-flight guard the ticker
 	// does rather than walking past it.
+	// applyHosts makes a freshly-loaded host list live EVERYWHERE, and is the
+	// single definition of what that means: the podman client's own host map,
+	// the instance service's, and hostsHolder (read by the periodic ingress
+	// reconcile, the prune scheduler's policies and the boot-converge
+	// goroutine). Anything that changes the host set — SIGHUP, and the host
+	// rename route via the hosts reloader below — must go through here; a
+	// caller that updates only one of the three leaves the others working an
+	// id that no longer exists (final-review findings #1 and #2).
+	//
+	// Called from the SIGHUP goroutine and from HTTP handlers, so it locks:
+	// seenHostIDs is plain map state.
+	var hostsApplyMu sync.Mutex
+	applyHosts := func(newHosts []config.Host) {
+		hostsApplyMu.Lock()
+		defer hostsApplyMu.Unlock()
+
+		client.SetHosts(newHosts)
+		svc.SetHosts(newHosts)
+		hostsHolder.Store(&newHosts)
+		draining := 0
+		for _, hh := range newHosts {
+			if hh.Drain {
+				draining++
+			}
+		}
+		// A host id this process has not tracked before — either genuinely
+		// new, or previously removed by an earlier SIGHUP and now re-added, or
+		// the target of a rename — needs a boot-converge pass of its own
+		// (#231 review findings #3 and #4). Neither the one-shot startup
+		// converge (only ran once, over the hosts loaded at start) nor the
+		// inventory poller's own reboot detector (its first observation of any
+		// host is deliberately baseline-only, see inventory.Poller.checkBoot)
+		// ever reconciles such a host, so without this, a host whose pods were
+		// already down when it was (re-)added stays down until it reboots a
+		// SECOND time after being added.
+		var newlySeen []string
+		newlySeen, seenHostIDs = diffNewlySeenHosts(seenHostIDs, newHosts)
+		log.Printf("hosts applied: %d entries (%d draining)", len(newHosts), draining)
+		if len(newlySeen) > 0 {
+			log.Printf("hosts: boot-converging %d newly-seen host(s): %v", len(newlySeen), newlySeen)
+			go func(ids []string) {
+				var wg sync.WaitGroup
+				for _, id := range ids {
+					wg.Add(1)
+					go func(hostID string) {
+						defer wg.Done()
+						svc.ReconcileSpecsOnHost(runnerCtx, hostID)
+					}(id)
+				}
+				wg.Wait()
+			}(newlySeen)
+		}
+	}
+
 	routerOpts := []api.RouterOption{}
 	if regPruneSched != nil {
 		routerOpts = append(routerOpts, api.WithRegistryPruner(regPruneSched))
 	}
+	routerOpts = append(routerOpts, api.WithHostRenamer(config.HostsDir(*hostsDir)))
+	// The rename handler does not know about client/hostsHolder/pollers: it
+	// just asks the server to re-read hosts/*.yaml, exactly as a SIGHUP would,
+	// once the rename has been committed to the file and the store.
+	routerOpts = append(routerOpts, api.WithHostsReloader(func() error {
+		newHosts, err := config.LoadHosts(*hostsDir)
+		if err != nil {
+			return err
+		}
+		applyHosts(newHosts)
+		return nil
+	}))
 	router := api.NewRouter(svc, jobStore, keyStore, combined, nil, canceller, Version, registryClient, routerOpts...)
 
 	var opHolder atomic.Pointer[config.Operator]
@@ -594,43 +661,7 @@ func RunWithFlags(opts ...Option) error {
 			if newHosts, err := config.LoadHosts(*hostsDir); err != nil {
 				log.Printf("hosts reload FAILED, keeping previous set: %v", err)
 			} else {
-				client.SetHosts(newHosts)
-				svc.SetHosts(newHosts)
-				hostsHolder.Store(&newHosts)
-				draining := 0
-				for _, hh := range newHosts {
-					if hh.Drain {
-						draining++
-					}
-				}
-				// A host id this process has not tracked before — either
-				// genuinely new, or previously removed by an earlier SIGHUP and
-				// now re-added — needs a boot-converge pass of its own (#231
-				// review findings #3 and #4). Neither the one-shot startup
-				// converge (only ran once, over the hosts loaded at start) nor
-				// the inventory poller's own reboot detector (its first
-				// observation of any host is deliberately baseline-only, see
-				// inventory.Poller.checkBoot) ever reconciles such a host, so
-				// without this, a host whose pods were already down when it
-				// was (re-)added stays down until it reboots a SECOND time
-				// after being added.
-				var newlySeen []string
-				newlySeen, seenHostIDs = diffNewlySeenHosts(seenHostIDs, newHosts)
-				log.Printf("hosts reloaded: %d entries (%d draining)", len(newHosts), draining)
-				if len(newlySeen) > 0 {
-					log.Printf("hosts reload: boot-converging %d newly-seen host(s): %v", len(newlySeen), newlySeen)
-					go func(ids []string) {
-						var wg sync.WaitGroup
-						for _, id := range ids {
-							wg.Add(1)
-							go func(hostID string) {
-								defer wg.Done()
-								svc.ReconcileSpecsOnHost(runnerCtx, hostID)
-							}(id)
-						}
-						wg.Wait()
-					}(newlySeen)
-				}
+				applyHosts(newHosts)
 			}
 
 			if *operatorFile != "" {

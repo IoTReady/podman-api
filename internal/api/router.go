@@ -10,6 +10,13 @@ import (
 	"github.com/iotready/podman-api/internal/store"
 )
 
+// HostFileRenamer rewrites a host's id in its hosts/*.yaml config file,
+// returning the file's path and its original content (for revert-on-failure).
+// Implemented by config.HostsDir.
+type HostFileRenamer interface {
+	RenameHostFile(oldID, newID string) (path string, original []byte, err error)
+}
+
 // NewRouter builds the full HTTP handler tree.
 // audit is an optional middleware applied around auth-guarded handlers; pass nil for no-op.
 // metricsHandler is an optional handler mounted at GET /metrics; pass nil to omit the endpoint.
@@ -54,6 +61,9 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 	mux.Handle("GET /hosts/{host}", guard("hosts:read", http.HandlerFunc(h.getHost)))
 	mux.Handle("GET /hosts/{host}/healthz", guard("hosts:read", http.HandlerFunc(h.hostHealthz)))
 	mux.Handle("GET /hosts/{host}/ports-in-use", guard("hosts:read", http.HandlerFunc(h.portsInUse)))
+
+	// Host rename. 501 when no HostFileRenamer is wired (WithHostRenamer).
+	mux.Handle("POST /hosts/{host}/rename", guard("hosts:write", http.HandlerFunc(h.renameHost)))
 
 	// Templates (catalog CRUD + clone).
 	mux.Handle("GET /templates", guard("templates:read", http.HandlerFunc(h.listTemplates)))
@@ -147,11 +157,13 @@ func NewRouter(svc *instance.Service, jobs store.JobStore, keys *auth.KeyStore, 
 // handlers holds per-request dependencies. Each method is a thin adapter
 // around svc.
 type handlers struct {
-	svc       *instance.Service
-	jobs      store.JobStore
-	canceller JobCanceller
-	registry  imgregistry.Client
-	pruner    RegistryPruner
+	svc           *instance.Service
+	jobs          store.JobStore
+	canceller     JobCanceller
+	registry      imgregistry.Client
+	pruner        RegistryPruner
+	hostRenamer   HostFileRenamer
+	hostsReloader func() error
 }
 
 // RouterOption supplies an optional dependency to NewRouter. Options exist
@@ -164,4 +176,24 @@ type RouterOption func(*handlers)
 // exactly as the browse routes do without a registry client.
 func WithRegistryPruner(p RegistryPruner) RouterOption {
 	return func(h *handlers) { h.pruner = p }
+}
+
+// WithHostRenamer enables POST /hosts/{host}/rename. Without it the route
+// responds 501, the same "absent, not disabled" shape as the registry browse
+// routes without a client.
+func WithHostRenamer(r HostFileRenamer) RouterOption {
+	return func(h *handlers) { h.hostRenamer = r }
+}
+
+// WithHostsReloader supplies "re-read hosts/*.yaml and make it live
+// everywhere", i.e. exactly what SIGHUP does. The rename handler calls it after
+// a successful rename so the podman client's host map and the server's
+// background-poller host list follow the new id, instead of working the old one
+// until the next SIGHUP.
+//
+// Unlike WithHostRenamer its absence is not a 501: the reload runs AFTER the
+// rename has been committed to both the config file and the store, so a missing
+// or failing reloader is logged, never a failed request.
+func WithHostsReloader(reload func() error) RouterOption {
+	return func(h *handlers) { h.hostsReloader = reload }
 }

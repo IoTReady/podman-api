@@ -78,6 +78,17 @@ func (c *volumeUsageCache) put(host string, u HostVolumeUsage) {
 	c.mu.Unlock()
 }
 
+// drop evicts one host's sizing outright. Unlike statsCache.drop this is NOT
+// used on a failed walk (see the type comment — a transient error must not
+// punch an hour-wide hole in the gauge); it exists for the case where the host
+// id itself has gone away, e.g. a rename, where keeping the entry would export
+// a series under an id that no longer exists forever.
+func (c *volumeUsageCache) drop(host string) {
+	c.mu.Lock()
+	delete(c.data, host)
+	c.mu.Unlock()
+}
+
 func (c *volumeUsageCache) snapshot() map[string]HostVolumeUsage {
 	c.mu.Lock()
 	defer c.mu.Unlock()

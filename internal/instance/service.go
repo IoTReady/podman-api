@@ -9,6 +9,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,8 @@ import (
 // Sentinel errors mapped by the API layer to JSON error codes.
 var (
 	ErrUnknownHost       = errors.New("unknown host")
+	ErrHostAlreadyExists = errors.New("host already exists")
+	ErrHostHasBackups    = errors.New("host has backups; rename would orphan their blob storage")
 	ErrUnknownTemplate   = errors.New("unknown template")
 	ErrInstanceNotFound  = errors.New("instance not found")
 	ErrInstanceExists    = errors.New("instance already exists")
@@ -1432,6 +1435,191 @@ func (s *Service) Hosts() []config.Host {
 		out = append(out, h)
 	}
 	return out
+}
+
+// CanRenameHost reports whether RenameHost(oldID, newID) would be accepted,
+// without changing anything. It runs exactly the checks RenameHost does — live
+// host list, then the store's refusal cases — and returns the same errors.
+//
+// It exists purely to answer the most common refusal, ErrHostHasBackups,
+// without paying for a destructive config rewrite plus a revert inside
+// RenameHost. It is advisory and must never be load-bearing: it takes no lock,
+// so its answer can be stale by the time RenameHost runs. RenameHost re-runs
+// checkRenameHosts inside the host lock and the store re-checks its own
+// refusals inside the migration transaction — those, not this, are the source
+// of truth.
+func (s *Service) CanRenameHost(ctx context.Context, oldID, newID string) error {
+	if err := s.checkRenameHosts(oldID, newID); err != nil {
+		return err
+	}
+	return mapRenameHostStoreErr(s.store.CheckHostRename(ctx, oldID, newID))
+}
+
+// checkRenameHosts validates a rename against the live host list only.
+func (s *Service) checkRenameHosts(oldID, newID string) error {
+	hosts := s.Hosts()
+	found := false
+	for _, h := range hosts {
+		if h.ID == oldID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		return ErrUnknownHost
+	}
+	for _, h := range hosts {
+		if h.ID == newID {
+			return ErrHostAlreadyExists
+		}
+	}
+	return nil
+}
+
+// mapRenameHostStoreErr translates the store's rename sentinels into the
+// service-level ones the API layer classifies.
+func mapRenameHostStoreErr(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, store.ErrHostRenameConflict):
+		return ErrHostAlreadyExists
+	case errors.Is(err, store.ErrHostRenameHasBackups):
+		return ErrHostHasBackups
+	default:
+		return err
+	}
+}
+
+// RenameHost migrates a host's store rows (specs, host secrets, backups) from
+// oldID to newID, rewrites the on-disk host config via rewriteFile, and on
+// success updates the live host set so the new id is resolvable immediately —
+// no restart or SIGHUP required. Returns
+// ErrUnknownHost if oldID isn't a currently-configured host,
+// ErrHostAlreadyExists if newID is already a currently-configured host or
+// collides with a store.ErrHostRenameConflict (stale rows under an id no
+// host currently claims), and ErrHostHasBackups if oldID has any backups
+// (S3 blob re-keying is out of scope; see
+// docs/superpowers/specs/2026-08-10-host-rename-design.md).
+//
+// rewriteFile mutates the on-disk host config (hosts/*.yaml) and returns a
+// revert closure that restores it verbatim. It is a parameter rather than
+// something the caller does around this call so that the ENTIRE mutating
+// sequence — config rewrite, store migration, revert-on-failure — happens
+// inside the one lock acquisition below. It must be non-nil.
+//
+// That is not a tidiness preference; two callers each doing their own rewrite
+// outside the lock is a split-brain generator. Two concurrent renames of h1
+// (h1->h2 and h1->h3) would both read the file before either wrote it, so one
+// write is silently lost; then both call in here, one wins the host lock and
+// commits h2 to the store, and the LOSER — which fails the post-lock
+// checkRenameHosts below with ErrUnknownHost — reverts the file to the `id: h1`
+// bytes IT captured, AFTER the winner committed. The config file then says h1
+// forever while the store and the live host set say h2, reachable from two
+// ordinary concurrent requests. With rewriteFile in here the loser never
+// rewrites anything: it fails the check before reaching this step.
+//
+// Locking: the rename is serialized against every concurrent Apply for oldID by
+// taking the host lock AND the per-instance lock of every instance the store
+// currently knows about on oldID, held across the whole body (config rewrite,
+// store migration, revert, host-list swap, client propagation, cache eviction).
+// Callers must not take any of these locks around this call. Without that, an Apply
+// that passed its own locks before the rename started can land its
+// PutSpec(host: oldID, …) AFTER the `UPDATE specs SET host = newID` has run:
+// the row is then permanently orphaned under an id no live host claims, and the
+// instance is unreachable through the API even though its pod is running.
+// The locks are taken in a fixed order — hostLock first, then instance locks
+// sorted by their composite key — matching Apply's own hostLock-before-
+// instanceLock order, so no cycle is possible (two operations on *different*
+// hosts share no locks at all).
+//
+// One race this does NOT close, honestly: an instance that does not exist yet.
+// An Apply for a (template, slug) that was absent when ListSpecKeys below took
+// its snapshot creates its own fresh instanceLock (instanceLock lazily creates
+// one for any key), which RenameHost never knew to acquire and therefore does
+// not hold — so that apply is not serialized against the rename and can still
+// orphan its spec under oldID. It is a strictly narrower window than the bug
+// this closes (both calls must interleave within the single ListSpecKeys
+// snapshot window, and only for an instance being created for the first time,
+// versus any existing instance at any point during the whole rename), but it is
+// a real residual gap, not a closed one.
+func (s *Service) RenameHost(ctx context.Context, oldID, newID string, rewriteFile func() (revert func() error, err error)) error {
+	hl := s.hostLock(oldID)
+	hl.Lock()
+	defer hl.Unlock()
+
+	// Re-checked here (not just by the caller-side CanRenameHost advisory
+	// check) inside the host lock: two concurrent RenameHost(oldID -> ...)
+	// calls can both pass validation against the same pre-lock Hosts()
+	// snapshot, then serialize on hl. Without re-checking after acquiring
+	// the lock, the loser would proceed anyway once unblocked — oldID is no
+	// longer live, store.RenameHost matches zero rows (already renamed by
+	// the winner), and the function would return nil: a success response
+	// for a rename that did not happen. checkRenameHosts only reads
+	// s.Hosts() and takes no lock of its own, so calling it here is safe.
+	//
+	// This does NOT serialize two renames converging on the same newID from
+	// two DIFFERENT old hosts (each takes a different hostLock) — that case
+	// stays covered by the store's ErrHostRenameConflict and is out of
+	// scope here.
+	if err := s.checkRenameHosts(oldID, newID); err != nil {
+		return err
+	}
+
+	keys, err := s.store.ListSpecKeys(ctx, oldID)
+	if err != nil {
+		return fmt.Errorf("list instances on %q: %w", oldID, err)
+	}
+	slices.SortFunc(keys, func(a, b store.SpecKey) int {
+		if c := strings.Compare(a.Template, b.Template); c != 0 {
+			return c
+		}
+		return strings.Compare(a.Slug, b.Slug)
+	})
+	for _, k := range keys {
+		il := s.instanceLock(oldID, k.Template, k.Slug)
+		il.Lock()
+		defer il.Unlock()
+	}
+
+	// The config rewrite goes here — after the definitive checks and inside every
+	// lock, but before the store migration, so a failure to write the file leaves
+	// the store untouched and there is nothing to revert.
+	revert, err := rewriteFile()
+	if err != nil {
+		return err
+	}
+
+	if err := mapRenameHostStoreErr(s.store.RenameHost(ctx, oldID, newID)); err != nil {
+		if rerr := revert(); rerr != nil {
+			log.Printf("rename host %s -> %s: store migration failed (%v) AND reverting the host config failed (%v) — the config file is now inconsistent with the store, fix by hand", oldID, newID, err, rerr)
+		}
+		return err
+	}
+
+	hosts := s.Hosts()
+	for i := range hosts {
+		if hosts[i].ID == oldID {
+			hosts[i].ID = newID
+		}
+	}
+	s.SetHosts(hosts)
+	// The podman client keeps its OWN host map (podman.Real.hosts), so without
+	// this every podman operation against newID fails `unknown host` — and the
+	// stale oldID keeps resolving — until a SIGHUP. SIGHUP's reload does the
+	// same two calls; see server.applyHosts, which additionally refreshes the
+	// background pollers' host list (the API handler triggers that via the
+	// hosts reloader after this returns).
+	s.client.SetHosts(hosts)
+
+	// Evict every per-host cache keyed by the old id. Not migrated to newID on
+	// purpose: they repopulate on the next read/poll now that newID is
+	// reachable, whereas a stale oldID entry would be exported as a metric
+	// under a host that no longer exists for the lifetime of the process.
+	s.instCache.invalidate(oldID)
+	s.statsCache.drop(oldID)
+	s.volCache.drop(oldID)
+	return nil
 }
 
 // Templates returns the catalog's templates (read-only view). A store error is

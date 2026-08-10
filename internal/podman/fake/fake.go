@@ -65,6 +65,8 @@ type Fake struct {
 	// Unknown lists hosts that Knows should report as not registered; nil means
 	// every host is known. Lets a test exercise the scheduler's unknown-host skip.
 	Unknown map[string]bool
+	// SetHostsCalls records every host list passed to SetHosts, in order.
+	SetHostsCalls [][]config.Host
 	// VersionStr overrides the version Version reports; empty means "fake-1.0".
 	VersionStr string
 
@@ -624,9 +626,16 @@ func (f *Fake) Knows(id string) bool {
 	return !f.Unknown[id]
 }
 
-// SetHosts is a no-op: the fake has no persistent host map — it services any
-// host ID, so a reload does not change behaviour.
-func (f *Fake) SetHosts(_ []config.Host) {}
+// SetHosts does not change behaviour — the fake has no persistent host map and
+// services any host ID — but it RECORDS the call in SetHostsCalls. Behaviour
+// being a no-op is exactly why a caller that forgets to propagate a host-list
+// change to the real client (podman.Real keeps its own map) is invisible to
+// every fake-backed test; the recorder makes that observable.
+func (f *Fake) SetHosts(hosts []config.Host) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.SetHostsCalls = append(f.SetHostsCalls, append([]config.Host(nil), hosts...))
+}
 
 func (f *Fake) HostInfo(_ context.Context, _ string) (podman.HostInfo, error) {
 	f.mu.Lock()

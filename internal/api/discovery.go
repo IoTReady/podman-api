@@ -16,7 +16,7 @@ All endpoints except /healthz, /openapi.yaml, /mcp, and /agent-docs require:
     Authorization: Bearer <token>
 
 Tokens carry scopes. Grant only the scopes a workflow needs:
-  hosts:read, templates:read, templates:write,
+  hosts:read, hosts:write, templates:read, templates:write,
   instances:read, instances:write,
   secrets:read, secrets:write, jobs:read
 

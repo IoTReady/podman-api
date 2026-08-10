@@ -11,6 +11,12 @@ import (
 )
 
 // NameRe is the DNS-label constraint for template ids and instance slugs.
+//
+// It is ALSO the shape check for a new host id on POST /hosts/{host}/rename
+// (via the API layer's validName). A change made for template-id reasons
+// therefore silently changes what host ids the rename route will accept — and
+// a host id that no longer matches is one nobody can rename to, even though
+// hosts/*.yaml itself imposes no such constraint. Check both callers.
 var NameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$`)
 
 // ValidName reports whether s is a valid template id / name.

@@ -189,6 +189,7 @@ GET    /hosts
 GET    /hosts/{host}
 GET    /hosts/{host}/healthz
 GET    /hosts/{host}/ports-in-use
+POST   /hosts/{host}/rename                     body: {"new_id": "..."}
 
 GET    /templates
 GET    /templates/{id}
@@ -233,6 +234,7 @@ GET    /jobs/{id}
 
 **Notes:**
 - `POST /migrate` and `POST /evacuate` require `-state-db` (else `501`), validate synchronously, and return `202 {job_id}`. Poll `GET /jobs/{id}` for progress.
+- `POST /hosts/{host}/rename` returns `409` for two distinct reasons, told apart by the error `code`: `host_already_exists` (another host, or stale store state, already holds `new_id`) and `host_has_backups` (the host has backup rows; their blob keys are not re-keyed, so renaming would make existing backups unreachable — delete them first). `501 not_implemented` means the server was built/wired without the host-rename dependency.
 - `?skip_pull=true` on POST/PUT skips the pre-pull step.
 - The two `PATCH` routes change one instance in place and reuse its sealed per-instance secrets, so they work on an instance whose secret plaintext nobody can read back (a full `PUT` requires every declared secret). Both merge — omitted parameters/secrets keep their stored value, and neither can delete one. Both replace the pod.
 - On DELETE, `prune_volumes` and `prune_secrets` default to `false`. Pass both as `true` to reap volumes and secrets. DELETE is idempotent — a prune-requested delete on an already-gone pod still removes orphaned volumes/secrets and returns `204`.

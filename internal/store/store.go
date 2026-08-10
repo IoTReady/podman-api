@@ -33,6 +33,19 @@ var ErrSpecCorrupt = errors.New("store: spec row corrupt (malformed)")
 // so callers (boot reconciliation) keep retrying rather than failing terminally.
 var ErrSecretsUndecryptable = errors.New("store: secrets undecryptable (wrong or missing -spec-key-file)")
 
+// ErrHostRenameConflict is returned by RenameHost when newID already has spec,
+// host-secret or backup rows — renaming into an id that already has state
+// would silently merge two hosts' instances (or, for host_secrets, overwrite
+// one host's credential with another's).
+var ErrHostRenameConflict = errors.New("store: rename target host id already has state")
+
+// ErrHostRenameHasBackups is returned by RenameHost when oldID has any backup
+// rows. On-demand snapshot backups are keyed by S3 blob prefixes that are NOT
+// re-keyed by this call (out of scope — see docs/superpowers/specs/2026-08-10-host-rename-design.md),
+// so renaming a host with backups would make those backups unreachable via the
+// restore API. Refuse rather than silently orphan them.
+var ErrHostRenameHasBackups = errors.New("store: host has backups; rename would orphan their blob storage")
+
 // InjectorSecret is one secret declared by a SidecarInjector. It carries the
 // data key needed to reconstruct the podman/K8s secret on boot converge.
 type InjectorSecret struct {
@@ -89,6 +102,23 @@ type Store interface {
 	GetHostSecret(ctx context.Context, host, name string) ([]byte, error)
 	// DeleteHostSecret removes a per-host secret; absent is not an error.
 	DeleteHostSecret(ctx context.Context, host, name string) error
+
+	// RenameHost atomically migrates every specs/host_secrets/backups row from
+	// oldID to newID. Returns ErrHostRenameConflict if newID already has spec,
+	// host-secret or backup rows, or ErrHostRenameHasBackups if oldID has any
+	// backup rows.
+	RenameHost(ctx context.Context, oldID, newID string) error
+
+	// CheckHostRename runs RenameHost's refusal checks WITHOUT mutating
+	// anything, returning the same sentinel errors. It exists so a caller can
+	// preflight a rename before taking an irreversible step of its own (the
+	// API handler rewrites hosts/*.yaml before calling RenameHost, and must
+	// not do so for a rename the store is going to refuse).
+	//
+	// It is advisory: nothing is locked between the check and the RenameHost
+	// that follows, so RenameHost still performs the checks itself inside its
+	// transaction.
+	CheckHostRename(ctx context.Context, oldID, newID string) error
 
 	// SecretsEnabled reports whether this store can persist secrets — true only
 	// when it was opened with an encryption key. Callers use it to reject a

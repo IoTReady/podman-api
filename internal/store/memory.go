@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -536,6 +537,80 @@ func (m *Memory) DeleteBackup(_ context.Context, id string) error {
 }
 
 var _ BackupStore = (*Memory)(nil)
+
+// hostRenameChecksLocked returns RenameHost's refusal error, or nil. Caller
+// holds m.mu. Mirrors *SQLite's hostRenameChecks exactly — including the
+// host_secrets and backups arms of the newID conflict, without which a rename
+// into an id holding a host secret silently overwrote it.
+func (m *Memory) hostRenameChecksLocked(oldID, newID string) error {
+	for _, s := range m.specs {
+		if s.Host == newID {
+			return ErrHostRenameConflict
+		}
+	}
+	for key := range m.hostSecrets {
+		if host, _, ok := strings.Cut(key, "\x00"); ok && host == newID {
+			return ErrHostRenameConflict
+		}
+	}
+	for _, b := range m.backups {
+		if b.Host == newID {
+			return ErrHostRenameConflict
+		}
+	}
+	for _, b := range m.backups {
+		if b.Host == oldID {
+			return ErrHostRenameHasBackups
+		}
+	}
+	return nil
+}
+
+// CheckHostRename runs RenameHost's refusal checks read-only. See the Store
+// interface for why this exists.
+func (m *Memory) CheckHostRename(_ context.Context, oldID, newID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.hostRenameChecksLocked(oldID, newID)
+}
+
+// RenameHost migrates every spec/host-secret/backup entry from oldID to
+// newID. Mirrors *SQLite's refusal cases: ErrHostRenameConflict if newID
+// already has specs, host secrets or backups; ErrHostRenameHasBackups if
+// oldID has any backups.
+func (m *Memory) RenameHost(_ context.Context, oldID, newID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if err := m.hostRenameChecksLocked(oldID, newID); err != nil {
+		return err
+	}
+
+	for key, s := range m.specs {
+		if s.Host != oldID {
+			continue
+		}
+		delete(m.specs, key)
+		s.Host = newID
+		m.specs[memKey(newID, s.Template, s.Slug)] = s
+	}
+	for key, v := range m.hostSecrets {
+		host, name, ok := strings.Cut(key, "\x00")
+		if !ok || host != oldID {
+			continue
+		}
+		delete(m.hostSecrets, key)
+		m.hostSecrets[newID+"\x00"+name] = v
+	}
+	for id, b := range m.backups {
+		if b.Host != oldID {
+			continue
+		}
+		b.Host = newID
+		m.backups[id] = b
+	}
+	return nil
+}
 
 // ---------------------------------------------------------------------------
 // TemplateStore implementation

@@ -2,6 +2,9 @@ package api
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
+	"log"
 	"net/http"
 	"sync"
 	"time"
@@ -115,6 +118,113 @@ func (h *handlers) hostHealthz(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	WriteJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (h *handlers) renameHost(w http.ResponseWriter, r *http.Request) {
+	// "Feature absent" is checked before anything else, so an unwired server
+	// never answers a rename with "unknown host" or "conflict" — answers that
+	// describe the request when the real answer is that the route does nothing
+	// here.
+	if h.hostRenamer == nil {
+		WriteJSON(w, http.StatusNotImplemented, ErrorBody{Code: "not_implemented", Message: "host rename is not configured on this server"})
+		return
+	}
+
+	oldID := r.PathValue("host")
+	var req struct {
+		NewID string `json:"new_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+		return
+	}
+	if req.NewID == "" {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "new_id is required"})
+		return
+	}
+	if !validName(req.NewID) {
+		writeInvalidName(w, "new_id", req.NewID)
+		return
+	}
+	if req.NewID == oldID {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "new_id must differ from the current host id"})
+		return
+	}
+
+	found := false
+	for _, hh := range h.svc.Hosts() {
+		if hh.ID == oldID {
+			found = true
+		}
+		if hh.ID == req.NewID {
+			WriteJSON(w, http.StatusConflict, ErrorBody{Code: "host_already_exists", Message: fmt.Sprintf("host %q already exists", req.NewID)})
+			return
+		}
+	}
+	if !found {
+		WriteError(w, instance.ErrUnknownHost)
+		return
+	}
+
+	// Preflight the store's own refusals. The most common one by far —
+	// host_has_backups, true of any host that has ever taken a backup — would
+	// otherwise cost a destructive rewrite of hosts/*.yaml followed by a revert,
+	// for a request that was always going to be refused. It is advisory only: it
+	// takes no lock, so it can be stale by the time RenameHost runs, and
+	// RenameHost's own checks inside the host lock remain the source of truth.
+	if err := h.svc.CanRenameHost(r.Context(), oldID, req.NewID); err != nil {
+		WriteError(w, err)
+		return
+	}
+
+	// The config rewrite is handed to RenameHost rather than done here so it
+	// runs inside the same host lock as the store migration, together with its
+	// revert. Doing it here — two unsynchronized mutation points — let two
+	// concurrent renames of the same host lose one write and then have the
+	// loser's revert land after the winner committed, leaving the file
+	// permanently disagreeing with the store. See Service.RenameHost's doc.
+	var fileErr error
+	rewrite := func() (func() error, error) {
+		path, original, err := h.hostRenamer.RenameHostFile(oldID, req.NewID)
+		if err != nil {
+			// Remembered so the response can stay a 500 "internal" rather than
+			// being classified as one of the rename-specific conflicts.
+			fileErr = err
+			return nil, err
+		}
+		return func() error {
+			if err := config.WriteFileAtomic(path, original); err != nil {
+				return fmt.Errorf("restore %s: %w", path, err)
+			}
+			return nil
+		}, nil
+	}
+
+	if err := h.svc.RenameHost(r.Context(), oldID, req.NewID, rewrite); err != nil {
+		if fileErr != nil {
+			WriteJSON(w, http.StatusInternalServerError, ErrorBody{Code: "internal", Message: fileErr.Error()})
+			return
+		}
+		WriteError(w, err)
+		return
+	}
+
+	// The rename is committed at this point (config file + store + the
+	// service's own host map). What is left is the rest of the process:
+	// the podman client's host map is updated by Service.RenameHost, but the
+	// server's background loops (ingress reconcile, prune policies) read their
+	// own host list, which only a reload refreshes. A failure here is logged,
+	// never surfaced as a failed rename — the rename did happen.
+	switch {
+	case h.hostsReloader == nil:
+		log.Printf("host rename %s -> %s: no hosts reloader wired; background loops keep working the old id until SIGHUP", oldID, req.NewID)
+	default:
+		if err := h.hostsReloader(); err != nil {
+			log.Printf("host rename %s -> %s: succeeded, but reloading the host list failed (%v); background loops keep working the old id until SIGHUP", oldID, req.NewID, err)
+		}
+	}
+
+	WriteJSON(w, http.StatusOK, map[string]string{"old_id": oldID, "new_id": req.NewID})
 }
 
 func (h *handlers) portsInUse(w http.ResponseWriter, r *http.Request) {

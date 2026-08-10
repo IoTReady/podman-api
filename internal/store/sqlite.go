@@ -991,6 +991,75 @@ WHERE state IN ('succeeded','failed','canceled') AND finished IS NOT NULL AND fi
 	return int(total), nil
 }
 
+// rowQueryer is the read surface hostRenameChecks needs, satisfied by both
+// *sql.DB and *sql.Tx — so the preflight (CheckHostRename) and the
+// transactional rename run exactly the same checks.
+type rowQueryer interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// hostRenameChecks returns RenameHost's refusal error, or nil if the rename may
+// proceed. It reads only.
+//
+// The newID conflict covers all three tables, not just specs: host_secrets has
+// PK (host, name), so a collision there would otherwise surface as an opaque
+// constraint violation (SQLite) or a silent overwrite (Memory).
+func hostRenameChecks(ctx context.Context, q rowQueryer, oldID, newID string) error {
+	for _, table := range []string{"specs", "host_secrets", "backups"} {
+		var n int
+		if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM `+table+` WHERE host = ?`, newID).Scan(&n); err != nil {
+			return err
+		}
+		if n > 0 {
+			return ErrHostRenameConflict
+		}
+	}
+
+	var backupCount int
+	if err := q.QueryRowContext(ctx, `SELECT COUNT(*) FROM backups WHERE host = ?`, oldID).Scan(&backupCount); err != nil {
+		return err
+	}
+	if backupCount > 0 {
+		return ErrHostRenameHasBackups
+	}
+	return nil
+}
+
+// CheckHostRename runs RenameHost's refusal checks read-only. See the Store
+// interface for why this exists.
+func (s *SQLite) CheckHostRename(ctx context.Context, oldID, newID string) error {
+	return hostRenameChecks(ctx, s.db, oldID, newID)
+}
+
+// RenameHost atomically migrates every specs/host_secrets/backups row from
+// oldID to newID in one transaction. See ErrHostRenameConflict and
+// ErrHostRenameHasBackups for the two refusal cases.
+func (s *SQLite) RenameHost(ctx context.Context, oldID, newID string) error {
+	return s.write(ctx, func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer tx.Rollback() //nolint:errcheck // no-op after a successful Commit
+
+		if err := hostRenameChecks(ctx, tx, oldID, newID); err != nil {
+			return err
+		}
+
+		if _, err := tx.ExecContext(ctx, `UPDATE specs SET host = ? WHERE host = ?`, newID, oldID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE host_secrets SET host = ? WHERE host = ?`, newID, oldID); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE backups SET host = ? WHERE host = ?`, newID, oldID); err != nil {
+			return err
+		}
+
+		return tx.Commit()
+	})
+}
+
 // ---------------------------------------------------------------------------
 // TemplateStore implementation
 // ---------------------------------------------------------------------------
