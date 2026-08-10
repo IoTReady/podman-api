@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -171,6 +172,50 @@ func TestBackups_DeleteAndNotFound(t *testing.T) {
 			_, err = bs.GetBackup(ctx, id)
 			assert.ErrorIs(t, err, ErrNotFound)
 		})
+	}
+}
+
+// TestCompleteBackup_roundTripsExcluded verifies a volume's Excluded record
+// (patterns applied + what they dropped) survives CompleteBackup -> GetBackup
+// on every store backend. (#248)
+func TestCompleteBackup_roundTripsExcluded(t *testing.T) {
+	for name, bs := range backupStores(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			id := NewBackupID()
+			require.NoError(t, bs.CreateBackup(ctx, Backup{
+				ID: id, Host: "h", Template: "t", Slug: "s", State: BackupCreating,
+			}))
+			vols := []BackupVolume{{
+				Name: "t-s-sites", SizeBytes: 10,
+				Excluded: &ExcludedPaths{Patterns: []string{"*/private/backups/**"}, Entries: 3, Bytes: 999},
+			}}
+			ok, err := bs.CompleteBackup(ctx, id, vols)
+			require.NoError(t, err)
+			require.True(t, ok)
+
+			got, err := bs.GetBackup(ctx, id)
+			require.NoError(t, err)
+			require.Len(t, got.Volumes, 1)
+			ex := got.Volumes[0].Excluded
+			require.NotNil(t, ex, "excluded round-trip lost data")
+			assert.Equal(t, 3, ex.Entries)
+			assert.Equal(t, int64(999), ex.Bytes)
+			assert.Equal(t, []string{"*/private/backups/**"}, ex.Patterns)
+		})
+	}
+}
+
+// TestCompleteBackup_omitsExcludedWhenNil pins the nil case: a volume that
+// declared no exclude patterns must serialize with no "excluded" key at all,
+// so existing rows/wire payloads are unaffected. (#248)
+func TestCompleteBackup_omitsExcludedWhenNil(t *testing.T) {
+	b, err := json.Marshal(BackupVolume{Name: "v", SizeBytes: 1})
+	require.NoError(t, err)
+	assert.NotContains(t, string(b), "excluded", "unfiltered volume must not carry an excluded key: %s", b)
+
+	if !strings.Contains(string(b), `"name":"v"`) {
+		t.Fatalf("sanity check failed, marshal shape unexpected: %s", b)
 	}
 }
 

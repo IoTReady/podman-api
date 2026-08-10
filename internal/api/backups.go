@@ -73,10 +73,20 @@ type BackupView struct {
 	Finished string             `json:"finished,omitempty"`
 }
 
-// BackupVolumeView is one exported volume's public metadata: name + tar size.
+// ExcludedView reports the backup exclude patterns applied to one volume and
+// what they removed. Absent when the volume was exported in full. (#248)
+type ExcludedView struct {
+	Patterns []string `json:"patterns"`
+	Entries  int      `json:"entries"`
+	Bytes    int64    `json:"bytes"`
+}
+
+// BackupVolumeView is one exported volume's public metadata: name, tar size,
+// and — when the template declared exclude patterns — what they dropped.
 type BackupVolumeView struct {
-	Name      string `json:"name"`
-	SizeBytes int64  `json:"size_bytes"`
+	Name      string        `json:"name"`
+	SizeBytes int64         `json:"size_bytes"`
+	Excluded  *ExcludedView `json:"excluded,omitempty"`
 }
 
 // toBackupViews maps store rows to their public JSON shape. Times are
@@ -91,7 +101,15 @@ func toBackupViews(bs []store.Backup) []BackupView {
 			Created: b.Created.UTC().Format(time.RFC3339),
 		}
 		for _, vol := range b.Volumes {
-			v.Volumes = append(v.Volumes, BackupVolumeView{Name: vol.Name, SizeBytes: vol.SizeBytes})
+			vv := BackupVolumeView{Name: vol.Name, SizeBytes: vol.SizeBytes}
+			if vol.Excluded != nil {
+				vv.Excluded = &ExcludedView{
+					Patterns: vol.Excluded.Patterns,
+					Entries:  vol.Excluded.Entries,
+					Bytes:    vol.Excluded.Bytes,
+				}
+			}
+			v.Volumes = append(v.Volumes, vv)
 		}
 		if !b.Finished.IsZero() {
 			v.Finished = b.Finished.UTC().Format(time.RFC3339)

@@ -15,15 +15,28 @@ const (
 	BackupFailed   BackupState = "failed"   // job failed or was interrupted; not restorable
 )
 
+// ExcludedPaths records what a volume's backup exclude patterns removed. It
+// is nil for a volume that declared no patterns, so an unfiltered backup is
+// byte-identical in the row as well as on the wire. Entries == 0 with a
+// non-empty Patterns means the patterns matched nothing — usually a stale or
+// misspelled pattern. (#248)
+type ExcludedPaths struct {
+	Patterns []string `json:"patterns"`
+	Entries  int      `json:"entries"`
+	Bytes    int64    `json:"bytes"`
+}
+
 // BackupVolume records one exported volume: its full name
 // (<template>-<slug>-<vol>), the tar's byte size, and the sha256 per-file
 // manifest (the instance package's Manifest, serialized). Manifests live in
 // the row — not the blob store — so restore verifies the artifact against
-// metadata it does not have to trust.
+// metadata it does not have to trust. Excluded is set only when the template
+// declared exclude patterns for this volume (#248).
 type BackupVolume struct {
 	Name      string          `json:"name"`
 	SizeBytes int64           `json:"size_bytes"`
 	Manifest  json.RawMessage `json:"manifest"`
+	Excluded  *ExcludedPaths  `json:"excluded,omitempty"`
 }
 
 // Backup is one row of the backups table.
