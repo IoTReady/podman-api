@@ -137,6 +137,82 @@ func TestFilterTar_directoryEntryVsContents(t *testing.T) {
 	}
 }
 
+func TestFilterTar_literalDirPatternAloneDropsTheDirectory(t *testing.T) {
+	// A single literal (non-"/**") pattern that matches a directory's own
+	// name must drop that directory entry outright — the TypeDir "**
+	// consumed zero segments" rescue in newDropper must not apply here,
+	// since there is no "/**" suffix to strip. The pattern has no globstar to
+	// reach the nested file, so that entry is unaffected: this test isolates
+	// the directory-entry-only claim from TestFilterTar_directoryEntryVsContents,
+	// which conflates it with the file also being dropped via the second
+	// "*/private/backups/**" pattern.
+	entries := []tarEntry{
+		{name: "site/private/backups", typ: tar.TypeDir},
+		{name: "site/private/backups/db.sql.gz", body: "D"},
+	}
+	var out bytes.Buffer
+	if _, _, err := filterTar(&out, bytes.NewReader(makeTar(t, entries)), []string{"*/private/backups"}); err != nil {
+		t.Fatal(err)
+	}
+	got := tarNames(t, out.Bytes())
+	want := []string{"site/private/backups/db.sql.gz"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("entries = %v, want %v (only the directory entry itself drops)", got, want)
+	}
+}
+
+func TestFilterTar_nestedDirUnderExcludedRootIsDropped(t *testing.T) {
+	// The TypeDir rescue in newDropper must only save the excluded root's own
+	// directory entry, not every directory beneath it — a subtly wrong prefix
+	// check here would silently start keeping whole subtrees.
+	entries := []tarEntry{
+		{name: "site/private/backups", typ: tar.TypeDir},
+		{name: "site/private/backups/sub", typ: tar.TypeDir},
+		{name: "site/private/backups/sub/f.txt", body: "F"},
+	}
+	var out bytes.Buffer
+	if _, _, err := filterTar(&out, bytes.NewReader(makeTar(t, entries)), []string{"*/private/backups/**"}); err != nil {
+		t.Fatal(err)
+	}
+	got := tarNames(t, out.Bytes())
+	want := []string{"site/private/backups"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("entries = %v, want %v (only the excluded root's own dir entry survives)", got, want)
+	}
+}
+
+func TestFilterTar_excludePathStillWrittenButOmittedFromManifest(t *testing.T) {
+	// Locks the #142/#248 separation: a path excludePath() hides from the
+	// fingerprint must still ship its bytes in the filtered tar when it is
+	// not matched by any drop pattern. Regresses if a future parseTar edit
+	// moves the excludePath check above the WriteHeader/body copy.
+	src := makeTar(t, []tarEntry{
+		{name: "db-litestream/x.wal", body: "WAL"},
+		{name: "normal.txt", body: "N"},
+	})
+	var out bytes.Buffer
+	m, _, err := filterTar(&out, bytes.NewReader(src), []string{"nothing/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := tarNames(t, out.Bytes())
+	found := false
+	for _, n := range got {
+		if n == "db-litestream/x.wal" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("entries = %v, want db-litestream/x.wal present in the output tar", got)
+	}
+	if _, ok := m["db-litestream/x.wal"]; ok {
+		t.Fatal("db-litestream/x.wal must be excluded from the manifest (#142)")
+	}
+	if _, ok := m["normal.txt"]; !ok {
+		t.Fatal("normal.txt missing from the manifest")
+	}
+}
+
 func TestFilterTar_dropsHardlinkToDroppedTarget(t *testing.T) {
 	src := makeTar(t, []tarEntry{
 		{name: "junk/big.bin", body: "BIG"},
