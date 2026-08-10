@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"gopkg.in/yaml.v3"
 )
 
@@ -72,6 +73,15 @@ type Secrets struct {
 type Volume struct {
 	Name   string `yaml:"name" json:"name"`
 	Backup string `yaml:"backup,omitempty" json:"backup,omitempty"`
+	// Exclude lists glob patterns (doublestar syntax, `**` spans separators)
+	// matched against each tar entry's path.Clean'ed name relative to the
+	// volume root. Matching entries are omitted from the volume's BACKUP tar
+	// and from nothing else — rename/migrate/copy always export everything.
+	//
+	// A trailing "/**" matches a directory's contents but not the directory
+	// entry, so the directory restores as empty; a pattern naming the
+	// directory itself drops it entirely.
+	Exclude []string `yaml:"exclude,omitempty" json:"exclude,omitempty"`
 }
 
 // Ingress declares which container+port in the rendered pod serves HTTP, so the
@@ -107,6 +117,32 @@ func ValidateIngress(ing *Ingress) error {
 	}
 	if ing.Port <= 0 || ing.Port > 65535 {
 		return fmt.Errorf("template-meta: ingress.port %d out of range", ing.Port)
+	}
+	return nil
+}
+
+// ValidateVolumes checks each volume's exclude patterns: non-empty, relative,
+// no ".." segment (so a pattern cannot be read as host-absolute or escape the
+// volume root), and compilable. Rejecting at registration means a typo fails
+// visibly instead of silently matching nothing at backup time.
+func ValidateVolumes(m Meta) error {
+	for _, v := range m.Volumes {
+		for _, p := range v.Exclude {
+			if strings.TrimSpace(p) == "" {
+				return fmt.Errorf("template-meta: volume %q: exclude pattern must not be empty", v.Name)
+			}
+			if strings.HasPrefix(p, "/") {
+				return fmt.Errorf("template-meta: volume %q: exclude pattern %q must be relative to the volume root", v.Name, p)
+			}
+			for _, seg := range strings.Split(p, "/") {
+				if seg == ".." {
+					return fmt.Errorf("template-meta: volume %q: exclude pattern %q must not contain a %q segment", v.Name, p, "..")
+				}
+			}
+			if !doublestar.ValidatePattern(p) {
+				return fmt.Errorf("template-meta: volume %q: invalid pattern %q", v.Name, p)
+			}
+		}
 	}
 	return nil
 }
@@ -235,6 +271,10 @@ func ParseMeta(src string) (Meta, string, error) {
 	}
 
 	if err := ValidateIngress(wrapper.Meta.Ingress); err != nil {
+		return Meta{}, "", err
+	}
+
+	if err := ValidateVolumes(wrapper.Meta); err != nil {
 		return Meta{}, "", err
 	}
 

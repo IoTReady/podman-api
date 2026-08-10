@@ -4,6 +4,7 @@ go 1.26.3
 
 require (
 	github.com/blang/semver/v4 v4.0.0
+	github.com/bmatcuk/doublestar/v4 v4.10.0
 	github.com/containers/podman/v5 v5.8.2
 	github.com/docker/docker v28.5.1+incompatible
 	github.com/prometheus/client_golang v1.23.2

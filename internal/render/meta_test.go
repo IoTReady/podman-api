@@ -237,3 +237,68 @@ kind: Pod
 	require.NoError(t, err)
 	assert.Nil(t, meta.PreBackup)
 }
+
+func TestValidateVolumes(t *testing.T) {
+	cases := []struct {
+		name    string
+		vols    []Volume
+		wantErr string
+	}{
+		{name: "no volumes", vols: nil},
+		{name: "no patterns", vols: []Volume{{Name: "data"}}},
+		{name: "valid pattern", vols: []Volume{{Name: "sites", Exclude: []string{"*/private/backups/**"}}}},
+		{name: "empty pattern", vols: []Volume{{Name: "sites", Exclude: []string{""}}}, wantErr: "must not be empty"},
+		{name: "whitespace pattern", vols: []Volume{{Name: "sites", Exclude: []string{"  "}}}, wantErr: "must not be empty"},
+		{name: "absolute pattern", vols: []Volume{{Name: "sites", Exclude: []string{"/etc/**"}}}, wantErr: "must be relative"},
+		{name: "parent escape", vols: []Volume{{Name: "sites", Exclude: []string{"../other/**"}}}, wantErr: "must not contain"},
+		{name: "parent escape mid-path", vols: []Volume{{Name: "sites", Exclude: []string{"a/../../b"}}}, wantErr: "must not contain"},
+		{name: "malformed glob", vols: []Volume{{Name: "sites", Exclude: []string{"[a-"}}}, wantErr: "invalid pattern"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateVolumes(Meta{Volumes: tc.vols})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("want nil, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestParseMeta_rejectsBadExclude(t *testing.T) {
+	src := `# template-meta:
+#   id: t1
+#   volumes:
+#     - { name: data, exclude: ["/abs/**"] }
+---
+apiVersion: v1
+kind: Pod
+`
+	if _, _, err := ParseMeta(src); err == nil {
+		t.Fatal("want ParseMeta to reject an absolute exclude pattern")
+	}
+}
+
+func TestParseMeta_acceptsExclude(t *testing.T) {
+	src := `# template-meta:
+#   id: t1
+#   volumes:
+#     - { name: sites, backup: "s3; interval=24h", exclude: ["*/private/backups/**"] }
+---
+apiVersion: v1
+kind: Pod
+`
+	m, _, err := ParseMeta(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(m.Volumes) != 1 || len(m.Volumes[0].Exclude) != 1 ||
+		m.Volumes[0].Exclude[0] != "*/private/backups/**" {
+		t.Fatalf("exclude not parsed: %+v", m.Volumes)
+	}
+}

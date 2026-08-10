@@ -166,6 +166,18 @@ func TestValidateTemplate_RejectsSecretParameter(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrNotFound)
 }
 
+// A volume declaring an exclude pattern that escapes the volume root
+// (render.ValidateVolumes) fails template validation, whatever the entry
+// point. (#248)
+func TestValidateTemplate_rejectsBadExcludePattern(t *testing.T) {
+	tpl := webTemplate()
+	tpl.Meta.Volumes = []render.Volume{{Name: "data", Exclude: []string{"../escape"}}}
+	err := ValidateTemplate(tpl)
+	if err == nil || !errors.Is(err, ErrInvalidTemplate) {
+		t.Fatalf("want ErrInvalidTemplate, got %v", err)
+	}
+}
+
 func TestDeleteTemplate_BlockedWhenInUse(t *testing.T) {
 	ctx := context.Background()
 	f := fake.New()
