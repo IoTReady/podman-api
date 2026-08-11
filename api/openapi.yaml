@@ -312,17 +312,6 @@ components:
       properties:
         name: {type: string}
         size_bytes: {type: integer, format: int64}
-        excluded:
-          type: object
-          description: >
-            Backup exclude patterns applied to this volume and what they
-            removed. Absent when the volume was exported in full. entries=0
-            with a non-empty patterns list means the patterns matched nothing.
-          required: [patterns, entries, bytes]
-          properties:
-            patterns: {type: array, items: {type: string}}
-            entries: {type: integer}
-            bytes: {type: integer, format: int64}
 
     Observed:
       type: object
