@@ -258,6 +258,8 @@ func TestValidateVolumes(t *testing.T) {
 		{name: "internal double slash", vols: []Volume{{Name: "sites", Exclude: []string{"private//backups"}}}, wantErr: "not clean"},
 		{name: "leading slash still wins its own message", vols: []Volume{{Name: "sites", Exclude: []string{"/private/backups/"}}}, wantErr: "must be relative"},
 		{name: "parent escape still wins its own message", vols: []Volume{{Name: "sites", Exclude: []string{"a/../../b/"}}}, wantErr: "must not contain"},
+		{name: "consecutive globstar", vols: []Volume{{Name: "sites", Exclude: []string{"a/**/**"}}}, wantErr: "consecutive"},
+		{name: "legitimate multi-globstar", vols: []Volume{{Name: "sites", Exclude: []string{"**/b/**"}}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

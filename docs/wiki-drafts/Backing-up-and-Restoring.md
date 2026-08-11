@@ -50,9 +50,21 @@ volumes:
 
 Patterns are [doublestar](https://github.com/bmatcuk/doublestar/v4) globs —
 `**` spans directory separators — matched against each tar entry's cleaned
-path relative to the volume root. They must be relative: no leading `/`, no
-`..` segment. A template with a pattern that fails either check is rejected
-at registration, not at backup time.
+path relative to the volume root. A template with a pattern that fails any of
+the following checks is rejected at registration, not at backup time, since
+the only runtime signal for a pattern that matches nothing is a silent
+`excluded.entries: 0` in a backup row nobody reads:
+
+- Must be relative: no leading `/`.
+- No `..` segment.
+- Must already be `path.Clean`-equivalent to itself: no leading `./`, no
+  trailing `/`, no internal `//`. Patterns are matched against `path.Clean`ed
+  tar entry names, so an unclean pattern can never match anything.
+- No two `**` segments directly adjacent (e.g. `a/**/**`). The second `**`
+  makes the directory-contents rescue below fire for every descendant, not
+  just the one directory the first `**` names — so the whole pattern
+  silently drops nothing at all, files included. A single `**` elsewhere in
+  the pattern (e.g. `**/b/**`) is unaffected and stays valid.
 
 A pattern never drops a directory's own tar entry, no matter which form it
 takes or how it matches — only files and links are ever removed. A directory

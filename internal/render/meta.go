@@ -130,9 +130,9 @@ func ValidateIngress(ing *Ingress) error {
 
 // ValidateVolumes checks each volume's exclude patterns: non-empty, relative,
 // no ".." segment (so a pattern cannot be read as host-absolute or escape the
-// volume root), clean (see below), and compilable. Rejecting at registration
-// means a typo fails visibly instead of silently matching nothing at backup
-// time.
+// volume root), clean (see below), no consecutive "**" segments (see below),
+// and compilable. Rejecting at registration means a typo fails visibly
+// instead of silently matching nothing at backup time.
 //
 // Patterns are matched against path.Clean'ed tar entry names (tarfilter.go),
 // so a pattern that is not itself already clean — a leading "./", a trailing
@@ -145,6 +145,14 @@ func ValidateIngress(ing *Ingress) error {
 // resolve a leading "..", so those two checks above remain load-bearing on
 // their own and are kept ahead of this one so their more specific messages
 // win first.
+//
+// Consecutive "**" segments (e.g. "a/**/**") are rejected for a related
+// reason: the second "**" makes newDropper's zero-segment rescue (tarfilter.go)
+// fire for every descendant, not just the directory named by the first "**"'s
+// prefix — so the whole pattern silently drops nothing at all, files
+// included, with the same invisible `excluded.entries: 0` signal. A single
+// "**" elsewhere in the pattern (e.g. "**/b/**") is unaffected and stays
+// valid; only two "**" segments directly adjacent to each other are rejected.
 func ValidateVolumes(m Meta) error {
 	for _, v := range m.Volumes {
 		for _, p := range v.Exclude {
@@ -161,6 +169,12 @@ func ValidateVolumes(m Meta) error {
 			}
 			if cleaned := path.Clean(p); cleaned != p {
 				return fmt.Errorf("template-meta: volume %q: exclude pattern %q is not clean (did you mean %q?); it would never match a path.Clean'ed tar entry name", v.Name, p, cleaned)
+			}
+			segs := strings.Split(p, "/")
+			for i := 1; i < len(segs); i++ {
+				if segs[i-1] == "**" && segs[i] == "**" {
+					return fmt.Errorf("template-meta: volume %q: exclude pattern %q: consecutive \"**\" segments never match", v.Name, p)
+				}
 			}
 			if !doublestar.ValidatePattern(p) {
 				return fmt.Errorf("template-meta: volume %q: invalid pattern %q", v.Name, p)
