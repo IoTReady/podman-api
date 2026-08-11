@@ -79,8 +79,11 @@ type Volume struct {
 	// and from nothing else — rename/migrate/copy always export everything.
 	//
 	// A trailing "/**" matches a directory's contents but not the directory
-	// entry, so the directory restores as empty; a pattern naming the
-	// directory itself drops it entirely.
+	// entry, so the directory restores as empty. A pattern naming the
+	// directory itself (no "/**" suffix) drops only that directory's own tar
+	// entry — its contents are unaffected and still ship, so the directory is
+	// recreated implicitly (with default mode/ownership) as its children are
+	// restored. To drop a subtree entirely, combine both: "dir" and "dir/**".
 	Exclude []string `yaml:"exclude,omitempty" json:"exclude,omitempty"`
 }
 

@@ -310,3 +310,37 @@ func TestNewDropper_rejectsBadPattern(t *testing.T) {
 		t.Fatal("want an error for an uncompilable pattern")
 	}
 }
+
+// countingReader wraps an io.Reader and tracks how many bytes were actually
+// read out of it, so a test can assert a source stream was fully drained.
+type countingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += int64(n)
+	return n, err
+}
+
+// TestFilterTar_drainsSourceOnSuccess guards against filterTar returning
+// after tw.Close() without reading the rest of src: podman's HTTP response
+// body must be fully drained for the caller's Close to release the
+// connection for reuse (see buildManifest's doc comment). The source is
+// padded to a 10240-byte record boundary — the blocking factor real tar
+// producers use — so unread trailing padding is not masked by an already-
+// exact archive/tar minimal encoding.
+func TestFilterTar_drainsSourceOnSuccess(t *testing.T) {
+	src := padTarToRecordBoundary(makeTar(t, []tarEntry{
+		{name: "a.txt", body: "A"},
+		{name: "b.txt", body: "B"},
+	}))
+	cr := &countingReader{r: bytes.NewReader(src)}
+	if _, _, err := filterTar(io.Discard, cr, []string{"nothing/**"}); err != nil {
+		t.Fatal(err)
+	}
+	if cr.n != int64(len(src)) {
+		t.Fatalf("source not fully drained: read %d of %d bytes", cr.n, len(src))
+	}
+}

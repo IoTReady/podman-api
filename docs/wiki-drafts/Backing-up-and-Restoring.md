@@ -48,7 +48,7 @@ volumes:
       - "*/private/backups/**"
 ```
 
-Patterns are [doublestar](https://github.com/bmatcuza/doublestar) globs —
+Patterns are [doublestar](https://github.com/bmatcuk/doublestar/v4) globs —
 `**` spans directory separators — matched against each tar entry's cleaned
 path relative to the volume root. They must be relative: no leading `/`, no
 `..` segment. A template with a pattern that fails either check is rejected
@@ -59,7 +59,7 @@ itself. `*/private/backups/**` drops everything *under* `private/backups`,
 so it restores as an empty directory. Naming the directory outright
 (`*/private/backups`) drops the directory entry too — and since that leaves
 its children's parent absent from the tar, restore recreates the directory
-implicitly and it comes back with the wrong mode and ownership. Prefer the
+implicitly and it may come back with a default mode and ownership. Prefer the
 `**`-suffixed form unless the application recreates the directory itself.
 
 A hardlink whose target was excluded is dropped along with it, otherwise the

@@ -856,6 +856,35 @@ func TestBackup_excludesDeclaredPaths(t *testing.T) {
 	}
 }
 
+// TestBackup_excludePatternMatchesNothing verifies the stale-pattern signal:
+// a volume whose exclude pattern matches nothing in the exported tar still
+// backs up successfully, and the backup row records Excluded with the
+// declared patterns and Entries: 0 — the visible signal (per dropStats' doc
+// comment) that a pattern is stale or misspelled, deliberately not an error.
+func TestBackup_excludePatternMatchesNothing(t *testing.T) {
+	svc, f, st := newBackupTestService(t)
+	ctx := context.Background()
+	f.SetVolumeData("h", "t-s-sites", makeTar(t, []tarEntry{
+		{name: "site/files/a.pdf", body: "PDF"},
+	}))
+	setTemplateVolumes(t, st, "t", []render.Volume{
+		{Name: "sites", Backup: "s3; interval=24h", Exclude: []string{"*/private/backups/**"}},
+	})
+
+	id := store.NewBackupID()
+	require.NoError(t, svc.Backup(ctx, BackupRequest{BackupID: id, Host: "h", Template: "t", Slug: "s"}, nil))
+
+	b, err := st.GetBackup(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 1)
+	v := b.Volumes[0]
+	if v.Excluded == nil {
+		t.Fatal("want Excluded recorded even when the pattern matches nothing")
+	}
+	assert.Equal(t, 0, v.Excluded.Entries)
+	assert.Equal(t, []string{"*/private/backups/**"}, v.Excluded.Patterns)
+}
+
 // TestBackup_noExcludeIsByteForByte is the safety-property guard: a volume
 // declaring no exclude patterns must still take the original TeeReader copy
 // path, producing a blob byte-for-byte identical to the exported tar, and

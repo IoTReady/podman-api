@@ -24,6 +24,10 @@ type dropStats struct {
 // nil (not an error) when patterns is empty, so callers can test for "no
 // filtering" with a nil check.
 //
+// The returned predicate is stateful: it closes over a "dropped" map used for
+// hardlink resolution, so it is single-use per tar stream and must not be
+// reused across streams or called concurrently.
+//
 // Hardlinks: a tar TypeLink entry carries no body — it points at an earlier
 // entry's inode. Keeping a link whose target was dropped produces an archive
 // that fails to import, so the returned predicate also drops a link whose
@@ -106,5 +110,6 @@ func filterTar(dst io.Writer, src io.Reader, patterns []string) (Manifest, dropS
 	if err := tw.Close(); err != nil {
 		return nil, stats, err
 	}
+	io.Copy(io.Discard, src) //nolint:errcheck // drain so the caller's Close is clean
 	return m, stats, nil
 }
