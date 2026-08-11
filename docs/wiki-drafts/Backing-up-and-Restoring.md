@@ -60,11 +60,16 @@ the only runtime signal for a pattern that matches nothing is a silent
 - Must already be `path.Clean`-equivalent to itself: no leading `./`, no
   trailing `/`, no internal `//`. Patterns are matched against `path.Clean`ed
   tar entry names, so an unclean pattern can never match anything.
-- No two `**` segments directly adjacent (e.g. `a/**/**`). The second `**`
-  makes the directory-contents rescue below fire for every descendant, not
-  just the one directory the first `**` names — so the whole pattern
-  silently drops nothing at all, files included. A single `**` elsewhere in
-  the pattern (e.g. `**/b/**`) is unaffected and stays valid.
+- For a `/**`-suffixed pattern, the stripped prefix must not itself end in a
+  wildcard segment (`*` or `**`) while also containing a `**` segment
+  somewhere in it (e.g. `a/**/**`, `**/**`, `**/*/**`, `a/**/*/**`). In that
+  shape the prefix matches every entry the full pattern matches, so the
+  directory-contents rescue below fires unconditionally and the whole
+  pattern silently drops nothing at all, files included. `a/**`, `a/*/**`,
+  and `**/b/**` are all fine — none of their stripped prefixes end in a
+  wildcard segment while also containing a `**`. A bare `**` (no `/**`
+  suffix to strip) is unaffected by this check and legitimately matches,
+  and so drops, every entry.
 
 A pattern never drops a directory's own tar entry, no matter which form it
 takes or how it matches — only files and links are ever removed. A directory

@@ -258,8 +258,17 @@ func TestValidateVolumes(t *testing.T) {
 		{name: "internal double slash", vols: []Volume{{Name: "sites", Exclude: []string{"private//backups"}}}, wantErr: "not clean"},
 		{name: "leading slash still wins its own message", vols: []Volume{{Name: "sites", Exclude: []string{"/private/backups/"}}}, wantErr: "must be relative"},
 		{name: "parent escape still wins its own message", vols: []Volume{{Name: "sites", Exclude: []string{"a/../../b/"}}}, wantErr: "must not contain"},
-		{name: "consecutive globstar", vols: []Volume{{Name: "sites", Exclude: []string{"a/**/**"}}}, wantErr: "consecutive"},
-		{name: "legitimate multi-globstar", vols: []Volume{{Name: "sites", Exclude: []string{"**/b/**"}}}},
+		// The zero-segment-rescue-swallows-everything class, not just the
+		// "consecutive **" spelling of it — pinned against all seven probed
+		// shapes plus bare "**".
+		{name: "a/** drops something: accept", vols: []Volume{{Name: "sites", Exclude: []string{"a/**"}}}},
+		{name: "a/*/** drops something: accept", vols: []Volume{{Name: "sites", Exclude: []string{"a/*/**"}}}},
+		{name: "**/b/** drops something: accept", vols: []Volume{{Name: "sites", Exclude: []string{"**/b/**"}}}},
+		{name: "a/**/** swallows everything: reject", vols: []Volume{{Name: "sites", Exclude: []string{"a/**/**"}}}, wantErr: "matches everything"},
+		{name: "**/** swallows everything: reject", vols: []Volume{{Name: "sites", Exclude: []string{"**/**"}}}, wantErr: "matches everything"},
+		{name: "**/*/** swallows everything: reject", vols: []Volume{{Name: "sites", Exclude: []string{"**/*/**"}}}, wantErr: "matches everything"},
+		{name: "a/**/*/** swallows everything: reject", vols: []Volume{{Name: "sites", Exclude: []string{"a/**/*/**"}}}, wantErr: "matches everything"},
+		{name: "bare ** legitimately drops everything: accept", vols: []Volume{{Name: "sites", Exclude: []string{"**"}}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
