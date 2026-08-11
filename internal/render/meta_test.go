@@ -253,6 +253,11 @@ func TestValidateVolumes(t *testing.T) {
 		{name: "parent escape", vols: []Volume{{Name: "sites", Exclude: []string{"../other/**"}}}, wantErr: "must not contain"},
 		{name: "parent escape mid-path", vols: []Volume{{Name: "sites", Exclude: []string{"a/../../b"}}}, wantErr: "must not contain"},
 		{name: "malformed glob", vols: []Volume{{Name: "sites", Exclude: []string{"[a-"}}}, wantErr: "invalid pattern"},
+		{name: "leading dot-slash", vols: []Volume{{Name: "sites", Exclude: []string{"./private/**"}}}, wantErr: "not clean"},
+		{name: "trailing slash", vols: []Volume{{Name: "sites", Exclude: []string{"private/backups/"}}}, wantErr: "not clean"},
+		{name: "internal double slash", vols: []Volume{{Name: "sites", Exclude: []string{"private//backups"}}}, wantErr: "not clean"},
+		{name: "leading slash still wins its own message", vols: []Volume{{Name: "sites", Exclude: []string{"/private/backups/"}}}, wantErr: "must be relative"},
+		{name: "parent escape still wins its own message", vols: []Volume{{Name: "sites", Exclude: []string{"a/../../b/"}}}, wantErr: "must not contain"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

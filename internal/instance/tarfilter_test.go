@@ -127,25 +127,28 @@ func TestFilterTar_directoryEntryVsContents(t *testing.T) {
 	if n := len(tarNames(t, keep.Bytes())); n != 1 {
 		t.Fatalf("dir/** kept %d entries, want 1 (the directory)", n)
 	}
-	// "dir" drops the directory entry too.
+	// "dir" ALSO keeps the directory entry — directory entries are never
+	// dropped (Finding 1: dropping one makes the backup unrestorable,
+	// because VolumeImport recreates it implicitly and the re-export then
+	// carries a key the stored manifest lacks). Only the file underneath,
+	// matched by the second pattern, is dropped.
 	var drop bytes.Buffer
 	if _, _, err := filterTar(&drop, bytes.NewReader(makeTar(t, entries)), []string{"*/private/backups", "*/private/backups/**"}); err != nil {
 		t.Fatal(err)
 	}
-	if n := len(tarNames(t, drop.Bytes())); n != 0 {
-		t.Fatalf("dir pattern kept %d entries, want 0", n)
+	got := tarNames(t, drop.Bytes())
+	want := []string{"site/private/backups"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("entries = %v, want %v (the directory entry always survives)", got, want)
 	}
 }
 
-func TestFilterTar_literalDirPatternAloneDropsTheDirectory(t *testing.T) {
-	// A single literal (non-"/**") pattern that matches a directory's own
-	// name must drop that directory entry outright — the TypeDir "**
-	// consumed zero segments" rescue in newDropper must not apply here,
-	// since there is no "/**" suffix to strip. The pattern has no globstar to
-	// reach the nested file, so that entry is unaffected: this test isolates
-	// the directory-entry-only claim from TestFilterTar_directoryEntryVsContents,
-	// which conflates it with the file also being dropped via the second
-	// "*/private/backups/**" pattern.
+func TestFilterTar_literalDirPatternNeverDropsTheDirectory(t *testing.T) {
+	// A literal (non-"/**") pattern that matches a directory's own name
+	// must NOT drop that directory entry — directory entries are never
+	// dropped, full stop (Finding 1). The pattern has no globstar to reach
+	// the nested file, so that entry survives too: this pattern is a no-op
+	// against this tree.
 	entries := []tarEntry{
 		{name: "site/private/backups", typ: tar.TypeDir},
 		{name: "site/private/backups/db.sql.gz", body: "D"},
@@ -155,16 +158,38 @@ func TestFilterTar_literalDirPatternAloneDropsTheDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := tarNames(t, out.Bytes())
-	want := []string{"site/private/backups/db.sql.gz"}
-	if len(got) != len(want) || got[0] != want[0] {
-		t.Fatalf("entries = %v, want %v (only the directory entry itself drops)", got, want)
+	want := []string{"site/private/backups", "site/private/backups/db.sql.gz"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("entries = %v, want %v (a bare directory pattern is a no-op: dir and contents both ship)", got, want)
 	}
 }
 
-func TestFilterTar_nestedDirUnderExcludedRootIsDropped(t *testing.T) {
-	// The TypeDir rescue in newDropper must only save the excluded root's own
-	// directory entry, not every directory beneath it — a subtly wrong prefix
-	// check here would silently start keeping whole subtrees.
+// TestFilterTar_dirEntrySurvivesInManifestEvenWhenTargeted pins the
+// motivating bug directly: with the directory itself targeted by a bare
+// pattern, the manifest returned by filterTar must still contain the
+// directory's own key. A re-export of the restored volume recreates the
+// directory implicitly (VolumeImport), so any manifest missing this key
+// would fail restoreVolume's firstDiff integrity check — after the
+// instance has already been torn down for the restore.
+func TestFilterTar_dirEntrySurvivesInManifestEvenWhenTargeted(t *testing.T) {
+	entries := []tarEntry{
+		{name: "site/private/backups", typ: tar.TypeDir},
+		{name: "site/private/backups/db.sql.gz", body: "D"},
+	}
+	m, _, err := filterTar(io.Discard, bytes.NewReader(makeTar(t, entries)), []string{"*/private/backups"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m["site/private/backups"]; !ok {
+		t.Fatalf("manifest = %v, missing the directory entry key %q — a restore verify against a re-export would fail", m, "site/private/backups")
+	}
+}
+
+func TestFilterTar_nestedDirUnderExcludedRootSurvives(t *testing.T) {
+	// Directory entries are never dropped (Finding 1) — not just the
+	// excluded root's own entry, but every directory beneath it too, even
+	// though "*/private/backups/**" matches all of them. Only the file
+	// content is actually removed.
 	entries := []tarEntry{
 		{name: "site/private/backups", typ: tar.TypeDir},
 		{name: "site/private/backups/sub", typ: tar.TypeDir},
@@ -175,9 +200,9 @@ func TestFilterTar_nestedDirUnderExcludedRootIsDropped(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := tarNames(t, out.Bytes())
-	want := []string{"site/private/backups"}
-	if len(got) != len(want) || got[0] != want[0] {
-		t.Fatalf("entries = %v, want %v (only the excluded root's own dir entry survives)", got, want)
+	want := []string{"site/private/backups", "site/private/backups/sub"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("entries = %v, want %v (every directory entry survives; only the file drops)", got, want)
 	}
 }
 
@@ -230,6 +255,40 @@ func TestFilterTar_dropsHardlinkToDroppedTarget(t *testing.T) {
 	}
 	if stats.Entries != 2 {
 		t.Fatalf("stats.Entries = %d, want 2 (the file and its link)", stats.Entries)
+	}
+}
+
+func TestFilterTar_globstarSuffixDoesNotDropBarePrefixOfAnyType(t *testing.T) {
+	// Finding 2: doublestar.Match("logs/**", "logs") is true (zero-segment
+	// "**"), so a naive check would drop a regular file or a symlink named
+	// exactly "logs" as a side effect of a "logs/**" pattern meant to
+	// target the CONTENTS of a directory named "logs". The zero-segment
+	// rescue in newDropper must apply to every entry type, not just
+	// directories, or a symlink named after the excluded directory gets
+	// dropped while the directory itself (protected by Finding 1's rule)
+	// survives — contradicting "symlinks are NOT resolved".
+	entries := []tarEntry{
+		{name: "logs", typ: tar.TypeReg, body: "L"},
+	}
+	var regOut bytes.Buffer
+	if _, _, err := filterTar(&regOut, bytes.NewReader(makeTar(t, entries)), []string{"logs/**"}); err != nil {
+		t.Fatal(err)
+	}
+	got := tarNames(t, regOut.Bytes())
+	if len(got) != 1 || got[0] != "logs" {
+		t.Fatalf("regular file: entries = %v, want the bare-named file to survive", got)
+	}
+
+	symEntries := []tarEntry{
+		{name: "logs", typ: tar.TypeSymlink, link: "/var/log"},
+	}
+	var symOut bytes.Buffer
+	if _, _, err := filterTar(&symOut, bytes.NewReader(makeTar(t, symEntries)), []string{"logs/**"}); err != nil {
+		t.Fatal(err)
+	}
+	got = tarNames(t, symOut.Bytes())
+	if len(got) != 1 || got[0] != "logs" {
+		t.Fatalf("symlink: entries = %v, want the bare-named symlink to survive", got)
 	}
 }
 

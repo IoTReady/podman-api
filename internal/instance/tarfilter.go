@@ -40,17 +40,28 @@ type dropStats struct {
 // Symlinks are NOT resolved: a symlink is a name, and a dangling one is
 // exactly what the source filesystem would have.
 //
-// A directory entry gets one extra rule. doublestar's "**" matches zero or
-// more path segments, so a pattern like "dir/**" matches the literal name
-// "dir" as well as everything under it — which would drop the directory
-// entry itself, not just its contents. We want "dir/**" to mean "contents
-// of dir", matching bash's globstar rather than doublestar's zero-segment
-// reading: for a TypeDir header, a "/**"-suffixed pattern is checked against
-// its own prefix first, and skipped (for that pattern only) when the
-// directory's cleaned name is exactly what the prefix matches — i.e. the
+// A directory entry is NEVER dropped, regardless of which pattern matches
+// it or how. VolumeImport recreates directories implicitly from the paths
+// beneath them, so a tar that ships a file but omits its parent directory
+// entry produces a re-export whose manifest carries a key the stored
+// manifest lacks — restoreVolume's firstDiff then fails integrity
+// verification on a backup that was actually fine, after the instance has
+// already been torn down for the restore. A pattern can therefore empty a
+// directory but never remove it; the cost is one 512-byte header per
+// surviving directory, which is negligible next to the risk.
+//
+// Independently of that, doublestar's "**" matches zero or more path
+// segments, so a pattern like "dir/**" matches the literal name "dir" as
+// well as everything under it. We want "dir/**" to mean "contents of dir"
+// only, matching bash's globstar rather than doublestar's zero-segment
+// reading — for ANY entry type, not just directories (a regular file or a
+// symlink named "logs" must not be swept up by a "logs/**" pattern aimed at
+// a directory's contents). A "/**"-suffixed pattern is therefore checked
+// against its own prefix first, and skipped (for that pattern only) when
+// the entry's cleaned name is exactly what the prefix matches — i.e. the
 // only reason it matched was the trailing globstar consuming nothing. A
-// literal pattern with no "/**" suffix (e.g. "dir" itself) still drops the
-// directory entry as expected.
+// literal pattern with no "/**" suffix (e.g. "dir" itself) still matches a
+// non-directory entry of that exact name as expected.
 func newDropper(patterns []string) (func(hdr *tar.Header) bool, error) {
 	if len(patterns) == 0 {
 		return nil, nil
@@ -69,14 +80,16 @@ func newDropper(patterns []string) (func(hdr *tar.Header) bool, error) {
 			if !ok {
 				continue
 			}
-			if hdr.Typeflag == tar.TypeDir {
-				if prefix, isGlobstar := strings.CutSuffix(p, "/**"); isGlobstar {
-					if pOk, _ := doublestar.Match(prefix, cleaned); pOk {
-						// Matched only because "**" consumed zero segments;
-						// this pattern means "contents of", not the dir itself.
-						continue
-					}
+			if prefix, isGlobstar := strings.CutSuffix(p, "/**"); isGlobstar {
+				if pOk, _ := doublestar.Match(prefix, cleaned); pOk {
+					// Matched only because "**" consumed zero segments;
+					// this pattern means "contents of", not the entry itself.
+					continue
 				}
+			}
+			if hdr.Typeflag == tar.TypeDir {
+				// Directory entries are never dropped (see doc comment).
+				continue
 			}
 			match = true
 			break

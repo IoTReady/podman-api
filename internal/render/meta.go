@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 
@@ -78,12 +79,15 @@ type Volume struct {
 	// volume root. Matching entries are omitted from the volume's BACKUP tar
 	// and from nothing else — rename/migrate/copy always export everything.
 	//
-	// A trailing "/**" matches a directory's contents but not the directory
-	// entry, so the directory restores as empty. A pattern naming the
-	// directory itself (no "/**" suffix) drops only that directory's own tar
-	// entry — its contents are unaffected and still ship, so the directory is
-	// recreated implicitly (with default mode/ownership) as its children are
-	// restored. To drop a subtree entirely, combine both: "dir" and "dir/**".
+	// A directory's own tar entry is NEVER dropped, no matter which pattern
+	// matches it or how — only files and links are ever removed. VolumeImport
+	// recreates a directory implicitly from the paths beneath it, so a tar
+	// missing a directory entry its children still need would fail restore's
+	// integrity verification (a re-export compared against the stored
+	// manifest), and that failure lands only after the instance has already
+	// been torn down for the restore. A pattern can therefore empty a
+	// directory but never remove it: "dir/**" drops everything under "dir"
+	// while "dir" itself still ships.
 	Exclude []string `yaml:"exclude,omitempty" json:"exclude,omitempty"`
 }
 
@@ -126,8 +130,21 @@ func ValidateIngress(ing *Ingress) error {
 
 // ValidateVolumes checks each volume's exclude patterns: non-empty, relative,
 // no ".." segment (so a pattern cannot be read as host-absolute or escape the
-// volume root), and compilable. Rejecting at registration means a typo fails
-// visibly instead of silently matching nothing at backup time.
+// volume root), clean (see below), and compilable. Rejecting at registration
+// means a typo fails visibly instead of silently matching nothing at backup
+// time.
+//
+// Patterns are matched against path.Clean'ed tar entry names (tarfilter.go),
+// so a pattern that is not itself already clean — a leading "./", a trailing
+// slash, an internal "//" — can never match anything: it differs from every
+// cleaned name by construction. That failure mode is silent (a legitimate
+// zero-match backup and a typo'd one both show `excluded.entries: 0` in a
+// backup row nobody reads), which is exactly what this validator exists to
+// catch, so such a pattern is rejected outright rather than accepted and
+// left to quietly do nothing. path.Clean does not strip a leading "/" or
+// resolve a leading "..", so those two checks above remain load-bearing on
+// their own and are kept ahead of this one so their more specific messages
+// win first.
 func ValidateVolumes(m Meta) error {
 	for _, v := range m.Volumes {
 		for _, p := range v.Exclude {
@@ -141,6 +158,9 @@ func ValidateVolumes(m Meta) error {
 				if seg == ".." {
 					return fmt.Errorf("template-meta: volume %q: exclude pattern %q must not contain a %q segment", v.Name, p, "..")
 				}
+			}
+			if cleaned := path.Clean(p); cleaned != p {
+				return fmt.Errorf("template-meta: volume %q: exclude pattern %q is not clean (did you mean %q?); it would never match a path.Clean'ed tar entry name", v.Name, p, cleaned)
 			}
 			if !doublestar.ValidatePattern(p) {
 				return fmt.Errorf("template-meta: volume %q: invalid pattern %q", v.Name, p)

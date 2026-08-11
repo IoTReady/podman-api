@@ -54,13 +54,17 @@ path relative to the volume root. They must be relative: no leading `/`, no
 `..` segment. A template with a pattern that fails either check is rejected
 at registration, not at backup time.
 
-Matching a directory's contents is not the same as matching the directory
-itself. `*/private/backups/**` drops everything *under* `private/backups`,
-so it restores as an empty directory. Naming the directory outright
-(`*/private/backups`) drops the directory entry too — and since that leaves
-its children's parent absent from the tar, restore recreates the directory
-implicitly and it may come back with a default mode and ownership. Prefer the
-`**`-suffixed form unless the application recreates the directory itself.
+A pattern never drops a directory's own tar entry, no matter which form it
+takes or how it matches — only files and links are ever removed. A directory
+can be emptied but not removed: `*/private/backups/**` drops everything
+*under* `private/backups`, so it restores as an empty directory, and naming
+the directory outright (`*/private/backups`) is a no-op — the directory entry
+still ships, exactly as if no pattern had matched it. This is deliberate:
+restore recreates a directory implicitly from the paths beneath it, so a tar
+that omitted a directory entry its children still need would produce a
+re-export with a key the stored manifest lacks, and that failure surfaces
+only in restore's integrity check — after the instance has already been torn
+down for the restore.
 
 A hardlink whose target was excluded is dropped along with it, otherwise the
 archive would fail to import. Symlinks are not resolved this way: a symlink
