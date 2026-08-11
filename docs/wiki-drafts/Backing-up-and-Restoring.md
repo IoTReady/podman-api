@@ -35,6 +35,50 @@ parameters and secrets are in the state store at restore time).
 
 ---
 
+## Excluding paths from a volume's backup
+
+A template may declare glob patterns on a volume that keep matching paths out
+of that volume's backup tar entirely:
+
+```yaml
+volumes:
+  - name: sites
+    backup: "s3; interval=24h"
+    exclude:
+      - "*/private/backups/**"
+```
+
+Patterns are [doublestar](https://github.com/bmatcuza/doublestar) globs —
+`**` spans directory separators — matched against each tar entry's cleaned
+path relative to the volume root. They must be relative: no leading `/`, no
+`..` segment. A template with a pattern that fails either check is rejected
+at registration, not at backup time.
+
+Matching a directory's contents is not the same as matching the directory
+itself. `*/private/backups/**` drops everything *under* `private/backups`,
+so it restores as an empty directory. Naming the directory outright
+(`*/private/backups`) drops the directory entry too — and since that leaves
+its children's parent absent from the tar, restore recreates the directory
+implicitly and it comes back with the wrong mode and ownership. Prefer the
+`**`-suffixed form unless the application recreates the directory itself.
+
+A hardlink whose target was excluded is dropped along with it, otherwise the
+archive would fail to import. Symlinks are not resolved this way: a symlink
+pointing at an excluded path survives in the backup and comes back dangling,
+exactly as it would on the source filesystem.
+
+**Exclusion applies to backups only.** Instance rename, host migration, and
+volume copy always move every byte — they remove the source once the copy
+lands, so nothing can be safely left behind.
+
+What each pattern set actually excluded is recorded per backup and surfaced
+in the [list-backups API](#list-backups) response (`excluded.entries: 0`
+against a non-empty pattern list means the patterns matched nothing that
+backup — usually a stale or misspelled pattern, not a failure; a new
+instance legitimately has nothing to exclude yet).
+
+---
+
 ## Where artifacts live
 
 Artifact files are written to the local filesystem of the API server under
@@ -150,7 +194,13 @@ Returns newest-first. `?limit=` is the only pagination parameter; absent or
       "slug":     "my-db",
       "state":    "complete",
       "image":    "docker.io/library/postgres:16",
-      "volumes":  [{"name": "data", "size_bytes": 52428800}],
+      "volumes":  [
+        {"name": "data", "size_bytes": 52428800},
+        {
+          "name": "sites", "size_bytes": 8912896000,
+          "excluded": {"patterns": ["*/private/backups/**"], "entries": 8, "bytes": 3627000000}
+        }
+      ],
       "created":  "2026-06-06T10:00:00Z",
       "finished": "2026-06-06T10:01:23Z"
     }
@@ -160,6 +210,12 @@ Returns newest-first. `?limit=` is the only pagination parameter; absent or
 
 `state` is one of `creating`, `complete`, or `failed`. Only `complete` backups
 are restorable.
+
+`excluded` is present only on a volume whose template declared `exclude:`
+patterns for that backup — `data` above was exported in full and carries no
+`excluded` key at all, which is how a partial backup is distinguished from a
+complete one. When present, `patterns` is the list applied, `entries` the
+count of tar entries it dropped, and `bytes` their total uncompressed size.
 
 ### Restore from a backup
 
