@@ -860,10 +860,22 @@ func TestBackup_excludesDeclaredPaths(t *testing.T) {
 // declaring no exclude patterns must still take the original TeeReader copy
 // path, producing a blob byte-for-byte identical to the exported tar, and
 // must record no Excluded metadata.
+//
+// The source is padded to a 10240-byte record boundary (the blocking factor
+// GNU tar and podman's own export actually use) rather than left at
+// archive/tar's minimal per-entry block alignment. Without the padding this
+// test is vacuous: buildManifest's post-parse io.Copy(io.Discard, r) drain
+// happens to copy the same number of trailing bytes that filterTar's
+// tar.Writer re-encode independently produces for this fixture, so routing
+// every volume through filterTar (a real #248 regression) would still pass.
+// Padded, the two diverge — buildManifest's drain preserves the trailing
+// padding byte-for-byte, filterTar's re-encode does not — so this is what
+// makes the guard real. (Confirmed live: see the mutation check in the task-4
+// fix report.)
 func TestBackup_noExcludeIsByteForByte(t *testing.T) {
 	svc, f, st := newBackupTestService(t)
 	ctx := context.Background()
-	src := makeTar(t, []tarEntry{{name: "a.txt", body: "A"}, {name: "b.txt", body: "B"}})
+	src := padTarToRecordBoundary(makeTar(t, []tarEntry{{name: "a.txt", body: "A"}, {name: "b.txt", body: "B"}}))
 	f.SetVolumeData("h", "t-s-data", src)
 	setTemplateVolumes(t, st, "t", []render.Volume{{Name: "data", Backup: "s3; interval=24h"}})
 
@@ -880,6 +892,22 @@ func TestBackup_noExcludeIsByteForByte(t *testing.T) {
 	if b.Volumes[0].Excluded != nil {
 		t.Fatalf("unfiltered volume must record no exclusions: %+v", b.Volumes[0].Excluded)
 	}
+	assert.Equal(t, int64(len(src)), b.Volumes[0].SizeBytes)
+}
+
+// padTarToRecordBoundary pads a tar stream with zero bytes to the next
+// 10240-byte record boundary (blocking factor 20 x 512), matching what GNU
+// tar / podman's own volume export actually emits. archive/tar's Writer only
+// pads to 512-byte block alignment plus the two zero end-of-archive blocks,
+// so a synthetic makeTar() fixture left unpadded is too short to distinguish
+// a true byte-for-byte copy from a filter-and-reencode round-trip that
+// happens to produce the same length.
+func padTarToRecordBoundary(b []byte) []byte {
+	const record = 10240
+	if rem := len(b) % record; rem != 0 {
+		b = append(b, make([]byte, record-rem)...)
+	}
+	return b
 }
 
 // TestRestore_VerifyMismatchKeepsSpec extends TestRestore_VerifyMismatchFails
