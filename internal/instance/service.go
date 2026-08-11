@@ -1760,6 +1760,10 @@ func (s *Service) SetVerifyVolumes(v bool) { s.verifyVolumes = v }
 
 // volumeManifest exports a host's volume and fingerprints its tar stream.
 func (s *Service) volumeManifest(ctx context.Context, host, name string) (Manifest, error) {
+	// Unfiltered on purpose: backup exclude patterns (#248) apply only to
+	// backupVolume. This path fingerprints a volume for verification, not a
+	// backup; a filtered fingerprint would false-mismatch against an
+	// unfiltered destination.
 	rc, err := s.client.VolumeExport(ctx, host, name)
 	if err != nil {
 		return nil, err
@@ -1778,6 +1782,9 @@ func (s *Service) volumeManifest(ctx context.Context, host, name string) (Manife
 // re-exporting the source (which would risk a false mismatch if the source is
 // still settling — see #153).
 func (s *Service) CopyVolume(ctx context.Context, fromHost, toHost, name string) (Manifest, error) {
+	// Unfiltered on purpose: backup exclude patterns (#248) apply only to
+	// backupVolume. This path removes the source once the copy lands, so a
+	// dropped entry would have no second copy to recover from.
 	rc, err := s.client.VolumeExport(ctx, fromHost, name)
 	if err != nil {
 		return nil, fmt.Errorf("export volume %q from %s: %w", name, fromHost, err)

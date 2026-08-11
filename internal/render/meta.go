@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"errors"
 	"fmt"
+	"path"
 	"regexp"
 	"strings"
 
+	"github.com/bmatcuk/doublestar/v4"
 	"gopkg.in/yaml.v3"
 )
 
@@ -72,6 +74,21 @@ type Secrets struct {
 type Volume struct {
 	Name   string `yaml:"name" json:"name"`
 	Backup string `yaml:"backup,omitempty" json:"backup,omitempty"`
+	// Exclude lists glob patterns (doublestar syntax, `**` spans separators)
+	// matched against each tar entry's path.Clean'ed name relative to the
+	// volume root. Matching entries are omitted from the volume's BACKUP tar
+	// and from nothing else — rename/migrate/copy always export everything.
+	//
+	// A directory's own tar entry is NEVER dropped, no matter which pattern
+	// matches it or how — only files and links are ever removed. VolumeImport
+	// recreates a directory implicitly from the paths beneath it, so a tar
+	// missing a directory entry its children still need would fail restore's
+	// integrity verification (a re-export compared against the stored
+	// manifest), and that failure lands only after the instance has already
+	// been torn down for the restore. A pattern can therefore empty a
+	// directory but never remove it: "dir/**" drops everything under "dir"
+	// while "dir" itself still ships.
+	Exclude []string `yaml:"exclude,omitempty" json:"exclude,omitempty"`
 }
 
 // Ingress declares which container+port in the rendered pod serves HTTP, so the
@@ -107,6 +124,77 @@ func ValidateIngress(ing *Ingress) error {
 	}
 	if ing.Port <= 0 || ing.Port > 65535 {
 		return fmt.Errorf("template-meta: ingress.port %d out of range", ing.Port)
+	}
+	return nil
+}
+
+// ValidateVolumes checks each volume's exclude patterns: non-empty, relative,
+// no ".." segment (so a pattern cannot be read as host-absolute or escape the
+// volume root), clean (see below), not a "/**"-suffixed pattern whose
+// zero-segment rescue swallows everything (see below), and compilable.
+// Rejecting at registration means a typo fails visibly instead of silently
+// matching nothing at backup time.
+//
+// Patterns are matched against path.Clean'ed tar entry names (tarfilter.go),
+// so a pattern that is not itself already clean — a leading "./", a trailing
+// slash, an internal "//" — can never match anything: it differs from every
+// cleaned name by construction. That failure mode is silent (a legitimate
+// zero-match backup and a typo'd one both show `excluded.entries: 0` in a
+// backup row nobody reads), which is exactly what this validator exists to
+// catch, so such a pattern is rejected outright rather than accepted and
+// left to quietly do nothing. path.Clean does not strip a leading "/" or
+// resolve a leading "..", so those two checks above remain load-bearing on
+// their own and are kept ahead of this one so their more specific messages
+// win first.
+//
+// A "/**"-suffixed pattern whose stripped prefix ALSO ends in a wildcard
+// segment ("*" or "**") and contains a "**" segment somewhere in it is
+// rejected for a related reason: newDropper's zero-segment rescue
+// (tarfilter.go) skips a match when the pattern's own stripped prefix
+// matches the same entry. If that prefix's last segment is itself a
+// wildcard, the prefix matches every entry the full pattern matches too —
+// so the rescue fires unconditionally and the pattern silently drops
+// nothing at all, files included, with the same invisible
+// `excluded.entries: 0` signal. "**/b/**" is unaffected (its prefix "**/b"
+// ends in the literal "b", not a wildcard) and stays valid; "a/**/**",
+// "**/**", "**/*/**" and "a/**/*/**" are all rejected by this rule. A bare
+// "**" (no "/**" suffix to strip) is untouched by this check and stays
+// valid — it legitimately matches, and so drops, every entry.
+func ValidateVolumes(m Meta) error {
+	for _, v := range m.Volumes {
+		for _, p := range v.Exclude {
+			if strings.TrimSpace(p) == "" {
+				return fmt.Errorf("template-meta: volume %q: exclude pattern must not be empty", v.Name)
+			}
+			if strings.HasPrefix(p, "/") {
+				return fmt.Errorf("template-meta: volume %q: exclude pattern %q must be relative to the volume root", v.Name, p)
+			}
+			for _, seg := range strings.Split(p, "/") {
+				if seg == ".." {
+					return fmt.Errorf("template-meta: volume %q: exclude pattern %q must not contain a %q segment", v.Name, p, "..")
+				}
+			}
+			if cleaned := path.Clean(p); cleaned != p {
+				return fmt.Errorf("template-meta: volume %q: exclude pattern %q is not clean (did you mean %q?); it would never match a path.Clean'ed tar entry name", v.Name, p, cleaned)
+			}
+			if prefix, isGlobstar := strings.CutSuffix(p, "/**"); isGlobstar {
+				prefixSegs := strings.Split(prefix, "/")
+				last := prefixSegs[len(prefixSegs)-1]
+				hasGlobstarSeg := false
+				for _, seg := range prefixSegs {
+					if seg == "**" {
+						hasGlobstarSeg = true
+						break
+					}
+				}
+				if hasGlobstarSeg && (last == "*" || last == "**") {
+					return fmt.Errorf("template-meta: volume %q: exclude pattern %q: the \"/**\"-stripped prefix %q matches everything the pattern matches, so the zero-segment rescue swallows the whole pattern and it never drops anything", v.Name, p, prefix)
+				}
+			}
+			if !doublestar.ValidatePattern(p) {
+				return fmt.Errorf("template-meta: volume %q: invalid pattern %q", v.Name, p)
+			}
+		}
 	}
 	return nil
 }
@@ -235,6 +323,10 @@ func ParseMeta(src string) (Meta, string, error) {
 	}
 
 	if err := ValidateIngress(wrapper.Meta.Ingress); err != nil {
+		return Meta{}, "", err
+	}
+
+	if err := ValidateVolumes(wrapper.Meta); err != nil {
 		return Meta{}, "", err
 	}
 

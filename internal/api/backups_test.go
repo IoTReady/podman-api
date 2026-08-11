@@ -188,6 +188,28 @@ func TestAPI_ListBackups(t *testing.T) {
 	require.Len(t, out.Backups, 1)
 }
 
+// TestToBackupViews_carriesExcluded checks toBackupViews maps a volume's
+// store.ExcludedPaths onto its ExcludedView, and leaves it nil for a volume
+// exported in full. (#248)
+func TestToBackupViews_carriesExcluded(t *testing.T) {
+	in := []store.Backup{{
+		ID: "bk_1", Host: "h", Template: "t", Slug: "s", State: store.BackupComplete,
+		Volumes: []store.BackupVolume{
+			{Name: "t-s-sites", SizeBytes: 10, Excluded: &store.ExcludedPaths{
+				Patterns: []string{"*/private/backups/**"}, Entries: 3, Bytes: 999}},
+			{Name: "t-s-logs", SizeBytes: 5},
+		},
+	}}
+	out := toBackupViews(in)
+	require.Len(t, out, 1)
+	require.Len(t, out[0].Volumes, 2)
+	require.NotNil(t, out[0].Volumes[0].Excluded, "excluded not mapped")
+	assert.Equal(t, 3, out[0].Volumes[0].Excluded.Entries)
+	assert.Equal(t, int64(999), out[0].Volumes[0].Excluded.Bytes)
+	assert.Equal(t, []string{"*/private/backups/**"}, out[0].Volumes[0].Excluded.Patterns)
+	assert.Nil(t, out[0].Volumes[1].Excluded, "unfiltered volume must have no excluded block")
+}
+
 func TestAPI_PostRestore_Enqueues(t *testing.T) {
 	srv, tok, _, mem, _ := newBackupSrv(t)
 	ctx := context.Background()

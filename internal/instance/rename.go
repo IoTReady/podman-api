@@ -216,6 +216,9 @@ func (s *Service) Rename(ctx context.Context, host, tmpl, slug string, req Renam
 // with possibly different source and destination volume names. The destination
 // volume must already exist.
 func (s *Service) copyVolumeAs(ctx context.Context, fromHost, toHost, fromName, toName string) (Manifest, error) {
+	// Unfiltered on purpose: backup exclude patterns (#248) apply only to
+	// backupVolume. This path removes the source once the copy lands, so a
+	// dropped entry would have no second copy to recover from.
 	rc, err := s.client.VolumeExport(ctx, fromHost, fromName)
 	if err != nil {
 		return nil, fmt.Errorf("export volume %q from %s: %w", fromName, fromHost, err)

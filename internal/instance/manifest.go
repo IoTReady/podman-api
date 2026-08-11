@@ -53,12 +53,26 @@ func (f *fileInfo) UnmarshalJSON(b []byte) error {
 // pipe, should a future caller tee the copy stream into it.)
 func buildManifest(r io.Reader) (Manifest, error) {
 	m := Manifest{}
-	err := parseTar(r, m)
+	err := parseTar(r, m, tarOpts{})
 	io.Copy(io.Discard, r) //nolint:errcheck // best-effort drain (see doc comment)
 	return m, err
 }
 
-func parseTar(r io.Reader, m Manifest) error {
+// tarOpts configures parseTar. The zero value is manifest-only: read the
+// stream, fingerprint it, write nothing.
+//
+// Note the two distinct notions of "exclude" in this file. excludePath (below)
+// omits paths from the fingerprint while their bytes still ship — it exists so
+// a copy and its verify pass compare equal (#142). drop omits the bytes
+// themselves from w, for backup exclude patterns (#248). An excludePath entry
+// is still written to w.
+type tarOpts struct {
+	w     *tar.Writer                // nil = do not re-emit
+	drop  func(hdr *tar.Header) bool // nil = drop nothing
+	stats *dropStats                 // nil = do not count
+}
+
+func parseTar(r io.Reader, m Manifest, opt tarOpts) error {
 	tr := tar.NewReader(r)
 	for {
 		hdr, err := tr.Next()
@@ -69,18 +83,41 @@ func parseTar(r io.Reader, m Manifest) error {
 			return err
 		}
 		cleaned := path.Clean(hdr.Name)
+
+		if opt.drop != nil && opt.drop(hdr) {
+			n, err := io.Copy(io.Discard, tr)
+			if err != nil {
+				return err
+			}
+			if opt.stats != nil {
+				opt.stats.Entries++
+				opt.stats.Bytes += n
+			}
+			continue
+		}
+
 		excluded := excludePath(cleaned)
+
+		// Re-emit the header before the body: tar.Writer requires it, and the
+		// body below is teed into it.
+		var body io.Writer = io.Discard
+		if opt.w != nil {
+			if err := opt.w.WriteHeader(hdr); err != nil {
+				return err
+			}
+			body = opt.w
+		}
 
 		fi := fileInfo{typ: hdr.Typeflag}
 		switch hdr.Typeflag {
 		case tar.TypeReg:
 			if excluded {
-				if _, err := io.Copy(io.Discard, tr); err != nil {
+				if _, err := io.Copy(body, tr); err != nil {
 					return err
 				}
 			} else {
 				h := sha256.New()
-				n, err := io.Copy(h, tr)
+				n, err := io.Copy(io.MultiWriter(h, body), tr)
 				if err != nil {
 					return err
 				}

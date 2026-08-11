@@ -128,9 +128,24 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 		restart()
 		return fail(fmt.Errorf("list volumes: %w", err))
 	}
+	// Declared exclude patterns are keyed by the template's short volume name;
+	// InstanceVolumes returns podman's full <template>-<slug>-<vol> names.
+	// Resolve through the same volumeName() the pod manifest uses, so the two
+	// cannot drift.
+	tpl, err := s.lookup(ctx, req.Host, req.Template)
+	if err != nil {
+		restart()
+		return fail(fmt.Errorf("lookup template: %w", err))
+	}
+	excludes := map[string][]string{}
+	for _, v := range tpl.Meta.Volumes {
+		if len(v.Exclude) > 0 {
+			excludes[volumeName(req.Template, req.Slug, v.Name)] = v.Exclude
+		}
+	}
 	var bvols []store.BackupVolume
 	for _, v := range vols {
-		bv, err := s.backupVolume(ctx, req, v.Name)
+		bv, err := s.backupVolume(ctx, req, v.Name, excludes[v.Name])
 		if err != nil {
 			restart()
 			return fail(fmt.Errorf("backup volume %q: %w", v.Name, err))
@@ -168,7 +183,12 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 // for all three framing modes (Content-Length, chunked, connection-close) when
 // a connection drops mid-transfer. A truncated tar emitted by podman itself
 // would not be detected: no expected-size oracle exists on this path.
-func (s *Service) backupVolume(ctx context.Context, req BackupRequest, name string) (store.BackupVolume, error) {
+//
+// When patterns is non-empty the copy is not byte-for-byte: the tar is decoded,
+// filtered and re-encoded in the same pass that builds the manifest (#248).
+// With no patterns the original TeeReader copy runs unchanged, so every volume
+// that has not opted in is bit-identical to before.
+func (s *Service) backupVolume(ctx context.Context, req BackupRequest, name string, patterns []string) (store.BackupVolume, error) {
 	rc, err := s.client.VolumeExport(ctx, req.Host, name)
 	if err != nil {
 		return store.BackupVolume{}, fmt.Errorf("export: %w", err)
@@ -180,7 +200,16 @@ func (s *Service) backupVolume(ctx context.Context, req BackupRequest, name stri
 		return store.BackupVolume{}, fmt.Errorf("open blob: %w", err)
 	}
 	cw := &countingWriter{w: w}
-	m, err := buildManifest(io.TeeReader(rc, cw))
+
+	var (
+		m     Manifest
+		stats dropStats
+	)
+	if len(patterns) == 0 {
+		m, err = buildManifest(io.TeeReader(rc, cw))
+	} else {
+		m, stats, err = filterTar(cw, rc, patterns)
+	}
 	if err != nil {
 		_ = w.Abort()
 		return store.BackupVolume{}, fmt.Errorf("read tar: %w", err)
@@ -192,7 +221,13 @@ func (s *Service) backupVolume(ctx context.Context, req BackupRequest, name stri
 	if err != nil {
 		return store.BackupVolume{}, fmt.Errorf("marshal manifest: %w", err)
 	}
-	return store.BackupVolume{Name: name, SizeBytes: cw.n, Manifest: raw}, nil
+	bv := store.BackupVolume{Name: name, SizeBytes: cw.n, Manifest: raw}
+	if len(patterns) > 0 {
+		bv.Excluded = &store.ExcludedPaths{
+			Patterns: stats.Patterns, Entries: stats.Entries, Bytes: stats.Bytes,
+		}
+	}
+	return bv, nil
 }
 
 // countingWriter counts bytes through to w.

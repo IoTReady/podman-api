@@ -35,6 +35,71 @@ parameters and secrets are in the state store at restore time).
 
 ---
 
+## Excluding paths from a volume's backup
+
+A template may declare glob patterns on a volume that keep matching paths out
+of that volume's backup tar entirely:
+
+```yaml
+volumes:
+  - name: sites
+    backup: "s3; interval=24h"
+    exclude:
+      - "*/private/backups/**"
+```
+
+Patterns are [doublestar](https://github.com/bmatcuk/doublestar/v4) globs —
+`**` spans directory separators — matched against each tar entry's cleaned
+path relative to the volume root. A template with a pattern that fails any of
+the following checks is rejected at registration, not at backup time, since
+the only runtime signal for a pattern that matches nothing is a silent
+`excluded.entries: 0` in a backup row nobody reads:
+
+- Must be relative: no leading `/`.
+- No `..` segment.
+- Must already be `path.Clean`-equivalent to itself: no leading `./`, no
+  trailing `/`, no internal `//`. Patterns are matched against `path.Clean`ed
+  tar entry names, so an unclean pattern can never match anything.
+- For a `/**`-suffixed pattern, the stripped prefix must not itself end in a
+  wildcard segment (`*` or `**`) while also containing a `**` segment
+  somewhere in it (e.g. `a/**/**`, `**/**`, `**/*/**`, `a/**/*/**`). In that
+  shape the prefix matches every entry the full pattern matches, so the
+  directory-contents rescue below fires unconditionally and the whole
+  pattern silently drops nothing at all, files included. `a/**`, `a/*/**`,
+  and `**/b/**` are all fine — none of their stripped prefixes end in a
+  wildcard segment while also containing a `**`. A bare `**` (no `/**`
+  suffix to strip) is unaffected by this check and legitimately matches,
+  and so drops, every entry.
+
+A pattern never drops a directory's own tar entry, no matter which form it
+takes or how it matches — only files and links are ever removed. A directory
+can be emptied but not removed: `*/private/backups/**` drops everything
+*under* `private/backups`, so it restores as an empty directory, and naming
+the directory outright (`*/private/backups`) is a no-op — the directory entry
+still ships, exactly as if no pattern had matched it. This is deliberate:
+restore recreates a directory implicitly from the paths beneath it, so a tar
+that omitted a directory entry its children still need would produce a
+re-export with a key the stored manifest lacks, and that failure surfaces
+only in restore's integrity check — after the instance has already been torn
+down for the restore.
+
+A hardlink whose target was excluded is dropped along with it, otherwise the
+archive would fail to import. Symlinks are not resolved this way: a symlink
+pointing at an excluded path survives in the backup and comes back dangling,
+exactly as it would on the source filesystem.
+
+**Exclusion applies to backups only.** Instance rename, host migration, and
+volume copy always move every byte — they remove the source once the copy
+lands, so nothing can be safely left behind.
+
+What each pattern set actually excluded is recorded per backup and surfaced
+in the [list-backups API](#list-backups) response (`excluded.entries: 0`
+against a non-empty pattern list means the patterns matched nothing that
+backup — usually a stale or misspelled pattern, not a failure; a new
+instance legitimately has nothing to exclude yet).
+
+---
+
 ## Where artifacts live
 
 Artifact files are written to the local filesystem of the API server under
@@ -150,7 +215,13 @@ Returns newest-first. `?limit=` is the only pagination parameter; absent or
       "slug":     "my-db",
       "state":    "complete",
       "image":    "docker.io/library/postgres:16",
-      "volumes":  [{"name": "data", "size_bytes": 52428800}],
+      "volumes":  [
+        {"name": "data", "size_bytes": 52428800},
+        {
+          "name": "sites", "size_bytes": 8912896000,
+          "excluded": {"patterns": ["*/private/backups/**"], "entries": 8, "bytes": 3627000000}
+        }
+      ],
       "created":  "2026-06-06T10:00:00Z",
       "finished": "2026-06-06T10:01:23Z"
     }
@@ -160,6 +231,12 @@ Returns newest-first. `?limit=` is the only pagination parameter; absent or
 
 `state` is one of `creating`, `complete`, or `failed`. Only `complete` backups
 are restorable.
+
+`excluded` is present only on a volume whose template declared `exclude:`
+patterns for that backup — `data` above was exported in full and carries no
+`excluded` key at all, which is how a partial backup is distinguished from a
+complete one. When present, `patterns` is the list applied, `entries` the
+count of tar entries it dropped, and `bytes` their total uncompressed size.
 
 ### Restore from a backup
 

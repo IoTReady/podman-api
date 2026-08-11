@@ -197,6 +197,8 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string, force bool) err
 //     contain a container whose name matches Ingress.Container.
 //  4. No parameter may set `secret: true` (render.ValidateParamDefs) — parameter
 //     values are stored in plaintext, so authors must use secrets.per_instance.
+//  5. Every volume's exclude patterns must be relative, non-empty and
+//     compilable (render.ValidateVolumes).
 func ValidateTemplate(t store.Template) error {
 	if !render.ValidName(t.Meta.ID) {
 		return fmt.Errorf("%w: id %q must match %s", ErrInvalidTemplate, t.Meta.ID, render.NameRe.String())
@@ -213,6 +215,10 @@ func ValidateTemplate(t store.Template) error {
 	// before rendering. API-created templates build render.Meta directly and so
 	// skip ParseMeta's checks; this re-runs the same validation (#61).
 	if err := render.ValidateIngress(t.Meta.Ingress); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
+	}
+
+	if err := render.ValidateVolumes(t.Meta); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
 

@@ -756,6 +756,189 @@ func TestReconcileBackup_InstanceGoneSkipsRestart(t *testing.T) {
 	assert.Equal(t, store.BackupFailed, b.State)
 }
 
+// newBackupTestService seeds host "h", a minimal single-volume template "t"
+// (volumes populated per-test via setTemplateVolumes), a deployed instance
+// t/s (spec + running pod), and wires an in-memory blob store. It is the
+// harness for the exclude-filter tests below, deliberately smaller than
+// newBackupSvc's postgres fixture since these tests only care about the
+// volume-export path, not the app container shape.
+func newBackupTestService(t *testing.T) (*Service, *fake.Fake, *store.Memory) {
+	t.Helper()
+	hosts := []config.Host{{ID: "h", Addr: "unix", Socket: "/x"}}
+	f := fake.New()
+
+	tmpl := store.Template{
+		Meta: render.Meta{
+			ID:         "t",
+			Parameters: requiredParams("slug"),
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: t-{{.slug}}
+  labels:
+    podman-api/template: t
+    podman-api/slug: {{.slug}}
+spec:
+  containers:
+    - name: app
+      image: busybox
+`,
+		Origin: "seed",
+	}
+	svc, mem := newSvcWith(t, f, hosts, tmpl)
+
+	require.NoError(t, mem.PutSpec(context.Background(), store.Spec{
+		Host: "h", Template: "t", Slug: "s",
+		Parameters: map[string]any{"slug": "s"},
+	}))
+
+	f.AddPod("h", podman.Pod{
+		Name: "t-s", ID: "t-s", Status: "Running",
+		Containers: []podman.Container{{Name: "t-s-app", Image: "busybox", Status: "Running"}},
+		Labels:     map[string]string{"podman-api/template": "t", "podman-api/slug": "s"},
+	})
+
+	svc.SetBlobStore(newMemBlob())
+	return svc, f, mem
+}
+
+// setTemplateVolumes overwrites template tmplID's declared volumes — the
+// exclude-filter tests need per-test volume declarations (including Exclude
+// patterns) on top of newBackupTestService's minimal fixture.
+func setTemplateVolumes(t *testing.T, st *store.Memory, tmplID string, vols []render.Volume) {
+	t.Helper()
+	tmpl, err := st.GetTemplate(context.Background(), tmplID)
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = vols
+	require.NoError(t, st.PutTemplate(context.Background(), tmpl))
+}
+
+// blobBytes reads a committed blob straight from svc's blob store.
+func blobBytes(t *testing.T, svc *Service, key string) []byte {
+	t.Helper()
+	rc, err := svc.blobs.Get(context.Background(), key)
+	require.NoError(t, err)
+	defer rc.Close()
+	b, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	return b
+}
+
+// TestBackup_excludesDeclaredPaths verifies that a volume's declared exclude
+// patterns are applied to the exported tar and recorded on the backup row.
+func TestBackup_excludesDeclaredPaths(t *testing.T) {
+	svc, f, st := newBackupTestService(t)
+	ctx := context.Background()
+	f.SetVolumeData("h", "t-s-sites", makeTar(t, []tarEntry{
+		{name: "site/private/backups/db.sql.gz", body: "DUMP"},
+		{name: "site/private/files/a.pdf", body: "PDF"},
+	}))
+	setTemplateVolumes(t, st, "t", []render.Volume{
+		{Name: "sites", Backup: "s3; interval=24h", Exclude: []string{"*/private/backups/**"}},
+	})
+
+	id := store.NewBackupID()
+	require.NoError(t, svc.Backup(ctx, BackupRequest{BackupID: id, Host: "h", Template: "t", Slug: "s"}, nil))
+
+	b, err := st.GetBackup(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 1)
+	v := b.Volumes[0]
+	if v.Excluded == nil || v.Excluded.Entries != 1 {
+		t.Fatalf("excluded = %+v, want 1 entry dropped", v.Excluded)
+	}
+	names := tarNames(t, blobBytes(t, svc, backupBlobKey("h", "t", "s", id, "t-s-sites")))
+	for _, n := range names {
+		if strings.Contains(n, "private/backups") {
+			t.Fatalf("dropped path present in the blob: %v", names)
+		}
+	}
+}
+
+// TestBackup_excludePatternMatchesNothing verifies the stale-pattern signal:
+// a volume whose exclude pattern matches nothing in the exported tar still
+// backs up successfully, and the backup row records Excluded with the
+// declared patterns and Entries: 0 — the visible signal (per dropStats' doc
+// comment) that a pattern is stale or misspelled, deliberately not an error.
+func TestBackup_excludePatternMatchesNothing(t *testing.T) {
+	svc, f, st := newBackupTestService(t)
+	ctx := context.Background()
+	f.SetVolumeData("h", "t-s-sites", makeTar(t, []tarEntry{
+		{name: "site/files/a.pdf", body: "PDF"},
+	}))
+	setTemplateVolumes(t, st, "t", []render.Volume{
+		{Name: "sites", Backup: "s3; interval=24h", Exclude: []string{"*/private/backups/**"}},
+	})
+
+	id := store.NewBackupID()
+	require.NoError(t, svc.Backup(ctx, BackupRequest{BackupID: id, Host: "h", Template: "t", Slug: "s"}, nil))
+
+	b, err := st.GetBackup(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 1)
+	v := b.Volumes[0]
+	if v.Excluded == nil {
+		t.Fatal("want Excluded recorded even when the pattern matches nothing")
+	}
+	assert.Equal(t, 0, v.Excluded.Entries)
+	assert.Equal(t, []string{"*/private/backups/**"}, v.Excluded.Patterns)
+}
+
+// TestBackup_noExcludeIsByteForByte is the safety-property guard: a volume
+// declaring no exclude patterns must still take the original TeeReader copy
+// path, producing a blob byte-for-byte identical to the exported tar, and
+// must record no Excluded metadata.
+//
+// The source is padded to a 10240-byte record boundary (the blocking factor
+// GNU tar and podman's own export actually use) rather than left at
+// archive/tar's minimal per-entry block alignment. Without the padding this
+// test is vacuous: buildManifest's post-parse io.Copy(io.Discard, r) drain
+// happens to copy the same number of trailing bytes that filterTar's
+// tar.Writer re-encode independently produces for this fixture, so routing
+// every volume through filterTar (a real #248 regression) would still pass.
+// Padded, the two diverge — buildManifest's drain preserves the trailing
+// padding byte-for-byte, filterTar's re-encode does not — so this is what
+// makes the guard real. (Confirmed live: see the mutation check in the task-4
+// fix report.)
+func TestBackup_noExcludeIsByteForByte(t *testing.T) {
+	svc, f, st := newBackupTestService(t)
+	ctx := context.Background()
+	src := padTarToRecordBoundary(makeTar(t, []tarEntry{{name: "a.txt", body: "A"}, {name: "b.txt", body: "B"}}))
+	f.SetVolumeData("h", "t-s-data", src)
+	setTemplateVolumes(t, st, "t", []render.Volume{{Name: "data", Backup: "s3; interval=24h"}})
+
+	id := store.NewBackupID()
+	require.NoError(t, svc.Backup(ctx, BackupRequest{BackupID: id, Host: "h", Template: "t", Slug: "s"}, nil))
+
+	got := blobBytes(t, svc, backupBlobKey("h", "t", "s", id, "t-s-data"))
+	if !bytes.Equal(got, src) {
+		t.Fatal("a volume with no exclude patterns must be stored byte-for-byte")
+	}
+	b, err := st.GetBackup(ctx, id)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 1)
+	if b.Volumes[0].Excluded != nil {
+		t.Fatalf("unfiltered volume must record no exclusions: %+v", b.Volumes[0].Excluded)
+	}
+	assert.Equal(t, int64(len(src)), b.Volumes[0].SizeBytes)
+}
+
+// padTarToRecordBoundary pads a tar stream with zero bytes to the next
+// 10240-byte record boundary (blocking factor 20 x 512), matching what GNU
+// tar / podman's own volume export actually emits. archive/tar's Writer only
+// pads to 512-byte block alignment plus the two zero end-of-archive blocks,
+// so a synthetic makeTar() fixture left unpadded is too short to distinguish
+// a true byte-for-byte copy from a filter-and-reencode round-trip that
+// happens to produce the same length.
+func padTarToRecordBoundary(b []byte) []byte {
+	const record = 10240
+	if rem := len(b) % record; rem != 0 {
+		b = append(b, make([]byte, record-rem)...)
+	}
+	return b
+}
+
 // TestRestore_VerifyMismatchKeepsSpec extends TestRestore_VerifyMismatchFails
 // to also assert that the spec row survives after an ErrVolumeIntegrity
 // failure so the restore is retryable.
