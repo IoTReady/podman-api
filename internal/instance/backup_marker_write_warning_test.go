@@ -9,6 +9,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/iotready/podman-api/internal/config"
+	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
 )
@@ -86,4 +88,57 @@ func TestTemplateWrite_WarnsAboutNoneMarkers(t *testing.T) {
 	tpl3.Meta.Volumes = []render.Volume{{Name: "data", Backup: "s3; interval=24h"}}
 	out = captureLog(t, func() { require.NoError(t, svc.UpdateTemplate(ctx, tpl3)) })
 	assert.NotContains(t, out, "HARD VETO")
+}
+
+// A template row stored with a near-miss `None` marker — registered before the
+// registration validator existed, which is the whole population that validator
+// was written about — must stay EDITABLE. ValidateVolumes runs on
+// UpdateTemplate too, so rejecting the near-miss there failed every PUT,
+// including one changing an unrelated field, and there is no in-product path to
+// the row to fix the marker by hand. Consumption fails closed (the marker still
+// vetoes), so the strict rule is belt-and-braces and can yield here.
+// (review-4 finding 4)
+func TestUpdateTemplate_StoredNearMissMarkerStaysEditable(t *testing.T) {
+	ctx := context.Background()
+	f := fake.New()
+	stored := pgTemplate()
+	for i := range stored.Meta.Volumes {
+		if stored.Meta.Volumes[i].Name == "logs" {
+			stored.Meta.Volumes[i].Backup = "None"
+		}
+	}
+	svc, mem := newSvcWith(t, f, []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}})
+	// Seeded directly, bypassing CreateTemplate: this is a row that predates the
+	// validator, which is the only way such a row exists.
+	require.NoError(t, mem.PutTemplate(ctx, stored))
+
+	edit := stored
+	edit.Meta.Display.Description = "our postgres"
+	logs := captureLog(t, func() {
+		require.NoError(t, svc.UpdateTemplate(ctx, edit),
+			"an unrelated edit must not be held hostage by a marker the row already carried")
+	})
+	// The write-path warning still names the volume, so the edit is informed.
+	assert.Contains(t, logs, "logs")
+
+	got, err := svc.GetTemplate(ctx, edit.Meta.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "our postgres", got.Meta.Display.Description)
+
+	// A near-miss the update NEWLY introduces is still rejected.
+	bad := stored
+	bad.Meta.Volumes = append([]render.Volume(nil), stored.Meta.Volumes...)
+	for i := range bad.Meta.Volumes {
+		if bad.Meta.Volumes[i].Name == "data" {
+			bad.Meta.Volumes[i].Backup = "NONE"
+		}
+	}
+	err = svc.UpdateTemplate(ctx, bad)
+	require.ErrorIs(t, err, ErrInvalidTemplate)
+	assert.Contains(t, err.Error(), `must be exactly "none"`)
+
+	// And create is unchanged: registering the same shape fresh is refused.
+	fresh := stored
+	fresh.Meta.ID = "pg-copy"
+	assert.ErrorIs(t, svc.CreateTemplate(ctx, fresh), ErrInvalidTemplate)
 }

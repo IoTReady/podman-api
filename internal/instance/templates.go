@@ -68,12 +68,21 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 	if err := render.NormalizeParams(&t.Meta); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
-	if err := ValidateTemplate(t); err != nil {
+	// The stored row is read BEFORE validation because validation depends on it:
+	// a near-miss `none` marker the row already carries must not fail an edit
+	// that does not touch it (review-4 finding 4). The error precedence a caller
+	// sees is unchanged — an invalid submission is still reported as invalid,
+	// even for an id that does not exist — so the lookup error is held back
+	// until after ValidateTemplateUpdate has had its say.
+	existing, gerr := s.GetTemplate(ctx, t.Meta.ID)
+	if gerr != nil && !errors.Is(gerr, ErrUnknownTemplate) {
+		return gerr
+	}
+	if err := ValidateTemplateUpdate(t, existing); err != nil {
 		return err
 	}
-	existing, err := s.GetTemplate(ctx, t.Meta.ID)
-	if err != nil {
-		return err
+	if gerr != nil {
+		return gerr
 	}
 	t.Origin = existing.Origin
 
@@ -250,7 +259,20 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string, force bool) err
 //     values are stored in plaintext, so authors must use secrets.per_instance.
 //  5. Every volume's exclude patterns must be relative, non-empty and
 //     compilable (render.ValidateVolumes).
-func ValidateTemplate(t store.Template) error {
+func ValidateTemplate(t store.Template) error { return validateTemplate(t, nil) }
+
+// ValidateTemplateUpdate is ValidateTemplate for an EDIT of stored: identical
+// except that a near-miss `none` volume marker already present in the stored
+// row is not rejected (render.ValidateVolumesUpdate). Without that, a row
+// registered before the near-miss rule existed can never be edited again, for
+// any reason, and there is no in-product path to the row to fix it. A near-miss
+// the update NEWLY introduces is still rejected. Pass a zero store.Template to
+// validate strictly.
+func ValidateTemplateUpdate(t, stored store.Template) error {
+	return validateTemplate(t, &stored)
+}
+
+func validateTemplate(t store.Template, stored *store.Template) error {
 	if !render.ValidName(t.Meta.ID) {
 		return fmt.Errorf("%w: id %q must match %s", ErrInvalidTemplate, t.Meta.ID, render.NameRe.String())
 	}
@@ -269,8 +291,12 @@ func ValidateTemplate(t store.Template) error {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
 
-	if err := render.ValidateVolumes(t.Meta); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
+	volErr := render.ValidateVolumes(t.Meta)
+	if stored != nil {
+		volErr = render.ValidateVolumesUpdate(t.Meta, stored.Meta)
+	}
+	if volErr != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidTemplate, volErr)
 	}
 
 	rendered, err := render.RenderBody(t.Body, dummyParams(t.Meta))

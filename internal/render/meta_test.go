@@ -269,13 +269,12 @@ func TestValidateVolumes(t *testing.T) {
 		{name: "**/*/** swallows everything: reject", vols: []Volume{{Name: "sites", Exclude: []string{"**/*/**"}}}, wantErr: "matches everything"},
 		{name: "a/**/*/** swallows everything: reject", vols: []Volume{{Name: "sites", Exclude: []string{"a/**/*/**"}}}, wantErr: "matches everything"},
 		{name: "bare ** legitimately drops everything: accept", vols: []Volume{{Name: "sites", Exclude: []string{"**"}}}},
-		// The `none` veto is exact-string equality wherever it is consumed, so a
-		// near-miss vetoes nothing and does so silently — the volume is exported
-		// into every blob with no error, no warning and no skip-volume step. A
-		// marker that differs from "none" ONLY by case or surrounding whitespace
-		// is therefore rejected at registration rather than normalised: the
-		// author wrote something they believed was a veto and must be told it is
-		// not one.
+		// Consumption of the `none` veto fails CLOSED — IsBackupMarkerNone folds
+		// case and trims, so `None` really does veto. The registration rule on
+		// top of that is not the safety mechanism; it is what keeps the stored
+		// text saying what it does, so an author who wrote something they
+		// believed was a veto is TOLD rather than guessed at, and a reader of the
+		// meta and a reader of the code cannot reach different conclusions.
 		{name: "exact none: accept", vols: []Volume{{Name: "logs", Backup: "none"}}},
 		{name: "no marker at all: accept", vols: []Volume{{Name: "logs"}}},
 		{name: "opaque commercial marker: accept", vols: []Volume{{Name: "sites", Backup: "s3; interval=24h"}}},
@@ -332,4 +331,47 @@ kind: Pod
 		m.Volumes[0].Exclude[0] != "*/private/backups/**" {
 		t.Fatalf("exclude not parsed: %+v", m.Volumes)
 	}
+}
+
+// ValidateVolumes runs on UPDATE as well as create, so the near-miss rule made
+// a row already stored with `None` — exactly the population the rule was
+// written about — permanently uneditable: every PUT failed, including one
+// touching an unrelated field, with no in-product path to the row.
+// ValidateVolumesUpdate grandfathers a near-miss the stored row already carries
+// and nothing else. (review-4 finding 4)
+func TestValidateVolumesUpdate_GrandfathersStoredNearMiss(t *testing.T) {
+	stored := Meta{Volumes: []Volume{{Name: "sites", Backup: "None"}, {Name: "data"}}}
+
+	t.Run("unrelated edit against a stored near-miss is allowed", func(t *testing.T) {
+		next := Meta{Volumes: []Volume{{Name: "sites", Backup: "None", Exclude: []string{"tmp/**"}}, {Name: "data"}}}
+		if err := ValidateVolumesUpdate(next, stored); err != nil {
+			t.Fatalf("want nil, got %v", err)
+		}
+		// Create is unchanged: the same meta registered fresh is still rejected.
+		if err := ValidateVolumes(next); err == nil {
+			t.Fatal("create must still reject a near-miss marker")
+		}
+	})
+
+	t.Run("a newly introduced near-miss is still rejected", func(t *testing.T) {
+		next := Meta{Volumes: []Volume{{Name: "sites", Backup: "None"}, {Name: "data", Backup: "NONE"}}}
+		err := ValidateVolumesUpdate(next, stored)
+		if err == nil || !strings.Contains(err.Error(), `must be exactly "none"`) {
+			t.Fatalf("want a rejection for the newly introduced marker, got %v", err)
+		}
+	})
+
+	t.Run("changing one near-miss to a different one is rejected", func(t *testing.T) {
+		next := Meta{Volumes: []Volume{{Name: "sites", Backup: "NONE"}, {Name: "data"}}}
+		if err := ValidateVolumesUpdate(next, stored); err == nil {
+			t.Fatal("only the exact stored value is grandfathered")
+		}
+	})
+
+	t.Run("every other rule still applies on update", func(t *testing.T) {
+		next := Meta{Volumes: []Volume{{Name: "sites", Backup: "None", Exclude: []string{"/abs"}}, {Name: "data"}}}
+		if err := ValidateVolumesUpdate(next, stored); err == nil {
+			t.Fatal("exclude-pattern validation must not be relaxed on update")
+		}
+	})
 }

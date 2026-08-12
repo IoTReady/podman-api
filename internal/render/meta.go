@@ -191,13 +191,45 @@ func ValidateIngress(ing *Ingress) error {
 // "**/**", "**/*/**" and "a/**/*/**" are all rejected by this rule. A bare
 // "**" (no "/**" suffix to strip) is untouched by this check and stays
 // valid — it legitimately matches, and so drops, every entry.
-func ValidateVolumes(m Meta) error {
+//
+// It validates a template being CREATED: a near-miss `none` marker is rejected
+// outright. Use ValidateVolumesUpdate for an edit of a stored template, which
+// must not reject a near-miss the stored row already carries.
+func ValidateVolumes(m Meta) error { return validateVolumes(m, nil) }
+
+// ValidateVolumesUpdate validates m as an UPDATE of the already-stored meta.
+// It is ValidateVolumes with exactly one relaxation: a near-miss `none` marker
+// that the STORED row already carries on the same volume is accepted, while one
+// the update newly introduces (or changes to a different near-miss) is rejected
+// as on create.
+//
+// Without this, a row registered before the near-miss rule existed — precisely
+// the population that rule was written about — becomes permanently uneditable:
+// every PUT fails, including one changing an unrelated field, and there is no
+// in-product path to the row to fix the marker. Consumption fails CLOSED
+// (IsBackupMarkerNone folds case, so `None` really does veto), so grandfathering
+// the stored value costs no safety; it just declines to hold an unrelated edit
+// hostage. The write-path warning still names the volume on every such edit.
+func ValidateVolumesUpdate(m, stored Meta) error { return validateVolumes(m, &stored) }
+
+func validateVolumes(m Meta, stored *Meta) error {
+	storedMarker := map[string]string{}
+	if stored != nil {
+		for _, v := range stored.Volumes {
+			storedMarker[v.Name] = v.Backup
+		}
+	}
 	for _, v := range m.Volumes {
-		// The `none` veto is exact-string equality everywhere it is consumed, so
-		// a near-miss vetoes nothing and does so silently. Catch it at
-		// registration, where an author is present to read the message.
-		if IsBackupMarkerNone(v.Backup) && v.Backup != BackupMarkerNone {
-			return fmt.Errorf("template-meta: volume %q: backup marker %q is not the veto literal — it must be exactly %q (lowercase, no surrounding whitespace); as written it vetoes nothing and the volume would be backed up in full", v.Name, v.Backup, BackupMarkerNone)
+		// A near-miss `none` is caught at registration so an author who wrote
+		// `None` is TOLD rather than guessed at. This is belt-and-braces, not the
+		// safety mechanism: every consumer compares through IsBackupMarkerNone,
+		// which folds case and trims, so a near-miss already vetoes — the
+		// comparison fails closed. What the strict rule buys is that the stored
+		// text says what it does, so an operator reading the meta and the code
+		// reading the marker cannot reach different conclusions.
+		if IsBackupMarkerNone(v.Backup) && v.Backup != BackupMarkerNone &&
+			storedMarker[v.Name] != v.Backup {
+			return fmt.Errorf("template-meta: volume %q: backup marker %q is not the veto literal — it must be exactly %q (lowercase, no surrounding whitespace); as written it is still read as the veto, but only because every consumer folds case, and the stored text says something the marker grammar does not define", v.Name, v.Backup, BackupMarkerNone)
 		}
 		for _, p := range v.Exclude {
 			if strings.TrimSpace(p) == "" {
