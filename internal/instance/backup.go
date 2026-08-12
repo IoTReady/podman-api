@@ -316,7 +316,13 @@ func (s *Service) Restore(ctx context.Context, req RestoreRequest, step func(ste
 	// per-instance secrets — Apply below re-pushes them from the spec anyway,
 	// and host-scoped secrets must survive. Delete also reconciles away the
 	// spec row; Apply re-persists it. Tolerate an already-gone pod.
-	if err := s.Delete(ctx, b.Host, b.Template, b.Slug, DeleteOptions{PruneVolumes: true}); err != nil && !errors.Is(err, ErrInstanceNotFound) {
+	// PruneVolumes is deliberately false: a backup may cover fewer volumes than
+	// the instance declares (a scoped backup, or one whose `none`-marked volumes
+	// were vetoed), and a pruning teardown would delete those and never put them
+	// back. Each volume the backup DOES carry is removed by restoreVolume
+	// immediately before it is recreated, so an import never merges into stale
+	// content. Removing the pod first is what makes those volumes unreferenced.
+	if err := s.Delete(ctx, b.Host, b.Template, b.Slug, DeleteOptions{PruneVolumes: false}); err != nil && !errors.Is(err, ErrInstanceNotFound) {
 		return fmt.Errorf("teardown: %w", err)
 	}
 	step("teardown", b.Host)
@@ -370,6 +376,12 @@ func (s *Service) restorePostTeardown(ctx context.Context, b store.Backup, spec 
 // always verifies regardless of the verifyVolumes flag — it is the only safety
 // mechanism available when restoring from a blob (no live source to compare against).
 func (s *Service) restoreVolume(ctx context.Context, b store.Backup, bv store.BackupVolume) error {
+	// Remove before create: VolumeCreate is idempotent, so without this an
+	// import would merge into whatever the old volume still held. ErrNotFound is
+	// ordinary — a DR rebuild restores onto a host with no such volume yet.
+	if err := s.client.VolumeRemove(ctx, b.Host, bv.Name, true); err != nil && !errors.Is(err, podman.ErrNotFound) {
+		return fmt.Errorf("remove before restore: %w", err)
+	}
 	if err := s.client.VolumeCreate(ctx, b.Host, bv.Name); err != nil {
 		return fmt.Errorf("create: %w", err)
 	}

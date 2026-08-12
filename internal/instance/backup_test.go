@@ -102,12 +102,23 @@ func newBackupSvc(t *testing.T) (*Service, *fake.Fake, *store.Memory, *memBlob) 
 
 	tmpl := pgTemplate()
 	tmpl.Meta.ID = "pg"
+	// pgTemplate's Body hardcodes "postgres" (pod name, template label) rather
+	// than templating off the Meta.ID above — harmless for the other consumers
+	// of this fixture, which never call Apply/PlayKube, but a Restore (which
+	// does) would render a pod named "postgres-a" while every other lookup
+	// here (AddPod, VolumeRemove/Create, waitRunning) expects "pg-a" derived
+	// from Meta.ID. Keep the rendered body consistent with the overridden ID.
+	tmpl.Body = strings.ReplaceAll(tmpl.Body, "postgres", "pg")
 	svc, mem := newSvcWith(t, f, hosts, tmpl)
 
-	// Stored desired-state spec for pg/a.
+	// Stored desired-state spec for pg/a. Secrets carries the template's
+	// required "password" so a Restore (which re-applies the spec through
+	// validation) succeeds — newBackupSvc was originally Backup-only fixture
+	// and never needed this until Restore started using it too.
 	require.NoError(t, mem.PutSpec(context.Background(), store.Spec{
 		Host: "h1", Template: "pg", Slug: "a",
 		Parameters: map[string]any{"slug": "a", "image": "pg:16", "port": 5432, "db": "d", "user": "u"},
+		Secrets:    map[string]string{"password": "p"},
 	}))
 
 	// Running pod pg-a with one container carrying an image ref.
@@ -976,4 +987,41 @@ func TestRestore_VerifyMismatchKeepsSpec(t *testing.T) {
 	// Spec row must survive so the operator can retry with a corrected backup.
 	_, serr := mem.GetSpec(ctx, "h1", "postgres", "a")
 	require.NoError(t, serr, "spec row must be preserved after verify-mismatch failure")
+}
+
+// TestRestore_LeavesVolumesOutsideTheBackupAlone locks the invariant that a
+// restore may never delete a volume it has no copy of. Before this, Restore
+// tore down every DECLARED volume via PruneVolumes:true and recreated only the
+// ones the backup recorded — harmless while every backup held every volume, and
+// data loss the moment one is narrower.
+//
+// The volume must be DECLARED by the template to reproduce: pruneInstanceResources
+// derives what to remove from t.Meta.Volumes, so an undeclared volume was never
+// at risk and would make this test pass vacuously. The scenario here is the
+// ordinary one that gets there today — a template that gained a volume after the
+// backup was taken.
+func TestRestore_LeavesVolumesOutsideTheBackupAlone(t *testing.T) {
+	svc, f, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	req := newBackupReq()
+	require.NoError(t, svc.Backup(ctx, req, nil))
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 1)
+	require.Equal(t, "pg-a-data", b.Volumes[0].Name)
+
+	// The template gains a volume AFTER the backup, and the instance populates
+	// it. The backup has no copy of it.
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "extra"})
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	f.SetVolumeData("h1", "pg-a-extra", tarBytes(t, map[string]string{"keep": "me"}))
+
+	require.NoError(t, svc.Restore(ctx, RestoreRequest{BackupID: req.BackupID}, nil))
+
+	assert.NotEmpty(t, f.VolumeData("h1", "pg-a-extra"),
+		"restore deleted a declared volume the backup had no copy of")
 }
