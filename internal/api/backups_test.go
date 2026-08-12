@@ -463,3 +463,74 @@ func TestAPI_Backup_ScopeEnforced(t *testing.T) {
 	resp := backupReq(t, "POST", srv.URL+"/hosts/h1/instances/postgres/a/backup", "t")
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
 }
+
+// TestAPI_PostBackup_NoBodyIsUnscoped is the wire-compatibility lock: every
+// client that exists today sends no body at all, and must keep meaning "every
+// backupable volume".
+func TestAPI_PostBackup_NoBodyIsUnscoped(t *testing.T) {
+	srv, tok, _, mem, _ := newBackupSrv(t)
+	ctx := context.Background()
+
+	resp := backupReq(t, "POST", srv.URL+"/hosts/h1/instances/postgres/a/backup", tok)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	var acc struct {
+		JobID string `json:"job_id"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&acc))
+
+	job, err := mem.GetJob(ctx, acc.JobID)
+	require.NoError(t, err)
+	var args instance.BackupRequest
+	require.NoError(t, json.Unmarshal(job.Args, &args))
+	assert.Empty(t, args.Volumes)
+}
+
+func TestAPI_PostBackup_ScopedBody(t *testing.T) {
+	srv, tok, _, mem, _ := newBackupSrv(t)
+	ctx := context.Background()
+
+	resp := postJSON(t, srv, tok, "POST", "/hosts/h1/instances/postgres/a/backup",
+		`{"volumes":["data"]}`)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	var acc struct {
+		JobID string `json:"job_id"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&acc))
+
+	job, err := mem.GetJob(ctx, acc.JobID)
+	require.NoError(t, err)
+	var args instance.BackupRequest
+	require.NoError(t, json.Unmarshal(job.Args, &args))
+	assert.Equal(t, []string{"data"}, args.Volumes)
+}
+
+func TestAPI_PostBackup_InvalidScopeIs400(t *testing.T) {
+	srv, tok, _, mem, _ := newBackupSrv(t)
+	ctx := context.Background()
+
+	for _, body := range []string{`{"volumes":["nope"]}`, `{"volumes":["logs"]}`} {
+		resp := postJSON(t, srv, tok, "POST", "/hosts/h1/instances/postgres/a/backup", body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, body)
+		var eb ErrorBody
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&eb))
+		_ = resp.Body.Close()
+		assert.Equal(t, "invalid_backup_scope", eb.Code, body)
+	}
+
+	jobs, err := mem.ListJobs(ctx, store.JobFilter{Kind: "backup", Limit: 10})
+	require.NoError(t, err)
+	assert.Empty(t, jobs, "a rejected scope must enqueue nothing")
+}
+
+func TestAPI_PostBackup_MalformedBodyIs400(t *testing.T) {
+	srv, tok, _, _, _ := newBackupSrv(t)
+
+	resp := postJSON(t, srv, tok, "POST", "/hosts/h1/instances/postgres/a/backup", `{`)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var eb ErrorBody
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&eb))
+	assert.Equal(t, "invalid_request", eb.Code)
+}

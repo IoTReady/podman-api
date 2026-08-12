@@ -2,6 +2,8 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,11 +21,26 @@ func (h *handlers) postBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	host, tmpl, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
-	if err := h.svc.CheckBackupable(r.Context(), host, tmpl, slug, nil); err != nil {
+
+	// The body is optional: every client predating volume scoping sends none,
+	// and an absent body must keep meaning "every backupable volume". io.EOF is
+	// therefore the ordinary case, not an error.
+	var body struct {
+		Volumes []string `json:"volumes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_request", Message: "body must be a JSON object"})
+		return
+	}
+
+	if err := h.svc.CheckBackupable(r.Context(), host, tmpl, slug, body.Volumes); err != nil {
 		WriteError(w, err)
 		return
 	}
-	req := instance.BackupRequest{BackupID: store.NewBackupID(), Host: host, Template: tmpl, Slug: slug}
+	req := instance.BackupRequest{
+		BackupID: store.NewBackupID(), Host: host, Template: tmpl, Slug: slug,
+		Volumes: body.Volumes,
+	}
 	args, err := json.Marshal(req)
 	if err != nil {
 		WriteJSON(w, http.StatusInternalServerError, ErrorBody{Code: "internal", Message: err.Error()})
