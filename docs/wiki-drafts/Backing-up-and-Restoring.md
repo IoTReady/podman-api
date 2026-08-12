@@ -126,6 +126,20 @@ none`, returns `400` with `{"code": "invalid_backup_scope", ...}` and stops
 no pod. A scoped backup does not silently degrade to a smaller one on a typo
 — it fails the request outright.
 
+Three shapes are deliberately **not** read as "back up everything":
+
+- `{"volumes": []}` — an explicitly empty scope is rejected
+  (`invalid_backup_scope`). Omit the body entirely to mean "everything".
+- `{"volume": ["sites"]}` — an unknown field (the singular typo, say) is
+  rejected `400 invalid_request` rather than decoding to an empty scope.
+- An explicit scope that names only volumes which do not exist on the host
+  fails the **job**: this is knowable only once the run resolves what exists,
+  so the backup row is marked `failed`, any partial artifacts are removed and
+  the instance is restarted. A caller that asked for something specific and
+  got nothing must not be handed a green backup row. (An **unscoped** backup
+  of an instance whose volumes have not been created yet still succeeds, with
+  an empty `volumes` list — that is a brand-new instance's first backup.)
+
 **This does not shrink the outage to zero.** A snapshot backup still stops
 the whole pod for the duration of the export — scoping only reduces how many
 bytes are copied while it's down, in proportion to what you drop. Excluding
@@ -146,6 +160,14 @@ is not opted out — it is still backed up in full by an unscoped request; the
 absence of a marker carries no meaning to the core beyond "no commercial
 scheduler will pick this volume up on its own." Don't read a missing
 `backup:` field as "excluded" — that's what `none` is for.
+
+**The spelling is exact, and enforced at registration.** The comparison is
+plain string equality everywhere it is consumed, so `None`, `NONE` or
+`"none "` would veto *nothing* — silently, with the volume exported into
+every blob and no error to read. Template registration therefore **rejects**
+a marker that differs from `none` only by case or surrounding whitespace,
+naming the exact literal required. It is not quietly corrected: an author who
+wrote `None` believed they were vetoing a volume and is told they were not.
 
 A vetoed volume named explicitly in a scope request is rejected at the door
 (`invalid_backup_scope`, above). A vetoed volume left out of an unscoped
@@ -357,7 +379,8 @@ shows a **BACKUPS** section with:
 - A list of existing backups (ID, timestamp, state, image hint, per-volume
   size).
   - **Restore** button (only on `complete` rows) — triggers the confirmation
-    dialog ("This stops the instance and OVERWRITES its current data"), then
+    dialog, which names the volumes this backup actually contains and warns
+    that every other volume keeps its current data, then
     enqueues a restore job and re-renders the page with a notice.
   - **Delete** button — removes the backup after a browser confirm prompt.
 
@@ -400,6 +423,32 @@ data with no way to bring it back. That hole is closed; check *which*
 volumes a backup covers (the `volumes` list in its
 [list-backups](#list-backups) row) before relying on a restore to put
 everything back the way it was.
+
+> ⚠️ **A partial restore can leave an instance internally inconsistent, and
+> nothing detects it.** The volumes a backup covers go back to the moment the
+> backup was taken; every other volume stays at **today**. For anything whose
+> state is split across two volumes that must agree, that is a broken instance,
+> not a partial one:
+>
+> - A Postgres data directory restored to yesterday beside a WAL volume left at
+>   today either refuses to start on an invalid checkpoint record, or replays
+>   stale WAL over the restored directory.
+> - An application database restored to yesterday beside an uploads/files volume
+>   left at today has rows referencing files that do not exist, and files no row
+>   knows about.
+>
+> This is the direct cost of the guarantee above — a restore may never delete a
+> volume it has no copy of — and it is the right trade, because the alternative
+> destroys data outright. But it means `backup: none` and an explicit scope are
+> decisions about **restorability**, not just about backup size. Do not mark a
+> volume `none` (or scope it out) if the instance's correctness depends on it
+> agreeing with a volume that *is* backed up. Where two volumes must move
+> together, back them up together.
+>
+> Before restoring, check the `volumes` list on the backup row
+> ([list-backups](#list-backups)) against the volumes the instance declares. If
+> the backup covers fewer, decide explicitly what happens to the rest —
+> restoring is not that decision.
 
 **There is no rollback.** A failure after step 2 (teardown) leaves the
 instance **down** with volumes partially restored. The spec row is

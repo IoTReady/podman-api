@@ -1528,20 +1528,64 @@ paths:
       summary: enqueue a backup of an instance's volumes (requires -state-db and -backup-dir)
       description: >-
         Validates synchronously (known host/template, an existing stored spec, a
-        wired blob store) and enqueues a backup job, returning the job id and the
-        id of the backup row it will populate. The export itself (stop, snapshot
-        each volume, restart) runs inside the job; failures surface via
-        GET /jobs/{id}, not as the POST status.
+        wired blob store, and the requested volume scope) and enqueues a backup
+        job, returning the job id and the id of the backup row it will populate.
+        The export itself (stop, snapshot each volume, restart) runs inside the
+        job; failures surface via GET /jobs/{id}, not as the POST status.
+
+
+        The request body is OPTIONAL and narrows what the backup captures. An
+        entirely absent body means "every declared volume not marked
+        `backup: none`" — the behaviour every client predating volume scoping
+        relies on. An explicitly empty `volumes` array is NOT the same request
+        and is rejected (400 invalid_backup_scope): it must never be read as
+        "back up everything". Unknown fields are rejected too (400
+        invalid_request), so a `volume`/`volumes` typo fails rather than
+        silently widening the backup to the whole instance.
+
+
+        A scope naming volumes that exist only in the template but not on the
+        host cannot be caught here (it is knowable only once the job resolves
+        what exists) and fails the JOB: the backup row is marked failed, partial
+        artifacts are removed, and the instance is restarted.
       parameters:
         - {name: host, in: path, required: true, schema: {type: string}}
         - {name: template, in: path, required: true, schema: {type: string}}
         - {name: slug, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                volumes:
+                  type: array
+                  minItems: 1
+                  items: {type: string}
+                  description: >-
+                    the template's declared SHORT volume names to capture (e.g.
+                    ["sites"], not the resolved "<template>-<slug>-sites" podman
+                    name). Omit the whole body for every volume not marked
+                    `backup: none`; an empty array is rejected.
+                  example: ['sites']
       responses:
         '202':
           description: backup job accepted
           content:
             application/json:
               schema: {$ref: '#/components/schemas/BackupAccepted'}
+        '400':
+          description: >-
+            malformed body or unknown field (code invalid_request), or an
+            invalid volume scope (code invalid_backup_scope) — a name the
+            template does not declare, a volume marked `backup: none`, an
+            explicitly empty `volumes` array, or a template whose every declared
+            volume is vetoed. Nothing is enqueued and no pod is stopped.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '404':
           description: unknown host, unknown template, or no such instance (codes unknown_host, unknown_template, instance_not_found)
           content:

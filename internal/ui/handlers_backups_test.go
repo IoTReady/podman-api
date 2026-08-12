@@ -143,6 +143,27 @@ func TestUI_InstanceDetailShowsBackups(t *testing.T) {
 	}
 }
 
+// TestUI_RestoreConfirmNamesTheCoveredVolumes: the confirmation used to promise
+// the restore "OVERWRITES its current data", which since volume scoping is only
+// true of the volumes the backup actually contains. A volume the backup does
+// not cover — scoped out, or vetoed by `backup: none` — keeps its CURRENT
+// content, which is how a Postgres `data` restored to yesterday ends up beside
+// a `wal` left at today. The operator has to be told that before clicking.
+func TestUI_RestoreConfirmNamesTheCoveredVolumes(t *testing.T) {
+	u, mem := uiWithBackups(t)
+	seedCompleteBackup(t, mem)
+
+	body := authedGet(t, u, "/ui/hosts/edge-1/instances/postgres/main").Body.String()
+	if strings.Contains(body, "OVERWRITES its current data") {
+		t.Error("confirm still promises a whole-instance overwrite")
+	}
+	for _, want := range []string{"only the 1 volume(s) this backup contains", "postgres-main-data", "keeps its CURRENT"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("confirm text missing %q\nbody:\n%s", want, body)
+		}
+	}
+}
+
 func TestUI_BackupNow(t *testing.T) {
 	u, mem := uiWithBackups(t)
 
