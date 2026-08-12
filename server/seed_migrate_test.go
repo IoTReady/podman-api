@@ -62,12 +62,12 @@ func TestMigrateSeededTemplates_RewritesUntouchedOldSeed(t *testing.T) {
 		t.Fatalf("put: %v", err)
 	}
 
-	ids, err := migrateSeededTemplates(ctx, db, templates.Files)
+	rw, err := migrateSeededTemplates(ctx, db, templates.Files)
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	if len(ids) != 1 || ids[0] != "postgres" {
-		t.Fatalf("want [postgres] migrated, got %v", ids)
+	if len(rw) != 1 || rw[0].Template != "postgres" || rw[0].Volume != "data" || rw[0].From != "none" {
+		t.Fatalf("want one postgres.data rewrite from `none`, got %+v", rw)
 	}
 	got, err := db.GetTemplate(ctx, "postgres")
 	if err != nil {
@@ -83,12 +83,12 @@ func TestMigrateSeededTemplates_RewritesUntouchedOldSeed(t *testing.T) {
 	}
 
 	// Idempotent: a second boot has nothing left to rewrite.
-	ids2, err := migrateSeededTemplates(ctx, db, templates.Files)
+	rw2, err := migrateSeededTemplates(ctx, db, templates.Files)
 	if err != nil {
 		t.Fatalf("migrate again: %v", err)
 	}
-	if len(ids2) != 0 {
-		t.Errorf("second run rewrote %v; want none", ids2)
+	if len(rw2) != 0 {
+		t.Errorf("second run rewrote %+v; want none", rw2)
 	}
 }
 
@@ -105,8 +105,8 @@ func TestMigrateSeededTemplates_NeverRevisitsAMigratedRow(t *testing.T) {
 	if err := db.PutTemplate(ctx, storedLegacySeed(t)); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if ids, err := migrateSeededTemplates(ctx, db, templates.Files); err != nil || len(ids) != 1 {
-		t.Fatalf("first migrate: ids=%v err=%v", ids, err)
+	if rw, err := migrateSeededTemplates(ctx, db, templates.Files); err != nil || len(rw) != 1 {
+		t.Fatalf("first migrate: rewrites=%+v err=%v", rw, err)
 	}
 
 	// The operator now deliberately vetoes `data`, through the ordinary update
@@ -125,12 +125,12 @@ func TestMigrateSeededTemplates_NeverRevisitsAMigratedRow(t *testing.T) {
 		t.Fatalf("put vetoed row: %v", err)
 	}
 
-	ids, err := migrateSeededTemplates(ctx, db, templates.Files)
+	rw, err := migrateSeededTemplates(ctx, db, templates.Files)
 	if err != nil {
 		t.Fatalf("second migrate: %v", err)
 	}
-	if len(ids) != 0 {
-		t.Fatalf("rewrote %v; a deliberate veto set after the migration ran must never be revisited", ids)
+	if len(rw) != 0 {
+		t.Fatalf("rewrote %+v; a deliberate veto set after the migration ran must never be revisited", rw)
 	}
 	got, err := db.GetTemplate(ctx, "postgres")
 	if err != nil {
@@ -141,28 +141,26 @@ func TestMigrateSeededTemplates_NeverRevisitsAMigratedRow(t *testing.T) {
 	}
 }
 
-// The bar for rewriting a row is "recognisably the untouched old seed". Any
-// divergence means the operator has expressed an intent of their own, and
-// overwriting that is worse than the bug being fixed.
-func TestMigrateSeededTemplates_LeavesEditedRowsAlone(t *testing.T) {
+// TestMigrateSeededTemplates_CorrectsEditedRowsToo is the review-6 finding 1
+// case, and it inverts what an earlier version of this migration did. Requiring
+// the whole row to match the old seed byte-for-byte meant an operator who had
+// ever touched it — a bumped default image, a tweaked description, an added
+// parameter — kept `data: backup: none`. That marker is now a HARD VETO of the
+// template's ONLY volume, so CheckBackupable refused every backup of every
+// postgres instance on that fleet, permanently. The population most engaged
+// with the product got the outage.
+//
+// The evidence is now the marker itself, not the whole row: this volume still
+// carries exactly what our old seed shipped. Everything else the operator wrote
+// must survive untouched.
+func TestMigrateSeededTemplates_CorrectsEditedRowsToo(t *testing.T) {
 	ctx := context.Background()
 
 	cases := map[string]func(*store.Template){
-		"edited body": func(tp *store.Template) {
-			tp.Body += "\n# operator note\n"
-		},
-		"edited meta": func(tp *store.Template) {
-			tp.Meta.Display.Description = "our postgres"
-		},
-		"operator chose the marker themselves": func(tp *store.Template) {
-			for i := range tp.Meta.Volumes {
-				if tp.Meta.Volumes[i].Name == "data" {
-					tp.Meta.Volumes[i].Backup = "None"
-				}
-			}
-		},
-		"origin is user": func(tp *store.Template) {
-			tp.Origin = "user"
+		"edited body": func(tp *store.Template) { tp.Body += "\n# operator note\n" },
+		"edited meta": func(tp *store.Template) { tp.Meta.Display.Description = "our postgres" },
+		"added a parameter": func(tp *store.Template) {
+			tp.Meta.Parameters = append(tp.Meta.Parameters, render.ParamDef{Name: "extra", Type: "string"})
 		},
 	}
 
@@ -174,21 +172,110 @@ func TestMigrateSeededTemplates_LeavesEditedRowsAlone(t *testing.T) {
 			if err := db.PutTemplate(ctx, row); err != nil {
 				t.Fatalf("put: %v", err)
 			}
-			ids, err := migrateSeededTemplates(ctx, db, templates.Files)
+			rw, err := migrateSeededTemplates(ctx, db, templates.Files)
 			if err != nil {
 				t.Fatalf("migrate: %v", err)
 			}
-			if len(ids) != 0 {
-				t.Fatalf("rewrote %v; an edited row must never be touched", ids)
+			if len(rw) != 1 {
+				t.Fatalf("rewrote %+v; an edited row still carrying our stale default must be corrected", rw)
 			}
 			got, err := db.GetTemplate(ctx, "postgres")
 			if err != nil {
 				t.Fatalf("get: %v", err)
 			}
-			if got.Body != row.Body || postgresDataMarker(t, got) != postgresDataMarker(t, row) {
-				t.Fatalf("stored row changed: body/marker differ from what the operator stored")
+			if m := postgresDataMarker(t, got); render.IsBackupMarkerNone(m) {
+				t.Fatalf("marker still vetoes the only volume: %q", m)
+			}
+			// Everything the operator wrote survives: only the one marker moved.
+			if got.Body != row.Body {
+				t.Errorf("body was rewritten; the migration must touch the marker and nothing else")
+			}
+			if got.Meta.Display.Description != row.Meta.Display.Description {
+				t.Errorf("description = %q; want the operator's %q", got.Meta.Display.Description, row.Meta.Display.Description)
+			}
+			if len(got.Meta.Parameters) != len(row.Meta.Parameters) {
+				t.Errorf("params = %d; want the operator's %d", len(got.Meta.Parameters), len(row.Meta.Parameters))
 			}
 		})
+	}
+}
+
+// What is still never touched: a marker the operator chose (it is not the value
+// our seed shipped, so it is not ours to correct) and a row that is not ours at
+// all. These are the cases where overwriting really would be worse than the bug.
+func TestMigrateSeededTemplates_LeavesForeignMarkersAlone(t *testing.T) {
+	ctx := context.Background()
+
+	cases := map[string]func(*store.Template){
+		"operator chose the marker themselves": func(tp *store.Template) {
+			for i := range tp.Meta.Volumes {
+				if tp.Meta.Volumes[i].Name == "data" {
+					tp.Meta.Volumes[i].Backup = "None"
+				}
+			}
+		},
+		"origin is user": func(tp *store.Template) { tp.Origin = "user" },
+	}
+
+	for name, edit := range cases {
+		t.Run(name, func(t *testing.T) {
+			db := store.NewMemory()
+			row := storedLegacySeed(t)
+			edit(&row)
+			if err := db.PutTemplate(ctx, row); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			rw, err := migrateSeededTemplates(ctx, db, templates.Files)
+			if err != nil {
+				t.Fatalf("migrate: %v", err)
+			}
+			if len(rw) != 0 {
+				t.Fatalf("rewrote %+v; a marker the operator chose is not ours to correct", rw)
+			}
+			got, err := db.GetTemplate(ctx, "postgres")
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			if postgresDataMarker(t, got) != postgresDataMarker(t, row) {
+				t.Fatalf("marker changed from what the operator stored")
+			}
+		})
+	}
+}
+
+// TestMigrateSeededTemplates_StampsEvenWhenNothingChanged: the applied-once
+// marker has to land on rows the migration examined but did not need to change,
+// not only on rows it rewrote. Those are precisely the rows an operator might
+// later set `backup: none` on — and if the stamp were skipped, the next boot
+// would see our old default's spelling and revert their deliberate veto.
+func TestMigrateSeededTemplates_StampsEvenWhenNothingChanged(t *testing.T) {
+	ctx := context.Background()
+	db := store.NewMemory()
+	row := storedLegacySeed(t)
+	for i := range row.Meta.Volumes {
+		if row.Meta.Volumes[i].Name == "data" {
+			row.Meta.Volumes[i].Backup = "s3; interval=12h" // already fixed by hand
+		}
+	}
+	if err := db.PutTemplate(ctx, row); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	rw, err := migrateSeededTemplates(ctx, db, templates.Files)
+	if err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if len(rw) != 0 {
+		t.Fatalf("rewrote %+v; nothing needed correcting", rw)
+	}
+	got, err := db.GetTemplate(ctx, "postgres")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Origin != seedMigratedOrigin {
+		t.Fatalf("origin = %q; want %q so a later deliberate `none` is never revisited", got.Origin, seedMigratedOrigin)
+	}
+	if m := postgresDataMarker(t, got); m != "s3; interval=12h" {
+		t.Fatalf("marker = %q; the operator's own value must survive", m)
 	}
 }
 
@@ -197,11 +284,11 @@ func TestMigrateSeededTemplates_LeavesEditedRowsAlone(t *testing.T) {
 func TestMigrateSeededTemplates_AbsentRowIsNoOp(t *testing.T) {
 	ctx := context.Background()
 	db := store.NewMemory()
-	ids, err := migrateSeededTemplates(ctx, db, templates.Files)
+	rw, err := migrateSeededTemplates(ctx, db, templates.Files)
 	if err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	if len(ids) != 0 {
-		t.Fatalf("rewrote %v against an empty catalog", ids)
+	if len(rw) != 0 {
+		t.Fatalf("rewrote %+v against an empty catalog", rw)
 	}
 }
