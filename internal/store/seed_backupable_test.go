@@ -22,6 +22,12 @@ import (
 //
 // A template declaring NO volumes at all (basic-web) is deliberately fine —
 // it is stateless, there is nothing to capture, and CheckBackupable accepts it.
+//
+// This does NOT require a bundled volume to carry a marker. An EMPTY marker is
+// exportable — it is only the `none` veto that removes a volume from every
+// backup — and marker GRAMMAR beyond the veto (`s3; interval=…`) is commercial,
+// so the OSS catalog deliberately ships bare `- name: data` volumes rather than
+// prescribing a cadence a fresh install never asked for.
 func TestBundledTemplates_AreBackupable(t *testing.T) {
 	seeds, err := ParseSeeds(templates.Files)
 	require.NoError(t, err)
