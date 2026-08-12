@@ -7,10 +7,11 @@ import (
 
 // BackupInstance is one live instance that has at least one backup-marked
 // volume, projected for a commercial BackupScheduler to act on. Volumes carries
-// only the backup-marked volumes, each with its raw marker string. The marker
-// grammar (e.g. cadence, mode) is owned by the commercial layer — the core
-// projects the string verbatim and ascribes no meaning to it beyond
-// "non-empty == marked for backup".
+// only the backup-marked volumes, each with its raw marker string. The core
+// interprets exactly one literal — `none`, meaning never back this volume up,
+// which is filtered out before projection so a scheduler never sees one. Every
+// other non-empty marker value is opaque and belongs to the commercial marker
+// grammar (e.g. cadence, mode).
 type BackupInstance struct {
 	Host     string
 	Template string
@@ -46,7 +47,8 @@ type BackupOptions struct {
 // learn when each last succeeded, and enqueue a backup job.
 type BackupController interface {
 	// ListBackupInstances returns every live instance (across all known hosts)
-	// that has at least one backup-marked volume, with those markers attached.
+	// that has at least one volume whose marker is not `none`, with those
+	// markers attached.
 	ListBackupInstances(ctx context.Context) ([]BackupInstance, error)
 
 	// LastBackupAt returns the finish time of the newest successful (complete)

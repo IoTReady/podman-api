@@ -22,8 +22,9 @@ type BackupRequest struct {
 	Slug     string `json:"slug"`
 	// Volumes is the declared (short) volume names to capture. Empty means
 	// every declared volume not marked `none`. Persisted in the job args so a
-	// backup interrupted by a daemon restart reconciles with the scope it
-	// started with.
+	// queued job re-claimed after a daemon restart (before it starts running)
+	// carries the scope it was enqueued with — ReconcileBackup itself never
+	// re-runs the export; it only fails the row and restarts the instance.
 	Volumes []string `json:"volumes,omitempty"`
 }
 
@@ -59,12 +60,26 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 		}
 		return err
 	}
-	if len(volumes) == 0 {
-		return nil
-	}
 	declared := make(map[string]string, len(t.Meta.Volumes))
 	for _, v := range t.Meta.Volumes {
 		declared[v.Name] = v.Backup
+	}
+	if len(volumes) == 0 {
+		// An empty scope means "every declared volume not marked `none`" — but
+		// if the template declares no volumes at all, or every declared volume
+		// is vetoed, that set is empty and the backup would capture nothing: a
+		// green row, a real stop/restart outage, and no data. Reject it here,
+		// synchronously, rather than letting it through to produce that backup.
+		// A declared volume that does not yet exist on the host is NOT this
+		// case — this check is over what the template declares, not over what
+		// currently exists (a brand-new instance must be able to take its
+		// first, empty backup).
+		for _, marker := range declared {
+			if marker != BackupMarkerNone {
+				return nil
+			}
+		}
+		return fmt.Errorf("%w: every declared volume is marked `backup: none`", ErrInvalidBackupScope)
 	}
 	for _, name := range volumes {
 		marker, ok := declared[name]

@@ -54,7 +54,7 @@ func uiWithBackups(t *testing.T) (*UI, *store.Memory) {
 				{Name: "slug", Type: "string", Required: true},
 				{Name: "image", Type: "string", Required: true},
 			},
-			Volumes: []render.Volume{{Name: "data", Backup: "none"}},
+			Volumes: []render.Volume{{Name: "data", Backup: "s3; interval=24h"}},
 		},
 		Body: `apiVersion: v1
 kind: Pod

@@ -296,10 +296,14 @@ func newBackupSvcTwoVols(t *testing.T) (*Service, *fake.Fake, *store.Memory, *me
 	tmpl.Meta.ID = "pg"
 	// pgTemplate() already declares "logs" as backup: none (vetoed, never
 	// exported) — this fixture needs a SECOND volume that IS exported so its
-	// mid-export failure is reachable, so override the declaration to a real
-	// marker. Map insertion order in backupVolume's declared lookup means this
-	// later entry wins over pgTemplate's own "logs" declaration.
-	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "logs", Backup: "s3; interval=24h"})
+	// mid-export failure is reachable, so replace that declaration in place
+	// with a real marker rather than appending a duplicate — a real template
+	// cannot declare the same volume name twice.
+	for i, v := range tmpl.Meta.Volumes {
+		if v.Name == "logs" {
+			tmpl.Meta.Volumes[i].Backup = "s3; interval=24h"
+		}
+	}
 	svc, mem := newSvcWith(t, f, hosts, tmpl)
 
 	require.NoError(t, mem.PutSpec(context.Background(), store.Spec{
@@ -1117,6 +1121,40 @@ func TestCheckBackupable_AcceptsEmptyAndDeclaredScope(t *testing.T) {
 	ctx := context.Background()
 	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil))
 	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", []string{"data"}))
+}
+
+// TestCheckBackupable_RejectsEmptyScopeWhenEveryDeclaredVolumeIsNone: with
+// every declared volume vetoed, an empty scope ("everything not vetoed")
+// resolves to nothing exportable — reject rather than let a request through
+// that stops the pod, exports zero volumes, and records a green backup.
+func TestCheckBackupable_RejectsEmptyScopeWhenEveryDeclaredVolumeIsNone(t *testing.T) {
+	svc, _, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	for i := range tmpl.Meta.Volumes {
+		tmpl.Meta.Volumes[i].Backup = BackupMarkerNone
+	}
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+
+	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
+	assert.ErrorIs(t, err, ErrInvalidBackupScope)
+}
+
+// TestCheckBackupable_RejectsEmptyScopeWhenNoVolumesDeclared: same failure
+// mode, template declares no volumes at all.
+func TestCheckBackupable_RejectsEmptyScopeWhenNoVolumesDeclared(t *testing.T) {
+	svc, _, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = nil
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+
+	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
+	assert.ErrorIs(t, err, ErrInvalidBackupScope)
 }
 
 // TestBackup_ScopeNarrowsTheExportSet: with two exportable volumes present, a

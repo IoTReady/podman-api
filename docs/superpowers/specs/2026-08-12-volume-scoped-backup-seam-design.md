@@ -121,11 +121,19 @@ Correct — both stop the same pod.
   it), or
 - a volume marked `none`.
 
-Both fail the synchronous POST with 400 and fail a scheduler's `EnqueueBackup`
-call, so neither ever reaches a `Stop`. The alternative — intersecting the
-request with what is exportable and backing up whatever survives — was rejected:
-a scheduler misconfigured to name the wrong volume would then produce a fleet of
-green, empty backups, which is #104's failure mode one level up.
+It also rejects an **empty** scope — "every declared volume not marked
+`none`" — when that set is itself empty: the template declares no volumes at
+all, or every declared volume is marked `none`. Left unchecked this is the
+same failure one level up: a green, empty backup that stopped the pod for
+nothing. `CheckBackupable` is where this is caught, not the runner, for the
+same synchronous-upfront reason as the other two cases.
+
+All three fail the synchronous POST with 400 and fail a scheduler's
+`EnqueueBackup` call, so none of them ever reaches a `Stop`. The alternative —
+intersecting the request with what is exportable and backing up whatever
+survives — was rejected: a scheduler misconfigured to name the wrong volume
+would then produce a fleet of green, empty backups, which is #104's failure
+mode one level up.
 
 One case is tolerated rather than rejected: a **declared** volume that does not
 yet exist on the host. `InstanceVolumes` already skips those (a declared volume

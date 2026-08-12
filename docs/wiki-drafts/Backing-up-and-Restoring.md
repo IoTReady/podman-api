@@ -7,8 +7,10 @@ podman-api. Introduced in #66 (OSS primitive).
 
 ## What a backup is
 
-A **backup** captures every Podman volume attached to one instance at the
-same stopped moment — a consistent, SQLite-safe snapshot:
+A **backup** captures the Podman volumes attached to one instance — by
+default every declared volume not marked `backup: none`, or a narrower
+explicit scope naming a subset of them — at the same stopped moment: a
+consistent, SQLite-safe snapshot:
 
 1. The instance is stopped.
 2. Each volume is exported as a plain uncompressed tar (`podman volume export`),
