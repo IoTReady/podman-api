@@ -184,8 +184,16 @@ func scopeCovers(inFlight, want []string) bool {
 // is in a non-terminal state AND its scope covers the requested volumes. The
 // in-flight job's own scope is read back out of its persisted args, which is
 // where the enqueue wrote it.
+//
+// JobReconciling is deliberately NOT counted as coverage (round-3 finding 9).
+// It is non-terminal, but ReconcileBackup only fails the row, reaps partial
+// blobs and restarts the instance — it never exports anything. Counting it
+// would answer a tick that landed on a crashed job with "already handled", and
+// that window's snapshot would then never be taken and never retried: exactly
+// the silent drop this coverage check exists to prevent, on the one job state
+// guaranteed to produce no backup.
 func (c *Controller) backupInFlightCovering(ctx context.Context, host, template, slug string, want []string) (bool, error) {
-	for _, st := range []store.JobState{store.JobQueued, store.JobRunning, store.JobReconciling} {
+	for _, st := range []store.JobState{store.JobQueued, store.JobRunning} {
 		jobs, err := c.Jobs.ListJobs(ctx, store.JobFilter{State: st, Kind: "backup", Limit: store.MaxJobLimit})
 		if err != nil {
 			return false, err

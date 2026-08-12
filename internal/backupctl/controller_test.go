@@ -354,3 +354,31 @@ func TestBackupMarkers_NearMissNoneStillVetoes(t *testing.T) {
 	require.Len(t, got[0].Volumes, 1)
 	assert.Equal(t, "data", got[0].Volumes[0].Name)
 }
+
+// TestEnqueueBackup_ReconcilingJobIsNotCoverage (round-3 finding 9):
+// a reconciling backup job is non-terminal, but ReconcileBackup only fails the
+// row, reaps partial blobs and restarts the instance — it never exports. So a
+// tick landing on a crashed job must NOT be answered with ("", nil) as though
+// the window were handled; that snapshot would never be taken and never
+// retried.
+func TestEnqueueBackup_ReconcilingJobIsNotCoverage(t *testing.T) {
+	ctx := context.Background()
+	mem := store.NewMemory()
+
+	pre := instance.BackupRequest{BackupID: store.NewBackupID(), Host: "h1", Template: "web", Slug: "a"}
+	args, _ := json.Marshal(pre)
+	_, err := mem.Enqueue(ctx, "backup", args, "")
+	require.NoError(t, err)
+	// queued -> running -> reconciling (the daemon-restart sweep's own path).
+	_, ok, err := mem.ClaimNext(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	n, err := mem.MarkReconciling(ctx, []string{"backup"})
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+
+	c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
+	id, err := c.EnqueueBackup(ctx, "h1", "web", "a", extension.BackupOptions{})
+	require.NoError(t, err)
+	assert.NotEmpty(t, id, "a reconciling job exports nothing, so it cannot cover this tick")
+}
