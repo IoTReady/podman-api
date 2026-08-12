@@ -1544,10 +1544,12 @@ paths:
         silently widening the backup to the whole instance.
 
 
-        A scope naming volumes that exist only in the template but not on the
-        host cannot be caught here (it is knowable only once the job resolves
-        what exists) and fails the JOB: the backup row is marked failed, partial
-        artifacts are removed, and the instance is restarted.
+        A scope naming volumes that are declared by the template but do not
+        exist on the host (an instance that predates the declaration and has not
+        been re-applied) is rejected SYNCHRONOUSLY — 400 invalid_backup_scope,
+        nothing enqueued, no pod stopped. Do not expect a 202 and a job to poll
+        for this case: a client that only inspects job results would record the
+        request as pending and never learn it was refused.
       parameters:
         - {name: host, in: path, required: true, schema: {type: string}}
         - {name: template, in: path, required: true, schema: {type: string}}
@@ -1580,9 +1582,13 @@ paths:
           description: >-
             malformed body or unknown field (code invalid_request), or an
             invalid volume scope (code invalid_backup_scope) — a name the
-            template does not declare, a volume marked `backup: none`, an
-            explicitly empty `volumes` array, or a template whose every declared
-            volume is vetoed. Nothing is enqueued and no pod is stopped.
+            template does not declare, a volume marked `backup: none`, a
+            declared volume that does not exist on the host (the instance
+            predates the declaration — re-apply it first), an explicitly empty
+            `volumes` array, a template whose every declared volume is vetoed,
+            or an instance whose volumes have all disappeared although an
+            earlier backup captured them. Nothing is enqueued and no pod is
+            stopped.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}

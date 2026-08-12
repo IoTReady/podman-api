@@ -151,12 +151,21 @@ Three shapes are deliberately **not** read as "back up everything":
   artifacts are removed and the instance restarted. A caller that asked for
   something specific and got only part of it must not be handed a green
   backup row.)
-- An **unscoped** backup fails the job if it would capture nothing *while the
-  instance has volumes* — e.g. every existing volume is `backup: none`.
-  A green row with an empty artifact set is worse than an error: it counts in
-  retention and restores nothing. The one case that still succeeds empty is an
-  instance with **no volumes created yet** — a brand-new instance's first
-  backup.
+- An **unscoped** backup is rejected `400 invalid_backup_scope`, **before any
+  pod is stopped**, if it would capture nothing *while the instance has
+  volumes* — e.g. every existing volume is `backup: none`. It is not a job
+  failure: nothing is enqueued, so there is no job id to poll and an
+  automation that watches only job results must read the POST status to see
+  it. A green row with an empty artifact set is worse than an error: it counts
+  in retention and restores nothing.
+- The one case that still succeeds empty is an instance with **no volumes
+  created yet** — a brand-new instance's first backup. "Nothing exists yet"
+  and "everything that existed is gone" reach that same condition, though, so
+  they are told apart by the instance's own backup history: if an earlier
+  **complete** backup captured volumes and none exist now (host rebuilt,
+  volumes pruned, an evacuation that did not land), the request is refused
+  `400 invalid_backup_scope` rather than recording a green, empty row that
+  would age the last real backup out of retention.
 
 **This does not shrink the outage to zero.** A snapshot backup still stops
 the whole pod for the duration of the export — scoping only reduces how many
