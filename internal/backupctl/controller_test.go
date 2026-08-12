@@ -3,6 +3,7 @@ package backupctl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 
@@ -25,6 +26,13 @@ type fakeSvc struct {
 	backups       map[string][]store.Backup      // "host/tmpl/slug" -> newest-first
 	backupableErr error
 	listErr       error
+
+	// hostErr is returned by CheckBackupable only — the half that touches the
+	// host — so a test can tell the declarative check apart from the existence
+	// one. backupableErr is returned by both, as a scope error would be.
+	hostErr         error
+	declaredCalls   int
+	backupableCalls int
 }
 
 func key(host, tmpl, slug string) string { return host + "/" + tmpl + "/" + slug }
@@ -51,6 +59,15 @@ func (f *fakeSvc) ListBackups(_ context.Context, host, tmpl, slug string, _ int)
 }
 
 func (f *fakeSvc) CheckBackupable(_ context.Context, _, _, _ string, _ []string) error {
+	f.backupableCalls++
+	if f.hostErr != nil {
+		return f.hostErr
+	}
+	return f.backupableErr
+}
+
+func (f *fakeSvc) CheckBackupScopeDeclared(_ context.Context, _, _, _ string, _ []string) error {
+	f.declaredCalls++
 	return f.backupableErr
 }
 
@@ -184,6 +201,47 @@ func TestEnqueueBackup_ValidatesScopeBeforeDedupe(t *testing.T) {
 	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a",
 		extension.BackupOptions{Volumes: &[]string{"typo"}})
 	require.ErrorIs(t, err, instance.ErrInvalidBackupScope)
+	assert.Empty(t, id)
+}
+
+// TestEnqueueBackup_HostResolutionRunsOnlyForATickThatEnqueues: the declarative
+// scope check runs before dedupe, so a bad scope is never masked by a run in
+// flight; the existence check runs AFTER, so a covered tick costs no host round
+// trips at all. Before this split, a sweep paid a VolumeInspect per declared
+// volume for every instance it was about to skip (review-6 finding 5).
+func TestEnqueueBackup_HostResolutionRunsOnlyForATickThatEnqueues(t *testing.T) {
+	mem := store.NewMemory()
+	pre := instance.BackupRequest{BackupID: store.NewBackupID(), Host: "h1", Template: "web", Slug: "a"}
+	args, _ := json.Marshal(pre)
+	_, err := mem.Enqueue(context.Background(), "backup", args, "")
+	require.NoError(t, err)
+
+	svc := &fakeSvc{}
+	c := &Controller{Svc: svc, Jobs: mem}
+
+	// Covered by the unscoped job already in flight: dedupes, and never asks
+	// the host anything.
+	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a", extension.BackupOptions{})
+	require.NoError(t, err)
+	assert.Empty(t, id)
+	assert.Equal(t, 1, svc.declaredCalls, "declarative check must still run, so a bad scope is not masked by dedupe")
+	assert.Zero(t, svc.backupableCalls, "a deduped tick must not touch the host")
+
+	// A different instance is not covered, so this one does resolve.
+	_, err = c.EnqueueBackup(context.Background(), "h1", "web", "b", extension.BackupOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, 1, svc.backupableCalls, "a tick that enqueues resolves exactly once")
+}
+
+// TestEnqueueBackup_HostErrorSurfacesFromTheEnqueueingTick: the existence check
+// moved after dedupe, so its errors must still reach the caller — a scheduler
+// has to tell a transient host blip from a permanent scope problem.
+func TestEnqueueBackup_HostErrorSurfacesFromTheEnqueueingTick(t *testing.T) {
+	svc := &fakeSvc{hostErr: errors.New("list volumes on h1: dial: connection refused")}
+	c := &Controller{Svc: svc, Jobs: store.NewMemory()}
+	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a", extension.BackupOptions{})
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, instance.ErrInvalidBackupScope, "a host error must never read as a scope error")
 	assert.Empty(t, id)
 }
 

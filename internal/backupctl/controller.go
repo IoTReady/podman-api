@@ -21,6 +21,7 @@ type Service interface {
 	GetTemplate(ctx context.Context, id string) (store.Template, error)
 	ListBackups(ctx context.Context, host, template, slug string, limit int) ([]store.Backup, error)
 	CheckBackupable(ctx context.Context, host, template, slug string, volumes []string) error
+	CheckBackupScopeDeclared(ctx context.Context, host, template, slug string, volumes []string) error
 }
 
 // Controller is the core-side implementation of extension.BackupController. It
@@ -131,7 +132,20 @@ func (c *Controller) EnqueueBackup(ctx context.Context, host, template, slug str
 		}
 		volumes = *opts.Volumes
 	}
-	if err := c.Svc.CheckBackupable(ctx, host, template, slug, volumes); err != nil {
+	// The DECLARATIVE half of the check runs first, and only that half. It is
+	// what stops dedupe masking a misconfigured scope (a typo'd volume name, one
+	// newly marked `backup: none`) — the whole reason validation precedes dedupe
+	// — and it is answerable from the store alone.
+	//
+	// The existence half is deliberately NOT run here. It issues a VolumeInspect
+	// per declared volume, and running it before the two store-local
+	// short-circuits below put that cost on every tick of every instance,
+	// including every instance whose backup is already queued or running: a
+	// 200-instance sweep paid ~600 host round trips to enqueue nothing, and a
+	// briefly unreachable host turned every tick against it into an error rather
+	// than the covered/deferred answer (review-6 finding 5). It runs below,
+	// once, for the tick that is actually going to enqueue.
+	if err := c.Svc.CheckBackupScopeDeclared(ctx, host, template, slug, volumes); err != nil {
 		return "", err
 	}
 	// Reconciling is not COVERAGE (below) but it IS CONCURRENCY: the instance is
@@ -162,6 +176,14 @@ func (c *Controller) EnqueueBackup(ctx context.Context, host, template, slug str
 	}
 	if covered {
 		return "", nil
+	}
+	// Nothing has claimed this window, so this tick will enqueue — now resolve
+	// what exists on the host. Same check the HTTP handler runs, same errors,
+	// just deferred past the short-circuits that would have thrown the answer
+	// away. A host error surfaces as a host error, so a scheduler can tell a
+	// transient blip from a permanent scope problem and keep retrying.
+	if err := c.Svc.CheckBackupable(ctx, host, template, slug, volumes); err != nil {
+		return "", err
 	}
 	req := instance.BackupRequest{
 		BackupID: store.NewBackupID(), Host: host, Template: template, Slug: slug,
