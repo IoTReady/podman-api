@@ -47,11 +47,22 @@ func backupBlobPrefix(host, tmpl, slug, id string) string {
 // scheduler fails the request outright rather than stopping a pod and
 // producing a green, empty backup.
 //
-// It cannot catch everything: this runs against what the template DECLARES,
-// while whether a declared volume actually exists on the host is only knowable
-// once the run reaches InstanceVolumes. Backup carries the second half of the
-// rule — an explicit scope that resolves to zero exportable volumes fails the
-// run there.
+// For an EXPLICIT scope it also confirms each named volume actually EXISTS on
+// the host, which makes this check touch the host rather than being purely
+// declarative. That cost buys the difference between a loud permanent error and
+// a permanent OUTAGE loop: the names a scheduler passes come from template
+// meta, so a template edit marking a volume on a fleet that has not been
+// re-applied hands Backup a name that is declared but not materialised. Caught
+// only after the export (the defensive set comparison in Backup), every
+// scheduler tick stops the pod, exports, fails and restarts, forever, recording
+// nothing. Caught here it is a synchronous 400 with the instance still serving.
+// A host error is wrapped as a host error, never reported as an invalid scope.
+//
+// An UNSCOPED request is deliberately NOT existence-checked here: "every
+// declared volume not vetoed" legitimately resolves to nothing on a brand-new
+// instance whose volumes podman has not created yet, and that first, empty
+// backup must succeed. Backup carries that half of the rule, where it can tell
+// "nothing exists yet" from "everything that exists was skipped".
 func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, volumes []string) error {
 	if s.blobs == nil {
 		return ErrBackupsDisabled
@@ -104,6 +115,27 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 		if IsBackupMarkerNone(marker) {
 			return fmt.Errorf("%w: %q is marked `backup: none`", ErrInvalidBackupScope, name)
 		}
+	}
+	// Existence, resolved through the same volumeName() the pod manifest and
+	// Backup itself use, so the two cannot drift. InstanceVolumes returns only
+	// the declared volumes that actually exist (it skips ErrNotFound and fails
+	// loud on anything else), which is exactly the set wanted here.
+	vols, err := s.InstanceVolumes(ctx, host, tmpl, slug)
+	if err != nil {
+		return fmt.Errorf("list volumes on %s: %w", host, err)
+	}
+	present := make(map[string]bool, len(vols))
+	for _, v := range vols {
+		present[v.Name] = true
+	}
+	var missing []string
+	for _, name := range volumes {
+		if !present[volumeName(tmpl, slug, name)] {
+			missing = append(missing, name)
+		}
+	}
+	if len(missing) > 0 {
+		return fmt.Errorf("%w: requested volumes %v are declared by template %s but do not exist on %s (the instance predates the declaration — re-apply it first)", ErrInvalidBackupScope, missing, tmpl, host)
 	}
 	return nil
 }
@@ -246,19 +278,18 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 	}
 
 	// Every volume an EXPLICIT scope named must have been captured — this is a
-	// SET comparison, not an emptiness check. CheckBackupable validates the
-	// scope against what the template DECLARES; whether those volumes actually
-	// exist on the host is only knowable here, after InstanceVolumes has
-	// resolved them. A partial hit is the dangerous shape: {"db","sites"} with
-	// `db` gone (host rebuild, an evacuated volume) captures `sites` alone and
-	// would otherwise record a green `complete` row that a later restore tears
-	// the pod down for and brings `db` back unrestored — while the operator
-	// believes it was captured. An emptiness check catches only the all-missing
-	// case, so it misses exactly that.
+	// SET comparison, not an emptiness check. A partial hit is the dangerous
+	// shape: {"db","sites"} with `db` gone (host rebuild, an evacuated volume)
+	// captures `sites` alone and would otherwise record a green `complete` row
+	// that a later restore tears the pod down for and brings `db` back
+	// unrestored — while the operator believes it was captured. An emptiness
+	// check catches only the all-missing case, so it misses exactly that.
 	//
-	// An UNSCOPED backup that resolves to nothing still succeeds: that is the
-	// brand-new-instance case, where no volume has been created yet and a
-	// first, empty backup is legitimate.
+	// This is now a DEFENSIVE BACKSTOP, not the primary guard: CheckBackupable
+	// resolves the same existence question up front, before anything is
+	// stopped, so in the ordinary case nothing reaches here. What is left is the
+	// race — a volume removed between that check and this export — where
+	// failing after the fact is the only option available.
 	if len(req.Volumes) > 0 {
 		var missing []string
 		for _, short := range req.Volumes {
@@ -268,8 +299,19 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 		}
 		if len(missing) > 0 {
 			restart()
-			return fail(fmt.Errorf("%w: requested volumes %v were not captured (they do not exist on %s)", ErrInvalidBackupScope, missing, req.Host))
+			return fail(fmt.Errorf("%w: requested volumes %v were not captured (they disappeared from %s during the backup)", ErrInvalidBackupScope, missing, req.Host))
 		}
+	} else if len(bvols) == 0 && len(vols) > 0 {
+		// An UNSCOPED run that exported nothing WHILE THE INSTANCE HAS VOLUMES.
+		// The carve-out here is "no volume exists yet" — a brand-new instance
+		// whose first, empty backup is legitimate — and NOT "no scope was
+		// given". Without that distinction, a template declaring a vetoed `data`
+		// plus a `cache` existing instances have not materialised stops the pod
+		// for real, skips `data`, finds no `cache`, and records a green
+		// `complete` row with an empty blob set: a real outage, a backup of
+		// nothing counted by retention, and a restore that restores nothing.
+		restart()
+		return fail(fmt.Errorf("%w: every volume of %s/%s was skipped, so this backup would capture nothing (all %d existing volume(s) are marked `backup: none`)", ErrInvalidBackupScope, req.Template, req.Slug, len(vols)))
 	}
 
 	ok, err := s.store.CompleteBackup(ctx, req.BackupID, bvols)
@@ -367,8 +409,15 @@ type RestoreRequest struct {
 
 // CheckRestorable runs the synchronous validation the POST handler needs and
 // returns the backup row: row exists and is complete, host known and not
-// draining, instance (spec) still present. The drain check is upfront so a
-// draining host can't fail the job after teardown.
+// draining, instance (spec) still present, and EVERY blob of the backup
+// readable. The drain check is upfront so a draining host can't fail the job
+// after teardown; the blob preflight is here for the same reason and a stronger
+// one. It used to run at the top of restorePostTeardown, i.e. after Restore had
+// already deleted the pod — so a missing blob left every volume untouched (the
+// point of checking the whole set at once) while the instance was DOWN, Apply
+// unreached, and stayed down until a human noticed a failed job. It needs
+// nothing from the teardown, so running it here turns that total outage into a
+// rejected request with the instance still serving.
 func (s *Service) CheckRestorable(ctx context.Context, backupID string) (store.Backup, error) {
 	if s.blobs == nil {
 		return store.Backup{}, ErrBackupsDisabled
@@ -396,6 +445,9 @@ func (s *Service) CheckRestorable(ctx context.Context, backupID string) (store.B
 		}
 		return store.Backup{}, err
 	}
+	if err := s.preflightBlobs(ctx, b); err != nil {
+		return store.Backup{}, err
+	}
 	return b, nil
 }
 
@@ -419,7 +471,9 @@ func (s *Service) Restore(ctx context.Context, req RestoreRequest, step func(ste
 	lk.Lock()
 	defer lk.Unlock()
 
-	// Re-check under the lock (a concurrent delete may have raced us).
+	// Re-check under the lock (a concurrent delete may have raced us). This
+	// re-runs the blob preflight too, so the set is known complete as late as
+	// possible before the teardown — the narrowest window this design allows.
 	b, err = s.CheckRestorable(ctx, req.BackupID)
 	if err != nil {
 		return err
@@ -429,6 +483,10 @@ func (s *Service) Restore(ctx context.Context, req RestoreRequest, step func(ste
 		return err
 	}
 	step("load", b.Host+"/"+b.Template+"/"+b.Slug)
+	// The preflight itself ran inside CheckRestorable above (twice: once before
+	// the lock, once under it). Report it here so the job trail keeps naming the
+	// phase, in the same load → preflight → teardown order it always had.
+	step("preflight-blobs", fmt.Sprintf("%d volume(s)", len(b.Volumes)))
 
 	// Teardown: pod + volumes (a referenced volume can't be removed). Keep
 	// per-instance secrets — Apply below re-pushes them from the spec anyway,
@@ -466,24 +524,9 @@ func (s *Service) Restore(ctx context.Context, req RestoreRequest, step func(ste
 // restorePostTeardown runs the post-teardown steps of a restore: recreate
 // volumes from blobs, re-apply the spec, wait healthy. Any error here is
 // handled by the caller, which re-persists the spec row before returning.
+// The whole-set blob preflight this used to open with now runs in
+// CheckRestorable, ahead of the pod teardown (see there).
 func (s *Service) restorePostTeardown(ctx context.Context, b store.Backup, spec store.Spec, step func(step, detail string)) error {
-	// Preflight EVERY blob before the first destructive remove. restoreVolume
-	// opens its own blob ahead of its own remove, which makes each volume
-	// individually safe — but the invariant is instance-wide: a 3-volume
-	// restore whose third blob is missing would otherwise roll volumes 1 and 2
-	// back to backup-epoch content, then fail, leaving the instance down and
-	// mixed-epoch with those two overwrites unrecoverable. Checking the whole
-	// set first makes the failure case atomic: nothing is touched.
-	//
-	// BlobStore has no Stat, so existence is checked by opening and immediately
-	// closing each reader. They are deliberately not held open across the
-	// restore — a many-volume instance would otherwise pin one file handle (or
-	// one HTTP body, on the S3 backend) per volume for the whole run.
-	if err := s.preflightBlobs(ctx, b); err != nil {
-		return err
-	}
-	step("preflight-blobs", fmt.Sprintf("%d volume(s)", len(b.Volumes)))
-
 	for _, bv := range b.Volumes {
 		if err := s.restoreVolume(ctx, b, bv); err != nil {
 			return fmt.Errorf("restore volume %q: %w", bv.Name, err)
@@ -509,7 +552,16 @@ func (s *Service) restorePostTeardown(ctx context.Context, b store.Backup, spec 
 // preflightBlobs confirms every blob of a backup is readable, without keeping
 // any of them open. It is the instance-wide half of "a restore may never
 // delete a volume it has no copy of": restoreVolume enforces it per volume,
-// this enforces it across the set before the first removal happens.
+// this enforces it across the set before the first removal happens — and, run
+// from CheckRestorable, before the pod is torn down at all. A 3-volume restore
+// whose third blob is missing would otherwise roll volumes 1 and 2 back to
+// backup-epoch content, then fail, leaving the instance down and mixed-epoch
+// with those two overwrites unrecoverable.
+//
+// BlobStore has no Stat, so existence is checked by opening and immediately
+// closing each reader. They are deliberately not held open across the restore —
+// a many-volume instance would otherwise pin one file handle (or one HTTP body,
+// on the S3 backend) per volume for the whole run.
 func (s *Service) preflightBlobs(ctx context.Context, b store.Backup) error {
 	for _, bv := range b.Volumes {
 		rc, err := s.blobs.Get(ctx, backupBlobKey(b.Host, b.Template, b.Slug, b.ID, bv.Name))

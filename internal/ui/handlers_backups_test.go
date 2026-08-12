@@ -42,6 +42,15 @@ func backupTarBytes(t *testing.T, name, content string) []byte {
 // the fake), a LocalDir blob store, and the Memory store wired as the JobStore.
 // Returns the UI and the Memory store so tests can seed/inspect rows and jobs.
 func uiWithBackups(t *testing.T) (*UI, *store.Memory) {
+	u, mem, _ := uiWithBackupsBlob(t)
+	return u, mem
+}
+
+// uiWithBackupsBlob is uiWithBackups plus the blob store, for tests that must
+// seed an artifact: CheckRestorable preflights every blob before the pod is
+// torn down (round-3 finding 2), so a fabricated complete row with no artifact
+// on disk is — correctly — not restorable.
+func uiWithBackupsBlob(t *testing.T) (*UI, *store.Memory, *backup.LocalDir) {
 	t.Helper()
 	hosts := []config.Host{{ID: "edge-1"}}
 
@@ -104,7 +113,23 @@ spec:
 	if err != nil {
 		t.Fatal(err)
 	}
-	return u, mem
+	return u, mem, blob
+}
+
+// seedBlob writes a placeholder artifact for one volume of a backup, at the
+// key layout instance.backupBlobKey uses.
+func seedBlob(t *testing.T, blob *backup.LocalDir, id, volume string) {
+	t.Helper()
+	w, err := blob.Put(context.Background(), "edge-1/postgres/main/"+id+"/"+volume+".tar")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Commit(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // seedCompleteBackup inserts a complete backup row for postgres/main and
@@ -185,8 +210,9 @@ func TestUI_BackupNow(t *testing.T) {
 }
 
 func TestUI_RestoreEnqueues(t *testing.T) {
-	u, mem := uiWithBackups(t)
+	u, mem, blob := uiWithBackupsBlob(t)
 	id := seedCompleteBackup(t, mem)
+	seedBlob(t, blob, id, "postgres-main-data")
 
 	w := authedAction(t, u, "/ui/backups/"+id+"/restore")
 	if w.Code != http.StatusOK {

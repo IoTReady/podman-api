@@ -1208,11 +1208,14 @@ func TestBackup_ScopeNarrowsTheExportSet(t *testing.T) {
 }
 
 // TestBackup_ExplicitScopeCapturingNothingFails: an EXPLICIT scope naming a
-// declared volume that does not exist on the host captures nothing.
-// CheckBackupable cannot see this (it validates against what the template
-// DECLARES), so the run must fail after InstanceVolumes resolves the empty set
-// rather than recording a green, empty backup the caller would later restore
-// from and get nothing back.
+// declared volume that does not exist on the host captures nothing, and must
+// never record a green, empty backup the caller would later restore from and
+// get nothing back.
+//
+// Round-3 finding 4 moved WHERE that is caught: CheckBackupable now resolves
+// existence itself, so the rejection is synchronous and the pod is never
+// stopped. Failing after the export instead made a template edit on a
+// not-yet-re-applied fleet a permanent stop/restart loop.
 func TestBackup_ExplicitScopeCapturingNothingFails(t *testing.T) {
 	svc, f, mem, blob := newBackupSvc(t)
 	ctx := context.Background()
@@ -1228,12 +1231,9 @@ func TestBackup_ExplicitScopeCapturingNothingFails(t *testing.T) {
 	err = svc.Backup(ctx, req, nil)
 	require.ErrorIs(t, err, ErrInvalidBackupScope)
 
-	// The row is FAILED, not complete: it goes through the same fail() helper as
-	// any other mid-run failure.
-	b, err := svc.store.GetBackup(ctx, req.BackupID)
-	require.NoError(t, err)
-	assert.Equal(t, store.BackupFailed, b.State)
-	// Partial blobs reaped and the instance restarted, same as any mid-run failure.
+	// Rejected before anything happened: no row, no blobs, pod untouched.
+	_, gerr := svc.store.GetBackup(ctx, req.BackupID)
+	require.ErrorIs(t, gerr, store.ErrNotFound)
 	assert.Equal(t, 0, blob.len())
 	p, perr := f.PodInspect(ctx, "h1", "pg-a")
 	require.NoError(t, perr)
@@ -1299,6 +1299,49 @@ func TestBackup_PartialScopeMissFails(t *testing.T) {
 	// scope failed — the operator's next action depends on which one it was.
 	assert.Contains(t, err.Error(), "cache")
 	assert.NotContains(t, err.Error(), "[data cache]", "only the MISSING volumes belong in the message")
+
+	// Since round-3 finding 4 this is caught up front, so there is no row to
+	// fail and no partial blob to reap (both asserted here, since a regression
+	// that moved the check back would produce exactly those).
+	_, gerr := svc.store.GetBackup(ctx, req.BackupID)
+	require.ErrorIs(t, gerr, store.ErrNotFound)
+	assert.Equal(t, 0, blob.len())
+
+	p, perr := f.PodInspect(ctx, "h1", "pg-a")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status)
+}
+
+// TestBackup_PartialScopeMissRaceStillFailsAfterExport keeps the post-export
+// set comparison honest as the DEFENSIVE BACKSTOP it became: the forward check
+// in CheckBackupable makes it unreachable in the ordinary case, but a volume
+// removed between that check and the export is still a partial capture, and it
+// must still fail rather than record a green row.
+//
+// The race is driven through the template's pre_backup exec, which runs after
+// CheckBackupable and before Backup resolves InstanceVolumes.
+func TestBackup_PartialScopeMissRaceStillFailsAfterExport(t *testing.T) {
+	svc, f, mem, blob := newBackupSvc(t)
+	ctx := context.Background()
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "cache"})
+	tmpl.Meta.PreBackup = &render.PreBackup{Container: "db", Command: "true"}
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	f.SetVolumeData("h1", "pg-a-cache", tarBytes(t, map[string]string{"c": "1"}))
+
+	// `cache` passes the up-front existence check, then vanishes.
+	f.ExecFunc = func(host, container string, cmd []string) (podman.ExecResult, error) {
+		_ = f.VolumeRemove(ctx, "h1", "pg-a-cache", true)
+		return podman.ExecResult{}, nil
+	}
+
+	req := newBackupReq()
+	req.Volumes = []string{"data", "cache"}
+	err = svc.Backup(ctx, req, nil)
+	require.ErrorIs(t, err, ErrInvalidBackupScope)
+	assert.Contains(t, err.Error(), "cache")
 
 	b, err := svc.store.GetBackup(ctx, req.BackupID)
 	require.NoError(t, err)
@@ -1449,4 +1492,135 @@ func TestRestore_MissingThirdBlobLeavesEveryVolumeUntouched(t *testing.T) {
 		assert.Equal(t, data, f.VolumeData("h1", name),
 			"volume %q was rolled back before the restore discovered it could not finish", name)
 	}
+}
+
+// TestRestore_MissingBlobLeavesPodRunning (round-3 finding 2): the whole-set
+// blob preflight is right, but it used to run at the top of
+// restorePostTeardown — AFTER Restore had already deleted the pod. So a
+// missing blob left every volume untouched (the goal) while the instance was
+// down, Apply was never reached, and it stayed down until a human noticed a
+// failed job. The check is a pure read over the backup row, so it belongs in
+// CheckRestorable, where the caller gets a synchronous rejection and the
+// instance never stops serving.
+func TestRestore_MissingBlobLeavesPodRunning(t *testing.T) {
+	svc, f, _, blob, id := newRestoreSvc(t)
+	ctx := context.Background()
+
+	require.NoError(t, blob.DeleteAll(ctx, backupBlobPrefix("h1", "postgres", "a", id)))
+
+	// The synchronous check rejects it before Restore is even called.
+	_, err := svc.CheckRestorable(ctx, id)
+	require.ErrorIs(t, err, ErrBackupNotRestorable)
+
+	err = svc.Restore(ctx, RestoreRequest{BackupID: id}, nil)
+	require.ErrorIs(t, err, ErrBackupNotRestorable)
+
+	p, perr := f.PodInspect(ctx, "h1", "postgres-a")
+	require.NoError(t, perr, "the pod must still exist: a missing blob may not tear the instance down")
+	assert.Equal(t, "Running", p.Status,
+		"a restore rejected for a missing blob must leave the instance serving")
+}
+
+// TestCheckBackupable_ExplicitScopeRejectsUnmaterialisedVolume (round-3
+// finding 4): the post-export set comparison catches a declared-but-absent
+// volume only AFTER the pod has been stopped and every other volume exported —
+// so a template edit that marks a new volume on a fleet that has not been
+// re-applied turns every scheduler tick into a stop/export/fail/restart cycle,
+// forever, recording nothing. For an EXPLICIT scope the existence check moves
+// forward into CheckBackupable: the failure is synchronous, and no pod is ever
+// stopped.
+func TestCheckBackupable_ExplicitScopeRejectsUnmaterialisedVolume(t *testing.T) {
+	svc, f, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	// The template gains a `cache` volume; the running instance predates the
+	// edit, so pg-a-cache does not exist on the host.
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "cache", Backup: "s3; interval=24h"})
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+
+	err = svc.CheckBackupable(ctx, "h1", "pg", "a", []string{"data", "cache"})
+	require.ErrorIs(t, err, ErrInvalidBackupScope)
+	assert.Contains(t, err.Error(), "cache")
+
+	// A scope naming only materialised volumes still passes.
+	require.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", []string{"data"}))
+
+	// And the whole run refuses before anything is stopped.
+	req := newBackupReq()
+	req.Volumes = []string{"data", "cache"}
+	var steps []string
+	err = svc.Backup(ctx, req, recordSteps(&steps))
+	require.ErrorIs(t, err, ErrInvalidBackupScope)
+	assert.NotContains(t, steps, "stop", "the pod must not be stopped for a scope that cannot succeed")
+	assert.NotContains(t, steps, "export-volume")
+
+	p, perr := f.PodInspect(ctx, "h1", "pg-a")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status)
+
+	// No row was created, so nothing is left half-recorded either.
+	_, gerr := svc.store.GetBackup(ctx, req.BackupID)
+	require.ErrorIs(t, gerr, store.ErrNotFound)
+}
+
+// TestBackup_UnscopedExportingNothingFailsWhenVolumesExist (round-3 finding
+// 5): the "did we capture what was asked for" guard only ran for an explicit
+// scope, so an UNSCOPED run that exported nothing recorded a green `complete`
+// row with an empty blob set. Reachable whenever a template declares a vetoed
+// volume alongside one existing instances have not materialised: the pod is
+// stopped for real, `data` is skipped as vetoed, `cache` does not exist, and
+// the UI, retention and any later restore all see a good backup of nothing.
+func TestBackup_UnscopedExportingNothingFailsWhenVolumesExist(t *testing.T) {
+	svc, f, mem, blob := newBackupSvc(t)
+	ctx := context.Background()
+
+	// data: vetoed (and the only volume that exists on the host).
+	// cache: backupable, but declared by a template edit the instance predates.
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{
+		{Name: "data", Backup: "none"},
+		{Name: "cache", Backup: "s3; interval=24h"},
+	}
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+
+	req := newBackupReq()
+	err = svc.Backup(ctx, req, nil)
+	require.Error(t, err, "an unscoped backup that captures nothing must not report success")
+	assert.ErrorIs(t, err, ErrInvalidBackupScope)
+
+	b, gerr := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, gerr)
+	assert.Equal(t, store.BackupFailed, b.State, "the row must be failed, not a green backup of nothing")
+	assert.Zero(t, blob.len())
+
+	// The instance is restarted despite the failure.
+	p, perr := f.PodInspect(ctx, "h1", "pg-a")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status)
+}
+
+// TestBackup_UnscopedWithNoVolumesYetStillSucceeds is the other half of
+// finding 5: the carve-out is "no volume exists yet" (a brand-new instance
+// taking its first backup), NOT "no scope was given". It must keep succeeding
+// with an empty volume list.
+func TestBackup_UnscopedWithNoVolumesYetStillSucceeds(t *testing.T) {
+	svc, _, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	// Declared, backupable, and not created on the host yet.
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "cache", Backup: "s3; interval=24h"}}
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+
+	req := newBackupReq()
+	require.NoError(t, svc.Backup(ctx, req, nil))
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	assert.Equal(t, store.BackupComplete, b.State)
+	assert.Empty(t, b.Volumes)
 }
