@@ -134,6 +134,20 @@ func (c *Controller) EnqueueBackup(ctx context.Context, host, template, slug str
 	if err := c.Svc.CheckBackupable(ctx, host, template, slug, volumes); err != nil {
 		return "", err
 	}
+	// Reconciling is not COVERAGE (below) but it IS CONCURRENCY: the instance is
+	// mid-recovery from a crashed backup and ReconcileBackup is about to restart
+	// it. Enqueueing anything now — whatever its scope — starts a second backup
+	// against an instance the crash left STOPPED, which records wasRunning=false
+	// and so never restarts the pod afterwards: two rows for one window and a
+	// green backup on an instance that is not serving. Defer the tick instead;
+	// the next one lands after the reconcile has settled.
+	reconciling, err := c.backupReconciling(ctx, host, template, slug)
+	if err != nil {
+		return "", err
+	}
+	if reconciling {
+		return "", nil
+	}
 	covered, err := c.backupInFlightCovering(ctx, host, template, slug, volumes)
 	if err != nil {
 		return "", err
@@ -191,7 +205,9 @@ func scopeCovers(inFlight, want []string) bool {
 // would answer a tick that landed on a crashed job with "already handled", and
 // that window's snapshot would then never be taken and never retried: exactly
 // the silent drop this coverage check exists to prevent, on the one job state
-// guaranteed to produce no backup.
+// guaranteed to produce no backup. It is handled by backupReconciling instead,
+// which DEFERS the tick rather than satisfying it — reconciling is concurrency,
+// not coverage (review-4 finding 6).
 func (c *Controller) backupInFlightCovering(ctx context.Context, host, template, slug string, want []string) (bool, error) {
 	for _, st := range []store.JobState{store.JobQueued, store.JobRunning} {
 		jobs, err := c.Jobs.ListJobs(ctx, store.JobFilter{State: st, Kind: "backup", Limit: store.MaxJobLimit})
@@ -207,6 +223,33 @@ func (c *Controller) backupInFlightCovering(ctx context.Context, host, template,
 				scopeCovers(req.Volumes, want) {
 				return true, nil
 			}
+		}
+	}
+	return false, nil
+}
+
+// backupReconciling reports whether a backup job for this instance is sitting
+// in JobReconciling — a crashed run whose ReconcileBackup sweep has not yet
+// failed the row and restarted the instance.
+//
+// Scope is deliberately NOT consulted. A reconciling job covers nothing (it
+// exports no volume, whatever its scope), so this is not a coverage question at
+// all: the instance is mid-recovery and, right now, very likely STOPPED. Any
+// backup started against it captures a stopped instance and, recording
+// wasRunning=false, leaves it stopped afterwards. So a reconciling job of ANY
+// scope defers a tick of ANY scope.
+func (c *Controller) backupReconciling(ctx context.Context, host, template, slug string) (bool, error) {
+	jobs, err := c.Jobs.ListJobs(ctx, store.JobFilter{State: store.JobReconciling, Kind: "backup", Limit: store.MaxJobLimit})
+	if err != nil {
+		return false, err
+	}
+	for _, j := range jobs {
+		var req instance.BackupRequest
+		if err := json.Unmarshal(j.Args, &req); err != nil {
+			continue
+		}
+		if req.Host == host && req.Template == template && req.Slug == slug {
+			return true, nil
 		}
 	}
 	return false, nil

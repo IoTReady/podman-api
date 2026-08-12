@@ -355,30 +355,59 @@ func TestBackupMarkers_NearMissNoneStillVetoes(t *testing.T) {
 	assert.Equal(t, "data", got[0].Volumes[0].Name)
 }
 
-// TestEnqueueBackup_ReconcilingJobIsNotCoverage (round-3 finding 9):
-// a reconciling backup job is non-terminal, but ReconcileBackup only fails the
-// row, reaps partial blobs and restarts the instance — it never exports. So a
-// tick landing on a crashed job must NOT be answered with ("", nil) as though
-// the window were handled; that snapshot would never be taken and never
-// retried.
-func TestEnqueueBackup_ReconcilingJobIsNotCoverage(t *testing.T) {
-	ctx := context.Background()
-	mem := store.NewMemory()
+// TestEnqueueBackup_ReconcilingJobDefersTheTick (round-3 finding 9, corrected
+// by review-4 finding 6): a reconciling backup job is non-terminal, and
+// ReconcileBackup only fails the row, reaps partial blobs and restarts the
+// instance — it never exports. So it is not COVERAGE. But it IS concurrency:
+// the crash left the instance STOPPED, and a backup started now records
+// wasRunning=false and therefore never restarts the pod afterwards, leaving the
+// instance down with two rows for one window and a green backup on something
+// that is not serving. The tick is deferred — no job, no error — regardless of
+// scope, including a scope the reconciling job would not have covered.
+func TestEnqueueBackup_ReconcilingJobDefersTheTick(t *testing.T) {
+	reconciling := func(t *testing.T, pre instance.BackupRequest) *store.Memory {
+		t.Helper()
+		ctx := context.Background()
+		mem := store.NewMemory()
+		args, err := json.Marshal(pre)
+		require.NoError(t, err)
+		_, err = mem.Enqueue(ctx, "backup", args, "")
+		require.NoError(t, err)
+		// queued -> running -> reconciling (the daemon-restart sweep's own path).
+		_, ok, err := mem.ClaimNext(ctx)
+		require.NoError(t, err)
+		require.True(t, ok)
+		n, err := mem.MarkReconciling(ctx, []string{"backup"})
+		require.NoError(t, err)
+		require.Equal(t, 1, n)
+		return mem
+	}
 
-	pre := instance.BackupRequest{BackupID: store.NewBackupID(), Host: "h1", Template: "web", Slug: "a"}
-	args, _ := json.Marshal(pre)
-	_, err := mem.Enqueue(ctx, "backup", args, "")
-	require.NoError(t, err)
-	// queued -> running -> reconciling (the daemon-restart sweep's own path).
-	_, ok, err := mem.ClaimNext(ctx)
-	require.NoError(t, err)
-	require.True(t, ok)
-	n, err := mem.MarkReconciling(ctx, []string{"backup"})
-	require.NoError(t, err)
-	require.Equal(t, 1, n)
+	t.Run("unscoped tick", func(t *testing.T) {
+		mem := reconciling(t, instance.BackupRequest{BackupID: store.NewBackupID(), Host: "h1", Template: "web", Slug: "a"})
+		c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
+		id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a", extension.BackupOptions{})
+		require.NoError(t, err)
+		assert.Empty(t, id, "the instance is mid-recovery and very likely stopped; nothing may start against it")
+	})
 
-	c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
-	id, err := c.EnqueueBackup(ctx, "h1", "web", "a", extension.BackupOptions{})
-	require.NoError(t, err)
-	assert.NotEmpty(t, id, "a reconciling job exports nothing, so it cannot cover this tick")
+	t.Run("a scope the reconciling job would not have covered", func(t *testing.T) {
+		// The reconciling job is scoped to ["data"], so scopeCovers would say it
+		// does not cover a ["wal"] tick — which is true, and beside the point:
+		// coverage is not the question, concurrency is.
+		mem := reconciling(t, instance.BackupRequest{BackupID: store.NewBackupID(), Host: "h1", Template: "web", Slug: "a", Volumes: []string{"data"}})
+		c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
+		want := []string{"wal"}
+		id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a", extension.BackupOptions{Volumes: &want})
+		require.NoError(t, err)
+		assert.Empty(t, id, "a reconciling job of any scope defers a tick of any scope")
+	})
+
+	t.Run("a different instance is unaffected", func(t *testing.T) {
+		mem := reconciling(t, instance.BackupRequest{BackupID: store.NewBackupID(), Host: "h1", Template: "web", Slug: "a"})
+		c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
+		id, err := c.EnqueueBackup(context.Background(), "h1", "web", "b", extension.BackupOptions{})
+		require.NoError(t, err)
+		assert.NotEmpty(t, id, "the deferral is per instance, not global")
+	})
 }
