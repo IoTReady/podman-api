@@ -90,7 +90,7 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 			return nil
 		}
 		for _, marker := range declared {
-			if marker != BackupMarkerNone {
+			if !IsBackupMarkerNone(marker) {
 				return nil
 			}
 		}
@@ -101,7 +101,7 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 		if !ok {
 			return fmt.Errorf("%w: %q is not declared by template %s", ErrInvalidBackupScope, name, tmpl)
 		}
-		if marker == BackupMarkerNone {
+		if IsBackupMarkerNone(marker) {
 			return fmt.Errorf("%w: %q is marked `backup: none`", ErrInvalidBackupScope, name)
 		}
 	}
@@ -214,15 +214,22 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 	}
 
 	var bvols []store.BackupVolume
+	exported := map[string]bool{}
 	for _, v := range vols {
 		m := declared[v.Name]
-		if m.marker == BackupMarkerNone {
+		if IsBackupMarkerNone(m.marker) {
 			// State the absence rather than leaving it to be inferred from a
 			// backup that silently lacks a volume.
 			step("skip-volume", v.Name+" (backup: none)")
 			continue
 		}
 		if len(scope) > 0 && !scope[v.Name] {
+			// A DIFFERENT step name from the veto above, deliberately. Both
+			// produce a backup missing a volume, and after the fact the job
+			// trail is the only place an operator can tell "you asked for db
+			// and it was vetoed" from "db was never in this request's scope" —
+			// so `skip-volume` keeps meaning exactly the veto.
+			step("skip-volume-scope", v.Name+" (not in the requested scope)")
 			continue
 		}
 		// Emitted BEFORE the export so a multi-minute volume shows the phase in
@@ -234,22 +241,35 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 			return fail(fmt.Errorf("backup volume %q: %w", v.Name, err))
 		}
 		bvols = append(bvols, bv)
+		exported[v.Name] = true
 		step("export-volume-done", fmt.Sprintf("%s (%d bytes)", v.Name, bv.SizeBytes))
 	}
 
-	// An EXPLICIT scope that captured nothing is a failure, not a green empty
-	// backup. CheckBackupable validates the scope against what the template
-	// DECLARES; whether those volumes actually exist on the host is only
-	// knowable here, after InstanceVolumes has resolved them. The caller named
-	// something specific and it was not captured — recording that as a complete
-	// backup produces exactly the green, empty row (and a later restore that
-	// tears the pod down and restores nothing) the scope validation exists to
-	// prevent. An UNSCOPED backup that resolves to nothing still succeeds: that
-	// is the brand-new-instance case, where no volume has been created yet and a
+	// Every volume an EXPLICIT scope named must have been captured — this is a
+	// SET comparison, not an emptiness check. CheckBackupable validates the
+	// scope against what the template DECLARES; whether those volumes actually
+	// exist on the host is only knowable here, after InstanceVolumes has
+	// resolved them. A partial hit is the dangerous shape: {"db","sites"} with
+	// `db` gone (host rebuild, an evacuated volume) captures `sites` alone and
+	// would otherwise record a green `complete` row that a later restore tears
+	// the pod down for and brings `db` back unrestored — while the operator
+	// believes it was captured. An emptiness check catches only the all-missing
+	// case, so it misses exactly that.
+	//
+	// An UNSCOPED backup that resolves to nothing still succeeds: that is the
+	// brand-new-instance case, where no volume has been created yet and a
 	// first, empty backup is legitimate.
-	if len(req.Volumes) > 0 && len(bvols) == 0 {
-		restart()
-		return fail(fmt.Errorf("%w: none of the requested volumes %v exist on %s", ErrInvalidBackupScope, req.Volumes, req.Host))
+	if len(req.Volumes) > 0 {
+		var missing []string
+		for _, short := range req.Volumes {
+			if !exported[volumeName(req.Template, req.Slug, short)] {
+				missing = append(missing, short)
+			}
+		}
+		if len(missing) > 0 {
+			restart()
+			return fail(fmt.Errorf("%w: requested volumes %v were not captured (they do not exist on %s)", ErrInvalidBackupScope, missing, req.Host))
+		}
 	}
 
 	ok, err := s.store.CompleteBackup(ctx, req.BackupID, bvols)
@@ -447,6 +467,23 @@ func (s *Service) Restore(ctx context.Context, req RestoreRequest, step func(ste
 // volumes from blobs, re-apply the spec, wait healthy. Any error here is
 // handled by the caller, which re-persists the spec row before returning.
 func (s *Service) restorePostTeardown(ctx context.Context, b store.Backup, spec store.Spec, step func(step, detail string)) error {
+	// Preflight EVERY blob before the first destructive remove. restoreVolume
+	// opens its own blob ahead of its own remove, which makes each volume
+	// individually safe — but the invariant is instance-wide: a 3-volume
+	// restore whose third blob is missing would otherwise roll volumes 1 and 2
+	// back to backup-epoch content, then fail, leaving the instance down and
+	// mixed-epoch with those two overwrites unrecoverable. Checking the whole
+	// set first makes the failure case atomic: nothing is touched.
+	//
+	// BlobStore has no Stat, so existence is checked by opening and immediately
+	// closing each reader. They are deliberately not held open across the
+	// restore — a many-volume instance would otherwise pin one file handle (or
+	// one HTTP body, on the S3 backend) per volume for the whole run.
+	if err := s.preflightBlobs(ctx, b); err != nil {
+		return err
+	}
+	step("preflight-blobs", fmt.Sprintf("%d volume(s)", len(b.Volumes)))
+
 	for _, bv := range b.Volumes {
 		if err := s.restoreVolume(ctx, b, bv); err != nil {
 			return fmt.Errorf("restore volume %q: %w", bv.Name, err)
@@ -466,6 +503,24 @@ func (s *Service) restorePostTeardown(ctx context.Context, b store.Backup, spec 
 		return fmt.Errorf("verify: %w", err)
 	}
 	step("verify", b.Host)
+	return nil
+}
+
+// preflightBlobs confirms every blob of a backup is readable, without keeping
+// any of them open. It is the instance-wide half of "a restore may never
+// delete a volume it has no copy of": restoreVolume enforces it per volume,
+// this enforces it across the set before the first removal happens.
+func (s *Service) preflightBlobs(ctx context.Context, b store.Backup) error {
+	for _, bv := range b.Volumes {
+		rc, err := s.blobs.Get(ctx, backupBlobKey(b.Host, b.Template, b.Slug, b.ID, bv.Name))
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return fmt.Errorf("%w: blob for volume %q missing", ErrBackupNotRestorable, bv.Name)
+			}
+			return fmt.Errorf("open blob for volume %q: %w", bv.Name, err)
+		}
+		_ = rc.Close()
+	}
 	return nil
 }
 

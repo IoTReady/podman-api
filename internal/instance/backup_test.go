@@ -1274,3 +1274,179 @@ func TestBackup_InvalidScopeNeverStopsThePod(t *testing.T) {
 	require.NoError(t, perr)
 	assert.Equal(t, "Running", p.Status, "an invalid scope must not stop the pod")
 }
+
+// TestBackup_PartialScopeMissFails (re-review A) is the case an emptiness check
+// misses: a scope naming two volumes, one of which no longer exists on the
+// host, resolves to a NON-empty export set. Without a set comparison the run
+// records a green `complete` row containing only the volume that happened to
+// exist, and a later restore tears the pod down and brings the other one back
+// unrestored while the operator believes it was captured.
+func TestBackup_PartialScopeMissFails(t *testing.T) {
+	svc, f, mem, blob := newBackupSvc(t)
+	ctx := context.Background()
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "cache"})
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	// `data` exists (newBackupSvc populated it); `cache` is declared but absent.
+
+	req := newBackupReq()
+	req.Volumes = []string{"data", "cache"}
+	err = svc.Backup(ctx, req, nil)
+	require.ErrorIs(t, err, ErrInvalidBackupScope)
+	// The message must name the volume that was not captured, not just say the
+	// scope failed — the operator's next action depends on which one it was.
+	assert.Contains(t, err.Error(), "cache")
+	assert.NotContains(t, err.Error(), "[data cache]", "only the MISSING volumes belong in the message")
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	assert.Equal(t, store.BackupFailed, b.State, "a partially-satisfied scope must not record a complete backup")
+	assert.Equal(t, 0, blob.len(), "the partial blob must be reaped")
+
+	p, perr := f.PodInspect(ctx, "h1", "pg-a")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status)
+}
+
+// TestBackup_FullyResolvedScopeSucceeds is the other half of A: the set
+// comparison must not reject a scope every one of whose volumes WAS captured.
+func TestBackup_FullyResolvedScopeSucceeds(t *testing.T) {
+	svc, f, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "cache"})
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	f.SetVolumeData("h1", "pg-a-cache", tarBytes(t, map[string]string{"c": "1"}))
+
+	req := newBackupReq()
+	req.Volumes = []string{"data", "cache"}
+	require.NoError(t, svc.Backup(ctx, req, nil))
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 2)
+}
+
+// TestBackup_ScopeExcludedVolumeEmitsItsOwnStep (re-review J): a volume left
+// out because it was not in the requested scope must be distinguishable, in the
+// job trail, from one left out by a `backup: none` veto. Both produce a backup
+// missing a volume and the trail is the only after-the-fact record.
+func TestBackup_ScopeExcludedVolumeEmitsItsOwnStep(t *testing.T) {
+	svc, f, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "cache"})
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	f.SetVolumeData("h1", "pg-a-cache", tarBytes(t, map[string]string{"c": "1"}))
+	// pgTemplate declares `logs` as backup: none; give it content so it is a
+	// live volume the loop actually reaches.
+	f.SetVolumeData("h1", "pg-a-logs", tarBytes(t, map[string]string{"app.log": "noise"}))
+
+	req := newBackupReq()
+	req.Volumes = []string{"data"}
+	var steps []string
+	require.NoError(t, svc.Backup(ctx, req, recordSteps(&steps)))
+
+	assert.Contains(t, steps, "skip-volume-scope", "a scope-excluded volume must be recorded")
+	assert.Contains(t, steps, "skip-volume", "the veto keeps its own step name")
+}
+
+// TestBackup_NearMissNoneMarkerOnAStoredRowStillVetoes (re-review D):
+// registration rejects `None`, but nothing re-validates a template row
+// persisted before that validator existed — so the comparison itself must fail
+// CLOSED. A row carrying `None` must veto exactly like `none`, not export the
+// volume against the operator's explicit instruction.
+func TestBackup_NearMissNoneMarkerOnAStoredRowStillVetoes(t *testing.T) {
+	svc, f, mem, blob := newBackupSvc(t)
+	ctx := context.Background()
+
+	// PutTemplate directly, as a pre-validator row would have been stored.
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "cache", Backup: "None"})
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	f.SetVolumeData("h1", "pg-a-cache", tarBytes(t, map[string]string{"c": "1"}))
+
+	req := newBackupReq()
+	require.NoError(t, svc.Backup(ctx, req, nil))
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 1)
+	assert.Equal(t, "pg-a-data", b.Volumes[0].Name)
+	_, err = blob.Get(ctx, "h1/pg/a/"+req.BackupID+"/pg-a-cache.tar")
+	assert.ErrorIs(t, err, fs.ErrNotExist, "a `None`-marked volume must write no blob")
+
+	// The same veto must hold on the scope-validation path.
+	assert.ErrorIs(t, svc.CheckBackupable(ctx, "h1", "pg", "a", []string{"cache"}), ErrInvalidBackupScope)
+}
+
+// TestCheckBackupable_NearMissNoneOnEveryVolumeRejectsEmptyScope: the
+// all-vetoed rule reads the markers through the same fail-closed comparison, so
+// a catalog of `NONE` markers is still "every declared volume is vetoed" rather
+// than a green, empty backup.
+func TestCheckBackupable_NearMissNoneOnEveryVolumeRejectsEmptyScope(t *testing.T) {
+	svc, _, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	for i := range tmpl.Meta.Volumes {
+		tmpl.Meta.Volumes[i].Backup = " NONE "
+	}
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+
+	assert.ErrorIs(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil), ErrInvalidBackupScope)
+}
+
+// TestRestore_MissingThirdBlobLeavesEveryVolumeUntouched (re-review E): the
+// "never delete a volume we have no copy of" invariant is instance-wide, not
+// per volume. Opening each blob immediately before its own remove makes each
+// volume individually safe but still rolls volumes 1 and 2 back to
+// backup-epoch content before discovering blob 3 is gone — leaving the instance
+// down AND mixed-epoch, with those two overwrites unrecoverable.
+func TestRestore_MissingThirdBlobLeavesEveryVolumeUntouched(t *testing.T) {
+	svc, f, mem, blob := newBackupSvc(t)
+	ctx := context.Background()
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes,
+		render.Volume{Name: "cache"}, render.Volume{Name: "extra"})
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	f.SetVolumeData("h1", "pg-a-cache", tarBytes(t, map[string]string{"c": "1"}))
+	f.SetVolumeData("h1", "pg-a-extra", tarBytes(t, map[string]string{"e": "1"}))
+
+	req := newBackupReq()
+	require.NoError(t, svc.Backup(ctx, req, nil))
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 3)
+
+	// Every volume has diverged since the backup; the live bytes are the only
+	// copy of this epoch.
+	live := map[string][]byte{}
+	for _, bv := range b.Volumes {
+		data := tarBytes(t, map[string]string{"newer": bv.Name})
+		f.SetVolumeData("h1", bv.Name, data)
+		live[bv.Name] = data
+	}
+
+	// Drop ONLY the last volume's blob, so the first two would restore fine.
+	last := b.Volumes[len(b.Volumes)-1].Name
+	require.NoError(t, blob.DeleteAll(ctx, backupBlobKey("h1", "pg", "a", req.BackupID, last)))
+
+	err = svc.Restore(ctx, RestoreRequest{BackupID: req.BackupID}, nil)
+	require.ErrorIs(t, err, ErrBackupNotRestorable)
+
+	for name, data := range live {
+		assert.Equal(t, data, f.VolumeData("h1", name),
+			"volume %q was rolled back before the restore discovered it could not finish", name)
+	}
+}
