@@ -269,6 +269,21 @@ func TestValidateVolumes(t *testing.T) {
 		{name: "**/*/** swallows everything: reject", vols: []Volume{{Name: "sites", Exclude: []string{"**/*/**"}}}, wantErr: "matches everything"},
 		{name: "a/**/*/** swallows everything: reject", vols: []Volume{{Name: "sites", Exclude: []string{"a/**/*/**"}}}, wantErr: "matches everything"},
 		{name: "bare ** legitimately drops everything: accept", vols: []Volume{{Name: "sites", Exclude: []string{"**"}}}},
+		// The `none` veto is exact-string equality wherever it is consumed, so a
+		// near-miss vetoes nothing and does so silently — the volume is exported
+		// into every blob with no error, no warning and no skip-volume step. A
+		// marker that differs from "none" ONLY by case or surrounding whitespace
+		// is therefore rejected at registration rather than normalised: the
+		// author wrote something they believed was a veto and must be told it is
+		// not one.
+		{name: "exact none: accept", vols: []Volume{{Name: "logs", Backup: "none"}}},
+		{name: "no marker at all: accept", vols: []Volume{{Name: "logs"}}},
+		{name: "opaque commercial marker: accept", vols: []Volume{{Name: "sites", Backup: "s3; interval=24h"}}},
+		{name: "a marker merely containing none: accept", vols: []Volume{{Name: "sites", Backup: "s3; mode=none-ish"}}},
+		{name: "capitalised None: reject", vols: []Volume{{Name: "logs", Backup: "None"}}, wantErr: `must be exactly "none"`},
+		{name: "upper NONE: reject", vols: []Volume{{Name: "logs", Backup: "NONE"}}, wantErr: `must be exactly "none"`},
+		{name: "trailing space: reject", vols: []Volume{{Name: "logs", Backup: "none "}}, wantErr: `must be exactly "none"`},
+		{name: "leading space: reject", vols: []Volume{{Name: "logs", Backup: " none"}}, wantErr: `must be exactly "none"`},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

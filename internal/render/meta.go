@@ -71,8 +71,27 @@ type Secrets struct {
 	PerHostReferenced []string `yaml:"per_host_referenced" json:"per_host_referenced,omitempty"`
 }
 
+// BackupMarkerNone is the one `backup:` marker literal the core interprets: a
+// volume declaring it is never exported by a backup, on any path. Every other
+// marker string stays opaque and belongs to the commercial marker grammar. It
+// lives here, not in internal/instance, because the registration-time validator
+// that enforces the exact spelling (ValidateVolumes) is here and instance
+// imports render, not the other way round — instance.BackupMarkerNone is an
+// alias of this constant so the two cannot drift.
+const BackupMarkerNone = "none"
+
 type Volume struct {
-	Name   string `yaml:"name" json:"name"`
+	Name string `yaml:"name" json:"name"`
+	// Backup is the volume's backup target/marker. The core interprets exactly
+	// one literal, BackupMarkerNone ("none"); every other string is opaque.
+	//
+	// Because that comparison is exact-string equality at every site, a
+	// near-miss — `None`, `NONE`, `"none "` — would veto NOTHING, silently, and
+	// the volume would be exported into every blob with no error and no warning.
+	// For a marker whose entire job is "never capture this", failing open on a
+	// typo is the wrong direction, so ValidateVolumes REJECTS any value that
+	// differs from "none" only by case or surrounding whitespace. It is not
+	// normalised: an author who wrote `None` is told, not guessed at.
 	Backup string `yaml:"backup,omitempty" json:"backup,omitempty"`
 	// Exclude lists glob patterns (doublestar syntax, `**` spans separators)
 	// matched against each tar entry's path.Clean'ed name relative to the
@@ -162,6 +181,12 @@ func ValidateIngress(ing *Ingress) error {
 // valid — it legitimately matches, and so drops, every entry.
 func ValidateVolumes(m Meta) error {
 	for _, v := range m.Volumes {
+		// The `none` veto is exact-string equality everywhere it is consumed, so
+		// a near-miss vetoes nothing and does so silently. Catch it at
+		// registration, where an author is present to read the message.
+		if b := strings.ToLower(strings.TrimSpace(v.Backup)); b == BackupMarkerNone && v.Backup != BackupMarkerNone {
+			return fmt.Errorf("template-meta: volume %q: backup marker %q is not the veto literal — it must be exactly %q (lowercase, no surrounding whitespace); as written it vetoes nothing and the volume would be backed up in full", v.Name, v.Backup, BackupMarkerNone)
+		}
 		for _, p := range v.Exclude {
 			if strings.TrimSpace(p) == "" {
 				return fmt.Errorf("template-meta: volume %q: exclude pattern must not be empty", v.Name)

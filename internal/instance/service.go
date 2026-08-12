@@ -49,7 +49,12 @@ var (
 // declaring `backup: none` is never exported by a backup, on any path. Every
 // other marker string stays opaque — the grammar (cadence, mode) belongs to a
 // commercial BackupScheduler, and the core ascribes it no meaning.
-const BackupMarkerNone = "none"
+//
+// It is an alias of render.BackupMarkerNone rather than its own literal: the
+// registration-time validator that enforces the exact spelling (a `None` or
+// `"none "` would otherwise veto nothing, silently) lives in render, and the
+// two definitions must not be able to drift.
+const BackupMarkerNone = render.BackupMarkerNone
 
 // ApplyOptions controls the side effects of Apply beyond the request body.
 type ApplyOptions struct {
