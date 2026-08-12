@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -214,6 +215,24 @@ func RunWithFlags(opts ...Option) error {
 		}
 		svc.SetBlobStore(blobs)
 		log.Printf("backups enabled: %s", bdir)
+	}
+
+	// `backup: none` became a hard veto (#249): before it, ANY non-empty marker
+	// simply meant "marked", and this repo's own fixtures across five packages
+	// carried `none` on PRIMARY DATA volumes — good evidence real templates do
+	// too. Those instances keep returning 202 and completing green while the
+	// blob set quietly loses a volume, and the only trace is one `skip-volume`
+	// step buried in a job trail nobody reads on a success. Say it once, at
+	// startup, where an upgrading operator can see the reinterpretation.
+	//
+	// Log-only and once per process: it is a property of the catalog, not of
+	// any run, so failing startup would take a fleet down over a marker that
+	// may well be exactly what the author meant, and logging it per backup
+	// would bury it in noise.
+	if tmpls, err := db.ListTemplates(seedCtx); err != nil {
+		log.Printf("templates: listing for the `backup: none` audit failed: %v (skipping the audit)", err)
+	} else if w := backupMarkerNoneWarning(tmpls); w != "" {
+		log.Printf("WARNING: %s", w)
 	}
 
 	if c.sidecarInjector != nil {
@@ -751,6 +770,42 @@ func registerInventoryMetrics(reg prometheus.Registerer, src obs.InventorySource
 		return nil
 	}
 	return obs.NewInventoryCollector(reg, src, hosts)
+}
+
+// backupMarkerNoneWarning returns the one-time startup line naming every
+// template that declares a `backup: none` volume — or "" when the catalog has
+// none, which is the common case and must stay silent.
+//
+// The comparison is instance.IsBackupMarkerNone, not string equality, so a
+// near-miss spelling stored before the registration validator existed (`None`,
+// `"none "`) is reported here too: it vetoes now, and that is exactly the
+// reinterpretation an operator needs told.
+//
+// Templates and their volumes are both sorted so the line is stable across
+// restarts — an operator diffing two boots should see a change only when the
+// catalog changed.
+func backupMarkerNoneWarning(tmpls []store.Template) string {
+	var lines []string
+	for _, t := range tmpls {
+		var vols []string
+		for _, v := range t.Meta.Volumes {
+			if instance.IsBackupMarkerNone(v.Backup) {
+				vols = append(vols, v.Name)
+			}
+		}
+		if len(vols) == 0 {
+			continue
+		}
+		sort.Strings(vols)
+		lines = append(lines, fmt.Sprintf("%s[%s]", t.Meta.ID, strings.Join(vols, " ")))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	sort.Strings(lines)
+	return fmt.Sprintf("`backup: none` is a HARD VETO: these templates declare volume(s) that will NEVER be exported by any backup, "+
+		"and a backup of such an instance still completes green with that volume absent from the blob set — %s. "+
+		"If a volume there holds data you need restorable, remove its `none` marker.", strings.Join(lines, ", "))
 }
 
 // pollerDisabledMetricsWarning returns the line to log when the inventory
