@@ -132,13 +132,31 @@ Three shapes are deliberately **not** read as "back up everything":
   (`invalid_backup_scope`). Omit the body entirely to mean "everything".
 - `{"volume": ["sites"]}` — an unknown field (the singular typo, say) is
   rejected `400 invalid_request` rather than decoding to an empty scope.
-- An explicit scope that names only volumes which do not exist on the host
-  fails the **job**: this is knowable only once the run resolves what exists,
-  so the backup row is marked `failed`, any partial artifacts are removed and
-  the instance is restarted. A caller that asked for something specific and
-  got nothing must not be handed a green backup row. (An **unscoped** backup
-  of an instance whose volumes have not been created yet still succeeds, with
-  an empty `volumes` list — that is a brand-new instance's first backup.)
+
+  > **Wire break.** The body is decoded strictly, and this handler previously
+  > did not read it at all. A client that sends an unrelated object —
+  > `{"reason": "nightly"}`, say — used to get `202` and a job, and now gets
+  > `400 invalid_request` and **no backup**. The status code is the only
+  > signal, so an automation that ignores it simply stops taking backups.
+  > Send no body at all for an unscoped backup. The strictness is deliberate:
+  > tolerating unknown fields is what makes the singular-typo case above
+  > silently mean "back up everything".
+- An explicit scope naming a volume that does not exist on the host is
+  rejected `400 invalid_backup_scope`, **before any pod is stopped**. The
+  common way to hit this is a template edit that marks a new volume on a
+  fleet whose instances have not been re-applied: the volume is declared,
+  so the name looks valid, but nothing has created it yet. Re-apply the
+  instance, then back it up. (A volume that vanishes *during* a run is
+  caught after the export instead — the row is marked `failed`, partial
+  artifacts are removed and the instance restarted. A caller that asked for
+  something specific and got only part of it must not be handed a green
+  backup row.)
+- An **unscoped** backup fails the job if it would capture nothing *while the
+  instance has volumes* — e.g. every existing volume is `backup: none`.
+  A green row with an empty artifact set is worse than an error: it counts in
+  retention and restores nothing. The one case that still succeeds empty is an
+  instance with **no volumes created yet** — a brand-new instance's first
+  backup.
 
 **This does not shrink the outage to zero.** A snapshot backup still stops
 the whole pod for the duration of the export — scoping only reduces how many
@@ -161,13 +179,19 @@ absence of a marker carries no meaning to the core beyond "no commercial
 scheduler will pick this volume up on its own." Don't read a missing
 `backup:` field as "excluded" — that's what `none` is for.
 
-**The spelling is exact, and enforced at registration.** The comparison is
-plain string equality everywhere it is consumed, so `None`, `NONE` or
-`"none "` would veto *nothing* — silently, with the volume exported into
-every blob and no error to read. Template registration therefore **rejects**
-a marker that differs from `none` only by case or surrounding whitespace,
-naming the exact literal required. It is not quietly corrected: an author who
-wrote `None` believed they were vetoing a volume and is told they were not.
+**The spelling is exact, and enforced at registration — but the comparison
+itself fails closed.** A marker whose whole job is "never capture this" must
+not fail *open* on a typo, so every consumption site compares with case
+folded and surrounding whitespace trimmed: `None`, `NONE` and `"none "` all
+veto, exactly as `none` does. That covers rows written before the validator
+existed, which are never re-validated on read.
+
+Template registration **additionally rejects** a marker that differs from
+`none` only by case or whitespace, naming the exact literal required. The two
+are belt and braces, not redundancy: registration is where an author who
+wrote `None` is *told*, rather than left guessing which reading applies. It
+is not quietly corrected, and the stored string is never rewritten — only the
+comparison is tolerant.
 
 A vetoed volume named explicitly in a scope request is rejected at the door
 (`invalid_backup_scope`, above). A vetoed volume left out of an unscoped
@@ -346,16 +370,26 @@ The restore is enqueued as an async job:
 ```
 
 Poll `GET /jobs/01J4ZZ...` for progress. A successful restore job steps
-through: `load` → `teardown` → `restore-volume` (one step per volume) →
-`apply` → `verify`.
+through: `load` → `preflight-blobs` → `teardown` → `restore-volume` (one step
+per volume) → `apply` → `verify`.
 
 The endpoint validates synchronously before enqueuing:
 - The backup exists and is in `complete` state.
 - The backup's host is known and not draining (a 423 is returned if it is).
 - The instance spec exists in the state store.
+- **Every artifact file the backup lists is readable** — the whole set, not
+  one at a time.
 
 A draining host is refused **synchronously** (before teardown) so the job
 cannot be left in a half-restored state on a host that is being evacuated.
+The artifact preflight is upfront for the same reason and a stronger one: a
+restore whose third artifact is missing would otherwise roll the first two
+volumes back to backup-epoch content before discovering it cannot finish,
+leaving the instance **down** and mixed-epoch. Checking the set first makes
+that failure atomic — nothing is touched, and the instance keeps serving.
+So a backup whose artifacts were hand-deleted now fails the *request*
+(`422 backup_not_restorable`) rather than a job that has already stopped the
+instance.
 
 ### Delete a backup
 
