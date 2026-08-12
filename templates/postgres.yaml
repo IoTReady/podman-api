@@ -25,7 +25,7 @@
 #     per_host_referenced: []
 #   volumes:
 #     - name: data
-#       backup: none
+#       backup: "s3; interval=24h"
 ---
 apiVersion: v1
 kind: Pod
