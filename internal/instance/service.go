@@ -42,6 +42,7 @@ var (
 	ErrBackupNotRestorable = errors.New("backup is not restorable")
 	ErrBackupBusy          = errors.New("backup has a backup or restore in flight")
 	ErrBackupsDisabled     = errors.New("backups require a blob store (-backup-dir)")
+	ErrInvalidBackupScope  = errors.New("backup scope names a volume that cannot be backed up")
 )
 
 // BackupMarkerNone is the one marker literal the core interprets. A volume

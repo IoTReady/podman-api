@@ -19,7 +19,7 @@ type Service interface {
 	ListAllInstances(ctx context.Context, host string) ([]instance.Observed, error)
 	GetTemplate(ctx context.Context, id string) (store.Template, error)
 	ListBackups(ctx context.Context, host, template, slug string, limit int) ([]store.Backup, error)
-	CheckBackupable(ctx context.Context, host, template, slug string) error
+	CheckBackupable(ctx context.Context, host, template, slug string, volumes []string) error
 }
 
 // Controller is the core-side implementation of extension.BackupController. It
@@ -73,9 +73,14 @@ func (c *Controller) backupMarkers(ctx context.Context, template string) []exten
 	}
 	var markers []extension.BackupVolumeMarker
 	for _, v := range t.Meta.Volumes {
-		if v.Backup != "" {
-			markers = append(markers, extension.BackupVolumeMarker{Name: v.Name, Backup: v.Backup})
+		// `none` is the one marker the core interprets: the volume is never
+		// backed up, so projecting it would only make a scheduler re-derive the
+		// same veto — and an instance whose only marked volume is `none` is not
+		// backup-eligible at all.
+		if v.Backup == "" || v.Backup == instance.BackupMarkerNone {
+			continue
 		}
+		markers = append(markers, extension.BackupVolumeMarker{Name: v.Name, Backup: v.Backup})
 	}
 	return markers
 }
@@ -98,7 +103,7 @@ func (c *Controller) LastBackupAt(ctx context.Context, host, template, slug stri
 
 // EnqueueBackup enqueues a backup job for one instance, deduping against any
 // backup already queued/running/reconciling for the same instance.
-func (c *Controller) EnqueueBackup(ctx context.Context, host, template, slug string) (string, error) {
+func (c *Controller) EnqueueBackup(ctx context.Context, host, template, slug string, opts extension.BackupOptions) (string, error) {
 	inFlight, err := c.backupInFlight(ctx, host, template, slug)
 	if err != nil {
 		return "", err
@@ -106,10 +111,13 @@ func (c *Controller) EnqueueBackup(ctx context.Context, host, template, slug str
 	if inFlight {
 		return "", nil
 	}
-	if err := c.Svc.CheckBackupable(ctx, host, template, slug); err != nil {
+	if err := c.Svc.CheckBackupable(ctx, host, template, slug, opts.Volumes); err != nil {
 		return "", err
 	}
-	req := instance.BackupRequest{BackupID: store.NewBackupID(), Host: host, Template: template, Slug: slug}
+	req := instance.BackupRequest{
+		BackupID: store.NewBackupID(), Host: host, Template: template, Slug: slug,
+		Volumes: opts.Volumes,
+	}
 	args, err := json.Marshal(req)
 	if err != nil {
 		return "", err

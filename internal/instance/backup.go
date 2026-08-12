@@ -20,6 +20,11 @@ type BackupRequest struct {
 	Host     string `json:"host"`
 	Template string `json:"template"`
 	Slug     string `json:"slug"`
+	// Volumes is the declared (short) volume names to capture. Empty means
+	// every declared volume not marked `none`. Persisted in the job args so a
+	// backup interrupted by a daemon restart reconciles with the scope it
+	// started with.
+	Volumes []string `json:"volumes,omitempty"`
 }
 
 // backupBlobKey is the blob layout: <host>/<template>/<slug>/<backup-id>/<volume>.tar
@@ -33,12 +38,19 @@ func backupBlobPrefix(host, tmpl, slug, id string) string {
 }
 
 // CheckBackupable runs the cheap synchronous validation the POST handler
-// needs: known host, known template, stored spec present, blob store wired.
-func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string) error {
+// needs: known host, known template, stored spec present, blob store wired,
+// and — when volumes is non-empty — that every named volume is declared by the
+// template and not vetoed by a `none` marker.
+//
+// Scope validation is synchronous and upfront so a typo or a misconfigured
+// scheduler fails the request outright rather than stopping a pod and
+// producing a green, empty backup.
+func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, volumes []string) error {
 	if s.blobs == nil {
 		return ErrBackupsDisabled
 	}
-	if _, err := s.lookup(ctx, host, tmpl); err != nil {
+	t, err := s.lookup(ctx, host, tmpl)
+	if err != nil {
 		return err
 	}
 	if _, err := s.store.GetSpec(ctx, host, tmpl, slug); err != nil {
@@ -46,6 +58,22 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string) 
 			return ErrInstanceNotFound
 		}
 		return err
+	}
+	if len(volumes) == 0 {
+		return nil
+	}
+	declared := make(map[string]string, len(t.Meta.Volumes))
+	for _, v := range t.Meta.Volumes {
+		declared[v.Name] = v.Backup
+	}
+	for _, name := range volumes {
+		marker, ok := declared[name]
+		if !ok {
+			return fmt.Errorf("%w: %q is not declared by template %s", ErrInvalidBackupScope, name, tmpl)
+		}
+		if marker == BackupMarkerNone {
+			return fmt.Errorf("%w: %q is marked `backup: none`", ErrInvalidBackupScope, name)
+		}
 	}
 	return nil
 }
@@ -64,7 +92,7 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 	lk.Lock()
 	defer lk.Unlock()
 
-	if err := s.CheckBackupable(ctx, req.Host, req.Template, req.Slug); err != nil {
+	if err := s.CheckBackupable(ctx, req.Host, req.Template, req.Slug, req.Volumes); err != nil {
 		return err
 	}
 
@@ -148,6 +176,13 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 		return fail(fmt.Errorf("list volumes: %w", err))
 	}
 
+	// Scope in declared short names, resolved through the same volumeName() the
+	// pod manifest uses. Empty scope means "everything not vetoed".
+	scope := make(map[string]bool, len(req.Volumes))
+	for _, short := range req.Volumes {
+		scope[volumeName(req.Template, req.Slug, short)] = true
+	}
+
 	var bvols []store.BackupVolume
 	for _, v := range vols {
 		m := declared[v.Name]
@@ -155,6 +190,9 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 			// State the absence rather than leaving it to be inferred from a
 			// backup that silently lacks a volume.
 			step("skip-volume", v.Name+" (backup: none)")
+			continue
+		}
+		if len(scope) > 0 && !scope[v.Name] {
 			continue
 		}
 		// Emitted BEFORE the export so a multi-minute volume shows the phase in

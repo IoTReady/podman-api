@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/iotready/podman-api/extension"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/render"
@@ -49,7 +50,9 @@ func (f *fakeSvc) ListBackups(_ context.Context, host, tmpl, slug string, _ int)
 	return f.backups[key(host, tmpl, slug)], nil
 }
 
-func (f *fakeSvc) CheckBackupable(_ context.Context, _, _, _ string) error { return f.backupableErr }
+func (f *fakeSvc) CheckBackupable(_ context.Context, _, _, _ string, _ []string) error {
+	return f.backupableErr
+}
 
 func tmpl(id string, vols ...render.Volume) store.Template {
 	return store.Template{Meta: render.Meta{ID: id, Volumes: vols}}
@@ -118,7 +121,7 @@ func TestEnqueueBackup_enqueuesBackupJob(t *testing.T) {
 	mem := store.NewMemory()
 	c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
 
-	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a")
+	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a", extension.BackupOptions{})
 	require.NoError(t, err)
 	assert.NotEmpty(t, id)
 
@@ -143,7 +146,7 @@ func TestEnqueueBackup_dedupesInFlight(t *testing.T) {
 	require.NoError(t, err)
 
 	c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
-	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a")
+	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a", extension.BackupOptions{})
 	require.NoError(t, err)
 	assert.Empty(t, id, "should enqueue nothing when a backup is already in flight")
 
@@ -160,14 +163,48 @@ func TestEnqueueBackup_differentInstanceNotDeduped(t *testing.T) {
 	require.NoError(t, err)
 
 	c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
-	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "b") // different slug
+	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "b", extension.BackupOptions{}) // different slug
 	require.NoError(t, err)
 	assert.NotEmpty(t, id, "a different instance must not be deduped against an in-flight one")
 }
 
 func TestEnqueueBackup_propagatesCheckError(t *testing.T) {
 	c := &Controller{Svc: &fakeSvc{backupableErr: instance.ErrInstanceNotFound}, Jobs: store.NewMemory()}
-	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "gone")
+	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "gone", extension.BackupOptions{})
 	require.ErrorIs(t, err, instance.ErrInstanceNotFound)
 	assert.Empty(t, id)
+}
+
+// TestListBackupInstances_DropsNoneMarkedVolumes: the core now interprets `none`, so
+// a vetoed volume must not be projected to a scheduler that would then have to
+// re-derive the same veto — and an instance whose ONLY marked volume is `none`
+// is not backup-eligible at all.
+func TestListBackupInstances_DropsNoneMarkedVolumes(t *testing.T) {
+	svc := &fakeSvc{
+		hosts: []config.Host{{ID: "h1"}},
+		instances: map[string][]instance.Observed{
+			"h1": {
+				{Template: "web", Slug: "a"},
+				{Template: "vetoed", Slug: "b"},
+			},
+		},
+		templates: map[string]store.Template{
+			"web": tmpl("web",
+				render.Volume{Name: "sites", Backup: "s3; interval=24h"},
+				render.Volume{Name: "logs", Backup: "none"},
+				render.Volume{Name: "cache"}),
+			// Every marked volume is vetoed: not backup-eligible at all.
+			"vetoed": tmpl("vetoed", render.Volume{Name: "logs", Backup: "none"}),
+		},
+	}
+	c := &Controller{Svc: svc}
+
+	got, err := c.ListBackupInstances(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, got, 1, "an instance whose only marker is `none` is not eligible")
+	assert.Equal(t, "web", got[0].Template)
+	require.Len(t, got[0].Volumes, 1, "a `none` marker must not be projected")
+	assert.Equal(t, "sites", got[0].Volumes[0].Name)
+	assert.Equal(t, "s3; interval=24h", got[0].Volumes[0].Backup)
 }

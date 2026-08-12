@@ -1099,3 +1099,83 @@ func TestBackup_EmitsExportStepBeforeExporting(t *testing.T) {
 	require.NoError(t, svc.Backup(ctx, newBackupReq(), recordSteps(&steps)))
 	assert.Contains(t, steps, "export-volume-done")
 }
+
+func TestCheckBackupable_RejectsUndeclaredVolume(t *testing.T) {
+	svc, _, _, _ := newBackupSvc(t)
+	err := svc.CheckBackupable(context.Background(), "h1", "pg", "a", []string{"sitez"})
+	assert.ErrorIs(t, err, ErrInvalidBackupScope)
+}
+
+func TestCheckBackupable_RejectsNoneMarkedVolume(t *testing.T) {
+	svc, _, _, _ := newBackupSvc(t)
+	err := svc.CheckBackupable(context.Background(), "h1", "pg", "a", []string{"logs"})
+	assert.ErrorIs(t, err, ErrInvalidBackupScope)
+}
+
+func TestCheckBackupable_AcceptsEmptyAndDeclaredScope(t *testing.T) {
+	svc, _, _, _ := newBackupSvc(t)
+	ctx := context.Background()
+	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil))
+	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", []string{"data"}))
+}
+
+// TestBackup_ScopeNarrowsTheExportSet: with two exportable volumes present, a
+// scope of {data} captures only data.
+func TestBackup_ScopeNarrowsTheExportSet(t *testing.T) {
+	svc, f, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "cache"})
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	f.SetVolumeData("h1", "pg-a-cache", tarBytes(t, map[string]string{"c": "1"}))
+
+	req := newBackupReq()
+	req.Volumes = []string{"data"}
+	require.NoError(t, svc.Backup(ctx, req, nil))
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 1)
+	assert.Equal(t, "pg-a-data", b.Volumes[0].Name)
+}
+
+// TestBackup_ScopedToAnAbsentVolumeSucceeds: a DECLARED volume that does not
+// exist on the host yet is skipped, not an error — a brand-new instance must
+// not fail its first backup for it.
+func TestBackup_ScopedToAnAbsentVolumeSucceeds(t *testing.T) {
+	svc, _, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "cache"})
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	// Note: no SetVolumeData for pg-a-cache — it is declared but absent.
+
+	req := newBackupReq()
+	req.Volumes = []string{"cache"}
+	require.NoError(t, svc.Backup(ctx, req, nil))
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	assert.Equal(t, store.BackupComplete, b.State)
+	assert.Empty(t, b.Volumes)
+}
+
+// TestBackup_InvalidScopeNeverStopsThePod: validation is synchronous and runs
+// before the stop, so a scheduler bug or a typo cannot cost an outage.
+func TestBackup_InvalidScopeNeverStopsThePod(t *testing.T) {
+	svc, f, _, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	req := newBackupReq()
+	req.Volumes = []string{"nope"}
+	err := svc.Backup(ctx, req, nil)
+	assert.ErrorIs(t, err, ErrInvalidBackupScope)
+
+	p, perr := f.PodInspect(ctx, "h1", "pg-a")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status, "an invalid scope must not stop the pod")
+}

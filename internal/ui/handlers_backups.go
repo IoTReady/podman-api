@@ -37,7 +37,7 @@ func (u *UI) renderInstanceActionError(w http.ResponseWriter, r *http.Request, h
 func (u *UI) backupNow(w http.ResponseWriter, r *http.Request) {
 	host, tmpl, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
 	ctx := r.Context()
-	if err := u.cfg.Svc.CheckBackupable(ctx, host, tmpl, slug); err != nil {
+	if err := u.cfg.Svc.CheckBackupable(ctx, host, tmpl, slug, nil); err != nil {
 		u.renderInstanceActionError(w, r, host, tmpl, slug, err)
 		return
 	}

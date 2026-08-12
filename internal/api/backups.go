@@ -19,7 +19,7 @@ func (h *handlers) postBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	host, tmpl, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
-	if err := h.svc.CheckBackupable(r.Context(), host, tmpl, slug); err != nil {
+	if err := h.svc.CheckBackupable(r.Context(), host, tmpl, slug, nil); err != nil {
 		WriteError(w, err)
 		return
 	}
