@@ -182,7 +182,7 @@ func TestEnqueueBackup_ValidatesScopeBeforeDedupe(t *testing.T) {
 
 	c := &Controller{Svc: &fakeSvc{backupableErr: instance.ErrInvalidBackupScope}, Jobs: mem}
 	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a",
-		extension.BackupOptions{Volumes: []string{"typo"}})
+		extension.BackupOptions{Volumes: &[]string{"typo"}})
 	require.ErrorIs(t, err, instance.ErrInvalidBackupScope)
 	assert.Empty(t, id)
 }
@@ -226,4 +226,131 @@ func TestListBackupInstances_DropsNoneMarkedVolumes(t *testing.T) {
 	require.Len(t, got[0].Volumes, 1, "a `none` marker must not be projected")
 	assert.Equal(t, "sites", got[0].Volumes[0].Name)
 	assert.Equal(t, "s3; interval=24h", got[0].Volumes[0].Backup)
+}
+
+// TestEnqueueBackup_ExplicitlyEmptyScopeIsAnError (re-review F): a scheduler
+// whose filter produced an empty list must not receive a job id for a
+// FULL-INSTANCE backup it never asked for. nil means unscoped; an explicitly
+// empty slice is a request for nothing, which is a bug at the caller.
+func TestEnqueueBackup_ExplicitlyEmptyScopeIsAnError(t *testing.T) {
+	mem := store.NewMemory()
+	c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
+
+	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a",
+		extension.BackupOptions{Volumes: &[]string{}})
+	require.ErrorIs(t, err, instance.ErrInvalidBackupScope)
+	assert.Empty(t, id)
+
+	jobs, err := mem.ListJobs(context.Background(), store.JobFilter{Kind: "backup"})
+	require.NoError(t, err)
+	assert.Empty(t, jobs, "an empty scope must never escalate to a full-instance backup")
+}
+
+// TestEnqueueBackup_NilScopeIsUnscoped is the other half of F: absent still
+// means "every declared volume not marked none", and the persisted args carry
+// no scope.
+func TestEnqueueBackup_NilScopeIsUnscoped(t *testing.T) {
+	mem := store.NewMemory()
+	c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
+
+	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a", extension.BackupOptions{})
+	require.NoError(t, err)
+	require.NotEmpty(t, id)
+
+	jobs, err := mem.ListJobs(context.Background(), store.JobFilter{Kind: "backup"})
+	require.NoError(t, err)
+	require.Len(t, jobs, 1)
+	var req instance.BackupRequest
+	require.NoError(t, json.Unmarshal(jobs[0].Args, &req))
+	assert.Empty(t, req.Volumes)
+}
+
+// enqueueInFlight puts a backup job for h1/web/a with the given scope into the
+// queue, as an already-running backup would have left it.
+func enqueueInFlight(t *testing.T, mem *store.Memory, volumes []string) {
+	t.Helper()
+	pre := instance.BackupRequest{
+		BackupID: store.NewBackupID(), Host: "h1", Template: "web", Slug: "a", Volumes: volumes,
+	}
+	args, err := json.Marshal(pre)
+	require.NoError(t, err)
+	_, err = mem.Enqueue(context.Background(), "backup", args, "")
+	require.NoError(t, err)
+}
+
+// TestEnqueueBackup_DedupeOnlyWhenTheInFlightScopeCovers (re-review G): the
+// dedupe was safe while every enqueue for an instance requested the same work.
+// With scopes, swallowing a request the in-flight run will NOT satisfy drops
+// that window's snapshot entirely — never taken, never retried, no error.
+func TestEnqueueBackup_DedupeOnlyWhenTheInFlightScopeCovers(t *testing.T) {
+	tests := []struct {
+		name        string
+		inFlight    []string // nil = unscoped
+		want        *[]string
+		wantEnqueue bool
+	}{
+		{name: "unscoped in flight covers a scoped request", inFlight: nil, want: &[]string{"wal"}},
+		{name: "unscoped in flight covers an unscoped request", inFlight: nil, want: nil},
+		{name: "same scope is covered", inFlight: []string{"wal"}, want: &[]string{"wal"}},
+		{name: "a subset is covered", inFlight: []string{"wal", "data"}, want: &[]string{"wal"}},
+		{
+			name: "a disjoint scope is NOT covered", inFlight: []string{"data"},
+			want: &[]string{"wal"}, wantEnqueue: true,
+		},
+		{
+			name: "a superset is NOT covered", inFlight: []string{"wal"},
+			want: &[]string{"wal", "data"}, wantEnqueue: true,
+		},
+		{
+			// The in-flight run captures only `data`; an unscoped request asks
+			// for every volume, which that run will not deliver.
+			name: "a scoped run does NOT cover an unscoped request", inFlight: []string{"data"},
+			want: nil, wantEnqueue: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			mem := store.NewMemory()
+			enqueueInFlight(t, mem, tc.inFlight)
+			c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
+
+			id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a",
+				extension.BackupOptions{Volumes: tc.want})
+			require.NoError(t, err)
+
+			jobs, err := mem.ListJobs(context.Background(), store.JobFilter{Kind: "backup"})
+			require.NoError(t, err)
+			if tc.wantEnqueue {
+				assert.NotEmpty(t, id)
+				assert.Len(t, jobs, 2, "an uncovered request must be enqueued, not swallowed")
+			} else {
+				assert.Empty(t, id)
+				assert.Len(t, jobs, 1)
+			}
+		})
+	}
+}
+
+// TestBackupMarkers_NearMissNoneStillVetoes (re-review D): the projection reads
+// the marker through the same fail-closed comparison, so a `None` stored before
+// the registration validator existed is not handed to a scheduler as an opaque
+// commercial marker.
+func TestBackupMarkers_NearMissNoneStillVetoes(t *testing.T) {
+	svc := &fakeSvc{
+		hosts:     []config.Host{{ID: "h1"}},
+		instances: map[string][]instance.Observed{"h1": {{Template: "web", Slug: "a"}}},
+		templates: map[string]store.Template{
+			"web": tmpl("web",
+				render.Volume{Name: "logs", Backup: "None"},
+				render.Volume{Name: "data", Backup: "s3; interval=24h"},
+			),
+		},
+	}
+	c := &Controller{Svc: svc, Jobs: store.NewMemory()}
+
+	got, err := c.ListBackupInstances(context.Background())
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	require.Len(t, got[0].Volumes, 1)
+	assert.Equal(t, "data", got[0].Volumes[0].Name)
 }

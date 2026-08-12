@@ -3,6 +3,7 @@ package backupctl
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"time"
 
@@ -77,7 +78,7 @@ func (c *Controller) backupMarkers(ctx context.Context, template string) []exten
 		// backed up, so projecting it would only make a scheduler re-derive the
 		// same veto — and an instance whose only marked volume is `none` is not
 		// backup-eligible at all.
-		if v.Backup == "" || v.Backup == instance.BackupMarkerNone {
+		if v.Backup == "" || instance.IsBackupMarkerNone(v.Backup) {
 			continue
 		}
 		markers = append(markers, extension.BackupVolumeMarker{Name: v.Name, Backup: v.Backup})
@@ -101,8 +102,9 @@ func (c *Controller) LastBackupAt(ctx context.Context, host, template, slug stri
 	return time.Time{}, nil
 }
 
-// EnqueueBackup enqueues a backup job for one instance, deduping against any
-// backup already queued/running/reconciling for the same instance.
+// EnqueueBackup enqueues a backup job for one instance, deduping against a
+// backup already queued/running/reconciling for the same instance WHOSE SCOPE
+// COVERS the requested one.
 //
 // The scope is validated BEFORE the dedupe check, deliberately. The other order
 // answers a misconfigured scheduler — a typo'd volume name, or one newly marked
@@ -111,20 +113,37 @@ func (c *Controller) LastBackupAt(ctx context.Context, host, template, slug stri
 // then stays invisible for as long as backups keep overlapping, while the volume
 // the scheduler believes it is protecting is never captured. A bad scope is a
 // bad scope whether or not a run happens to be in flight.
+//
+// Coverage, not mere per-instance presence, is what the dedupe keys on. Per
+// instance was safe while every enqueue for an instance requested the same
+// work; with scopes it is not — a `{Volumes:["wal"]}` tick landing during an
+// unscoped nightly run would get `("", nil)`, "already handled", for work that
+// run does do, but a `{Volumes:["wal"]}` tick landing during a
+// `{Volumes:["data"]}` run would get the same answer for work nobody is doing.
+// That window's snapshot is then never taken and never retried, silently.
 func (c *Controller) EnqueueBackup(ctx context.Context, host, template, slug string, opts extension.BackupOptions) (string, error) {
-	if err := c.Svc.CheckBackupable(ctx, host, template, slug, opts.Volumes); err != nil {
+	// nil means unscoped; an explicitly EMPTY scope is an error rather than an
+	// escalation to a full-instance backup (see extension.BackupOptions).
+	var volumes []string
+	if opts.Volumes != nil {
+		if len(*opts.Volumes) == 0 {
+			return "", fmt.Errorf("%w: an explicitly empty volume scope requests nothing; pass a nil scope for a full-instance backup", instance.ErrInvalidBackupScope)
+		}
+		volumes = *opts.Volumes
+	}
+	if err := c.Svc.CheckBackupable(ctx, host, template, slug, volumes); err != nil {
 		return "", err
 	}
-	inFlight, err := c.backupInFlight(ctx, host, template, slug)
+	covered, err := c.backupInFlightCovering(ctx, host, template, slug, volumes)
 	if err != nil {
 		return "", err
 	}
-	if inFlight {
+	if covered {
 		return "", nil
 	}
 	req := instance.BackupRequest{
 		BackupID: store.NewBackupID(), Host: host, Template: template, Slug: slug,
-		Volumes: opts.Volumes,
+		Volumes: volumes,
 	}
 	args, err := json.Marshal(req)
 	if err != nil {
@@ -137,10 +156,35 @@ func (c *Controller) EnqueueBackup(ctx context.Context, host, template, slug str
 	return job.ID, nil
 }
 
-// backupInFlight reports whether a backup job targeting this instance is in a
-// non-terminal state. Mirrors instance.BackupInFlight but matches on the
-// host/template/slug triple instead of a specific backup id.
-func (c *Controller) backupInFlight(ctx context.Context, host, template, slug string) (bool, error) {
+// scopeCovers reports whether an in-flight job's scope covers a requested one.
+// An unscoped in-flight job (empty inFlight) captures every volume not vetoed,
+// so it covers everything, including an unscoped request. A scoped in-flight
+// job covers only a request whose volumes are all in its own set — and never an
+// unscoped request, which asks for more than it will capture.
+func scopeCovers(inFlight, want []string) bool {
+	if len(inFlight) == 0 {
+		return true
+	}
+	if len(want) == 0 {
+		return false
+	}
+	have := make(map[string]bool, len(inFlight))
+	for _, v := range inFlight {
+		have[v] = true
+	}
+	for _, v := range want {
+		if !have[v] {
+			return false
+		}
+	}
+	return true
+}
+
+// backupInFlightCovering reports whether a backup job targeting this instance
+// is in a non-terminal state AND its scope covers the requested volumes. The
+// in-flight job's own scope is read back out of its persisted args, which is
+// where the enqueue wrote it.
+func (c *Controller) backupInFlightCovering(ctx context.Context, host, template, slug string, want []string) (bool, error) {
 	for _, st := range []store.JobState{store.JobQueued, store.JobRunning, store.JobReconciling} {
 		jobs, err := c.Jobs.ListJobs(ctx, store.JobFilter{State: st, Kind: "backup", Limit: store.MaxJobLimit})
 		if err != nil {
@@ -151,7 +195,8 @@ func (c *Controller) backupInFlight(ctx context.Context, host, template, slug st
 			if err := json.Unmarshal(j.Args, &req); err != nil {
 				continue
 			}
-			if req.Host == host && req.Template == template && req.Slug == slug {
+			if req.Host == host && req.Template == template && req.Slug == slug &&
+				scopeCovers(req.Volumes, want) {
 				return true, nil
 			}
 		}

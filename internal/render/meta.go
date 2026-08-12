@@ -10,6 +10,8 @@ import (
 
 	"github.com/bmatcuk/doublestar/v4"
 	"gopkg.in/yaml.v3"
+
+	"github.com/iotready/podman-api/extension"
 )
 
 // NameRe is the DNS-label constraint for template ids and instance slugs.
@@ -73,25 +75,35 @@ type Secrets struct {
 
 // BackupMarkerNone is the one `backup:` marker literal the core interprets: a
 // volume declaring it is never exported by a backup, on any path. Every other
-// marker string stays opaque and belongs to the commercial marker grammar. It
-// lives here, not in internal/instance, because the registration-time validator
-// that enforces the exact spelling (ValidateVolumes) is here and instance
-// imports render, not the other way round — instance.BackupMarkerNone is an
-// alias of this constant so the two cannot drift.
-const BackupMarkerNone = "none"
+// marker string stays opaque and belongs to the commercial marker grammar.
+//
+// It is an ALIAS of extension.BackupMarkerNone, which is the canonical
+// definition: the literal is part of the public seam (a commercial consumer
+// links against it rather than hardcoding "none"), and a second declaration
+// here could drift from it. instance.BackupMarkerNone aliases this in turn.
+const BackupMarkerNone = extension.BackupMarkerNone
+
+// IsBackupMarkerNone reports whether a raw marker is the `none` veto, folding
+// case and trimming whitespace so the comparison fails CLOSED on a near-miss
+// registration never saw. Re-exported from extension so render's own consumers
+// have one comparison site; see extension.IsBackupMarkerNone for why.
+func IsBackupMarkerNone(marker string) bool { return extension.IsBackupMarkerNone(marker) }
 
 type Volume struct {
 	Name string `yaml:"name" json:"name"`
 	// Backup is the volume's backup target/marker. The core interprets exactly
 	// one literal, BackupMarkerNone ("none"); every other string is opaque.
 	//
-	// Because that comparison is exact-string equality at every site, a
-	// near-miss — `None`, `NONE`, `"none "` — would veto NOTHING, silently, and
-	// the volume would be exported into every blob with no error and no warning.
-	// For a marker whose entire job is "never capture this", failing open on a
-	// typo is the wrong direction, so ValidateVolumes REJECTS any value that
-	// differs from "none" only by case or surrounding whitespace. It is not
-	// normalised: an author who wrote `None` is told, not guessed at.
+	// A near-miss — `None`, `NONE`, `"none "` — is handled on BOTH sides, and
+	// they are not redundant. ValidateVolumes REJECTS such a value at
+	// registration, so an author who wrote `None` is told rather than guessed
+	// at. But registration only runs on the write path: a template row
+	// persisted before that validator existed is never re-validated on read, so
+	// every consumer ALSO compares through IsBackupMarkerNone, which folds case
+	// and trims whitespace. For a marker whose entire job is "never capture
+	// this", failing open on a typo is the wrong direction — the volume would
+	// be exported into every blob against the operator's explicit veto.
+	// The stored string is never rewritten; only the comparison is tolerant.
 	Backup string `yaml:"backup,omitempty" json:"backup,omitempty"`
 	// Exclude lists glob patterns (doublestar syntax, `**` spans separators)
 	// matched against each tar entry's path.Clean'ed name relative to the
@@ -184,7 +196,7 @@ func ValidateVolumes(m Meta) error {
 		// The `none` veto is exact-string equality everywhere it is consumed, so
 		// a near-miss vetoes nothing and does so silently. Catch it at
 		// registration, where an author is present to read the message.
-		if b := strings.ToLower(strings.TrimSpace(v.Backup)); b == BackupMarkerNone && v.Backup != BackupMarkerNone {
+		if IsBackupMarkerNone(v.Backup) && v.Backup != BackupMarkerNone {
 			return fmt.Errorf("template-meta: volume %q: backup marker %q is not the veto literal — it must be exactly %q (lowercase, no surrounding whitespace); as written it vetoes nothing and the volume would be backed up in full", v.Name, v.Backup, BackupMarkerNone)
 		}
 		for _, p := range v.Exclude {
