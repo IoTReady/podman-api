@@ -1566,12 +1566,21 @@ func TestCheckBackupable_ExplicitScopeRejectsUnmaterialisedVolume(t *testing.T) 
 }
 
 // TestBackup_UnscopedExportingNothingFailsWhenVolumesExist (round-3 finding
-// 5): the "did we capture what was asked for" guard only ran for an explicit
-// scope, so an UNSCOPED run that exported nothing recorded a green `complete`
-// row with an empty blob set. Reachable whenever a template declares a vetoed
-// volume alongside one existing instances have not materialised: the pod is
-// stopped for real, `data` is skipped as vetoed, `cache` does not exist, and
-// the UI, retention and any later restore all see a good backup of nothing.
+// 5, tightened in the unscoped-path loop-closure fix): the "did we capture
+// what was asked for" guard only ran for an explicit scope, so an UNSCOPED run
+// that exported nothing recorded a green `complete` row with an empty blob
+// set. Reachable whenever a template declares a vetoed volume alongside one
+// existing instances have not materialised: `data` is skipped as vetoed,
+// `cache` does not exist.
+//
+// This used to be caught only AFTER the pod was stopped and the (empty)
+// export ran — which reintroduced, on the unscoped path, exactly the
+// stop/export/fail/restart outage loop CheckBackupable's explicit-scope
+// existence check exists to prevent: since this scenario recurs every
+// scheduler tick, it would never resolve on its own. CheckBackupable now
+// resolves the same question up front by checking what is MATERIALISED on
+// the host (mirroring the explicit-scope branch), so this is rejected
+// synchronously and the pod is never touched.
 func TestBackup_UnscopedExportingNothingFailsWhenVolumesExist(t *testing.T) {
 	svc, f, mem, blob := newBackupSvc(t)
 	ctx := context.Background()
@@ -1586,20 +1595,43 @@ func TestBackup_UnscopedExportingNothingFailsWhenVolumesExist(t *testing.T) {
 	}
 	require.NoError(t, mem.PutTemplate(ctx, tmpl))
 
+	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
+	require.ErrorIs(t, err, ErrInvalidBackupScope)
+	assert.Contains(t, err.Error(), "backup: none")
+
 	req := newBackupReq()
-	err = svc.Backup(ctx, req, nil)
+	var steps []string
+	err = svc.Backup(ctx, req, recordSteps(&steps))
 	require.Error(t, err, "an unscoped backup that captures nothing must not report success")
 	assert.ErrorIs(t, err, ErrInvalidBackupScope)
+	assert.NotContains(t, steps, "stop", "the pod must not be stopped for an unscoped run that cannot capture anything")
+	assert.NotContains(t, steps, "export-volume")
 
-	b, gerr := svc.store.GetBackup(ctx, req.BackupID)
-	require.NoError(t, gerr)
-	assert.Equal(t, store.BackupFailed, b.State, "the row must be failed, not a green backup of nothing")
+	// Rejected before anything happened: no row, no blobs, pod untouched.
+	_, gerr := svc.store.GetBackup(ctx, req.BackupID)
+	require.ErrorIs(t, gerr, store.ErrNotFound)
 	assert.Zero(t, blob.len())
 
-	// The instance is restarted despite the failure.
 	p, perr := f.PodInspect(ctx, "h1", "pg-a")
 	require.NoError(t, perr)
 	assert.Equal(t, "Running", p.Status)
+}
+
+// TestCheckBackupable_UnscopedHostErrorNotMisclassified: a genuine host
+// failure while resolving materialised volumes for an unscoped request must
+// surface as a host error, never as ErrInvalidBackupScope — a transient blip
+// misread as a permanent scope error would stop a scheduler retrying.
+func TestCheckBackupable_UnscopedHostErrorNotMisclassified(t *testing.T) {
+	svc, f, _, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	// pgTemplate declares "data" (exportable) so the cheap all-vetoed
+	// short-circuit does not fire and the host call is actually reached.
+	f.VolumeInspectErr = errors.New("ssh: connection reset")
+
+	err := svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrInvalidBackupScope)
 }
 
 // TestBackup_UnscopedWithNoVolumesYetStillSucceeds is the other half of
