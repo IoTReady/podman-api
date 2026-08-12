@@ -122,11 +122,17 @@ Correct — both stop the same pod.
 - a volume marked `none`.
 
 It also rejects an **empty** scope — "every declared volume not marked
-`none`" — when that set is itself empty: the template declares no volumes at
-all, or every declared volume is marked `none`. Left unchecked this is the
-same failure one level up: a green, empty backup that stopped the pod for
-nothing. `CheckBackupable` is where this is caught, not the runner, for the
-same synchronous-upfront reason as the other two cases.
+`none`" — when the template declares volumes and **every one of them** is
+marked `none`. Left unchecked this is the same failure one level up: a green,
+empty backup that stopped the pod for nothing. `CheckBackupable` is where this
+is caught, not the runner, for the same synchronous-upfront reason as the other
+two cases.
+
+A template declaring **no volumes at all** is a different case and is
+**accepted**: a stateless template (the bundled `basic-web`) has nothing to
+back up, that is a valid no-op, and rejecting it would regress every caller
+that backs one up today — with a message pointing at a `none` marker that does
+not exist.
 
 All three fail the synchronous POST with 400 and fail a scheduler's
 `EnqueueBackup` call, so none of them ever reaches a `Stop`. The alternative —
@@ -135,10 +141,21 @@ survives — was rejected: a scheduler misconfigured to name the wrong volume
 would then produce a fleet of green, empty backups, which is #104's failure
 mode one level up.
 
-One case is tolerated rather than rejected: a **declared** volume that does not
-yet exist on the host. `InstanceVolumes` already skips those (a declared volume
-may legitimately not have been created yet), and a backup of a brand-new instance
-must not fail for it.
+A **declared** volume that does not yet exist on the host cannot be caught here
+at all: `CheckBackupable` runs against what the template declares, while what
+exists is only knowable once the run reaches `InstanceVolumes`. The rule splits
+by scope, and the second half lives in `Backup`, after the export loop:
+
+- An **explicit** scope (`req.Volumes` non-empty) that resolves to **zero**
+  exportable volumes **fails the run** — through the same `fail(...)` helper as
+  any other mid-run failure, so the row is marked failed, partial blobs are
+  reaped and the instance is restarted. The caller named something specific and
+  it was not captured; recording that as a complete backup is precisely the
+  green, empty backup this decision exists to prevent, and a later restore from
+  it would tear the pod down and restore nothing.
+- An **unscoped** backup (`req.Volumes` empty) that resolves to zero exportable
+  volumes still **succeeds**. That is the brand-new-instance case — no volume
+  has been written yet — and its first, empty backup must not fail.
 
 Asking for a `none`-marked volume is an error rather than an honoured veto so
 that "I asked for X and got a backup without X" is impossible. A caller wanting
@@ -213,8 +230,9 @@ TDD, per the repo's habit — each behaviour gets its failing test first.
 - **Validation:** an undeclared name and a `none`-marked name each fail
   `CheckBackupable` and produce 400 from the handler, with the pod never stopped
   (assert against the fake's call log, not just the error).
-- **Declared-but-absent volume:** scoped to it, the backup succeeds and records
-  no blob for it.
+- **Declared-but-absent volume:** scoped explicitly to it, the backup FAILS
+  (`ErrInvalidBackupScope`, row failed, blobs reaped, instance restarted);
+  unscoped with nothing on the host, it succeeds with an empty volume list.
 - **Scoped restore:** a `{sites}` backup restored against an instance holding
   `{sites, logs}` removes and recreates only `sites`; `logs` is never passed to
   `VolumeRemove`. The whole-instance case is asserted byte-for-byte unchanged

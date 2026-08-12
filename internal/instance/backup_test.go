@@ -454,6 +454,29 @@ func TestRestore_MissingBlob(t *testing.T) {
 	assert.ErrorIs(t, err, ErrBackupNotRestorable)
 }
 
+// TestRestore_MissingBlobLeavesExistingVolumeIntact: a restore may never delete
+// a volume it has no copy of. The blob is opened BEFORE the remove/create, so a
+// missing blob fails without touching the live content — the alternative leaves
+// the instance down with the volume recreated empty and its contents gone for
+// good.
+func TestRestore_MissingBlobLeavesExistingVolumeIntact(t *testing.T) {
+	svc, f, _, blob, id := newRestoreSvc(t)
+	ctx := context.Background()
+
+	// Live content diverged from the backup since it was taken; it is the only
+	// copy of these bytes once the blob is gone.
+	live := tarBytes(t, map[string]string{"f": "v2", "extra": "x"})
+	f.SetVolumeData("h1", "postgres-a-data", live)
+
+	require.NoError(t, blob.DeleteAll(ctx, backupBlobPrefix("h1", "postgres", "a", id)))
+
+	err := svc.Restore(ctx, RestoreRequest{BackupID: id}, nil)
+	require.ErrorIs(t, err, ErrBackupNotRestorable)
+
+	assert.Equal(t, live, f.VolumeData("h1", "postgres-a-data"),
+		"a missing blob must not destroy the volume it cannot restore")
+}
+
 func TestRestore_MissingBackup(t *testing.T) {
 	svc, _, _, _, _ := newRestoreSvc(t)
 	err := svc.Restore(context.Background(), RestoreRequest{BackupID: "bk_nope"}, nil)
@@ -1140,11 +1163,17 @@ func TestCheckBackupable_RejectsEmptyScopeWhenEveryDeclaredVolumeIsNone(t *testi
 
 	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
 	assert.ErrorIs(t, err, ErrInvalidBackupScope)
+	// The message must describe the case that actually happened — volumes ARE
+	// declared, and every one of them is vetoed — rather than sending an
+	// operator hunting for a marker on a template that declares nothing.
+	assert.Contains(t, err.Error(), "every one of them is marked")
 }
 
-// TestCheckBackupable_RejectsEmptyScopeWhenNoVolumesDeclared: same failure
-// mode, template declares no volumes at all.
-func TestCheckBackupable_RejectsEmptyScopeWhenNoVolumesDeclared(t *testing.T) {
+// TestCheckBackupable_AcceptsTemplateDeclaringNoVolumes: a stateless template
+// (the bundled `basic-web`) has nothing to back up. That is a valid no-op, not
+// an error — rejecting it would regress every caller that backs one up today,
+// with a message pointing at a `none` marker that does not exist.
+func TestCheckBackupable_AcceptsTemplateDeclaringNoVolumes(t *testing.T) {
 	svc, _, mem, _ := newBackupSvc(t)
 	ctx := context.Background()
 
@@ -1153,8 +1182,7 @@ func TestCheckBackupable_RejectsEmptyScopeWhenNoVolumesDeclared(t *testing.T) {
 	tmpl.Meta.Volumes = nil
 	require.NoError(t, mem.PutTemplate(ctx, tmpl))
 
-	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
-	assert.ErrorIs(t, err, ErrInvalidBackupScope)
+	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil))
 }
 
 // TestBackup_ScopeNarrowsTheExportSet: with two exportable volumes present, a
@@ -1179,11 +1207,14 @@ func TestBackup_ScopeNarrowsTheExportSet(t *testing.T) {
 	assert.Equal(t, "pg-a-data", b.Volumes[0].Name)
 }
 
-// TestBackup_ScopedToAnAbsentVolumeSucceeds: a DECLARED volume that does not
-// exist on the host yet is skipped, not an error — a brand-new instance must
-// not fail its first backup for it.
-func TestBackup_ScopedToAnAbsentVolumeSucceeds(t *testing.T) {
-	svc, _, mem, _ := newBackupSvc(t)
+// TestBackup_ExplicitScopeCapturingNothingFails: an EXPLICIT scope naming a
+// declared volume that does not exist on the host captures nothing.
+// CheckBackupable cannot see this (it validates against what the template
+// DECLARES), so the run must fail after InstanceVolumes resolves the empty set
+// rather than recording a green, empty backup the caller would later restore
+// from and get nothing back.
+func TestBackup_ExplicitScopeCapturingNothingFails(t *testing.T) {
+	svc, f, mem, blob := newBackupSvc(t)
 	ctx := context.Background()
 
 	tmpl, err := mem.GetTemplate(ctx, "pg")
@@ -1194,6 +1225,32 @@ func TestBackup_ScopedToAnAbsentVolumeSucceeds(t *testing.T) {
 
 	req := newBackupReq()
 	req.Volumes = []string{"cache"}
+	err = svc.Backup(ctx, req, nil)
+	require.ErrorIs(t, err, ErrInvalidBackupScope)
+
+	// The row is FAILED, not complete: it goes through the same fail() helper as
+	// any other mid-run failure.
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	assert.Equal(t, store.BackupFailed, b.State)
+	// Partial blobs reaped and the instance restarted, same as any mid-run failure.
+	assert.Equal(t, 0, blob.len())
+	p, perr := f.PodInspect(ctx, "h1", "pg-a")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status)
+}
+
+// TestBackup_UnscopedCapturingNothingSucceeds: the other half of the same rule.
+// An UNSCOPED backup resolving to zero exportable volumes is the brand-new
+// instance case — nothing has been written yet — and must still succeed.
+func TestBackup_UnscopedCapturingNothingSucceeds(t *testing.T) {
+	svc, f, _, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	// No volume exists on the host yet: the declared `data` was never created.
+	require.NoError(t, f.VolumeRemove(ctx, "h1", "pg-a-data", true))
+
+	req := newBackupReq() // no Volumes -> unscoped
 	require.NoError(t, svc.Backup(ctx, req, nil))
 
 	b, err := svc.store.GetBackup(ctx, req.BackupID)
