@@ -47,7 +47,10 @@ func backupTmpl() store.Template {
 				{Name: "slug", Type: "string", Required: true},
 				{Name: "image", Type: "string", Required: true},
 			},
-			Volumes: []render.Volume{{Name: "data", Backup: "none"}},
+			Volumes: []render.Volume{
+				{Name: "data", Backup: "s3; interval=24h"},
+				{Name: "logs", Backup: "none"},
+			},
 		},
 		Body: `apiVersion: v1
 kind: Pod

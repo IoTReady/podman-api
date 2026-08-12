@@ -61,7 +61,10 @@ func pgTemplate() store.Template {
 			Secrets: render.Secrets{
 				PerInstance: []string{"password"},
 			},
-			Volumes: []render.Volume{{Name: "data", Backup: "none"}},
+			Volumes: []render.Volume{
+				{Name: "data", Backup: "s3; interval=24h"},
+				{Name: "logs", Backup: "none"},
+			},
 		},
 		Body: `apiVersion: v1
 kind: Pod
@@ -1221,14 +1224,23 @@ func TestListAllInstancesPopulatesVolumeNames(t *testing.T) {
 	if found == nil {
 		t.Fatalf("expected postgres/demo in ListAllInstances output, got %+v", got)
 	}
-	if len(found.Volumes) != 1 {
-		t.Fatalf("volumes = %+v, want 1", found.Volumes)
+	// pgTemplate() declares two volumes ("data" and a none-marked "logs") — the
+	// declared sweep lists both regardless of backup markers; the veto only
+	// affects what Backup exports, not what ListAllInstances reports exists.
+	if len(found.Volumes) != 2 {
+		t.Fatalf("volumes = %+v, want 2", found.Volumes)
 	}
-	if want := "postgres-demo-data"; found.Volumes[0].Name != want {
-		t.Fatalf("volume name = %q, want %q", found.Volumes[0].Name, want)
+	names := map[string]bool{}
+	for _, v := range found.Volumes {
+		names[v.Name] = true
+		if v.SizeBytes != 0 {
+			t.Fatalf("size = %d, want 0 (sweep does not price volumes)", v.SizeBytes)
+		}
 	}
-	if found.Volumes[0].SizeBytes != 0 {
-		t.Fatalf("size = %d, want 0 (sweep does not price volumes)", found.Volumes[0].SizeBytes)
+	for _, want := range []string{"postgres-demo-data", "postgres-demo-logs"} {
+		if !names[want] {
+			t.Fatalf("volumes = %+v, want to include %q", found.Volumes, want)
+		}
 	}
 }
 

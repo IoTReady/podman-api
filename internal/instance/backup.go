@@ -123,35 +123,50 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 	}
 	step("stop", req.Host)
 
-	vols, err := s.InstanceVolumes(ctx, req.Host, req.Template, req.Slug)
-	if err != nil {
-		restart()
-		return fail(fmt.Errorf("list volumes: %w", err))
-	}
-	// Declared exclude patterns are keyed by the template's short volume name;
-	// InstanceVolumes returns podman's full <template>-<slug>-<vol> names.
-	// Resolve through the same volumeName() the pod manifest uses, so the two
-	// cannot drift.
+	// Template metadata is needed before the volume loop: it carries both the
+	// `none` veto and the declared exclude patterns. Declared exclude patterns
+	// are keyed by the template's short volume name; InstanceVolumes returns
+	// podman's full <template>-<slug>-<vol> names. Resolve through the same
+	// volumeName() the pod manifest uses, so the two cannot drift.
 	tpl, err := s.lookup(ctx, req.Host, req.Template)
 	if err != nil {
 		restart()
 		return fail(fmt.Errorf("lookup template: %w", err))
 	}
-	excludes := map[string][]string{}
-	for _, v := range tpl.Meta.Volumes {
-		if len(v.Exclude) > 0 {
-			excludes[volumeName(req.Template, req.Slug, v.Name)] = v.Exclude
-		}
+	type volMeta struct {
+		marker  string
+		exclude []string
 	}
+	declared := map[string]volMeta{}
+	for _, v := range tpl.Meta.Volumes {
+		declared[volumeName(req.Template, req.Slug, v.Name)] = volMeta{marker: v.Backup, exclude: v.Exclude}
+	}
+
+	vols, err := s.InstanceVolumes(ctx, req.Host, req.Template, req.Slug)
+	if err != nil {
+		restart()
+		return fail(fmt.Errorf("list volumes: %w", err))
+	}
+
 	var bvols []store.BackupVolume
 	for _, v := range vols {
-		bv, err := s.backupVolume(ctx, req, v.Name, excludes[v.Name])
+		m := declared[v.Name]
+		if m.marker == BackupMarkerNone {
+			// State the absence rather than leaving it to be inferred from a
+			// backup that silently lacks a volume.
+			step("skip-volume", v.Name+" (backup: none)")
+			continue
+		}
+		// Emitted BEFORE the export so a multi-minute volume shows the phase in
+		// progress rather than nothing until it returns (#135).
+		step("export-volume", v.Name)
+		bv, err := s.backupVolume(ctx, req, v.Name, m.exclude)
 		if err != nil {
 			restart()
 			return fail(fmt.Errorf("backup volume %q: %w", v.Name, err))
 		}
 		bvols = append(bvols, bv)
-		step("export-volume", v.Name)
+		step("export-volume-done", fmt.Sprintf("%s (%d bytes)", v.Name, bv.SizeBytes))
 	}
 
 	ok, err := s.store.CompleteBackup(ctx, req.BackupID, bvols)

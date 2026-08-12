@@ -61,7 +61,10 @@ func TestVolumeName_AllProducingPathsAgree(t *testing.T) {
 	require.Equal(t, want, got.Volumes[0].Name)
 
 	// 3. ListAllInstances (the sweep — declared names, no podman call; this is
-	//    the name the volume-usage collector joins on).
+	//    the name the volume-usage collector joins on). pgTemplate declares two
+	//    volumes ("data", "logs" — see internal/instance/service_test.go), so
+	//    the declared sweep lists both even though only "data" was added to the
+	//    fake host above.
 	all, err := svc.ListAllInstances(ctx, "h1")
 	require.NoError(t, err)
 	var swept []string
@@ -72,5 +75,5 @@ func TestVolumeName_AllProducingPathsAgree(t *testing.T) {
 			}
 		}
 	}
-	require.Equal(t, []string{want}, swept)
+	require.ElementsMatch(t, []string{want, volumeName(tmpl, slug, "logs")}, swept)
 }

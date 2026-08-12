@@ -44,6 +44,12 @@ var (
 	ErrBackupsDisabled     = errors.New("backups require a blob store (-backup-dir)")
 )
 
+// BackupMarkerNone is the one marker literal the core interprets. A volume
+// declaring `backup: none` is never exported by a backup, on any path. Every
+// other marker string stays opaque — the grammar (cadence, mode) belongs to a
+// commercial BackupScheduler, and the core ascribes it no meaning.
+const BackupMarkerNone = "none"
+
 // ApplyOptions controls the side effects of Apply beyond the request body.
 type ApplyOptions struct {
 	Replace  bool // if false and the pod exists, return ErrInstanceExists

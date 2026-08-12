@@ -294,8 +294,12 @@ func newBackupSvcTwoVols(t *testing.T) (*Service, *fake.Fake, *store.Memory, *me
 
 	tmpl := pgTemplate()
 	tmpl.Meta.ID = "pg"
-	// Add a second volume declaration alongside the existing "data" volume.
-	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "logs", Backup: "none"})
+	// pgTemplate() already declares "logs" as backup: none (vetoed, never
+	// exported) — this fixture needs a SECOND volume that IS exported so its
+	// mid-export failure is reachable, so override the declaration to a real
+	// marker. Map insertion order in backupVolume's declared lookup means this
+	// later entry wins over pgTemplate's own "logs" declaration.
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "logs", Backup: "s3; interval=24h"})
 	svc, mem := newSvcWith(t, f, hosts, tmpl)
 
 	require.NoError(t, mem.PutSpec(context.Background(), store.Spec{
@@ -1024,4 +1028,74 @@ func TestRestore_LeavesVolumesOutsideTheBackupAlone(t *testing.T) {
 
 	assert.NotEmpty(t, f.VolumeData("h1", "pg-a-extra"),
 		"restore deleted a declared volume the backup had no copy of")
+}
+
+// TestBackup_SkipsNoneMarkedVolumes proves `backup: none` is a veto rather than
+// documentation. The `logs` volume exists on the host and is exported today.
+func TestBackup_SkipsNoneMarkedVolumes(t *testing.T) {
+	svc, f, _, blob := newBackupSvc(t)
+	ctx := context.Background()
+	f.SetVolumeData("h1", "pg-a-logs", tarBytes(t, map[string]string{"app.log": "noise"}))
+
+	req := newBackupReq()
+	var steps []string
+	require.NoError(t, svc.Backup(ctx, req, recordSteps(&steps)))
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 1)
+	assert.Equal(t, "pg-a-data", b.Volumes[0].Name)
+
+	_, err = blob.Get(ctx, "h1/pg/a/"+req.BackupID+"/pg-a-logs.tar")
+	assert.ErrorIs(t, err, fs.ErrNotExist, "a none-marked volume must write no blob")
+
+	assert.Contains(t, steps, "skip-volume")
+}
+
+// TestBackup_ExportsUnmarkedVolumes locks the other half of the rule: only an
+// explicit `none` vetoes. A volume with no backup: field at all is still
+// captured — reading "unmarked" as "excluded" would silently shrink every
+// existing backup in the fleet.
+func TestBackup_ExportsUnmarkedVolumes(t *testing.T) {
+	svc, f, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "cache"})
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	f.SetVolumeData("h1", "pg-a-cache", tarBytes(t, map[string]string{"c": "1"}))
+
+	req := newBackupReq()
+	require.NoError(t, svc.Backup(ctx, req, nil))
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	names := []string{}
+	for _, v := range b.Volumes {
+		names = append(names, v.Name)
+	}
+	assert.ElementsMatch(t, []string{"pg-a-data", "pg-a-cache"}, names)
+}
+
+// TestBackup_EmitsExportStepBeforeExporting is the #135 fix: the step trail must
+// name the volume being exported for the DURATION of the export, not only once
+// it finishes. Without it the whole multi-minute stop window reads as dead air
+// between `stop` and the first sign of progress, and a live job is
+// indistinguishable from a hung one.
+func TestBackup_EmitsExportStepBeforeExporting(t *testing.T) {
+	svc, f, _, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	var steps []string
+	f.ExportReader = func(_, name string) io.ReadCloser {
+		// Assert mid-export: by the time bytes are being read, the step must
+		// already have been emitted.
+		assert.Contains(t, steps, "export-volume",
+			"export-volume must be emitted BEFORE the export begins")
+		return io.NopCloser(bytes.NewReader(tarBytes(t, map[string]string{"x": "1"})))
+	}
+
+	require.NoError(t, svc.Backup(ctx, newBackupReq(), recordSteps(&steps)))
+	assert.Contains(t, steps, "export-volume-done")
 }
