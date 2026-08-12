@@ -1673,7 +1673,7 @@ func TestBackup_UnscopedWithNoVolumesYetStillSucceeds(t *testing.T) {
 // regression against pre-branch behaviour, for a state it could not see.
 //
 // The core no longer guesses: nothing materialised means nothing is asserted.
-// Telling "renamed" from "new" from "lost" needs the spec's applied volume set,
+// Telling "renamed" from "new" from "lost" needs the spec's applied volume set (#257),
 // which store.Spec does not carry yet.
 func TestCheckBackupable_UnscopedAcceptsARenamedVolumeSet(t *testing.T) {
 	svc, f, mem, _ := newBackupSvc(t)
@@ -1722,6 +1722,18 @@ func TestCheckBackupable_UnscopedRefusesWhenEveryExistingVolumeIsVetoed(t *testi
 	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
 	require.ErrorIs(t, err, ErrInvalidBackupScope)
 	assert.Contains(t, err.Error(), "backup: none")
+
+	// The message must name BOTH halves of the observed state (review-6 finding
+	// 2). Rejecting is right either way — this run would stop the pod and
+	// capture nothing — but "every volume is vetoed" alone reads as a
+	// misconfiguration, when the commonest cause is an exportable volume the
+	// instance simply has not created yet. Naming the vetoed volume and the
+	// declared-but-absent one lets the operator recognise which case is theirs
+	// without the core having to guess.
+	assert.Contains(t, err.Error(), "pg-a-data", "must name the volume that exists and is vetoed")
+	assert.Contains(t, err.Error(), "cache", "must name the declared exportable volume that is absent")
+	assert.Contains(t, err.Error(), "resolves itself once it does",
+		"must say the not-yet-created case clears on its own, so it is not read as permanent")
 
 	// Remove the one existing volume and the guard must fall silent: nothing is
 	// materialised, so nothing was observed to skip, so nothing is asserted.

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"sort"
+	"strings"
 
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/render"
@@ -71,9 +73,33 @@ func backupBlobPrefix(host, tmpl, slug, id string) string {
 // review rounds of heuristics over backup history / scope presence / "did
 // anything materialise" each turned out to misclassify a real state. Telling
 // those apart needs the spec's APPLIED volume set, which store.Spec does not
-// carry today; until it does, the core does not guess.
+// carry today; until it does, the core does not guess. Tracked as #257, which
+// also records what each removed heuristic broke.
 func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, volumes []string) error {
-	_, err := s.checkBackupable(ctx, host, tmpl, slug, volumes)
+	_, err := s.checkBackupable(ctx, host, tmpl, slug, volumes, false)
+	return err
+}
+
+// CheckBackupScopeDeclared is CheckBackupable's DECLARATIVE half: everything
+// answerable from the store alone — backups configured, host and template
+// known, spec present, every named volume declared by the template and not
+// `backup: none`-vetoed, and the template not vetoed end to end. It never
+// contacts a host.
+//
+// It exists so a caller can reject a bad scope before paying for host
+// resolution, and specifically so backupctl can run it ahead of its dedupe
+// (which is store-local too) and resolve volumes only for a tick that will
+// actually enqueue. A misconfigured scope must never be masked by dedupe —
+// that was review-1 finding 6 — but only this half is needed to prevent it,
+// and doing the whole check first put a VolumeInspect per declared volume on
+// every tick of every instance, including ones already queued (review-6
+// finding 5).
+//
+// Passing it is NOT sufficient to admit a backup: the existence checks in
+// CheckBackupable can still refuse the run. Call this to fail early, then
+// CheckBackupable before enqueuing.
+func (s *Service) CheckBackupScopeDeclared(ctx context.Context, host, tmpl, slug string, volumes []string) error {
+	_, err := s.checkBackupable(ctx, host, tmpl, slug, volumes, true)
 	return err
 }
 
@@ -86,7 +112,7 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 // happens only when the template declares no volumes at all — in which case
 // InstanceVolumes would return an empty list anyway, since it iterates exactly
 // the declared names.
-func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, volumes []string) ([]podman.Volume, error) {
+func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, volumes []string, declaredOnly bool) ([]podman.Volume, error) {
 	if s.blobs == nil {
 		return nil, ErrBackupsDisabled
 	}
@@ -133,6 +159,9 @@ func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, 
 		if !anyDeclaredExportable {
 			return nil, fmt.Errorf("%w: template %s declares volumes but every one of them is marked `backup: none`", ErrInvalidBackupScope, tmpl)
 		}
+		if declaredOnly {
+			return nil, nil
+		}
 		// At least one declared volume is exportable in principle. Whether an
 		// unscoped run can actually capture anything depends on what is
 		// MATERIALISED on the host, so resolve that now — same InstanceVolumes
@@ -154,21 +183,50 @@ func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, 
 		// zero and the request is accepted. Whether that instance is new, renamed
 		// or emptied is exactly the question this branch used to guess at, and
 		// each guess broke a real case (review-5). It is answerable only from the
-		// spec's applied volume set, which is tracked separately.
+		// spec's applied volume set, tracked as #257.
 		markerByFullName := make(map[string]string, len(declared))
 		for short, marker := range declared {
 			markerByFullName[volumeName(tmpl, slug, short)] = marker
 		}
-		vetoed := 0
+		var vetoed []string
 		for _, v := range vols {
 			if IsBackupMarkerNone(markerByFullName[v.Name]) {
-				vetoed++
+				vetoed = append(vetoed, v.Name)
 				continue
 			}
 			return vols, nil // something exportable exists
 		}
-		if vetoed > 0 {
-			return nil, fmt.Errorf("%w: every volume of %s/%s present on %s is marked `backup: none` (nothing to capture)", ErrInvalidBackupScope, tmpl, slug, host)
+		if len(vetoed) > 0 {
+			// Reaching here means every MATERIALISED volume is vetoed while some
+			// DECLARED one is exportable but absent — the app has not created it
+			// yet, or it was lost. Which of those is the unanswerable question
+			// above, so the message asserts neither: it names what is present
+			// and vetoed, and what is declared, exportable and absent, and lets
+			// the operator recognise their own case.
+			//
+			// The rejection itself does not depend on telling them apart. Either
+			// way this run would stop the pod, walk past real data on purpose,
+			// and record a `complete` row with nothing in it — worth refusing on
+			// the outage alone, before the lying green row is even considered.
+			sort.Strings(vetoed)
+			present := make(map[string]bool, len(vols))
+			for _, v := range vols {
+				present[v.Name] = true
+			}
+			absent := make([]string, 0, len(declared))
+			for short, marker := range declared {
+				if !IsBackupMarkerNone(marker) && !present[volumeName(tmpl, slug, short)] {
+					absent = append(absent, short)
+				}
+			}
+			sort.Strings(absent)
+			detail := ""
+			if len(absent) > 0 {
+				detail = fmt.Sprintf("; the exportable volume(s) %s are declared but do not exist on %s — if the instance has not created them yet, this resolves itself once it does",
+					strings.Join(absent, " "), host)
+			}
+			return nil, fmt.Errorf("%w: every volume of %s/%s present on %s is marked `backup: none` (%s), so this backup would stop the pod and capture nothing%s",
+				ErrInvalidBackupScope, tmpl, slug, host, strings.Join(vetoed, " "), detail)
 		}
 		return vols, nil
 	}
@@ -180,6 +238,9 @@ func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, 
 		if IsBackupMarkerNone(marker) {
 			return nil, fmt.Errorf("%w: %q is marked `backup: none`", ErrInvalidBackupScope, name)
 		}
+	}
+	if declaredOnly {
+		return nil, nil
 	}
 	// Existence, resolved through the same volumeName() the pod manifest and
 	// Backup itself use, so the two cannot drift. InstanceVolumes returns only
@@ -224,7 +285,7 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 	// reused for the export loop below rather than being recomputed from
 	// scratch, so a backup costs one InstanceVolumes round trip here, not two
 	// (review-5 finding 7).
-	vols, err := s.checkBackupable(ctx, req.Host, req.Template, req.Slug, req.Volumes)
+	vols, err := s.checkBackupable(ctx, req.Host, req.Template, req.Slug, req.Volumes, false)
 	if err != nil {
 		return err
 	}
