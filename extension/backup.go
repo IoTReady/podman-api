@@ -136,6 +136,16 @@ type BackupController interface {
 	//     returns an empty jobID and an error wrapping ErrBackupDeferred.
 	//     Nothing was captured and nothing is in flight that will capture it —
 	//     retry on the next sweep, and do NOT record the window as satisfied.
+	//
+	// COST OF DISTINCT SCOPES. Because dedupe is by coverage rather than by
+	// instance, two ticks for the same instance with scopes neither of which
+	// covers the other BOTH enqueue. Each resulting job takes the instance lock,
+	// stops the pod, exports, and restarts it — so a scheduler emitting per-
+	// volume ticks buys one stop/start cycle PER SCOPE, serialized, not one for
+	// the window. That is the honest cost of not silently dropping a snapshot
+	// nobody else is taking, but it is a real outage multiplier: a scheduler
+	// that wants one outage per window should coalesce its volumes into a single
+	// scoped call rather than issuing one call per volume.
 	EnqueueBackup(ctx context.Context, host, template, slug string, opts BackupOptions) (jobID string, err error)
 }
 

@@ -1595,6 +1595,15 @@ paths:
             pod, skip all of it and capture nothing). Nothing is enqueued and no
             pod is stopped. An unscoped request against an instance with no
             volumes on the host at all is ACCEPTED and records an empty backup.
+
+
+            For that last case the message names both what it observed —
+            the volumes present and vetoed — and any volume the template
+            declares as exportable that does not exist on the host. The
+            commonest cause is not a misconfiguration but an exportable volume
+            the instance has not created yet, and that clears on its own once
+            it does; the two are not distinguishable from here, so the message
+            states both rather than asserting either.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}
