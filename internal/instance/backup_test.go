@@ -1656,3 +1656,91 @@ func TestBackup_UnscopedWithNoVolumesYetStillSucceeds(t *testing.T) {
 	assert.Equal(t, store.BackupComplete, b.State)
 	assert.Empty(t, b.Volumes)
 }
+
+// TestCheckBackupable_UnscopedRefusesWhenVolumesVanished (review-4 finding 2):
+// `len(vols) == 0` is reached by TWO different situations, and only one of them
+// is the brand-new-instance carve-out. When the instance's volumes DID exist
+// and are now gone (host rebuilt, `podman volume prune`, an evacuation that did
+// not land), an unscoped backup would stop the pod, export nothing and record a
+// green `complete` row with zero volumes — which then counts toward retention
+// and ages out the last backup that actually held data.
+//
+// The instance's own backup history tells the two apart: a prior COMPLETE
+// backup that recorded volumes is proof they existed.
+func TestCheckBackupable_UnscopedRefusesWhenVolumesVanished(t *testing.T) {
+	svc, f, _, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	// A real, successful backup of pg/a happened at some point.
+	req := newBackupReq()
+	require.NoError(t, svc.Backup(ctx, req, nil))
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	require.Equal(t, store.BackupComplete, b.State)
+	require.NotEmpty(t, b.Volumes, "fixture must have captured a volume for this test to mean anything")
+
+	// ...and then every volume of the instance disappeared.
+	require.NoError(t, f.VolumeRemove(ctx, "h1", "pg-a-data", true))
+
+	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
+	require.ErrorIs(t, err, ErrInvalidBackupScope,
+		"volumes that a prior complete backup captured are now missing: that is loss, not newness")
+	assert.Contains(t, err.Error(), "missing, not new")
+
+	// And the refusal is a PRE-STOP one: Backup itself never touches the pod.
+	var steps []string
+	err = svc.Backup(ctx, newBackupReq(), recordSteps(&steps))
+	require.ErrorIs(t, err, ErrInvalidBackupScope)
+	assert.NotContains(t, steps, "stop")
+
+	p, perr := f.PodInspect(ctx, "h1", "pg-a")
+	require.NoError(t, perr)
+	assert.Equal(t, "Running", p.Status)
+}
+
+// The other half of finding 2: history that does NOT prove the volumes ever
+// existed keeps the carve-out. A failed row proves nothing (it may have failed
+// BECAUSE the volumes were gone) and a complete row with no volumes is itself a
+// legitimate empty backup.
+func TestCheckBackupable_UnscopedKeepsCarveOutWithoutProvenVolumes(t *testing.T) {
+	ctx := context.Background()
+
+	cases := map[string]store.Backup{
+		"no history at all": {},
+		// A failed row never records volumes (FailBackup only sets the state), so
+		// it is no evidence either way — and it may have failed BECAUSE the
+		// volumes were already gone.
+		"a failed row": {
+			ID: "bk_failed", Host: "h1", Template: "pg", Slug: "a",
+			State: store.BackupFailed,
+		},
+		"a complete row that captured nothing": {
+			ID: "bk_empty", Host: "h1", Template: "pg", Slug: "a",
+			State: store.BackupComplete,
+		},
+	}
+
+	for name, row := range cases {
+		t.Run(name, func(t *testing.T) {
+			svc, f, _, _ := newBackupSvc(t)
+			require.NoError(t, f.VolumeRemove(ctx, "h1", "pg-a-data", true))
+			if row.ID != "" {
+				require.NoError(t, svc.store.CreateBackup(ctx, store.Backup{
+					ID: row.ID, Host: row.Host, Template: row.Template, Slug: row.Slug,
+				}))
+				switch row.State {
+				case store.BackupComplete:
+					ok, err := svc.store.CompleteBackup(ctx, row.ID, row.Volumes)
+					require.NoError(t, err)
+					require.True(t, ok)
+				case store.BackupFailed:
+					ok, err := svc.store.FailBackup(ctx, row.ID)
+					require.NoError(t, err)
+					require.True(t, ok)
+				}
+			}
+			assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil),
+				"nothing here proves the instance ever had a volume, so its first empty backup must still succeed")
+		})
+	}
+}

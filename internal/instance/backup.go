@@ -63,9 +63,10 @@ func backupBlobPrefix(host, tmpl, slug, id string) string {
 // template declares at least one non-vetoed volume, resolve what actually
 // exists on the host and reject if none of THOSE are exportable — i.e. every
 // materialised volume is vetoed, so the run would stop the pod and export
-// nothing. A brand-new instance with NO materialised volumes at all is still
-// the legitimate carve-out ("nothing exists yet") and is accepted: that first,
-// empty backup must succeed.
+// nothing. An instance with NO materialised volumes at all is accepted ONLY
+// when it has no backup history that recorded volumes — "nothing exists yet"
+// (first, empty backup, must succeed) as against "everything that existed is
+// gone" (host rebuilt, volumes pruned), which is refused.
 func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, volumes []string) error {
 	if s.blobs == nil {
 		return ErrBackupsDisabled
@@ -122,7 +123,26 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 			return fmt.Errorf("list volumes on %s: %w", host, err)
 		}
 		if len(vols) == 0 {
-			// Nothing materialised yet at all — the brand-new-instance carve-out.
+			// Nothing materialised. That is TWO states wearing one condition:
+			// "no volume has ever been created for this instance" (a brand-new
+			// instance whose first, empty backup must succeed) and "every volume
+			// this instance had is GONE" (host rebuilt, `podman volume prune`, an
+			// evacuation that did not land). Only the first is safe. The second
+			// would stop the pod, export nothing, and record a `complete` row with
+			// zero volumes — and retention then counts that empty row toward the
+			// keep-count and ages out the last backup that actually held data.
+			//
+			// The instance's own backup history distinguishes them: a prior
+			// COMPLETE backup that recorded volumes is proof this instance's
+			// volumes DID exist, so their absence now is loss, not newness. A
+			// failed or empty prior backup proves nothing and keeps the carve-out.
+			had, err := s.hadBackedUpVolumes(ctx, host, tmpl, slug)
+			if err != nil {
+				return err
+			}
+			if had {
+				return fmt.Errorf("%w: no volume of %s/%s exists on %s, but an earlier backup captured volumes for it — refusing to record an empty backup over a real one (the volumes are missing, not new)", ErrInvalidBackupScope, tmpl, slug, host)
+			}
 			return nil
 		}
 		markerByFullName := make(map[string]string, len(declared))
@@ -167,6 +187,29 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 		return fmt.Errorf("%w: requested volumes %v are declared by template %s but do not exist on %s (the instance predates the declaration — re-apply it first)", ErrInvalidBackupScope, missing, tmpl, host)
 	}
 	return nil
+}
+
+// hadBackedUpVolumes reports whether any COMPLETE backup of this instance
+// recorded at least one volume. It is the evidence that separates "this
+// instance is new" from "this instance's volumes are gone" when nothing is
+// materialised on the host.
+//
+// Only a complete row counts: a `creating` row may be the run asking the
+// question, and a `failed` one may have failed precisely because the volumes
+// were already missing. A complete row with zero volumes is a legitimate empty
+// backup (a stateless template, or a genuine first backup) and proves nothing
+// either.
+func (s *Service) hadBackedUpVolumes(ctx context.Context, host, tmpl, slug string) (bool, error) {
+	rows, err := s.store.ListBackups(ctx, host, tmpl, slug, store.MaxJobLimit)
+	if err != nil {
+		return false, fmt.Errorf("list backups of %s/%s on %s: %w", tmpl, slug, host, err)
+	}
+	for _, b := range rows {
+		if b.State == store.BackupComplete && len(b.Volumes) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Backup snapshots every volume of an instance into the blob store: stop,
