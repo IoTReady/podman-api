@@ -158,14 +158,16 @@ Three shapes are deliberately **not** read as "back up everything":
   automation that watches only job results must read the POST status to see
   it. A green row with an empty artifact set is worse than an error: it counts
   in retention and restores nothing.
-- The one case that still succeeds empty is an instance with **no volumes
-  created yet** — a brand-new instance's first backup. "Nothing exists yet"
-  and "everything that existed is gone" reach that same condition, though, so
-  they are told apart by the instance's own backup history: if an earlier
-  **complete** backup captured volumes and none exist now (host rebuilt,
-  volumes pruned, an evacuation that did not land), the request is refused
-  `400 invalid_backup_scope` rather than recording a green, empty row that
-  would age the last real backup out of retention.
+- An unscoped backup of an instance with **no volumes on the host at all**
+  still **succeeds**, recording an empty backup. That covers a brand-new
+  instance's first backup — but it also covers an instance whose volumes are
+  genuinely gone (host rebuilt, volumes pruned, an evacuation that did not
+  land) and one whose template has since **renamed** its volumes, and the
+  control plane cannot currently tell those apart: it knows which volumes a
+  template declares *now* and which exist on the host *now*, not which volumes
+  the instance was applied with. So it does not guess. If you are restoring
+  after a rebuild, check the backup's own `volumes` list rather than assuming
+  the newest row holds data.
 
 **This does not shrink the outage to zero.** A snapshot backup still stops
 the whole pod for the duration of the export — scoping only reduces how many

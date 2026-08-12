@@ -141,21 +141,45 @@ survives — was rejected: a scheduler misconfigured to name the wrong volume
 would then produce a fleet of green, empty backups, which is #104's failure
 mode one level up.
 
-A **declared** volume that does not yet exist on the host cannot be caught here
-at all: `CheckBackupable` runs against what the template declares, while what
-exists is only knowable once the run reaches `InstanceVolumes`. The rule splits
-by scope, and the second half lives in `Backup`, after the export loop:
+`CheckBackupable` also resolves what actually EXISTS on the host, through
+`InstanceVolumes`, and rejects two further cases before the pod is stopped:
 
-- An **explicit** scope (`req.Volumes` non-empty) that resolves to **zero**
-  exportable volumes **fails the run** — through the same `fail(...)` helper as
-  any other mid-run failure, so the row is marked failed, partial blobs are
-  reaped and the instance is restarted. The caller named something specific and
-  it was not captured; recording that as a complete backup is precisely the
-  green, empty backup this decision exists to prevent, and a later restore from
-  it would tear the pod down and restore nothing.
-- An **unscoped** backup (`req.Volumes` empty) that resolves to zero exportable
-  volumes still **succeeds**. That is the brand-new-instance case — no volume
-  has been written yet — and its first, empty backup must not fail.
+- an **explicit** scope naming a declared volume that does not exist (the
+  instance predates the declaration — re-apply it first), and
+- an **unscoped** request where at least one volume **exists** on the host and
+  **every** existing one is skipped because it is `none`-vetoed. We would stop
+  the pod, deliberately walk past real data, and record a `complete` row holding
+  nothing — a lie dressed as a backup, which retention then counts.
+
+That second rule is **the only guard on the unscoped path**, and every term in
+it is something the runner directly observed: the volume was inspected on the
+host, and the veto is read from the template meta. Note what it does **not**
+assert. When **nothing is materialised**, the request is **accepted**
+unconditionally. Whether that instance is brand new, or has been renamed in the
+template meta so `InstanceVolumes` no longer looks at the names its volumes
+actually carry, or has genuinely lost its volumes, is not decidable from
+anything the core can observe here.
+
+Four review rounds each proposed a heuristic for that question — "was a scope
+given", "did any volume materialise", "did a prior backup record volumes" — and
+each one was found to misclassify a real state; the last of them turned a
+template volume rename into a permanent 400 on every pre-existing instance of
+that template. The durable answer is a comparison against the **spec's applied
+volume set** (which volumes this instance was actually applied with), and
+`store.Spec` does not carry it today. Until it does, the core does not guess.
+That comparison is tracked as follow-up work; it also subsumes partial loss
+(some volumes survive, some are gone) and the admission-to-export race, neither
+of which is guarded today.
+
+The one post-export check that remains is on the **explicit-scope** path: every
+volume an explicit scope named must have been captured, as a SET comparison
+rather than an emptiness check — a partial hit is the dangerous shape. It fails
+the run through the same `fail(...)` helper as any other mid-run failure, so the
+row is marked failed, partial blobs are reaped and the instance is restarted.
+There is deliberately no post-export twin of it on the unscoped path: the guard
+above is decided pre-stop, from the same volume listing the export loop then
+consumes, and a second copy could only differ from it by re-observing state
+mid-run — the inference this design stopped making.
 
 Asking for a `none`-marked volume is an error rather than an honoured veto so
 that "I asked for X and got a backup without X" is impossible. A caller wanting

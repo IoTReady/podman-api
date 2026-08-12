@@ -1586,9 +1586,11 @@ paths:
             declared volume that does not exist on the host (the instance
             predates the declaration — re-apply it first), an explicitly empty
             `volumes` array, a template whose every declared volume is vetoed,
-            or an instance whose volumes have all disappeared although an
-            earlier backup captured them. Nothing is enqueued and no pod is
-            stopped.
+            or an unscoped request against an instance where every volume that
+            EXISTS on the host is marked `backup: none` (the run would stop the
+            pod, skip all of it and capture nothing). Nothing is enqueued and no
+            pod is stopped. An unscoped request against an instance with no
+            volumes on the host at all is ACCEPTED and records an empty backup.
           content:
             application/json:
               schema: {$ref: '#/components/schemas/Error'}

@@ -59,27 +59,46 @@ func backupBlobPrefix(host, tmpl, slug, id string) string {
 // A host error is wrapped as a host error, never reported as an invalid scope.
 //
 // An UNSCOPED request IS existence-checked here too, but only far enough to
-// close the same outage loop the explicit-scope check exists for: when the
-// template declares at least one non-vetoed volume, resolve what actually
-// exists on the host and reject if none of THOSE are exportable — i.e. every
-// materialised volume is vetoed, so the run would stop the pod and export
-// nothing. An instance with NO materialised volumes at all is accepted ONLY
-// when it has no backup history that recorded volumes — "nothing exists yet"
-// (first, empty backup, must succeed) as against "everything that existed is
-// gone" (host rebuilt, volumes pruned), which is refused.
+// close the same outage loop the explicit-scope check exists for: when at least
+// one volume EXISTS on the host and every one of those that exists is skipped
+// because it is `none`-vetoed, the run would stop the pod, deliberately skip
+// real data and capture nothing. That is refused here.
+//
+// Nothing is inferred beyond that. An instance with NO materialised volumes is
+// accepted unconditionally: whether that means "brand new, nothing written yet"
+// or "the volumes are under names this template no longer declares" or "they are
+// gone" is NOT decidable from anything this function can observe, and four
+// review rounds of heuristics over backup history / scope presence / "did
+// anything materialise" each turned out to misclassify a real state. Telling
+// those apart needs the spec's APPLIED volume set, which store.Spec does not
+// carry today; until it does, the core does not guess.
 func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, volumes []string) error {
+	_, err := s.checkBackupable(ctx, host, tmpl, slug, volumes)
+	return err
+}
+
+// checkBackupable is CheckBackupable's implementation, additionally returning
+// the instance's volumes as resolved on the host. Backup calls this under its
+// own lock and reuses the list for the export loop, so one backup costs one
+// InstanceVolumes round trip there rather than two (review-5 finding 7).
+//
+// The list is nil when the check short-circuited before touching the host, which
+// happens only when the template declares no volumes at all — in which case
+// InstanceVolumes would return an empty list anyway, since it iterates exactly
+// the declared names.
+func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, volumes []string) ([]podman.Volume, error) {
 	if s.blobs == nil {
-		return ErrBackupsDisabled
+		return nil, ErrBackupsDisabled
 	}
 	t, err := s.lookup(ctx, host, tmpl)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := s.store.GetSpec(ctx, host, tmpl, slug); err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return ErrInstanceNotFound
+			return nil, ErrInstanceNotFound
 		}
-		return err
+		return nil, err
 	}
 	declared := make(map[string]string, len(t.Meta.Volumes))
 	for _, v := range t.Meta.Volumes {
@@ -102,7 +121,7 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 		// exists (a brand-new instance must be able to take its first, empty
 		// backup).
 		if len(declared) == 0 {
-			return nil
+			return nil, nil
 		}
 		anyDeclaredExportable := false
 		for _, marker := range declared {
@@ -112,7 +131,7 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 			}
 		}
 		if !anyDeclaredExportable {
-			return fmt.Errorf("%w: template %s declares volumes but every one of them is marked `backup: none`", ErrInvalidBackupScope, tmpl)
+			return nil, fmt.Errorf("%w: template %s declares volumes but every one of them is marked `backup: none`", ErrInvalidBackupScope, tmpl)
 		}
 		// At least one declared volume is exportable in principle. Whether an
 		// unscoped run can actually capture anything depends on what is
@@ -120,49 +139,46 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 		// call, same cost, as the explicit-scope branch below.
 		vols, err := s.InstanceVolumes(ctx, host, tmpl, slug)
 		if err != nil {
-			return fmt.Errorf("list volumes on %s: %w", host, err)
+			return nil, fmt.Errorf("list volumes on %s: %w", host, err)
 		}
-		if len(vols) == 0 {
-			// Nothing materialised. That is TWO states wearing one condition:
-			// "no volume has ever been created for this instance" (a brand-new
-			// instance whose first, empty backup must succeed) and "every volume
-			// this instance had is GONE" (host rebuilt, `podman volume prune`, an
-			// evacuation that did not land). Only the first is safe. The second
-			// would stop the pod, export nothing, and record a `complete` row with
-			// zero volumes — and retention then counts that empty row toward the
-			// keep-count and ages out the last backup that actually held data.
-			//
-			// The instance's own backup history distinguishes them: a prior
-			// COMPLETE backup that recorded volumes is proof this instance's
-			// volumes DID exist, so their absence now is loss, not newness. A
-			// failed or empty prior backup proves nothing and keeps the carve-out.
-			had, err := s.hadBackedUpVolumes(ctx, host, tmpl, slug)
-			if err != nil {
-				return err
-			}
-			if had {
-				return fmt.Errorf("%w: no volume of %s/%s exists on %s, but an earlier backup captured volumes for it — refusing to record an empty backup over a real one (the volumes are missing, not new)", ErrInvalidBackupScope, tmpl, slug, host)
-			}
-			return nil
-		}
+		// The ONE guard, and it needs no inference: a volume EXISTS on the host
+		// and we would deliberately skip it because it is `none`-vetoed, and
+		// there is nothing else to capture. Stopping the pod, walking past real
+		// data on purpose and recording a `complete` row with zero volumes is a
+		// lie dressed as a backup — retention counts that green row and ages out
+		// the last one that actually held data. Every term here is something the
+		// runner directly observed: the volume was inspected on the host, and the
+		// veto is read from the template meta.
+		//
+		// Note what is NOT asserted: when NOTHING is materialised, `vetoed` is
+		// zero and the request is accepted. Whether that instance is new, renamed
+		// or emptied is exactly the question this branch used to guess at, and
+		// each guess broke a real case (review-5). It is answerable only from the
+		// spec's applied volume set, which is tracked separately.
 		markerByFullName := make(map[string]string, len(declared))
 		for short, marker := range declared {
 			markerByFullName[volumeName(tmpl, slug, short)] = marker
 		}
+		vetoed := 0
 		for _, v := range vols {
-			if !IsBackupMarkerNone(markerByFullName[v.Name]) {
-				return nil
+			if IsBackupMarkerNone(markerByFullName[v.Name]) {
+				vetoed++
+				continue
 			}
+			return vols, nil // something exportable exists
 		}
-		return fmt.Errorf("%w: every volume of %s/%s present on %s is marked `backup: none` (nothing to capture)", ErrInvalidBackupScope, tmpl, slug, host)
+		if vetoed > 0 {
+			return nil, fmt.Errorf("%w: every volume of %s/%s present on %s is marked `backup: none` (nothing to capture)", ErrInvalidBackupScope, tmpl, slug, host)
+		}
+		return vols, nil
 	}
 	for _, name := range volumes {
 		marker, ok := declared[name]
 		if !ok {
-			return fmt.Errorf("%w: %q is not declared by template %s", ErrInvalidBackupScope, name, tmpl)
+			return nil, fmt.Errorf("%w: %q is not declared by template %s", ErrInvalidBackupScope, name, tmpl)
 		}
 		if IsBackupMarkerNone(marker) {
-			return fmt.Errorf("%w: %q is marked `backup: none`", ErrInvalidBackupScope, name)
+			return nil, fmt.Errorf("%w: %q is marked `backup: none`", ErrInvalidBackupScope, name)
 		}
 	}
 	// Existence, resolved through the same volumeName() the pod manifest and
@@ -171,7 +187,7 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 	// loud on anything else), which is exactly the set wanted here.
 	vols, err := s.InstanceVolumes(ctx, host, tmpl, slug)
 	if err != nil {
-		return fmt.Errorf("list volumes on %s: %w", host, err)
+		return nil, fmt.Errorf("list volumes on %s: %w", host, err)
 	}
 	present := make(map[string]bool, len(vols))
 	for _, v := range vols {
@@ -184,32 +200,9 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 		}
 	}
 	if len(missing) > 0 {
-		return fmt.Errorf("%w: requested volumes %v are declared by template %s but do not exist on %s (the instance predates the declaration — re-apply it first)", ErrInvalidBackupScope, missing, tmpl, host)
+		return nil, fmt.Errorf("%w: requested volumes %v are declared by template %s but do not exist on %s (the instance predates the declaration — re-apply it first)", ErrInvalidBackupScope, missing, tmpl, host)
 	}
-	return nil
-}
-
-// hadBackedUpVolumes reports whether any COMPLETE backup of this instance
-// recorded at least one volume. It is the evidence that separates "this
-// instance is new" from "this instance's volumes are gone" when nothing is
-// materialised on the host.
-//
-// Only a complete row counts: a `creating` row may be the run asking the
-// question, and a `failed` one may have failed precisely because the volumes
-// were already missing. A complete row with zero volumes is a legitimate empty
-// backup (a stateless template, or a genuine first backup) and proves nothing
-// either.
-func (s *Service) hadBackedUpVolumes(ctx context.Context, host, tmpl, slug string) (bool, error) {
-	rows, err := s.store.ListBackups(ctx, host, tmpl, slug, store.MaxJobLimit)
-	if err != nil {
-		return false, fmt.Errorf("list backups of %s/%s on %s: %w", tmpl, slug, host, err)
-	}
-	for _, b := range rows {
-		if b.State == store.BackupComplete && len(b.Volumes) > 0 {
-			return true, nil
-		}
-	}
-	return false, nil
+	return vols, nil
 }
 
 // Backup snapshots every volume of an instance into the blob store: stop,
@@ -226,7 +219,13 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 	lk.Lock()
 	defer lk.Unlock()
 
-	if err := s.CheckBackupable(ctx, req.Host, req.Template, req.Slug, req.Volumes); err != nil {
+	// The recheck under the lock is deliberate — the handler's own pre-lock
+	// check may be arbitrarily stale by now — but its resolved volume list is
+	// reused for the export loop below rather than being recomputed from
+	// scratch, so a backup costs one InstanceVolumes round trip here, not two
+	// (review-5 finding 7).
+	vols, err := s.checkBackupable(ctx, req.Host, req.Template, req.Slug, req.Volumes)
+	if err != nil {
 		return err
 	}
 
@@ -304,11 +303,8 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 		declared[volumeName(req.Template, req.Slug, v.Name)] = volMeta{marker: v.Backup, exclude: v.Exclude}
 	}
 
-	vols, err := s.InstanceVolumes(ctx, req.Host, req.Template, req.Slug)
-	if err != nil {
-		restart()
-		return fail(fmt.Errorf("list volumes: %w", err))
-	}
+	// `vols` was resolved by the under-lock checkBackupable above; it is not
+	// re-listed here.
 
 	// Scope in declared short names, resolved through the same volumeName() the
 	// pod manifest uses. Empty scope means "everything not vetoed".
@@ -373,20 +369,13 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 			restart()
 			return fail(fmt.Errorf("%w: requested volumes %v were not captured (they disappeared from %s during the backup)", ErrInvalidBackupScope, missing, req.Host))
 		}
-	} else if len(bvols) == 0 && len(vols) > 0 {
-		// An UNSCOPED run that exported nothing WHILE THE INSTANCE HAS VOLUMES.
-		// CheckBackupable now resolves this same question up front, before
-		// anything is stopped (the "every materialised volume is vetoed" check,
-		// mirroring the explicit-scope existence check just above it in that
-		// function), so in the ordinary case nothing reaches here. This is now a
-		// DEFENSIVE BACKSTOP for the same race the explicit-scope comparison
-		// above guards against: a volume vetoed or removed between that check
-		// and this export. The carve-out is still "no volume exists yet" — a
-		// brand-new instance whose first, empty backup is legitimate — and NOT
-		// "no scope was given".
-		restart()
-		return fail(fmt.Errorf("%w: every volume of %s/%s was skipped, so this backup would capture nothing (all %d existing volume(s) are marked `backup: none`)", ErrInvalidBackupScope, req.Template, req.Slug, len(vols)))
 	}
+	// There is deliberately NO post-export emptiness check on the UNSCOPED path.
+	// The one guard that case needs — "volumes exist on the host and every one
+	// of them is `none`-vetoed" — is decided by checkBackupable above, from the
+	// same volume listing this loop just consumed, BEFORE the pod is stopped. A
+	// second copy here could only differ from it by re-observing state mid-run,
+	// which is the inference this design stopped making.
 
 	ok, err := s.store.CompleteBackup(ctx, req.BackupID, bvols)
 	if err != nil {
