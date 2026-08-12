@@ -142,3 +142,40 @@ func TestUpdateTemplate_StoredNearMissMarkerStaysEditable(t *testing.T) {
 	fresh.Meta.ID = "pg-copy"
 	assert.ErrorIs(t, svc.CreateTemplate(ctx, fresh), ErrInvalidTemplate)
 }
+
+// TestCloneTemplate_StoredNearMissMarkerStaysClonable is the same trap on the
+// clone path (review-6 finding 3). UpdateTemplate grandfathers a near-miss
+// marker the row already carried, but CloneTemplate validated strictly, so a
+// row registered before the rule existed could be edited and never copied —
+// 400 forever, with no in-product path to a working clone short of editing a
+// source template the operator may deliberately want left alone. A clone
+// introduces no marker its source did not already have.
+func TestCloneTemplate_StoredNearMissMarkerStaysClonable(t *testing.T) {
+	ctx := context.Background()
+	f := fake.New()
+	stored := pgTemplate()
+	for i := range stored.Meta.Volumes {
+		if stored.Meta.Volumes[i].Name == "logs" {
+			stored.Meta.Volumes[i].Backup = "None"
+		}
+	}
+	svc, mem := newSvcWith(t, f, []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}})
+	// Seeded directly, bypassing CreateTemplate: a row that predates the rule.
+	require.NoError(t, mem.PutTemplate(ctx, stored))
+
+	cl, err := svc.CloneTemplate(ctx, stored.Meta.ID, "pg-copy")
+	require.NoError(t, err, "a marker the source already carried must not block the copy")
+	assert.Equal(t, "pg-copy", cl.Meta.ID)
+	assert.Equal(t, "user", cl.Origin)
+
+	// The marker is copied verbatim — the clone is a copy, not a correction, and
+	// consumption still fails closed on it (IsBackupMarkerNone folds case).
+	var got string
+	for _, v := range cl.Meta.Volumes {
+		if v.Name == "logs" {
+			got = v.Backup
+		}
+	}
+	assert.Equal(t, "None", got)
+	assert.True(t, IsBackupMarkerNone(got), "the near-miss still vetoes, which is why grandfathering it is safe")
+}

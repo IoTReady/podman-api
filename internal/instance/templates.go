@@ -204,7 +204,15 @@ func (s *Service) CloneTemplate(ctx context.Context, srcID, newID string) (store
 	if err := render.NormalizeParams(&cl.Meta); err != nil {
 		return store.Template{}, fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
-	if err := ValidateTemplate(cl); err != nil {
+	// Validated as an EDIT of the source row, not strictly. A clone introduces
+	// no marker the source did not already carry, so a near-miss `none` stored
+	// before the registration rule existed must not make the row un-clonable —
+	// the same trap ValidateTemplateUpdate removes on the edit path, and with
+	// the same reasoning: there is otherwise no in-product path to a working
+	// clone short of editing a source template the operator may deliberately
+	// want left alone. A near-miss this clone NEWLY introduces cannot exist,
+	// since every marker here came from src.
+	if err := ValidateTemplateUpdate(cl, src); err != nil {
 		return store.Template{}, err
 	}
 	if _, err := s.GetTemplate(ctx, newID); err == nil {
