@@ -39,7 +39,7 @@ func TestBackupMarkerNoneWarning(t *testing.T) {
 			in: []store.Template{
 				tmpl("web", render.Volume{Name: "data"}, render.Volume{Name: "logs", Backup: "none"}),
 			},
-			want:  []string{"HARD VETO", "web[logs]"},
+			want: []string{"HARD VETO", "web[logs]"},
 			// The unmarked `data` volume is backed up normally and must not be
 			// listed among the vetoed ones.
 			nowat: []string{"data]", "[data"},

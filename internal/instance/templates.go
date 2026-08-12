@@ -53,6 +53,9 @@ func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
 	if t.Origin == "" {
 		t.Origin = "user"
 	}
+	if w := backupMarkerNoneWriteWarning(t); w != "" {
+		log.Printf("WARNING: %s", w)
+	}
 	return s.store.PutTemplate(ctx, t)
 }
 
@@ -90,7 +93,55 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 		}
 	}
 
+	if w := backupMarkerNoneWriteWarning(t); w != "" {
+		log.Printf("WARNING: %s", w)
+	}
+
 	return s.store.PutTemplate(ctx, t)
+}
+
+// BackupMarkerNoneVolumes returns the names of a template's volumes vetoed by
+// a `backup: none` marker, in declaration order. It is the ONE place the veto
+// is projected out of a Meta, so the startup audit (server) and the write-path
+// warning below cannot drift on what counts as vetoed — the comparison folds
+// case and trims, so a near-miss stored before the registration validator
+// existed is reported by both.
+func BackupMarkerNoneVolumes(m render.Meta) []string {
+	var out []string
+	for _, v := range m.Volumes {
+		if IsBackupMarkerNone(v.Backup) {
+			out = append(out, v.Name)
+		}
+	}
+	return out
+}
+
+// backupMarkerNoneWriteWarning returns the line to log when a template being
+// registered or edited declares `backup: none` volumes — or "" when it does
+// not, which is the common case and must stay silent.
+//
+// The startup audit (server.backupMarkerNoneWarning) covers the catalog as it
+// stands at boot, and nothing else: a template registered or edited against a
+// RUNNING daemon is never re-audited, so on a long-lived control plane the
+// reinterpretation of `none` stays invisible for months. The write path is
+// where the operator is actually standing, so it is where the consequence is
+// worth stating. Log-only, never a rejection: `none` may be exactly what the
+// author meant, and refusing it would break a legitimate declaration.
+//
+// The all-vetoed case gets its own sentence because its consequence is
+// categorically worse than a missing volume: CheckBackupable rejects EVERY
+// backup of every instance of such a template outright.
+func backupMarkerNoneWriteWarning(t store.Template) string {
+	vetoed := BackupMarkerNoneVolumes(t.Meta)
+	if len(vetoed) == 0 {
+		return ""
+	}
+	msg := fmt.Sprintf("template %q declares volume(s) %v as `backup: none`: they are a HARD VETO and will NEVER be exported by any backup, on any path — a backup of such an instance still completes green with those volumes absent from the blob set",
+		t.Meta.ID, vetoed)
+	if len(vetoed) == len(t.Meta.Volumes) {
+		msg += ". EVERY volume this template declares is vetoed, so every backup of every instance of it is now REJECTED (invalid_backup_scope)"
+	}
+	return msg
 }
 
 // ingressChanged reports whether an ingress declaration was removed or altered

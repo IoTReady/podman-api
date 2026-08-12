@@ -784,15 +784,15 @@ func registerInventoryMetrics(reg prometheus.Registerer, src obs.InventorySource
 // Templates and their volumes are both sorted so the line is stable across
 // restarts — an operator diffing two boots should see a change only when the
 // catalog changed.
+//
+// This covers the catalog AS IT STANDS AT BOOT and nothing more. A template
+// registered or edited against a running daemon is audited on the write path
+// instead (instance.CreateTemplate/UpdateTemplate), which is where the operator
+// making the change can actually read it.
 func backupMarkerNoneWarning(tmpls []store.Template) string {
 	var lines []string
 	for _, t := range tmpls {
-		var vols []string
-		for _, v := range t.Meta.Volumes {
-			if instance.IsBackupMarkerNone(v.Backup) {
-				vols = append(vols, v.Name)
-			}
-		}
+		vols := instance.BackupMarkerNoneVolumes(t.Meta)
 		if len(vols) == 0 {
 			continue
 		}
