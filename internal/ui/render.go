@@ -116,6 +116,8 @@ func errorStatus(err error) int {
 		return http.StatusConflict
 	case errors.Is(err, instance.ErrBackupsDisabled):
 		return http.StatusNotImplemented
+	case errors.Is(err, instance.ErrInvalidBackupScope):
+		return http.StatusBadRequest
 	case errors.Is(err, instance.ErrInstanceExists),
 		errors.Is(err, instance.ErrPortConflict):
 		return http.StatusConflict

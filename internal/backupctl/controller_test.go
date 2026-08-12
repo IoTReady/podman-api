@@ -168,6 +168,25 @@ func TestEnqueueBackup_differentInstanceNotDeduped(t *testing.T) {
 	assert.NotEmpty(t, id, "a different instance must not be deduped against an in-flight one")
 }
 
+// TestEnqueueBackup_ValidatesScopeBeforeDedupe: a bad scope must surface even
+// when a backup for the same instance is already in flight. The other order
+// answers a misconfigured scheduler with ("", nil) — "already in flight,
+// nothing to do" — which it records as a handled tick, so the typo'd or newly
+// vetoed volume name stays invisible for as long as backups keep overlapping.
+func TestEnqueueBackup_ValidatesScopeBeforeDedupe(t *testing.T) {
+	mem := store.NewMemory()
+	pre := instance.BackupRequest{BackupID: store.NewBackupID(), Host: "h1", Template: "web", Slug: "a"}
+	args, _ := json.Marshal(pre)
+	_, err := mem.Enqueue(context.Background(), "backup", args, "")
+	require.NoError(t, err)
+
+	c := &Controller{Svc: &fakeSvc{backupableErr: instance.ErrInvalidBackupScope}, Jobs: mem}
+	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a",
+		extension.BackupOptions{Volumes: []string{"typo"}})
+	require.ErrorIs(t, err, instance.ErrInvalidBackupScope)
+	assert.Empty(t, id)
+}
+
 func TestEnqueueBackup_propagatesCheckError(t *testing.T) {
 	c := &Controller{Svc: &fakeSvc{backupableErr: instance.ErrInstanceNotFound}, Jobs: store.NewMemory()}
 	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "gone", extension.BackupOptions{})

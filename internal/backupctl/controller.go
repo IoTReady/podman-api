@@ -103,16 +103,24 @@ func (c *Controller) LastBackupAt(ctx context.Context, host, template, slug stri
 
 // EnqueueBackup enqueues a backup job for one instance, deduping against any
 // backup already queued/running/reconciling for the same instance.
+//
+// The scope is validated BEFORE the dedupe check, deliberately. The other order
+// answers a misconfigured scheduler — a typo'd volume name, or one newly marked
+// `backup: none` — with the documented "already in flight, nothing to do"
+// (`"", nil`), which a scheduler records as a handled tick. The misconfiguration
+// then stays invisible for as long as backups keep overlapping, while the volume
+// the scheduler believes it is protecting is never captured. A bad scope is a
+// bad scope whether or not a run happens to be in flight.
 func (c *Controller) EnqueueBackup(ctx context.Context, host, template, slug string, opts extension.BackupOptions) (string, error) {
+	if err := c.Svc.CheckBackupable(ctx, host, template, slug, opts.Volumes); err != nil {
+		return "", err
+	}
 	inFlight, err := c.backupInFlight(ctx, host, template, slug)
 	if err != nil {
 		return "", err
 	}
 	if inFlight {
 		return "", nil
-	}
-	if err := c.Svc.CheckBackupable(ctx, host, template, slug, opts.Volumes); err != nil {
-		return "", err
 	}
 	req := instance.BackupRequest{
 		BackupID: store.NewBackupID(), Host: host, Template: template, Slug: slug,

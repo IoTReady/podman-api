@@ -524,6 +524,32 @@ func TestAPI_PostBackup_InvalidScopeIs400(t *testing.T) {
 	assert.Empty(t, jobs, "a rejected scope must enqueue nothing")
 }
 
+// TestAPI_PostBackup_TypoOrEmptyScopeNeverMeansEverything: the two shapes that
+// used to decode to an empty slice and be read as "unscoped" — a singular-key
+// typo, and an explicitly empty array — must be REJECTED, not answered with a
+// 202 that stops the pod and exports every volume the caller did not ask for.
+func TestAPI_PostBackup_TypoOrEmptyScopeNeverMeansEverything(t *testing.T) {
+	srv, tok, _, mem, _ := newBackupSrv(t)
+	ctx := context.Background()
+
+	for _, tc := range []struct{ body, code string }{
+		{`{"volume":["data"]}`, "invalid_request"},             // singular-key typo
+		{`{"volumes":[]}`, "invalid_backup_scope"},             // explicitly empty scope
+		{`{"volumes":["data"],"mode":"x"}`, "invalid_request"}, // unknown extra field
+	} {
+		resp := postJSON(t, srv, tok, "POST", "/hosts/h1/instances/postgres/a/backup", tc.body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, tc.body)
+		var eb ErrorBody
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&eb))
+		_ = resp.Body.Close()
+		assert.Equal(t, tc.code, eb.Code, tc.body)
+	}
+
+	jobs, err := mem.ListJobs(ctx, store.JobFilter{Kind: "backup", Limit: 10})
+	require.NoError(t, err)
+	assert.Empty(t, jobs, "none of these may enqueue a whole-instance backup")
+}
+
 func TestAPI_PostBackup_MalformedBodyIs400(t *testing.T) {
 	srv, tok, _, _, _ := newBackupSrv(t)
 
