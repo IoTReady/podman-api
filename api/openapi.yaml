@@ -1638,10 +1638,21 @@ paths:
       description: >-
         Validates synchronously (the backup exists and is complete, its host is
         known and not draining, the instance's spec still exists) and enqueues a
-        restore job. The restore replaces the instance's volumes in place from
-        the backup's blobs and re-applies the current spec; there is no rollback,
+        restore job. The restore replaces, in place, ONLY the volumes the backup
+        actually contains, and re-applies the current spec; there is no rollback,
         so a mid-restore failure leaves the instance down with the spec preserved
         for retry. Failures surface via GET /jobs/{id}.
+
+
+        WARNING — restoring a scoped backup produces a MIXED-EPOCH instance.
+        Volumes present in the backup are rolled back to the moment it was
+        taken; every other volume of the instance is left untouched and keeps
+        its current, NEWER content. Nothing is pruned. For an application whose
+        volumes are mutually consistent (a database plus its file store), that
+        combination may be a state the application has never seen. Check the
+        backup's `volumes` array (GET /backups/{id}, or the instance's backup
+        list) before restoring, and prefer an unscoped backup for whole-instance
+        recovery.
       parameters:
         - {name: id, in: path, required: true, schema: {type: string}}
       responses:
@@ -1681,9 +1692,11 @@ paths:
         pod with a restore intent handed to the sidecar injector (commercial
         Litestream): the injected initContainer rolls the backup-marked
         database(s) back to the requested instant. Distinct from
-        /backups/{id}/restore (which restores a tarball backup of all volumes):
-        this rolls a live instance back to a timestamp via the replication
-        replica. The intent is one-shot and is never persisted into the stored
+        /backups/{id}/restore (which restores a tarball backup of whichever
+        volumes that backup captured — every declared volume for an unscoped
+        backup, only the named ones for a scoped one, leaving the rest at their
+        current newer content): this rolls a live instance back to a timestamp
+        via the replication replica. The intent is one-shot and is never persisted into the stored
         spec, so a later pod restart does not replay the rollback. The timestamp
         is interpreted by the injector (Litestream uses RFC3339). Progress and
         failures (e.g. a timestamp outside the configured replica retention)

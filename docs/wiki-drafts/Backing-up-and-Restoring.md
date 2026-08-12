@@ -272,10 +272,17 @@ A completed job looks like:
 `export-volume` is emitted **before** that volume's export begins, so a
 multi-minute volume shows as in-progress in the step trail rather than
 nothing appearing until it finishes; `export-volume-done` follows with the
-byte count once the copy completes. A `skip-volume` step (detail `"<name>
-(backup: none)"`) is emitted instead, with no `export-volume` pair, for each
-volume the template vetoes — visible confirmation of what the backup does
-*not* contain, rather than leaving it to be inferred from an absence.
+byte count once the copy completes.
+
+Two different steps record a volume the backup does **not** contain, with no
+`export-volume` pair — they are distinct on purpose, because after the fact
+the step trail is the only place the two can be told apart:
+
+- `skip-volume` (detail `"<name> (backup: none)"`) — the template **vetoes**
+  that volume with `backup: none`. It would not be captured by any backup.
+- `skip-volume-scope` (detail `"<name> (not in the requested scope)"`) — the
+  volume is backup-able, but this request named a narrower scope. A later
+  unscoped backup captures it normally.
 
 ### List backups
 
