@@ -160,6 +160,14 @@ template meta so `InstanceVolumes` no longer looks at the names its volumes
 actually carry, or has genuinely lost its volumes, is not decidable from
 anything the core can observe here.
 
+One consequence of resolving the volume list once, under the lock, and reusing
+it for the export: the set a backup captures is the set observed at
+**admission**, not at export time. A volume that materialises in the window
+between the two — `pre_backup` runs and the pod stops in there — is omitted from
+an otherwise-successful unscoped backup rather than captured. That is the
+deliberate trade for not re-listing (the alternative costs a third host round
+trip per backup and still races), and it is bounded: the next run captures it.
+
 Four review rounds each proposed a heuristic for that question — "was a scope
 given", "did any volume materialise", "did a prior backup record volumes" — and
 each one was found to misclassify a real state; the last of them turned a
