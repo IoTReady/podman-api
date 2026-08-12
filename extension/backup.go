@@ -2,9 +2,23 @@ package extension
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"time"
 )
+
+// ErrBackupDeferred is returned by BackupController.EnqueueBackup when the
+// instance is temporarily unable to accept a backup and the tick was NOT
+// serviced by anything else. It is distinct from the "already covered by an
+// in-flight run" answer (`"", nil`) precisely because that one means the window
+// IS handled and this one means it is not: a scheduler that re-arms its interval
+// gate on a deferral silently drops every window the deferral spans.
+//
+// The correct response is to retry on the next sweep without treating the
+// window as satisfied. It is not a misconfiguration and should not be alerted on
+// as a failure — the condition (a crashed backup mid-reconcile) clears by
+// itself.
+var ErrBackupDeferred = errors.New("backup deferred: the instance is recovering from an interrupted backup")
 
 // BackupMarkerNone is the one `backup:` marker literal the core interprets: a
 // volume declaring it is never exported by a backup, on any path. Every other
@@ -101,14 +115,27 @@ type BackupController interface {
 	// opts.Volumes narrows what is captured; a nil scope means every declared
 	// volume not marked `none`, and an explicitly EMPTY one is an error.
 	//
-	// It is authoritative for in-flight dedupe: if a backup job for this
-	// instance is already in flight (queued, running, or reconciling) AND its
-	// scope COVERS the requested one, it enqueues nothing and returns an empty
-	// jobID with a nil error. An in-flight unscoped job covers every request; a
-	// scoped one covers only requests whose volumes are a subset of its own.
-	// A request the in-flight job does not cover is enqueued normally — it asks
-	// for work that run will not do, and swallowing it would drop that window's
-	// snapshot with no error and no retry.
+	// It is authoritative for in-flight dedupe, and distinguishes two answers a
+	// scheduler must NOT conflate:
+	//
+	//   - COVERED — a backup job for this instance is already queued or running
+	//     AND its scope COVERS the requested one. It enqueues nothing and
+	//     returns an empty jobID with a NIL error: the window is handled, and a
+	//     scheduler may re-arm its interval gate on it. An in-flight unscoped
+	//     job covers every request; a scoped one covers only requests whose
+	//     volumes are a subset of its own. A request the in-flight job does not
+	//     cover is enqueued normally — it asks for work that run will not do,
+	//     and swallowing it would drop that window's snapshot with no error and
+	//     no retry.
+	//
+	//   - DEFERRED — a backup job for this instance is RECONCILING, i.e. a
+	//     crashed run whose recovery sweep has not yet failed the row and
+	//     restarted the (currently stopped) pod. Reconciling exports nothing, so
+	//     it is not coverage at ANY scope; but starting a second backup now
+	//     would snapshot a stopped instance and leave it stopped. The call
+	//     returns an empty jobID and an error wrapping ErrBackupDeferred.
+	//     Nothing was captured and nothing is in flight that will capture it —
+	//     retry on the next sweep, and do NOT record the window as satisfied.
 	EnqueueBackup(ctx context.Context, host, template, slug string, opts BackupOptions) (jobID string, err error)
 }
 

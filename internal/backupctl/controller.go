@@ -141,12 +141,20 @@ func (c *Controller) EnqueueBackup(ctx context.Context, host, template, slug str
 	// and so never restarts the pod afterwards: two rows for one window and a
 	// green backup on an instance that is not serving. Defer the tick instead;
 	// the next one lands after the reconcile has settled.
+	//
+	// The deferral is reported as extension.ErrBackupDeferred, NOT as the
+	// `("", nil)` a covered tick returns (review-5 finding 6). Those two answers
+	// mean opposite things — "the window is handled" vs "nothing captured it and
+	// nothing will" — and a scheduler that re-arms its interval gate on `nil`
+	// would record every window a multi-sweep reconcile spans as taken. That is
+	// the exact silent drop the coverage check exists to prevent, relocated to
+	// the deferral path.
 	reconciling, err := c.backupReconciling(ctx, host, template, slug)
 	if err != nil {
 		return "", err
 	}
 	if reconciling {
-		return "", nil
+		return "", fmt.Errorf("%w: %s/%s/%s", extension.ErrBackupDeferred, host, template, slug)
 	}
 	covered, err := c.backupInFlightCovering(ctx, host, template, slug, volumes)
 	if err != nil {

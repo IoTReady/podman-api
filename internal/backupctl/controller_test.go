@@ -362,8 +362,13 @@ func TestBackupMarkers_NearMissNoneStillVetoes(t *testing.T) {
 // the crash left the instance STOPPED, and a backup started now records
 // wasRunning=false and therefore never restarts the pod afterwards, leaving the
 // instance down with two rows for one window and a green backup on something
-// that is not serving. The tick is deferred — no job, no error — regardless of
-// scope, including a scope the reconciling job would not have covered.
+// that is not serving. The tick is deferred regardless of scope, including a
+// scope the reconciling job would not have covered.
+//
+// The deferral is reported as extension.ErrBackupDeferred, NOT as the `("", nil)`
+// a covered tick returns (review-5 finding 6): those two answers mean opposite
+// things to a scheduler's interval gate, and returning the "handled" one here
+// would silently drop every window a multi-sweep reconcile spans.
 func TestEnqueueBackup_ReconcilingJobDefersTheTick(t *testing.T) {
 	reconciling := func(t *testing.T, pre instance.BackupRequest) *store.Memory {
 		t.Helper()
@@ -387,7 +392,8 @@ func TestEnqueueBackup_ReconcilingJobDefersTheTick(t *testing.T) {
 		mem := reconciling(t, instance.BackupRequest{BackupID: store.NewBackupID(), Host: "h1", Template: "web", Slug: "a"})
 		c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
 		id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a", extension.BackupOptions{})
-		require.NoError(t, err)
+		require.ErrorIs(t, err, extension.ErrBackupDeferred,
+			"a deferral must be distinguishable from a satisfied tick, or the scheduler re-arms its gate on an unhandled window")
 		assert.Empty(t, id, "the instance is mid-recovery and very likely stopped; nothing may start against it")
 	})
 
@@ -399,7 +405,7 @@ func TestEnqueueBackup_ReconcilingJobDefersTheTick(t *testing.T) {
 		c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
 		want := []string{"wal"}
 		id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a", extension.BackupOptions{Volumes: &want})
-		require.NoError(t, err)
+		require.ErrorIs(t, err, extension.ErrBackupDeferred)
 		assert.Empty(t, id, "a reconciling job of any scope defers a tick of any scope")
 	})
 
