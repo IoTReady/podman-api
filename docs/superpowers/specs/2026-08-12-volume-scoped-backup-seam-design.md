@@ -104,7 +104,7 @@ Carried through three places:
 
 - `instance.BackupRequest` gains `Volumes []string`, so a job's args survive a
   daemon restart and `ReconcileBackup` sees the same scope the run started with.
-- `POST /hosts/{host}/instances/{template}/{slug}/backups` accepts an optional
+- `POST /hosts/{host}/instances/{template}/{slug}/backup` (singular) accepts an optional
   JSON body `{"volumes": ["sites"]}`. An absent or empty body means today's
   behaviour, so every existing client is untouched.
 - `backupctl.Controller.EnqueueBackup` passes it straight through.
@@ -217,7 +217,7 @@ TDD, per the repo's habit — each behaviour gets its failing test first.
   from `ListBackupInstances`.
 - **Step trail:** `export-volume` precedes the export call; `skip-volume` names
   each vetoed volume.
-- **Wire compatibility:** a `POST /backups` with no body behaves exactly as
+- **Wire compatibility:** a `POST .../backup` with no body behaves exactly as
   before.
 
 ## Risks
