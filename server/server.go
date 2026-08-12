@@ -1,9 +1,12 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -37,6 +40,7 @@ import (
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/prune"
 	"github.com/iotready/podman-api/internal/registryprune"
+	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
 	"github.com/iotready/podman-api/internal/ui"
 	"github.com/iotready/podman-api/templates"
@@ -194,6 +198,12 @@ func RunWithFlags(opts ...Option) error {
 		return fmt.Errorf("seed templates: %w", err)
 	} else if n > 0 {
 		log.Printf("seeded %d templates into empty catalog", n)
+	}
+
+	if ids, err := migrateSeededTemplates(seedCtx, db, templates.Files); err != nil {
+		return fmt.Errorf("migrate seeded templates: %w", err)
+	} else if len(ids) > 0 {
+		log.Printf("templates: rewrote %d untouched seed row(s) to the current shipped seed: %s", len(ids), strings.Join(ids, ", "))
 	}
 
 	tmplCount, err := db.CountTemplates(seedCtx)
@@ -790,7 +800,7 @@ func registerInventoryMetrics(reg prometheus.Registerer, src obs.InventorySource
 // instead (instance.CreateTemplate/UpdateTemplate), which is where the operator
 // making the change can actually read it.
 func backupMarkerNoneWarning(tmpls []store.Template) string {
-	var lines []string
+	var lines, allVetoed []string
 	for _, t := range tmpls {
 		vols := instance.BackupMarkerNoneVolumes(t.Meta)
 		if len(vols) == 0 {
@@ -798,14 +808,31 @@ func backupMarkerNoneWarning(tmpls []store.Template) string {
 		}
 		sort.Strings(vols)
 		lines = append(lines, fmt.Sprintf("%s[%s]", t.Meta.ID, strings.Join(vols, " ")))
+		if len(vols) == len(t.Meta.Volumes) {
+			allVetoed = append(allVetoed, t.Meta.ID)
+		}
 	}
 	if len(lines) == 0 {
 		return ""
 	}
 	sort.Strings(lines)
-	return fmt.Sprintf("`backup: none` is a HARD VETO: these templates declare volume(s) that will NEVER be exported by any backup, "+
+	msg := fmt.Sprintf("`backup: none` is a HARD VETO: these templates declare volume(s) that will NEVER be exported by any backup, "+
 		"and a backup of such an instance still completes green with that volume absent from the blob set — %s. "+
 		"If a volume there holds data you need restorable, remove its `none` marker.", strings.Join(lines, ", "))
+	// A template whose volumes are ALL vetoed is a categorically stronger
+	// statement than "this template loses a volume": CheckBackupable refuses
+	// every backup of every instance of it, so those instances have no backup
+	// path at all — manual, scheduled or otherwise — and the operator finds out
+	// as a 400 at the next backup window unless it is said here. Named
+	// separately, and sorted for the same restart-stability reason.
+	if len(allVetoed) > 0 {
+		sort.Strings(allVetoed)
+		msg += fmt.Sprintf(" WORSE: EVERY volume declared by %s is vetoed, so instances of %s CANNOT BE BACKED UP AT ALL — "+
+			"every backup request is rejected outright (invalid_backup_scope), including the scheduler's.",
+			strings.Join(allVetoed, ", "),
+			map[bool]string{true: "that template", false: "those templates"}[len(allVetoed) == 1])
+	}
+	return msg
 }
 
 // pollerDisabledMetricsWarning returns the line to log when the inventory
@@ -1044,6 +1071,107 @@ func seedTemplates(ctx context.Context, db store.TemplateStore, fsys fs.FS) (int
 		}
 	}
 	return len(seeds), nil
+}
+
+// legacySeedVolumeMarkers records, per seed template id, the volume `backup:`
+// markers a PREVIOUS shipped seed carried, keyed by volume name. It is the
+// evidence a stored row is the untouched old seed rather than an operator's
+// own declaration, and nothing else — see migrateSeededTemplates.
+//
+// #249: `postgres` shipped `data: backup: none` back when a marker was opaque
+// ("non-empty means marked") and `none` therefore meant nothing in particular.
+// `none` is now a HARD VETO, which makes that row's every volume vetoed, and
+// CheckBackupable rejects such an instance outright — so on upgrade the exact
+// population with working postgres backups would get a permanent 400
+// `invalid_backup_scope` on every POST .../backup and every scheduler tick.
+var legacySeedVolumeMarkers = map[string]map[string]string{
+	"postgres": {"data": "none"},
+}
+
+// migrateSeededTemplates rewrites a stored template row to the currently
+// shipped seed — but ONLY when the row is recognisably the untouched previous
+// seed. seedTemplates returns early once the catalog is non-empty, so without
+// this a fix to a bundled template reaches fresh installs and nothing else.
+//
+// The bar for "untouched" is deliberately high: the row's origin must still be
+// "seed", its body must match the shipped body byte-for-byte, and its meta must
+// match the previous seed's meta exactly (compared through the same JSON
+// encoding the store round-trips it in). Any divergence — an edited body, an
+// added parameter, a marker the operator chose themselves — leaves the row
+// alone. Removing a `backup: none` the operator never wrote, from a row they
+// never touched, is correcting OUR reinterpretation of OUR own default;
+// anything less certain would be overwriting their intent, so it is not done.
+//
+// Returns the ids actually rewritten.
+func migrateSeededTemplates(ctx context.Context, db store.TemplateStore, fsys fs.FS) ([]string, error) {
+	seeds, err := store.ParseSeeds(fsys)
+	if err != nil {
+		return nil, err
+	}
+	var migrated []string
+	for _, seed := range seeds {
+		oldMarkers, ok := legacySeedVolumeMarkers[seed.Meta.ID]
+		if !ok {
+			continue
+		}
+		stored, err := db.GetTemplate(ctx, seed.Meta.ID)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return migrated, err
+		}
+		legacy, err := legacySeedMeta(seed.Meta, oldMarkers)
+		if err != nil {
+			return migrated, err
+		}
+		same, err := sameStoredMeta(stored.Meta, legacy)
+		if err != nil {
+			return migrated, err
+		}
+		if stored.Origin != "seed" || stored.Body != seed.Body || !same {
+			continue // operator-edited (or already current): never touched
+		}
+		upd := stored
+		upd.Meta = seed.Meta
+		upd.Body = seed.Body
+		if err := db.PutTemplate(ctx, upd); err != nil {
+			return migrated, err
+		}
+		migrated = append(migrated, seed.Meta.ID)
+	}
+	return migrated, nil
+}
+
+// legacySeedMeta returns m with the named volumes' markers set back to what the
+// previous seed shipped. The volume slice is copied, so the caller's meta (the
+// live seed) is never mutated.
+func legacySeedMeta(m render.Meta, markers map[string]string) (render.Meta, error) {
+	vols := make([]render.Volume, len(m.Volumes))
+	copy(vols, m.Volumes)
+	for i := range vols {
+		if marker, ok := markers[vols[i].Name]; ok {
+			vols[i].Backup = marker
+		}
+	}
+	m.Volumes = vols
+	return m, nil
+}
+
+// sameStoredMeta compares two metas through the JSON encoding the template
+// store persists them in, so the comparison sees exactly what a round trip
+// through the DB preserves and cannot be tripped by an unexported or
+// non-comparable field.
+func sameStoredMeta(a, b render.Meta) (bool, error) {
+	ja, err := json.Marshal(a)
+	if err != nil {
+		return false, err
+	}
+	jb, err := json.Marshal(b)
+	if err != nil {
+		return false, err
+	}
+	return bytes.Equal(ja, jb), nil
 }
 
 // resolveRegistryPassword picks the registry basic-auth password, preferring
