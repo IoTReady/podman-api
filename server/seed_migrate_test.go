@@ -76,8 +76,10 @@ func TestMigrateSeededTemplates_RewritesUntouchedOldSeed(t *testing.T) {
 	if m := postgresDataMarker(t, got); render.IsBackupMarkerNone(m) {
 		t.Fatalf("stored row still vetoes its only volume: marker %q", m)
 	}
-	if got.Origin != "seed" {
-		t.Errorf("origin changed to %q", got.Origin)
+	// The rewritten row is stamped as migrated — that stamp IS the applied-once
+	// marker (review-5 finding 2), so it must be recorded, not left at "seed".
+	if got.Origin != seedMigratedOrigin {
+		t.Errorf("origin = %q; want %q, the applied-once marker", got.Origin, seedMigratedOrigin)
 	}
 
 	// Idempotent: a second boot has nothing left to rewrite.
@@ -87,6 +89,55 @@ func TestMigrateSeededTemplates_RewritesUntouchedOldSeed(t *testing.T) {
 	}
 	if len(ids2) != 0 {
 		t.Errorf("second run rewrote %v; want none", ids2)
+	}
+}
+
+// TestMigrateSeededTemplates_NeverRevisitsAMigratedRow is the point of the
+// applied-once marker (review-5 finding 2). An operator who decides they
+// genuinely do not want postgres `data` backed up sets `backup: none` AFTER the
+// migration has run — and that row is byte-identical to the untouched legacy
+// seed, so the three-part "is this the old seed" guard cannot tell the two
+// apart. Without the marker, every subsequent boot silently reverts their veto,
+// in the fail-open direction, forever.
+func TestMigrateSeededTemplates_NeverRevisitsAMigratedRow(t *testing.T) {
+	ctx := context.Background()
+	db := store.NewMemory()
+	if err := db.PutTemplate(ctx, storedLegacySeed(t)); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if ids, err := migrateSeededTemplates(ctx, db, templates.Files); err != nil || len(ids) != 1 {
+		t.Fatalf("first migrate: ids=%v err=%v", ids, err)
+	}
+
+	// The operator now deliberately vetoes `data`, through the ordinary update
+	// path — which preserves the stored Origin. The resulting row is byte-for-
+	// byte the legacy seed again, apart from that Origin.
+	row, err := db.GetTemplate(ctx, "postgres")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	legacy, err := legacySeedMeta(row.Meta, legacySeedVolumeMarkers["postgres"])
+	if err != nil {
+		t.Fatalf("legacy meta: %v", err)
+	}
+	row.Meta = legacy
+	if err := db.PutTemplate(ctx, row); err != nil {
+		t.Fatalf("put vetoed row: %v", err)
+	}
+
+	ids, err := migrateSeededTemplates(ctx, db, templates.Files)
+	if err != nil {
+		t.Fatalf("second migrate: %v", err)
+	}
+	if len(ids) != 0 {
+		t.Fatalf("rewrote %v; a deliberate veto set after the migration ran must never be revisited", ids)
+	}
+	got, err := db.GetTemplate(ctx, "postgres")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if m := postgresDataMarker(t, got); !render.IsBackupMarkerNone(m) {
+		t.Fatalf("the operator's `none` was reverted to %q on the next boot", m)
 	}
 }
 

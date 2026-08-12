@@ -187,7 +187,11 @@ components:
           description: the renderable template body (Go text/template over YAML)
         origin:
           type: string
-          description: provenance of the stored template (e.g. "seed" or "api")
+          description: >-
+            provenance of the stored template: "seed" (shipped in the bundled
+            catalog), "user" (created through the API/UI), or "seed-migrated"
+            (a shipped row a boot-time seed migration has rewritten; also the
+            marker that keeps that migration one-shot)
         created: {type: string, format: date-time}
         updated: {type: string, format: date-time}
 

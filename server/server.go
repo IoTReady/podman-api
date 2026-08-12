@@ -1088,6 +1088,13 @@ var legacySeedVolumeMarkers = map[string]map[string]string{
 	"postgres": {"data": "none"},
 }
 
+// seedMigratedOrigin is the provenance stamped on a row migrateSeededTemplates
+// has rewritten. It is the applied-once marker: the migration only considers
+// rows whose origin is still "seed", so a row carrying this value is never
+// revisited on a later boot. It still reads as "we shipped this template", not
+// "a user created it" — the distinction Origin exists to record.
+const seedMigratedOrigin = "seed-migrated"
+
 // migrateSeededTemplates rewrites a stored template row to the currently
 // shipped seed — but ONLY when the row is recognisably the untouched previous
 // seed. seedTemplates returns early once the catalog is non-empty, so without
@@ -1101,6 +1108,23 @@ var legacySeedVolumeMarkers = map[string]map[string]string{
 // alone. Removing a `backup: none` the operator never wrote, from a row they
 // never touched, is correcting OUR reinterpretation of OUR own default;
 // anything less certain would be overwriting their intent, so it is not done.
+//
+// It is ONE-SHOT per row, and that is load-bearing rather than an efficiency
+// nicety (review-5 finding 2). An operator who decides they genuinely do not
+// want postgres `data` backed up and sets `backup: none` produces a row that is
+// BYTE-IDENTICAL to the untouched legacy seed — same origin, same body, same
+// meta — so the three-part guard above cannot tell their deliberate veto from
+// the row this migration exists to correct. Re-running every boot would revert
+// that veto, silently and in the fail-open direction, at every single restart.
+// Rewriting a row therefore stamps its Origin seedMigratedOrigin, which the
+// `Origin != "seed"` guard then skips forever: the correction happens at most
+// once per install, and any `none` set AFTER it is the operator's own and is
+// never revisited.
+//
+// Origin is the marker rather than a schema_migrations table because it is
+// already persisted per row, already survives UpdateTemplate (which preserves
+// the stored Origin), and the fact being recorded is genuinely per row — "has
+// THIS row been corrected" — not per database.
 //
 // Returns the ids actually rewritten.
 func migrateSeededTemplates(ctx context.Context, db store.TemplateStore, fsys fs.FS) ([]string, error) {
@@ -1135,6 +1159,7 @@ func migrateSeededTemplates(ctx context.Context, db store.TemplateStore, fsys fs
 		upd := stored
 		upd.Meta = seed.Meta
 		upd.Body = seed.Body
+		upd.Origin = seedMigratedOrigin
 		if err := db.PutTemplate(ctx, upd); err != nil {
 			return migrated, err
 		}
