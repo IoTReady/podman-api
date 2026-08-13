@@ -2,6 +2,9 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -19,11 +22,50 @@ func (h *handlers) postBackup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	host, tmpl, slug := r.PathValue("host"), r.PathValue("template"), r.PathValue("slug")
-	if err := h.svc.CheckBackupable(r.Context(), host, tmpl, slug); err != nil {
+
+	// The body is optional: every client predating volume scoping sends none,
+	// and an ENTIRELY ABSENT body must keep meaning "every backupable volume".
+	// That wire compatibility is load-bearing. io.EOF is therefore the ordinary
+	// case, not an error.
+	//
+	// `volumes` is a *[]string so absent and `[]` are distinguishable. They are
+	// NOT the same request: `{"volumes":[]}` (a UI where every box was
+	// deselected) previously decoded to an empty slice, which the handler read
+	// as "unscoped" and answered by stopping the pod and exporting every volume
+	// the caller explicitly did not ask for, behind a 202. An explicit empty
+	// array is rejected as an invalid scope instead — the safer reading, and the
+	// same direction as extension/backup.go's promise that a scope "never
+	// silently degrades to a smaller backup".
+	//
+	// DisallowUnknownFields catches the other half of that failure:
+	// `{"volume":["data"]}` (singular typo) decoded cleanly to an empty slice
+	// and was read as "everything" too.
+	var body struct {
+		Volumes *[]string `json:"volumes"`
+	}
+	dec := json.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_request", Message: "body must be a JSON object with an optional \"volumes\" array: " + err.Error()})
+		return
+	}
+	var volumes []string
+	if body.Volumes != nil {
+		if len(*body.Volumes) == 0 {
+			WriteError(w, fmt.Errorf("%w: \"volumes\" is present but empty; omit the body entirely to back up every volume not marked `backup: none`", instance.ErrInvalidBackupScope))
+			return
+		}
+		volumes = *body.Volumes
+	}
+
+	if err := h.svc.CheckBackupable(r.Context(), host, tmpl, slug, volumes); err != nil {
 		WriteError(w, err)
 		return
 	}
-	req := instance.BackupRequest{BackupID: store.NewBackupID(), Host: host, Template: tmpl, Slug: slug}
+	req := instance.BackupRequest{
+		BackupID: store.NewBackupID(), Host: host, Template: tmpl, Slug: slug,
+		Volumes: volumes,
+	}
 	args, err := json.Marshal(req)
 	if err != nil {
 		WriteJSON(w, http.StatusInternalServerError, ErrorBody{Code: "internal", Message: err.Error()})

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/iotready/podman-api/internal/api"
 	"github.com/iotready/podman-api/internal/instance"
 	"github.com/iotready/podman-api/internal/store"
 )
@@ -98,23 +99,64 @@ func TestLayoutCacheBustsAssets(t *testing.T) {
 
 func TestErrorStatus(t *testing.T) {
 	cases := map[error]int{
-		instance.ErrUnknownHost:       http.StatusNotFound,
-		instance.ErrUnknownTemplate:   http.StatusNotFound,
-		instance.ErrInstanceNotFound:  http.StatusNotFound,
-		instance.ErrInstanceExists:    http.StatusConflict,
-		instance.ErrPortConflict:      http.StatusConflict,
-		instance.ErrHostDraining:      http.StatusLocked,
-		instance.ErrHostSecretMissing: http.StatusUnprocessableEntity,
-		instance.ErrImagePull:         http.StatusBadGateway,
-		instance.ErrStoreDisabled:     http.StatusNotImplemented,
-		instance.ErrSameHost:          http.StatusBadRequest,
-		store.ErrSecretsNeedKey:       http.StatusBadRequest,
-		store.ErrSecretsUndecryptable: http.StatusUnprocessableEntity,
-		errors.New("boom"):            http.StatusInternalServerError,
+		instance.ErrUnknownHost:        http.StatusNotFound,
+		instance.ErrUnknownTemplate:    http.StatusNotFound,
+		instance.ErrInstanceNotFound:   http.StatusNotFound,
+		instance.ErrInstanceExists:     http.StatusConflict,
+		instance.ErrPortConflict:       http.StatusConflict,
+		instance.ErrHostDraining:       http.StatusLocked,
+		instance.ErrHostSecretMissing:  http.StatusUnprocessableEntity,
+		instance.ErrImagePull:          http.StatusBadGateway,
+		instance.ErrStoreDisabled:      http.StatusNotImplemented,
+		instance.ErrSameHost:           http.StatusBadRequest,
+		store.ErrSecretsNeedKey:        http.StatusBadRequest,
+		store.ErrSecretsUndecryptable:  http.StatusUnprocessableEntity,
+		instance.ErrInvalidBackupScope: http.StatusBadRequest,
+		errors.New("boom"):             http.StatusInternalServerError,
 	}
 	for err, want := range cases {
 		if got := errorStatus(err); got != want {
 			t.Errorf("errorStatus(%v) = %d, want %d", err, got, want)
+		}
+	}
+}
+
+// TestErrorStatus_AgreesWithAPIClassify locks the two parallel switches
+// together. errorStatus (here) and the JSON API's classify()
+// (internal/api/errors.go) are hand-maintained mirrors of each other, and they
+// drift silently: ErrInvalidBackupScope was added to classify() as a 400 and
+// missed here, so a plain client-side scope error rendered the UI page with a
+// 500 — enough to trip uptime monitors on a benign action. Any sentinel added
+// to one switch and not the other fails this test rather than waiting to be
+// noticed in production. classify() is unexported, so its status is read the
+// only way a caller can: through the exported WriteError.
+func TestErrorStatus_AgreesWithAPIClassify(t *testing.T) {
+	shared := []error{
+		instance.ErrUnknownHost,
+		instance.ErrUnknownTemplate,
+		instance.ErrInstanceNotFound,
+		instance.ErrInstanceExists,
+		instance.ErrPortConflict,
+		instance.ErrHostDraining,
+		instance.ErrHostSecretMissing,
+		instance.ErrImagePull,
+		instance.ErrStoreDisabled,
+		instance.ErrSameHost,
+		instance.ErrBackupNotFound,
+		instance.ErrBackupNotRestorable,
+		instance.ErrBackupBusy,
+		instance.ErrBackupsDisabled,
+		instance.ErrInvalidBackupScope,
+		store.ErrNotFound,
+		store.ErrSecretsNeedKey,
+		store.ErrSecretsUndecryptable,
+		store.ErrSpecCorrupt,
+	}
+	for _, err := range shared {
+		rec := httptest.NewRecorder()
+		api.WriteError(rec, err)
+		if got, want := errorStatus(err), rec.Code; got != want {
+			t.Errorf("errorStatus(%v) = %d, but api.classify() = %d — the two switches have drifted", err, got, want)
 		}
 	}
 }

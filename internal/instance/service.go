@@ -42,7 +42,25 @@ var (
 	ErrBackupNotRestorable = errors.New("backup is not restorable")
 	ErrBackupBusy          = errors.New("backup has a backup or restore in flight")
 	ErrBackupsDisabled     = errors.New("backups require a blob store (-backup-dir)")
+	ErrInvalidBackupScope  = errors.New("backup scope names a volume that cannot be backed up")
 )
+
+// BackupMarkerNone is the one marker literal the core interprets. A volume
+// declaring `backup: none` is never exported by a backup, on any path. Every
+// other marker string stays opaque — the grammar (cadence, mode) belongs to a
+// commercial BackupScheduler, and the core ascribes it no meaning.
+//
+// It is an alias of render.BackupMarkerNone (itself an alias of the canonical
+// extension.BackupMarkerNone) rather than its own literal, so the definitions
+// cannot drift.
+const BackupMarkerNone = render.BackupMarkerNone
+
+// IsBackupMarkerNone reports whether a raw marker is the `none` veto. Use this
+// rather than `== BackupMarkerNone`: the comparison folds case and trims
+// whitespace so a near-miss stored before the registration validator existed
+// still vetoes, instead of failing open and exporting the volume. See
+// extension.IsBackupMarkerNone.
+func IsBackupMarkerNone(marker string) bool { return render.IsBackupMarkerNone(marker) }
 
 // ApplyOptions controls the side effects of Apply beyond the request body.
 type ApplyOptions struct {

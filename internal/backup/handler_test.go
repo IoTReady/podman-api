@@ -48,7 +48,9 @@ func pgTemplate() store.Template {
 				{Name: "slug", Type: "string", Required: true},
 				{Name: "image", Type: "string", Required: true},
 			},
-			Volumes: []render.Volume{{Name: "data", Backup: "none"}},
+			// A real marker, not "none": these tests exercise an actual
+			// backup/restore round trip, which needs the volume exported.
+			Volumes: []render.Volume{{Name: "data", Backup: "s3; interval=24h"}},
 		},
 		Body: `apiVersion: v1
 kind: Pod

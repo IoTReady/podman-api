@@ -7,8 +7,10 @@ podman-api. Introduced in #66 (OSS primitive).
 
 ## What a backup is
 
-A **backup** captures every Podman volume attached to one instance at the
-same stopped moment — a consistent, SQLite-safe snapshot:
+A **backup** captures the Podman volumes attached to one instance — by
+default every declared volume not marked `backup: none`, or a narrower
+explicit scope naming a subset of them — at the same stopped moment: a
+consistent, SQLite-safe snapshot:
 
 1. The instance is stopped.
 2. Each volume is exported as a plain uncompressed tar (`podman volume export`),
@@ -100,6 +102,114 @@ instance legitimately has nothing to exclude yet).
 
 ---
 
+## Scoping a backup to specific volumes
+
+`POST .../backup` accepts an optional JSON body naming which of the
+template's declared volumes to capture:
+
+```sh
+curl -s -X POST \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"volumes": ["sites"]}' \
+  https://podman-api.example.com/hosts/prod-1/instances/frappe-otp/acme/backup
+```
+
+Names are the template's declared **short** volume names (`sites`, not the
+resolved `frappe-otp-acme-sites` podman name). An absent body means "every
+backupable volume" — the same behaviour as before this existed, so no
+existing caller has to change.
+
+Scope is validated **synchronously, before anything is enqueued**: naming a
+volume the template doesn't declare, or one the template marks `backup:
+none`, returns `400` with `{"code": "invalid_backup_scope", ...}` and stops
+no pod. A scoped backup does not silently degrade to a smaller one on a typo
+— it fails the request outright.
+
+Three shapes are deliberately **not** read as "back up everything":
+
+- `{"volumes": []}` — an explicitly empty scope is rejected
+  (`invalid_backup_scope`). Omit the body entirely to mean "everything".
+- `{"volume": ["sites"]}` — an unknown field (the singular typo, say) is
+  rejected `400 invalid_request` rather than decoding to an empty scope.
+
+  > **Wire break.** The body is decoded strictly, and this handler previously
+  > did not read it at all. A client that sends an unrelated object —
+  > `{"reason": "nightly"}`, say — used to get `202` and a job, and now gets
+  > `400 invalid_request` and **no backup**. The status code is the only
+  > signal, so an automation that ignores it simply stops taking backups.
+  > Send no body at all for an unscoped backup. The strictness is deliberate:
+  > tolerating unknown fields is what makes the singular-typo case above
+  > silently mean "back up everything".
+- An explicit scope naming a volume that does not exist on the host is
+  rejected `400 invalid_backup_scope`, **before any pod is stopped**. The
+  common way to hit this is a template edit that marks a new volume on a
+  fleet whose instances have not been re-applied: the volume is declared,
+  so the name looks valid, but nothing has created it yet. Re-apply the
+  instance, then back it up. (A volume that vanishes *during* a run is
+  caught after the export instead — the row is marked `failed`, partial
+  artifacts are removed and the instance restarted. A caller that asked for
+  something specific and got only part of it must not be handed a green
+  backup row.)
+- An **unscoped** backup is rejected `400 invalid_backup_scope`, **before any
+  pod is stopped**, if it would capture nothing *while the instance has
+  volumes* — e.g. every existing volume is `backup: none`. It is not a job
+  failure: nothing is enqueued, so there is no job id to poll and an
+  automation that watches only job results must read the POST status to see
+  it. A green row with an empty artifact set is worse than an error: it counts
+  in retention and restores nothing.
+- An unscoped backup of an instance with **no volumes on the host at all**
+  still **succeeds**, recording an empty backup. That covers a brand-new
+  instance's first backup — but it also covers an instance whose volumes are
+  genuinely gone (host rebuilt, volumes pruned, an evacuation that did not
+  land) and one whose template has since **renamed** its volumes, and the
+  control plane cannot currently tell those apart: it knows which volumes a
+  template declares *now* and which exist on the host *now*, not which volumes
+  the instance was applied with. So it does not guess. If you are restoring
+  after a rebuild, check the backup's own `volumes` list rather than assuming
+  the newest row holds data.
+
+**This does not shrink the outage to zero.** A snapshot backup still stops
+the whole pod for the duration of the export — scoping only reduces how many
+bytes are copied while it's down, in proportion to what you drop. Excluding
+a large, rarely-changed volume from the scope shortens the stop; it does not
+remove it.
+
+### The `none` veto
+
+A template volume can declare `backup: none` to opt permanently out of being
+backed up, on every path — an explicit scope in the POST body, the default
+"every volume", and a commercial scheduler's cadence-driven trigger all
+honour it identically. It is the **one** marker literal the core itself
+interprets; every other non-empty value (`s3; interval=6h`, a Litestream DB
+path, …) is opaque grammar owned by the commercial tier.
+
+**Only the literal `none` vetoes.** A volume with no `backup:` field at all
+is not opted out — it is still backed up in full by an unscoped request; the
+absence of a marker carries no meaning to the core beyond "no commercial
+scheduler will pick this volume up on its own." Don't read a missing
+`backup:` field as "excluded" — that's what `none` is for.
+
+**The spelling is exact, and enforced at registration — but the comparison
+itself fails closed.** A marker whose whole job is "never capture this" must
+not fail *open* on a typo, so every consumption site compares with case
+folded and surrounding whitespace trimmed: `None`, `NONE` and `"none "` all
+veto, exactly as `none` does. That covers rows written before the validator
+existed, which are never re-validated on read.
+
+Template registration **additionally rejects** a marker that differs from
+`none` only by case or whitespace, naming the exact literal required. The two
+are belt and braces, not redundancy: registration is where an author who
+wrote `None` is *told*, rather than left guessing which reading applies. It
+is not quietly corrected, and the stored string is never rewritten — only the
+comparison is tolerant.
+
+A vetoed volume named explicitly in a scope request is rejected at the door
+(`invalid_backup_scope`, above). A vetoed volume left out of an unscoped
+request is simply skipped, and the job's step trail says so — see below.
+
+---
+
 ## Where artifacts live
 
 Artifact files are written to the local filesystem of the API server under
@@ -184,14 +294,30 @@ A completed job looks like:
   "kind": "backup",
   "state": "succeeded",
   "steps": [
-    {"name": "load",         "detail": "prod-1/postgres/my-db"},
-    {"name": "stop",         "detail": "prod-1"},
-    {"name": "export-volume","detail": "data"},
-    {"name": "restart",      "detail": "prod-1"},
-    {"name": "complete",     "detail": "bk_01J4XY..."}
+    {"name": "load",              "detail": "prod-1/postgres/my-db"},
+    {"name": "stop",              "detail": "prod-1"},
+    {"name": "export-volume",     "detail": "data"},
+    {"name": "export-volume-done","detail": "data (52428800 bytes)"},
+    {"name": "restart",           "detail": "prod-1"},
+    {"name": "complete",          "detail": "bk_01J4XY..."}
   ]
 }
 ```
+
+`export-volume` is emitted **before** that volume's export begins, so a
+multi-minute volume shows as in-progress in the step trail rather than
+nothing appearing until it finishes; `export-volume-done` follows with the
+byte count once the copy completes.
+
+Two different steps record a volume the backup does **not** contain, with no
+`export-volume` pair — they are distinct on purpose, because after the fact
+the step trail is the only place the two can be told apart:
+
+- `skip-volume` (detail `"<name> (backup: none)"`) — the template **vetoes**
+  that volume with `backup: none`. It would not be captured by any backup.
+- `skip-volume-scope` (detail `"<name> (not in the requested scope)"`) — the
+  volume is backup-able, but this request named a narrower scope. A later
+  unscoped backup captures it normally.
 
 ### List backups
 
@@ -255,16 +381,26 @@ The restore is enqueued as an async job:
 ```
 
 Poll `GET /jobs/01J4ZZ...` for progress. A successful restore job steps
-through: `load` → `teardown` → `restore-volume` (one step per volume) →
-`apply` → `verify`.
+through: `load` → `preflight-blobs` → `teardown` → `restore-volume` (one step
+per volume) → `apply` → `verify`.
 
 The endpoint validates synchronously before enqueuing:
 - The backup exists and is in `complete` state.
 - The backup's host is known and not draining (a 423 is returned if it is).
 - The instance spec exists in the state store.
+- **Every artifact file the backup lists is readable** — the whole set, not
+  one at a time.
 
 A draining host is refused **synchronously** (before teardown) so the job
 cannot be left in a half-restored state on a host that is being evacuated.
+The artifact preflight is upfront for the same reason and a stronger one: a
+restore whose third artifact is missing would otherwise roll the first two
+volumes back to backup-epoch content before discovering it cannot finish,
+leaving the instance **down** and mixed-epoch. Checking the set first makes
+that failure atomic — nothing is touched, and the instance keeps serving.
+So a backup whose artifacts were hand-deleted now fails the *request*
+(`422 backup_not_restorable`) rather than a job that has already stopped the
+instance.
 
 ### Delete a backup
 
@@ -295,7 +431,8 @@ shows a **BACKUPS** section with:
 - A list of existing backups (ID, timestamp, state, image hint, per-volume
   size).
   - **Restore** button (only on `complete` rows) — triggers the confirmation
-    dialog ("This stops the instance and OVERWRITES its current data"), then
+    dialog, which names the volumes this backup actually contains and warns
+    that every other volume keeps its current data, then
     enqueues a restore job and re-renders the page with a notice.
   - **Delete** button — removes the backup after a browser confirm prompt.
 
@@ -306,13 +443,19 @@ behaviour (same validation, same job enqueue).
 
 ## Restore semantics
 
-Restore is **in-place** and **destructive**:
+Restore is **in-place** and **destructive** — but only for the volumes the
+backup actually covers:
 
 1. The instance is stopped.
-2. The pod and all its volumes are torn down (`Delete` with `PruneVolumes`).
-   Per-instance and host-scoped secrets are kept — `Apply` re-pushes them
-   from the stored spec.
-3. Each volume is recreated and imported from the backup's artifact file.
+2. The pod is torn down (`Delete` with `PruneVolumes: false` — volumes are
+   *not* bulk-removed here). Per-instance and host-scoped secrets are kept —
+   `Apply` re-pushes them from the stored spec.
+3. Each volume **the backup contains** is removed and recreated immediately
+   before its own import, one at a time, then imported from the backup's
+   artifact file. A volume the instance has today that the backup does not
+   cover — because it was scoped out at backup time, or vetoed by `backup:
+   none` — is never touched: it is not removed, not recreated, and keeps
+   whatever live content it had going into the restore.
 4. The content of every restored volume is **verified** against the sha256
    manifest stored in the DB. Verification always runs (unlike migrate, where
    it can be disabled). A mismatch fails the job before declaring success.
@@ -320,6 +463,44 @@ Restore is **in-place** and **destructive**:
    to recreate containers and start the instance.
 6. The job waits until every container is `Running` and every declared
    healthcheck reports `healthy` before succeeding.
+
+**A scoped restore is partial by design.** Restoring from a backup that only
+covers `sites` leaves every other volume exactly as it was before the
+restore ran — that's the point of the scope, not a limitation of it. The
+practical corollary: a restore can no longer delete data it has no copy of.
+Before this, tearing down the pod with `PruneVolumes` removed every volume
+the instance declared, including ones the backup being restored from never
+captured — so restoring a scoped or `none`-vetoed backup used to destroy
+data with no way to bring it back. That hole is closed; check *which*
+volumes a backup covers (the `volumes` list in its
+[list-backups](#list-backups) row) before relying on a restore to put
+everything back the way it was.
+
+> ⚠️ **A partial restore can leave an instance internally inconsistent, and
+> nothing detects it.** The volumes a backup covers go back to the moment the
+> backup was taken; every other volume stays at **today**. For anything whose
+> state is split across two volumes that must agree, that is a broken instance,
+> not a partial one:
+>
+> - A Postgres data directory restored to yesterday beside a WAL volume left at
+>   today either refuses to start on an invalid checkpoint record, or replays
+>   stale WAL over the restored directory.
+> - An application database restored to yesterday beside an uploads/files volume
+>   left at today has rows referencing files that do not exist, and files no row
+>   knows about.
+>
+> This is the direct cost of the guarantee above — a restore may never delete a
+> volume it has no copy of — and it is the right trade, because the alternative
+> destroys data outright. But it means `backup: none` and an explicit scope are
+> decisions about **restorability**, not just about backup size. Do not mark a
+> volume `none` (or scope it out) if the instance's correctness depends on it
+> agreeing with a volume that *is* backed up. Where two volumes must move
+> together, back them up together.
+>
+> Before restoring, check the `volumes` list on the backup row
+> ([list-backups](#list-backups)) against the volumes the instance declares. If
+> the backup covers fewer, decide explicitly what happens to the rest —
+> restoring is not that decision.
 
 **There is no rollback.** A failure after step 2 (teardown) leaves the
 instance **down** with volumes partially restored. The spec row is

@@ -75,7 +75,10 @@ func TestService_Apply_InjectsSidecar(t *testing.T) {
 
 	// Meta is the public projection of render.Meta, carrying ID + backup volumes.
 	assert.Equal(t, "postgres", inj.gotMeta.ID)
-	assert.Equal(t, []extension.TemplateVolume{{Name: "data", Backup: "none"}}, inj.gotMeta.Volumes)
+	assert.Equal(t, []extension.TemplateVolume{
+		{Name: "data", Backup: "s3; interval=24h"},
+		{Name: "logs", Backup: "none"},
+	}, inj.gotMeta.Volumes)
 
 	// The injected YAML — not the original — is what got played.
 	require.Len(t, f.PlayCalls, 1)

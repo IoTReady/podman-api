@@ -53,6 +53,9 @@ func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
 	if t.Origin == "" {
 		t.Origin = "user"
 	}
+	if w := backupMarkerNoneWriteWarning(t); w != "" {
+		log.Printf("WARNING: %s", w)
+	}
 	return s.store.PutTemplate(ctx, t)
 }
 
@@ -65,12 +68,21 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 	if err := render.NormalizeParams(&t.Meta); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
-	if err := ValidateTemplate(t); err != nil {
+	// The stored row is read BEFORE validation because validation depends on it:
+	// a near-miss `none` marker the row already carries must not fail an edit
+	// that does not touch it (review-4 finding 4). The error precedence a caller
+	// sees is unchanged — an invalid submission is still reported as invalid,
+	// even for an id that does not exist — so the lookup error is held back
+	// until after ValidateTemplateUpdate has had its say.
+	existing, gerr := s.GetTemplate(ctx, t.Meta.ID)
+	if gerr != nil && !errors.Is(gerr, ErrUnknownTemplate) {
+		return gerr
+	}
+	if err := ValidateTemplateUpdate(t, existing); err != nil {
 		return err
 	}
-	existing, err := s.GetTemplate(ctx, t.Meta.ID)
-	if err != nil {
-		return err
+	if gerr != nil {
+		return gerr
 	}
 	t.Origin = existing.Origin
 
@@ -90,7 +102,55 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 		}
 	}
 
+	if w := backupMarkerNoneWriteWarning(t); w != "" {
+		log.Printf("WARNING: %s", w)
+	}
+
 	return s.store.PutTemplate(ctx, t)
+}
+
+// BackupMarkerNoneVolumes returns the names of a template's volumes vetoed by
+// a `backup: none` marker, in declaration order. It is the ONE place the veto
+// is projected out of a Meta, so the startup audit (server) and the write-path
+// warning below cannot drift on what counts as vetoed — the comparison folds
+// case and trims, so a near-miss stored before the registration validator
+// existed is reported by both.
+func BackupMarkerNoneVolumes(m render.Meta) []string {
+	var out []string
+	for _, v := range m.Volumes {
+		if IsBackupMarkerNone(v.Backup) {
+			out = append(out, v.Name)
+		}
+	}
+	return out
+}
+
+// backupMarkerNoneWriteWarning returns the line to log when a template being
+// registered or edited declares `backup: none` volumes — or "" when it does
+// not, which is the common case and must stay silent.
+//
+// The startup audit (server.backupMarkerNoneWarning) covers the catalog as it
+// stands at boot, and nothing else: a template registered or edited against a
+// RUNNING daemon is never re-audited, so on a long-lived control plane the
+// reinterpretation of `none` stays invisible for months. The write path is
+// where the operator is actually standing, so it is where the consequence is
+// worth stating. Log-only, never a rejection: `none` may be exactly what the
+// author meant, and refusing it would break a legitimate declaration.
+//
+// The all-vetoed case gets its own sentence because its consequence is
+// categorically worse than a missing volume: CheckBackupable rejects EVERY
+// backup of every instance of such a template outright.
+func backupMarkerNoneWriteWarning(t store.Template) string {
+	vetoed := BackupMarkerNoneVolumes(t.Meta)
+	if len(vetoed) == 0 {
+		return ""
+	}
+	msg := fmt.Sprintf("template %q declares volume(s) %v as `backup: none`: they are a HARD VETO and will NEVER be exported by any backup, on any path — a backup of such an instance still completes green with those volumes absent from the blob set",
+		t.Meta.ID, vetoed)
+	if len(vetoed) == len(t.Meta.Volumes) {
+		msg += ". EVERY volume this template declares is vetoed, so every backup of every instance of it is now REJECTED (invalid_backup_scope)"
+	}
+	return msg
 }
 
 // ingressChanged reports whether an ingress declaration was removed or altered
@@ -144,7 +204,15 @@ func (s *Service) CloneTemplate(ctx context.Context, srcID, newID string) (store
 	if err := render.NormalizeParams(&cl.Meta); err != nil {
 		return store.Template{}, fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
-	if err := ValidateTemplate(cl); err != nil {
+	// Validated as an EDIT of the source row, not strictly. A clone introduces
+	// no marker the source did not already carry, so a near-miss `none` stored
+	// before the registration rule existed must not make the row un-clonable —
+	// the same trap ValidateTemplateUpdate removes on the edit path, and with
+	// the same reasoning: there is otherwise no in-product path to a working
+	// clone short of editing a source template the operator may deliberately
+	// want left alone. A near-miss this clone NEWLY introduces cannot exist,
+	// since every marker here came from src.
+	if err := ValidateTemplateUpdate(cl, src); err != nil {
 		return store.Template{}, err
 	}
 	if _, err := s.GetTemplate(ctx, newID); err == nil {
@@ -199,7 +267,20 @@ func (s *Service) DeleteTemplate(ctx context.Context, id string, force bool) err
 //     values are stored in plaintext, so authors must use secrets.per_instance.
 //  5. Every volume's exclude patterns must be relative, non-empty and
 //     compilable (render.ValidateVolumes).
-func ValidateTemplate(t store.Template) error {
+func ValidateTemplate(t store.Template) error { return validateTemplate(t, nil) }
+
+// ValidateTemplateUpdate is ValidateTemplate for an EDIT of stored: identical
+// except that a near-miss `none` volume marker already present in the stored
+// row is not rejected (render.ValidateVolumesUpdate). Without that, a row
+// registered before the near-miss rule existed can never be edited again, for
+// any reason, and there is no in-product path to the row to fix it. A near-miss
+// the update NEWLY introduces is still rejected. Pass a zero store.Template to
+// validate strictly.
+func ValidateTemplateUpdate(t, stored store.Template) error {
+	return validateTemplate(t, &stored)
+}
+
+func validateTemplate(t store.Template, stored *store.Template) error {
 	if !render.ValidName(t.Meta.ID) {
 		return fmt.Errorf("%w: id %q must match %s", ErrInvalidTemplate, t.Meta.ID, render.NameRe.String())
 	}
@@ -218,8 +299,12 @@ func ValidateTemplate(t store.Template) error {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
 
-	if err := render.ValidateVolumes(t.Meta); err != nil {
-		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
+	volErr := render.ValidateVolumes(t.Meta)
+	if stored != nil {
+		volErr = render.ValidateVolumesUpdate(t.Meta, stored.Meta)
+	}
+	if volErr != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidTemplate, volErr)
 	}
 
 	rendered, err := render.RenderBody(t.Body, dummyParams(t.Meta))

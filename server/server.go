@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"io/fs"
@@ -13,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -36,6 +38,7 @@ import (
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/prune"
 	"github.com/iotready/podman-api/internal/registryprune"
+	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
 	"github.com/iotready/podman-api/internal/ui"
 	"github.com/iotready/podman-api/templates"
@@ -195,6 +198,25 @@ func RunWithFlags(opts ...Option) error {
 		log.Printf("seeded %d templates into empty catalog", n)
 	}
 
+	if rw, err := migrateSeededTemplates(seedCtx, db, templates.Files); err != nil {
+		return fmt.Errorf("migrate seeded templates: %w", err)
+	} else if len(rw) > 0 {
+		// Name every marker changed, not just the count. This runs once per
+		// install and cannot tell our stale default from a deliberate veto that
+		// happens to spell the same thing (see migrateSeededTemplates), so the
+		// line has to carry enough for an operator reading logs afterwards to
+		// notice a veto of theirs was dropped and put it back — after which it
+		// is never touched again.
+		msgs := make([]string, 0, len(rw))
+		for _, r := range rw {
+			msgs = append(msgs, r.String())
+		}
+		sort.Strings(msgs)
+		log.Printf("templates: corrected %d stale seed volume marker(s) — %s. "+
+			"If one of these was a deliberate `backup: none` of yours, set it again: this correction runs once and will not revisit the row.",
+			len(rw), strings.Join(msgs, "; "))
+	}
+
 	tmplCount, err := db.CountTemplates(seedCtx)
 	if err != nil {
 		return fmt.Errorf("templates: count: %w", err)
@@ -214,6 +236,24 @@ func RunWithFlags(opts ...Option) error {
 		}
 		svc.SetBlobStore(blobs)
 		log.Printf("backups enabled: %s", bdir)
+	}
+
+	// `backup: none` became a hard veto (#249): before it, ANY non-empty marker
+	// simply meant "marked", and this repo's own fixtures across five packages
+	// carried `none` on PRIMARY DATA volumes — good evidence real templates do
+	// too. Those instances keep returning 202 and completing green while the
+	// blob set quietly loses a volume, and the only trace is one `skip-volume`
+	// step buried in a job trail nobody reads on a success. Say it once, at
+	// startup, where an upgrading operator can see the reinterpretation.
+	//
+	// Log-only and once per process: it is a property of the catalog, not of
+	// any run, so failing startup would take a fleet down over a marker that
+	// may well be exactly what the author meant, and logging it per backup
+	// would bury it in noise.
+	if tmpls, err := db.ListTemplates(seedCtx); err != nil {
+		log.Printf("templates: listing for the `backup: none` audit failed: %v (skipping the audit)", err)
+	} else if w := backupMarkerNoneWarning(tmpls); w != "" {
+		log.Printf("WARNING: %s", w)
 	}
 
 	if c.sidecarInjector != nil {
@@ -753,6 +793,59 @@ func registerInventoryMetrics(reg prometheus.Registerer, src obs.InventorySource
 	return obs.NewInventoryCollector(reg, src, hosts)
 }
 
+// backupMarkerNoneWarning returns the one-time startup line naming every
+// template that declares a `backup: none` volume — or "" when the catalog has
+// none, which is the common case and must stay silent.
+//
+// The comparison is instance.IsBackupMarkerNone, not string equality, so a
+// near-miss spelling stored before the registration validator existed (`None`,
+// `"none "`) is reported here too: it vetoes now, and that is exactly the
+// reinterpretation an operator needs told.
+//
+// Templates and their volumes are both sorted so the line is stable across
+// restarts — an operator diffing two boots should see a change only when the
+// catalog changed.
+//
+// This covers the catalog AS IT STANDS AT BOOT and nothing more. A template
+// registered or edited against a running daemon is audited on the write path
+// instead (instance.CreateTemplate/UpdateTemplate), which is where the operator
+// making the change can actually read it.
+func backupMarkerNoneWarning(tmpls []store.Template) string {
+	var lines, allVetoed []string
+	for _, t := range tmpls {
+		vols := instance.BackupMarkerNoneVolumes(t.Meta)
+		if len(vols) == 0 {
+			continue
+		}
+		sort.Strings(vols)
+		lines = append(lines, fmt.Sprintf("%s[%s]", t.Meta.ID, strings.Join(vols, " ")))
+		if len(vols) == len(t.Meta.Volumes) {
+			allVetoed = append(allVetoed, t.Meta.ID)
+		}
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	sort.Strings(lines)
+	msg := fmt.Sprintf("`backup: none` is a HARD VETO: these templates declare volume(s) that will NEVER be exported by any backup, "+
+		"and a backup of such an instance still completes green with that volume absent from the blob set — %s. "+
+		"If a volume there holds data you need restorable, remove its `none` marker.", strings.Join(lines, ", "))
+	// A template whose volumes are ALL vetoed is a categorically stronger
+	// statement than "this template loses a volume": CheckBackupable refuses
+	// every backup of every instance of it, so those instances have no backup
+	// path at all — manual, scheduled or otherwise — and the operator finds out
+	// as a 400 at the next backup window unless it is said here. Named
+	// separately, and sorted for the same restart-stability reason.
+	if len(allVetoed) > 0 {
+		sort.Strings(allVetoed)
+		msg += fmt.Sprintf(" WORSE: EVERY volume declared by %s is vetoed, so instances of %s CANNOT BE BACKED UP AT ALL — "+
+			"every backup request is rejected outright (invalid_backup_scope), including the scheduler's.",
+			strings.Join(allVetoed, ", "),
+			map[bool]string{true: "that template", false: "those templates"}[len(allVetoed) == 1])
+	}
+	return msg
+}
+
 // pollerDisabledMetricsWarning returns the line to log when the inventory
 // poller is off but the operator explicitly asked for metrics only the poller
 // can produce — or "" when there is nothing worth saying. Both resource-metric
@@ -989,6 +1082,155 @@ func seedTemplates(ctx context.Context, db store.TemplateStore, fsys fs.FS) (int
 		}
 	}
 	return len(seeds), nil
+}
+
+// legacySeedVolumeMarkers records, per seed template id, the volume `backup:`
+// markers a PREVIOUS shipped seed carried, keyed by volume name. It is the
+// evidence a stored row is the untouched old seed rather than an operator's
+// own declaration, and nothing else — see migrateSeededTemplates.
+//
+// #249: `postgres` shipped `data: backup: none` back when a marker was opaque
+// ("non-empty means marked") and `none` therefore meant nothing in particular.
+// `none` is now a HARD VETO, which makes that row's every volume vetoed, and
+// CheckBackupable rejects such an instance outright — so on upgrade the exact
+// population with working postgres backups would get a permanent 400
+// `invalid_backup_scope` on every POST .../backup and every scheduler tick.
+var legacySeedVolumeMarkers = map[string]map[string]string{
+	"postgres": {"data": "none"},
+}
+
+// seedMigratedOrigin is the provenance stamped on a row migrateSeededTemplates
+// has rewritten. It is the applied-once marker: the migration only considers
+// rows whose origin is still "seed", so a row carrying this value is never
+// revisited on a later boot. It still reads as "we shipped this template", not
+// "a user created it" — the distinction Origin exists to record.
+const seedMigratedOrigin = "seed-migrated"
+
+// seedMarkerRewrite records one volume marker this migration corrected, so the
+// startup line can name exactly what changed rather than only how many rows it
+// touched. An operator reading logs after the fact needs the volume and the
+// marker that was removed — that is the whole recoverable content of the event.
+type seedMarkerRewrite struct {
+	Template string
+	Volume   string
+	From     string
+	To       string
+}
+
+func (r seedMarkerRewrite) String() string {
+	to := r.To
+	if to == "" {
+		to = "unset"
+	}
+	return fmt.Sprintf("%s.%s: backup:%s → %s", r.Template, r.Volume, r.From, to)
+}
+
+// migrateSeededTemplates corrects, in stored seed rows, the volume `backup:`
+// markers a PREVIOUS shipped seed carried and the current one no longer does.
+// seedTemplates returns early once the catalog is non-empty, so without this a
+// fix to a bundled template reaches fresh installs and nothing else.
+//
+// It is MARKER-SCOPED, not row-scoped (review-6 finding 1). An earlier version
+// required the whole row to match the old seed byte-for-byte — origin, body and
+// meta — and skipped anything else as operator-edited. That bar was too high in
+// the one direction that mattered: an operator who had ever touched the row at
+// all (bumped the default image, tweaked a display string, added a parameter)
+// kept `data: backup: none`, which is now a HARD VETO of the template's only
+// volume, so CheckBackupable refused every backup of every postgres instance on
+// that fleet, permanently, with no in-product path to the cause. The population
+// most engaged with the product got the outage.
+//
+// So the evidence is narrowed to the fact actually being corrected: this volume
+// still carries EXACTLY the marker our old seed shipped, and our new seed ships
+// a different one. Nothing else about the row is read, and nothing else about it
+// is written — body, parameters, secrets and every other volume are left
+// untouched. What is being undone is OUR reinterpretation of OUR own default,
+// and that default lives on one field.
+//
+// It is ONE-SHOT per row, which is load-bearing rather than an efficiency
+// nicety (review-5 finding 2). An operator who decides they genuinely do not
+// want postgres `data` backed up and sets `backup: none` writes the same value
+// our old seed shipped, and nothing can tell their deliberate veto from the row
+// this exists to correct. Re-running every boot would revert that veto silently,
+// in the fail-open direction, at every restart. Every row considered here is
+// therefore stamped seedMigratedOrigin — including rows whose markers needed no
+// change, since those are exactly the rows an operator might later set `none` on
+// — and the `Origin != "seed"` guard then skips them forever. The correction
+// happens at most once per install; any `none` set AFTER it is the operator's
+// own and is never revisited.
+//
+// Origin is the marker rather than a schema_migrations table because it is
+// already persisted per row, already survives UpdateTemplate (which preserves
+// the stored Origin), and the fact being recorded is genuinely per row — "has
+// THIS row been corrected" — not per database.
+//
+// Returns the marker rewrites actually applied, for the caller to log.
+func migrateSeededTemplates(ctx context.Context, db store.TemplateStore, fsys fs.FS) ([]seedMarkerRewrite, error) {
+	seeds, err := store.ParseSeeds(fsys)
+	if err != nil {
+		return nil, err
+	}
+	var rewrites []seedMarkerRewrite
+	for _, seed := range seeds {
+		oldMarkers, ok := legacySeedVolumeMarkers[seed.Meta.ID]
+		if !ok {
+			continue
+		}
+		stored, err := db.GetTemplate(ctx, seed.Meta.ID)
+		if errors.Is(err, store.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return rewrites, err
+		}
+		if stored.Origin != "seed" {
+			continue // already corrected on an earlier boot, or user-created
+		}
+		shipped := make(map[string]string, len(seed.Meta.Volumes))
+		for _, v := range seed.Meta.Volumes {
+			shipped[v.Name] = v.Backup
+		}
+		upd := stored
+		vols := make([]render.Volume, len(stored.Meta.Volumes))
+		copy(vols, stored.Meta.Volumes)
+		var applied []seedMarkerRewrite
+		for i, v := range vols {
+			old, ok := oldMarkers[v.Name]
+			if !ok || v.Backup != old {
+				continue // not our old default, so not ours to correct
+			}
+			now, ok := shipped[v.Name]
+			if !ok || now == old {
+				continue // the volume is gone from the seed, or unchanged by it
+			}
+			vols[i].Backup = now
+			applied = append(applied, seedMarkerRewrite{
+				Template: seed.Meta.ID, Volume: v.Name, From: old, To: now,
+			})
+		}
+		upd.Meta.Volumes = vols
+		upd.Origin = seedMigratedOrigin
+		if err := db.PutTemplate(ctx, upd); err != nil {
+			return rewrites, err
+		}
+		rewrites = append(rewrites, applied...)
+	}
+	return rewrites, nil
+}
+
+// legacySeedMeta returns m with the named volumes' markers set back to what the
+// previous seed shipped. The volume slice is copied, so the caller's meta (the
+// live seed) is never mutated.
+func legacySeedMeta(m render.Meta, markers map[string]string) (render.Meta, error) {
+	vols := make([]render.Volume, len(m.Volumes))
+	copy(vols, m.Volumes)
+	for i := range vols {
+		if marker, ok := markers[vols[i].Name]; ok {
+			vols[i].Backup = marker
+		}
+	}
+	m.Volumes = vols
+	return m, nil
 }
 
 // resolveRegistryPassword picks the registry basic-auth password, preferring

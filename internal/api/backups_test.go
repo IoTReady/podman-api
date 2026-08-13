@@ -47,7 +47,10 @@ func backupTmpl() store.Template {
 				{Name: "slug", Type: "string", Required: true},
 				{Name: "image", Type: "string", Required: true},
 			},
-			Volumes: []render.Volume{{Name: "data", Backup: "none"}},
+			Volumes: []render.Volume{
+				{Name: "data", Backup: "s3; interval=24h"},
+				{Name: "logs", Backup: "none"},
+			},
 		},
 		Body: `apiVersion: v1
 kind: Pod
@@ -210,8 +213,22 @@ func TestToBackupViews_carriesExcluded(t *testing.T) {
 	assert.Nil(t, out[0].Volumes[1].Excluded, "unfiltered volume must have no excluded block")
 }
 
+// seedBlob writes a placeholder blob for one volume of a backup, at the key
+// layout instance.backupBlobKey uses. Needed by any test that fabricates a
+// COMPLETE backup row directly in the store: CheckRestorable preflights every
+// blob before the pod is torn down (round-3 finding 2), so a row whose blobs
+// were never written is — correctly — not restorable.
+func seedBlob(t *testing.T, blob *backup.LocalDir, host, tmpl, slug, id, volume string) {
+	t.Helper()
+	w, err := blob.Put(context.Background(), host+"/"+tmpl+"/"+slug+"/"+id+"/"+volume+".tar")
+	require.NoError(t, err)
+	_, err = w.Write([]byte("x"))
+	require.NoError(t, err)
+	require.NoError(t, w.Commit())
+}
+
 func TestAPI_PostRestore_Enqueues(t *testing.T) {
-	srv, tok, _, mem, _ := newBackupSrv(t)
+	srv, tok, _, mem, blob := newBackupSrv(t)
 	ctx := context.Background()
 
 	id := store.NewBackupID()
@@ -219,6 +236,7 @@ func TestAPI_PostRestore_Enqueues(t *testing.T) {
 	ok, err := mem.CompleteBackup(ctx, id, []store.BackupVolume{{Name: "postgres-a-data", SizeBytes: 1}})
 	require.NoError(t, err)
 	require.True(t, ok)
+	seedBlob(t, blob, "h1", "postgres", "a", id, "postgres-a-data")
 
 	resp := backupReq(t, "POST", srv.URL+"/backups/"+id+"/restore", tok)
 	require.Equal(t, http.StatusAccepted, resp.StatusCode)
@@ -459,4 +477,130 @@ func TestAPI_Backup_ScopeEnforced(t *testing.T) {
 
 	resp := backupReq(t, "POST", srv.URL+"/hosts/h1/instances/postgres/a/backup", "t")
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
+}
+
+// TestAPI_PostBackup_NoBodyIsUnscoped is the wire-compatibility lock: every
+// client that exists today sends no body at all, and must keep meaning "every
+// backupable volume".
+func TestAPI_PostBackup_NoBodyIsUnscoped(t *testing.T) {
+	srv, tok, _, mem, _ := newBackupSrv(t)
+	ctx := context.Background()
+
+	resp := backupReq(t, "POST", srv.URL+"/hosts/h1/instances/postgres/a/backup", tok)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	var acc struct {
+		JobID string `json:"job_id"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&acc))
+
+	job, err := mem.GetJob(ctx, acc.JobID)
+	require.NoError(t, err)
+	var args instance.BackupRequest
+	require.NoError(t, json.Unmarshal(job.Args, &args))
+	assert.Empty(t, args.Volumes)
+}
+
+func TestAPI_PostBackup_ScopedBody(t *testing.T) {
+	srv, tok, _, mem, _ := newBackupSrv(t)
+	ctx := context.Background()
+
+	resp := postJSON(t, srv, tok, "POST", "/hosts/h1/instances/postgres/a/backup",
+		`{"volumes":["data"]}`)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusAccepted, resp.StatusCode)
+	var acc struct {
+		JobID string `json:"job_id"`
+	}
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&acc))
+
+	job, err := mem.GetJob(ctx, acc.JobID)
+	require.NoError(t, err)
+	var args instance.BackupRequest
+	require.NoError(t, json.Unmarshal(job.Args, &args))
+	assert.Equal(t, []string{"data"}, args.Volumes)
+}
+
+func TestAPI_PostBackup_InvalidScopeIs400(t *testing.T) {
+	srv, tok, _, mem, _ := newBackupSrv(t)
+	ctx := context.Background()
+
+	for _, body := range []string{`{"volumes":["nope"]}`, `{"volumes":["logs"]}`} {
+		resp := postJSON(t, srv, tok, "POST", "/hosts/h1/instances/postgres/a/backup", body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, body)
+		var eb ErrorBody
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&eb))
+		_ = resp.Body.Close()
+		assert.Equal(t, "invalid_backup_scope", eb.Code, body)
+	}
+
+	jobs, err := mem.ListJobs(ctx, store.JobFilter{Kind: "backup", Limit: 10})
+	require.NoError(t, err)
+	assert.Empty(t, jobs, "a rejected scope must enqueue nothing")
+}
+
+// TestAPI_PostBackup_TypoOrEmptyScopeNeverMeansEverything: the two shapes that
+// used to decode to an empty slice and be read as "unscoped" — a singular-key
+// typo, and an explicitly empty array — must be REJECTED, not answered with a
+// 202 that stops the pod and exports every volume the caller did not ask for.
+func TestAPI_PostBackup_TypoOrEmptyScopeNeverMeansEverything(t *testing.T) {
+	srv, tok, _, mem, _ := newBackupSrv(t)
+	ctx := context.Background()
+
+	for _, tc := range []struct{ body, code string }{
+		{`{"volume":["data"]}`, "invalid_request"},             // singular-key typo
+		{`{"volumes":[]}`, "invalid_backup_scope"},             // explicitly empty scope
+		{`{"volumes":["data"],"mode":"x"}`, "invalid_request"}, // unknown extra field
+	} {
+		resp := postJSON(t, srv, tok, "POST", "/hosts/h1/instances/postgres/a/backup", tc.body)
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode, tc.body)
+		var eb ErrorBody
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&eb))
+		_ = resp.Body.Close()
+		assert.Equal(t, tc.code, eb.Code, tc.body)
+	}
+
+	jobs, err := mem.ListJobs(ctx, store.JobFilter{Kind: "backup", Limit: 10})
+	require.NoError(t, err)
+	assert.Empty(t, jobs, "none of these may enqueue a whole-instance backup")
+}
+
+func TestAPI_PostBackup_MalformedBodyIs400(t *testing.T) {
+	srv, tok, _, _, _ := newBackupSrv(t)
+
+	resp := postJSON(t, srv, tok, "POST", "/hosts/h1/instances/postgres/a/backup", `{`)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var eb ErrorBody
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&eb))
+	assert.Equal(t, "invalid_request", eb.Code)
+}
+
+// TestAPI_PostBackup_UnknownFieldBodyRejected locks a deliberate WIRE BREAK
+// (round-3 finding 10). postBackup never read the body before volume scoping,
+// so a client sending an unrelated object — `{"reason":"nightly"}` — got a 202
+// and a job. With DisallowUnknownFields it gets a 400 and NO job.
+//
+// The strict decoding is kept on purpose: the field it exists to catch is
+// `{"volume":["data"]}`, the singular typo, which otherwise decodes to an empty
+// scope and is read as "back up everything" — the caller silently gets the
+// opposite of a scoped request. Tolerating unknown fields to keep body-carrying
+// clients working would reopen exactly that. The break is documented in
+// docs/wiki-drafts/Backing-up-and-Restoring.md; this test is what makes it
+// deliberate rather than incidental.
+func TestAPI_PostBackup_UnknownFieldBodyRejected(t *testing.T) {
+	srv, tok, _, mem, _ := newBackupSrv(t)
+	ctx := context.Background()
+
+	resp := postJSON(t, srv, tok, "POST", "/hosts/h1/instances/postgres/a/backup",
+		`{"reason":"nightly"}`)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var body ErrorBody
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	assert.Equal(t, "invalid_request", body.Code)
+
+	jobs, err := mem.ListJobs(ctx, store.JobFilter{Kind: "backup"})
+	require.NoError(t, err)
+	assert.Empty(t, jobs, "a rejected body must not enqueue a backup")
 }

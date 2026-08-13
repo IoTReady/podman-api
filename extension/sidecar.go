@@ -18,8 +18,22 @@ type TemplateMeta struct {
 
 // TemplateVolume is one volume declared by a template.
 type TemplateVolume struct {
-	Name   string // volume name as referenced in the pod spec
-	Backup string // backup target/identifier; empty when not marked for backup
+	// Name is the volume name as referenced in the pod spec.
+	Name string
+	// Backup is the volume's `backup:` marker, passed through VERBATIM — this
+	// projection filters nothing. Empty means the template declared no marker.
+	//
+	// A non-empty marker is NOT "back this volume up". The core interprets
+	// exactly one literal, "none", as a veto: a volume marked that way is never
+	// exported by a backup, on any path. That literal still arrives here
+	// unchanged, deliberately — an injector's own marker grammar owns the
+	// string, and filtering it in the projection would change what an existing
+	// consumer receives.
+	//
+	// A consumer must therefore test the marker before acting on it. Reading
+	// non-empty as "arm continuous backup/PITR for this volume" would arm it for
+	// exactly the volume the operator vetoed.
+	Backup string
 }
 
 // InjectedSecret is a secret declared by a SidecarInjector. The core creates

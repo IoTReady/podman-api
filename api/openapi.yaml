@@ -187,7 +187,11 @@ components:
           description: the renderable template body (Go text/template over YAML)
         origin:
           type: string
-          description: provenance of the stored template (e.g. "seed" or "api")
+          description: >-
+            provenance of the stored template: "seed" (shipped in the bundled
+            catalog), "user" (created through the API/UI), or "seed-migrated"
+            (a shipped row a boot-time seed migration has rewritten; also the
+            marker that keeps that migration one-shot)
         created: {type: string, format: date-time}
         updated: {type: string, format: date-time}
 
@@ -1528,20 +1532,81 @@ paths:
       summary: enqueue a backup of an instance's volumes (requires -state-db and -backup-dir)
       description: >-
         Validates synchronously (known host/template, an existing stored spec, a
-        wired blob store) and enqueues a backup job, returning the job id and the
-        id of the backup row it will populate. The export itself (stop, snapshot
-        each volume, restart) runs inside the job; failures surface via
-        GET /jobs/{id}, not as the POST status.
+        wired blob store, and the requested volume scope) and enqueues a backup
+        job, returning the job id and the id of the backup row it will populate.
+        The export itself (stop, snapshot each volume, restart) runs inside the
+        job; failures surface via GET /jobs/{id}, not as the POST status.
+
+
+        The request body is OPTIONAL and narrows what the backup captures. An
+        entirely absent body means "every declared volume not marked
+        `backup: none`" — the behaviour every client predating volume scoping
+        relies on. An explicitly empty `volumes` array is NOT the same request
+        and is rejected (400 invalid_backup_scope): it must never be read as
+        "back up everything". Unknown fields are rejected too (400
+        invalid_request), so a `volume`/`volumes` typo fails rather than
+        silently widening the backup to the whole instance.
+
+
+        A scope naming volumes that are declared by the template but do not
+        exist on the host (an instance that predates the declaration and has not
+        been re-applied) is rejected SYNCHRONOUSLY — 400 invalid_backup_scope,
+        nothing enqueued, no pod stopped. Do not expect a 202 and a job to poll
+        for this case: a client that only inspects job results would record the
+        request as pending and never learn it was refused.
       parameters:
         - {name: host, in: path, required: true, schema: {type: string}}
         - {name: template, in: path, required: true, schema: {type: string}}
         - {name: slug, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              properties:
+                volumes:
+                  type: array
+                  minItems: 1
+                  items: {type: string}
+                  description: >-
+                    the template's declared SHORT volume names to capture (e.g.
+                    ["sites"], not the resolved "<template>-<slug>-sites" podman
+                    name). Omit the whole body for every volume not marked
+                    `backup: none`; an empty array is rejected.
+                  example: ['sites']
       responses:
         '202':
           description: backup job accepted
           content:
             application/json:
               schema: {$ref: '#/components/schemas/BackupAccepted'}
+        '400':
+          description: >-
+            malformed body or unknown field (code invalid_request), or an
+            invalid volume scope (code invalid_backup_scope) — a name the
+            template does not declare, a volume marked `backup: none`, a
+            declared volume that does not exist on the host (the instance
+            predates the declaration — re-apply it first), an explicitly empty
+            `volumes` array, a template whose every declared volume is vetoed,
+            or an unscoped request against an instance where every volume that
+            EXISTS on the host is marked `backup: none` (the run would stop the
+            pod, skip all of it and capture nothing). Nothing is enqueued and no
+            pod is stopped. An unscoped request against an instance with no
+            volumes on the host at all is ACCEPTED and records an empty backup.
+
+
+            For that last case the message names both what it observed —
+            the volumes present and vetoed — and any volume the template
+            declares as exportable that does not exist on the host. The
+            commonest cause is not a misconfiguration but an exportable volume
+            the instance has not created yet, and that clears on its own once
+            it does; the two are not distinguishable from here, so the message
+            states both rather than asserting either.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/Error'}
         '404':
           description: unknown host, unknown template, or no such instance (codes unknown_host, unknown_template, instance_not_found)
           content:
@@ -1594,10 +1659,21 @@ paths:
       description: >-
         Validates synchronously (the backup exists and is complete, its host is
         known and not draining, the instance's spec still exists) and enqueues a
-        restore job. The restore replaces the instance's volumes in place from
-        the backup's blobs and re-applies the current spec; there is no rollback,
+        restore job. The restore replaces, in place, ONLY the volumes the backup
+        actually contains, and re-applies the current spec; there is no rollback,
         so a mid-restore failure leaves the instance down with the spec preserved
         for retry. Failures surface via GET /jobs/{id}.
+
+
+        WARNING — restoring a scoped backup produces a MIXED-EPOCH instance.
+        Volumes present in the backup are rolled back to the moment it was
+        taken; every other volume of the instance is left untouched and keeps
+        its current, NEWER content. Nothing is pruned. For an application whose
+        volumes are mutually consistent (a database plus its file store), that
+        combination may be a state the application has never seen. Check the
+        backup's `volumes` array (GET /backups/{id}, or the instance's backup
+        list) before restoring, and prefer an unscoped backup for whole-instance
+        recovery.
       parameters:
         - {name: id, in: path, required: true, schema: {type: string}}
       responses:
@@ -1637,9 +1713,11 @@ paths:
         pod with a restore intent handed to the sidecar injector (commercial
         Litestream): the injected initContainer rolls the backup-marked
         database(s) back to the requested instant. Distinct from
-        /backups/{id}/restore (which restores a tarball backup of all volumes):
-        this rolls a live instance back to a timestamp via the replication
-        replica. The intent is one-shot and is never persisted into the stored
+        /backups/{id}/restore (which restores a tarball backup of whichever
+        volumes that backup captured — every declared volume for an unscoped
+        backup, only the named ones for a scoped one, leaving the rest at their
+        current newer content): this rolls a live instance back to a timestamp
+        via the replication replica. The intent is one-shot and is never persisted into the stored
         spec, so a later pod restart does not replay the rollback. The timestamp
         is interpreted by the injector (Litestream uses RFC3339). Progress and
         failures (e.g. a timestamp outside the configured replica retention)

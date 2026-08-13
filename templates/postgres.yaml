@@ -25,7 +25,6 @@
 #     per_host_referenced: []
 #   volumes:
 #     - name: data
-#       backup: none
 ---
 apiVersion: v1
 kind: Pod

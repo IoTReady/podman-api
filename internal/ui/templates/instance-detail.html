@@ -66,7 +66,7 @@
       <span data-label="Restore">
         {{if eq .State "complete"}}
         <button class="btn sm ghost" hx-post="/ui/backups/{{.ID}}/restore" hx-target="#main"
-                hx-confirm="Restore {{.ID}}? This stops the instance and OVERWRITES its current data." hx-disabled-elt="this">Restore</button>
+                hx-confirm="Restore {{.ID}}? This stops the instance and OVERWRITES {{if .Volumes}}only the {{len .Volumes}} volume(s) this backup contains ({{range $i, $v := .Volumes}}{{if $i}}, {{end}}{{$v.Name}}{{end}}){{else}}no volumes — this backup contains none{{end}}. Every other volume keeps its CURRENT (newer) data, which can leave it inconsistent with the restored ones." hx-disabled-elt="this">Restore</button>
         {{end}}
       </span>
       <span data-label="Delete">
