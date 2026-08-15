@@ -515,7 +515,7 @@ func (r *Real) connectFresh(ctx context.Context, hostID string) (*sshPoolEntry, 
 		}
 		return nil, h, nil, err
 	}
-	return nil, h, nil, fmt.Errorf("host %q: %w", hostID, errRetiredHost)
+	panic("unreachable: every loop body path above returns")
 }
 
 // sshSession runs one command on an established client, bounded by ctx.
