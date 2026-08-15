@@ -375,3 +375,74 @@ func TestValidateVolumesUpdate_GrandfathersStoredNearMiss(t *testing.T) {
 		}
 	})
 }
+
+func TestValidateNetworks(t *testing.T) {
+	cases := []struct {
+		name     string
+		networks []string
+		wantErr  string
+	}{
+		{name: "no networks", networks: nil},
+		{name: "single network", networks: []string{"frappe-shared"}},
+		{name: "several networks", networks: []string{"frappe-shared", "metrics"}},
+		{name: "empty name", networks: []string{""}, wantErr: "must not be empty"},
+		{name: "whitespace name", networks: []string{"  "}, wantErr: "must not be empty"},
+		{name: "uppercase rejected", networks: []string{"Frappe"}, wantErr: "is not a valid network name"},
+		{name: "underscore rejected", networks: []string{"frappe_shared"}, wantErr: "is not a valid network name"},
+		{name: "leading dash rejected", networks: []string{"-shared"}, wantErr: "is not a valid network name"},
+		{name: "duplicate rejected", networks: []string{"shared", "shared"}, wantErr: "declared twice"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateNetworks(Meta{Networks: tc.networks})
+			if tc.wantErr == "" {
+				if err != nil {
+					t.Fatalf("want nil, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("want error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestParseMeta_Networks(t *testing.T) {
+	src := `# template-meta:
+#   id: frappe-app
+#   networks:
+#     - frappe-shared
+---
+apiVersion: v1
+kind: Pod
+`
+	meta, _, err := ParseMeta(src)
+	require.NoError(t, err)
+	require.Equal(t, []string{"frappe-shared"}, meta.Networks)
+}
+
+func TestParseMeta_NoNetworks(t *testing.T) {
+	src := `# template-meta:
+#   id: postgres
+---
+apiVersion: v1
+kind: Pod
+`
+	meta, _, err := ParseMeta(src)
+	require.NoError(t, err)
+	require.Empty(t, meta.Networks)
+}
+
+func TestParseMeta_RejectsBadNetwork(t *testing.T) {
+	src := `# template-meta:
+#   id: frappe-app
+#   networks:
+#     - Not_Valid
+---
+apiVersion: v1
+kind: Pod
+`
+	_, _, err := ParseMeta(src)
+	require.Error(t, err)
+}

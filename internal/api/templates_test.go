@@ -361,3 +361,14 @@ func TestTemplateWriteRejectsReadOnlyKey(t *testing.T) {
 	resp.Body.Close()
 	assert.Equal(t, http.StatusForbidden, resp.StatusCode)
 }
+
+// The template wire format must surface `networks`, the same way it surfaces
+// ingress and pre_backup — and must accept it back on a create/update, or the
+// standard GET-edit-PUT round trip silently drops the declaration. (#243)
+func TestTemplateJSON_RoundTripsNetworks(t *testing.T) {
+	tpl := store.Template{Meta: render.Meta{ID: "db", Networks: []string{"frappe-shared"}}}
+	require.Equal(t, []string{"frappe-shared"}, templateJSON(tpl)["networks"])
+
+	body := templateBody{Networks: []string{"frappe-shared"}}
+	require.Equal(t, []string{"frappe-shared"}, body.toTemplate("db").Meta.Networks)
+}

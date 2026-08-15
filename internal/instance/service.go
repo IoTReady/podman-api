@@ -193,6 +193,46 @@ func (s *Service) SetIngress(c ingress.Controller, network string) {
 
 func (s *Service) ingressEnabled() bool { return s.ingressNet != "" }
 
+// ensureNetworks creates every podman network the instance's pod must join on
+// host, and returns their names in join order: the shared ingress network first
+// (when ingress is enabled AND the template declares ingress), then the
+// template's own `networks:` declarations (#243).
+//
+// The two are independent: a template with no ingress still joins its declared
+// networks, and it does so on a server started without -ingress — that is the
+// whole point of the seam, letting two instances reach each other by pod DNS
+// name with no host port published at all.
+//
+// Ensuring happens before the caller plays the pod, because podman fails a
+// `kube play` onto a network that does not exist yet — the first deploy on a
+// fresh host would otherwise fail. The result is de-duplicated, so a template
+// that names the ingress network explicitly does not produce a duplicate
+// --network (which podman rejects).
+//
+// This is the ONE place the join list is assembled; both the apply path and the
+// boot-converge path call it, so they cannot drift on what a pod is attached to.
+func (s *Service) ensureNetworks(ctx context.Context, hostID string, m render.Meta) ([]string, error) {
+	var want []string
+	if s.ingressEnabled() && m.Ingress != nil {
+		want = append(want, s.ingressNet)
+	}
+	want = append(want, m.Networks...)
+
+	out := make([]string, 0, len(want))
+	seen := make(map[string]struct{}, len(want))
+	for _, n := range want {
+		if _, dup := seen[n]; dup {
+			continue
+		}
+		seen[n] = struct{}{}
+		if err := s.client.NetworkEnsure(ctx, hostID, n); err != nil {
+			return nil, fmt.Errorf("ensure network %q on %s: %w", n, hostID, err)
+		}
+		out = append(out, n)
+	}
+	return out, nil
+}
+
 // validateIngress enforces the ingress rules for a request carrying domains
 // BEFORE the pod is played or the spec is persisted: ingress must be enabled,
 // the template must declare ingress:, and each domain must be unclaimed by any
@@ -647,13 +687,12 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 		}
 	}
 
-	var networks []string
-	if s.ingressEnabled() && tmpl.Meta.Ingress != nil {
-		log.Printf("apply: ensure ingress network %s on %s", s.ingressNet, host)
-		if err := s.client.NetworkEnsure(ctx, host, s.ingressNet); err != nil {
-			return fmt.Errorf("ensure ingress network: %w", err)
-		}
-		networks = []string{s.ingressNet}
+	networks, err := s.ensureNetworks(ctx, host, tmpl.Meta)
+	if err != nil {
+		return err
+	}
+	if len(networks) > 0 {
+		log.Printf("apply: ensured networks %v on %s", networks, host)
 	}
 	log.Printf("apply: play kube on %s", host)
 	if err := s.client.PlayKube(ctx, host, yaml, opts.Replace, networks...); err != nil {

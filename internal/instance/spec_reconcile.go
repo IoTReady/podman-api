@@ -465,13 +465,12 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 		}
 	}
 
-	// Step 7: ensure ingress network if the template declares ingress.
-	var networks []string
-	if s.ingressEnabled() && tmplObj.Meta.Ingress != nil {
-		if err := s.client.NetworkEnsure(ctx, hostID, s.ingressNet); err != nil {
-			return false, fmt.Errorf("ensure ingress network: %w", err)
-		}
-		networks = []string{s.ingressNet}
+	// Step 7: ensure the ingress network (when declared) and the template's own
+	// shared networks, so a pod re-converged after a reboot comes back with the
+	// same connectivity the apply path gave it.
+	networks, err := s.ensureNetworks(ctx, hostID, tmplObj.Meta)
+	if err != nil {
+		return false, err
 	}
 
 	// Step 8: play kube. replace=true when the pod exists (non-Running) so

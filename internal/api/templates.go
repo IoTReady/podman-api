@@ -18,6 +18,7 @@ func templateJSON(t store.Template) map[string]any {
 		"secrets":    t.Meta.Secrets,
 		"volumes":    t.Meta.Volumes,
 		"ingress":    t.Meta.Ingress,
+		"networks":   t.Meta.Networks,
 		"pre_backup": t.Meta.PreBackup,
 		"body":       t.Body,
 		"origin":     t.Origin,
@@ -43,6 +44,7 @@ type templateBody struct {
 	Secrets    render.Secrets    `json:"secrets"`
 	Volumes    []render.Volume   `json:"volumes"`
 	Ingress    *render.Ingress   `json:"ingress"`
+	Networks   []string          `json:"networks"`
 	PreBackup  *render.PreBackup `json:"pre_backup"`
 	Origin     string            `json:"origin,omitempty"`
 	Created    time.Time         `json:"created,omitempty"`
@@ -59,6 +61,7 @@ func (b templateBody) toTemplate(id string) store.Template {
 			Secrets:    b.Secrets,
 			Volumes:    b.Volumes,
 			Ingress:    b.Ingress,
+			Networks:   b.Networks,
 			PreBackup:  b.PreBackup,
 		},
 		Body: b.Body,

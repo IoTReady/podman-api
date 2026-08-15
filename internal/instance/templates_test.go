@@ -462,3 +462,48 @@ func TestCloneTemplate_TimestampsNonZero(t *testing.T) {
 	require.False(t, got.Created.IsZero(), "cloned template Created should be non-zero")
 	require.False(t, got.Updated.IsZero(), "cloned template Updated should be non-zero")
 }
+
+func TestNetworksChanged(t *testing.T) {
+	cases := []struct {
+		name     string
+		old, new []string
+		want     bool
+	}{
+		{"none-to-none", nil, nil, false},
+		{"unchanged", []string{"a", "b"}, []string{"a", "b"}, false},
+		// Order is not meaningful — the pod joins the same set either way, so a
+		// reordered declaration must not warn about a change that isn't one.
+		{"reordered", []string{"a", "b"}, []string{"b", "a"}, false},
+		// Both directions warn: a removed network leaves live instances still
+		// attached, an added one leaves them still detached, until reconcile.
+		{"added", nil, []string{"a"}, true},
+		{"removed", []string{"a"}, nil, true},
+		{"swapped", []string{"a"}, []string{"b"}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := networksChanged(c.old, c.new); got != c.want {
+				t.Errorf("networksChanged = %v, want %v", got, c.want)
+			}
+		})
+	}
+}
+
+// An API-created template builds render.Meta directly and so never goes through
+// ParseMeta. Its network declarations must still be validated, or an invalid
+// name is persisted and then fails NetworkEnsure on every deploy of every
+// instance of the template. (#243)
+func TestValidateTemplate_rejectsBadNetworkName(t *testing.T) {
+	tpl := webTemplate()
+	tpl.Meta.Networks = []string{"Not_Valid"}
+	err := ValidateTemplate(tpl)
+	if err == nil || !errors.Is(err, ErrInvalidTemplate) {
+		t.Fatalf("want ErrInvalidTemplate, got %v", err)
+	}
+}
+
+func TestValidateTemplate_acceptsNetworks(t *testing.T) {
+	tpl := webTemplate()
+	tpl.Meta.Networks = []string{"frappe-shared"}
+	require.NoError(t, ValidateTemplate(tpl))
+}
