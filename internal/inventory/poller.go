@@ -199,6 +199,29 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			defer cancel()
 			err := p.Svc.RefreshHost(hctx, host)
 			p.logTransition(host, err)
+			// The three sub-samplers below touch separate state maps by
+			// design and, other than stats' gate on err (already resolved
+			// above, before any of them start), do not depend on each other
+			// or on ordering relative to one another. Historically they ran
+			// one after another, so a host slow on all three paid their sum
+			// on top of the refresh — and tick blocks the ticker, so that sum
+			// stretched every other host's cadence too (#260). They now fan
+			// out concurrently and are joined below, so a host's worst case
+			// is refresh + max(stats, loadavg, boot) instead of refresh +
+			// stats + loadavg + boot. The budget invariant this enables is
+			// checked at startup by server.statsBudgetWarning.
+			var sub sync.WaitGroup
+			// spawn launches fn on its own goroutine, tracked by sub: a
+			// one-line stand-in for the sub.Add(1)/defer sub.Done() pair each
+			// sampler below would otherwise repeat.
+			spawn := func(fn func()) {
+				sub.Add(1)
+				go func() {
+					defer sub.Done()
+					fn()
+				}()
+			}
+
 			// Sampled under its own state map — whatever it does, the
 			// reachability verdict above is already final — and under its own
 			// StatsTimeout derived from ctx, NOT from the refresh's hctx.
@@ -219,7 +242,7 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			// So the sampler gets its own small budget, and the cadence
 			// invariant it used to guarantee structurally is now checked and
 			// warned about at startup instead (server.statsBudgetWarning):
-			// -inventory-refresh-timeout + -container-stats-timeout must stay
+			// -inventory-refresh-timeout + max(stats, loadavg, boot) must stay
 			// under -inventory-refresh-interval. At the defaults that is
 			// 20s + 5s < 30s.
 			//
@@ -241,14 +264,21 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			// attempted, so there is no outcome to record, and keeping the last
 			// real one means recovery logs the true transition, not a spurious
 			// one.
+			//
+			// This gate on err is the one ordering dependency in the fan-out
+			// (#260): err is resolved above, before any sub-sampler goroutine
+			// starts, so reading it here concurrently with the loadavg/boot
+			// goroutines below is safe — it is never written again.
 			if p.Stats != nil {
-				if err != nil {
-					p.Stats.DropHostStats(host)
-				} else {
-					sctx, scancel := context.WithTimeout(ctx, p.statsTimeout())
-					p.logStatsTransition(host, p.Stats.RefreshHostStats(sctx, host))
-					scancel()
-				}
+				spawn(func() {
+					if err != nil {
+						p.Stats.DropHostStats(host)
+					} else {
+						sctx, scancel := context.WithTimeout(ctx, p.statsTimeout())
+						p.logStatsTransition(host, p.Stats.RefreshHostStats(sctx, host))
+						scancel()
+					}
+				})
 			}
 			// Own budget derived from ctx, own state map — and, like the boot
 			// probe below and unlike the stats sampler, run regardless of the
@@ -269,12 +299,14 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			// its own. There is no equivalent of a cumulative counter frozen at
 			// its last value.
 			if p.LoadAvg != nil {
-				lctx, lcancel := context.WithTimeout(ctx, p.loadAvgTimeout())
-				sampled, lerr := p.LoadAvg.RefreshHostLoadAvg(lctx, host)
-				lcancel()
-				if sampled {
-					p.logLoadAvgTransition(host, lerr)
-				}
+				spawn(func() {
+					lctx, lcancel := context.WithTimeout(ctx, p.loadAvgTimeout())
+					sampled, lerr := p.LoadAvg.RefreshHostLoadAvg(lctx, host)
+					lcancel()
+					if sampled {
+						p.logLoadAvgTransition(host, lerr)
+					}
+				})
 			}
 			// Independent of the refresh's own outcome (err above): a reboot
 			// probe is a different, lighter libpod call, and a host that just
@@ -285,10 +317,13 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			// itself (the tick's own long-lived context, cancelled only on
 			// poller shutdown), never bctx: see BootTimeout's doc comment.
 			if p.Boot != nil {
-				bctx, bcancel := context.WithTimeout(ctx, p.bootTimeout())
-				p.checkBoot(bctx, ctx, host)
-				bcancel()
+				spawn(func() {
+					bctx, bcancel := context.WithTimeout(ctx, p.bootTimeout())
+					p.checkBoot(bctx, ctx, host)
+					bcancel()
+				})
 			}
+			sub.Wait()
 		}(h)
 	}
 	wg.Wait()

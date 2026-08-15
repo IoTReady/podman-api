@@ -909,17 +909,23 @@ func diffNewlySeenHosts(seen map[string]bool, current []config.Host) (newlySeen 
 	return newlySeen, nextSeen
 }
 
-// statsBudgetWarning returns the line to log when the per-host inventory,
-// stats and boot-probe budgets together can reach or exceed the poll
-// interval — or "" when there is nothing worth saying.
+// statsBudgetWarning returns the line to log when the per-host inventory
+// refresh, joined with the slowest of the stats/boot-probe/loadavg
+// sub-samplers, can reach or exceed the poll interval — or "" when there is
+// nothing worth saying.
 //
 // Until #212 the stats sample shared the refresh's hctx, which held the per-host
 // bound at exactly -inventory-refresh-timeout by construction; the price was
 // permanent starvation of the sampler on a host whose sweep ate that budget.
-// Now each of the three steps (refresh, stats sample, boot-reboot probe) gets
-// its own budget, so the true per-host bound is their sum, and nothing in the
-// type system stops an operator tuning past the interval. This is that missing
-// enforcement — deliberately a warning, not a fatal: a long
+// Each of the three sub-samplers (stats, boot-reboot probe, loadavg) then got
+// its own budget, and until #260 tick ran them one after another, so the true
+// per-host bound was their sum on top of the refresh. #260 fans them out
+// concurrently instead — they touch separate state maps and, other than
+// stats' gate on the refresh outcome, do not depend on each other — so the
+// true per-host bound is now the refresh plus whichever of the three takes
+// longest, not their sum. Nothing in the type system stops an operator tuning
+// past the interval even with that improvement, so this is the enforcement
+// for what remains — deliberately a warning, not a fatal: a long
 // -inventory-refresh-timeout is a legitimate choice on a slow fleet, and the
 // consequence (a stretched poll cadence, visible as
 // podman_api_inventory_age_seconds) is degradation, not breakage.
@@ -927,31 +933,28 @@ func diffNewlySeenHosts(seen map[string]bool, current []config.Host) (newlySeen 
 // The boot-probe term is folded in UNCONDITIONALLY once the poller itself is
 // enabled: unlike the stats sampler (gated by -container-stats), server.go
 // wires Boot: svc with no flag to turn it off, so tick() always pays this
-// third budget (#231 review finding #2). With the shipped defaults —
-// Timeout=20s, StatsTimeout=5s, Interval=30s — the old two-term sum (25s) was
-// silently fine while the poller's real per-host cost, 30s including the 5s
-// boot probe, was already AT the interval; this is exactly the hole that let
-// that pass unnoticed.
+// budget (#231 review finding #2). Likewise the loadavg term (#258): it too
+// is wired unconditionally alongside the poller.
 //
-// The stats term is silent when the sampler is off: with -container-stats=false
-// no stats call is ever made, so that budget cannot be spent and adding it
-// would be noise. Every term is silent with the poller off, for the same
-// reason — nothing ticks, and pollerDisabledMetricsWarning already explains
-// that case.
+// The stats term drops out of the max when the sampler is off: with
+// -container-stats=false no stats call is ever made, so that budget cannot be
+// spent and including it would overstate the real worst case. Every term is
+// silent with the poller off, for the same reason — nothing ticks, and
+// pollerDisabledMetricsWarning already explains that case.
 //
-// Both the stats and boot terms reason about their EFFECTIVE timeout, not the
+// All three sub-sampler terms reason about their EFFECTIVE timeout, not the
 // raw flag/field: the poller maps a non-positive value to its own default
-// (inventory.EffectiveStatsTimeout / inventory.EffectiveBootTimeout), so e.g.
-// -container-stats-timeout=0 with a 28s refresh timeout and a 30s interval
-// really spends 33s (28+5) while a raw-value check would compute 28s and stay
-// silent — a hole in exactly the invariant this function exists to police.
+// (inventory.EffectiveStatsTimeout / EffectiveBootTimeout /
+// EffectiveLoadAvgTimeout), so e.g. -container-stats-timeout=0 does not read
+// as zero budget — a raw-value check would compute a smaller total and stay
+// silent, a hole in exactly the invariant this function exists to police.
 //
 // -inventory-refresh-timeout gets no such normalisation because the poller
 // applies none: Poller.Timeout is passed to context.WithTimeout verbatim, where
 // 0 means a context that is already expired rather than a default. That is a
 // pre-existing sharp edge (a refresh timeout of 0 fails every refresh
 // immediately, loudly and on every host) and squarely outside #212; the honest
-// sum for that case is the one computed here.
+// total for that case is the one computed here.
 func statsBudgetWarning(interval, timeout, statsTimeout, bootTimeout, loadAvgTimeout time.Duration, statsEnabled bool) string {
 	if interval <= 0 {
 		return ""
@@ -960,21 +963,32 @@ func statsBudgetWarning(interval, timeout, statsTimeout, bootTimeout, loadAvgTim
 	// The loadavg sampler is wired unconditionally alongside the poller, so
 	// unlike the stats term this one is always part of the worst-case tick.
 	effLoad := inventory.EffectiveLoadAvgTimeout(loadAvgTimeout)
-	sum := timeout + effBoot + effLoad
-	terms := fmt.Sprintf("-inventory-refresh-timeout (%s) + boot-reboot-probe timeout (%s) + loadavg-sample timeout (%s)", timeout, effBoot, effLoad)
+	// max(stats, boot, loadavg): #260 fans the three sub-samplers out
+	// concurrently, so a host's worst-case per-tick cost is the refresh plus
+	// whichever of them is slowest, not their sum.
+	maxSub := effBoot
+	maxTerm := fmt.Sprintf("boot-reboot-probe timeout (%s)", effBoot)
+	if effLoad > maxSub {
+		maxSub = effLoad
+		maxTerm = fmt.Sprintf("loadavg-sample timeout (%s)", effLoad)
+	}
 	if statsEnabled {
 		effStats := inventory.EffectiveStatsTimeout(statsTimeout)
-		sum += effStats
-		terms = fmt.Sprintf("%s + -container-stats-timeout (%s)", terms, effStats)
+		if effStats > maxSub {
+			maxSub = effStats
+			maxTerm = fmt.Sprintf("-container-stats-timeout (%s)", effStats)
+		}
 	}
-	if sum < interval {
+	total := timeout + maxSub
+	terms := fmt.Sprintf("-inventory-refresh-timeout (%s) + max(%s)", timeout, maxTerm)
+	if total < interval {
 		return ""
 	}
 	return fmt.Sprintf("%s = %s, which is not under -inventory-refresh-interval (%s): "+
 		"a slow host can spend a whole interval on one tick and stretch the poll cadence "+
 		"for every host, inflating podman_api_inventory_age_seconds. Lower a timeout or "+
 		"raise the interval",
-		terms, sum, interval)
+		terms, total, interval)
 }
 
 // buildJobRegistry assembles the job kind -> handler table. regPrune is nil
