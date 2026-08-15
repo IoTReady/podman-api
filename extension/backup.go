@@ -46,13 +46,15 @@ func IsBackupMarkerNone(marker string) bool {
 	return strings.EqualFold(strings.TrimSpace(marker), BackupMarkerNone)
 }
 
-// BackupInstance is one live instance that has at least one backup-marked
-// volume, projected for a commercial BackupScheduler to act on. Volumes carries
-// only the backup-marked volumes, each with its raw marker string. The core
-// interprets exactly one literal — `none`, meaning never back this volume up,
-// which is filtered out before projection so a scheduler never sees one. Every
-// other non-empty marker value is opaque and belongs to the commercial marker
-// grammar (e.g. cadence, mode).
+// BackupInstance is one live instance that has at least one backup-ELIGIBLE
+// volume, projected for a commercial BackupScheduler to act on. Volumes
+// carries every eligible volume — including an unmarked one (empty
+// `Backup`), on the same footing as an explicitly marked one, since #255 —
+// each with its raw marker string. The core interprets exactly one literal —
+// `none`, meaning never back this volume up, which is filtered out before
+// projection so a scheduler never sees one. Every other marker value,
+// including empty, is opaque and belongs to the commercial marker grammar
+// (e.g. cadence, mode).
 type BackupInstance struct {
 	Host     string
 	Template string

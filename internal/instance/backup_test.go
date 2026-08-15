@@ -1912,6 +1912,51 @@ func TestCheckBackupable_AppliedSetRenameIsNotLossAccepts(t *testing.T) {
 	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil))
 }
 
+// TestBackup_RenamedAppliedVolumeIsActuallyExported (round-3 review, critical
+// finding 1): CheckBackupable accepting a rename is not the same as Backup
+// actually capturing it. `appliedVolumeLoss` confirms the renamed volume
+// survives under its OLD applied name, but that confirmation used to be
+// thrown away — checkBackupable's returned `vols` came only from
+// InstanceVolumes, which walks CURRENTLY declared names, so the renamed
+// volume (declared differently now) was never in it. Backup()'s export loop
+// walks exactly that list, so a rename-without-reapply produced a green
+// `complete` backup with the renamed volume's real data silently missing.
+func TestBackup_RenamedAppliedVolumeIsActuallyExported(t *testing.T) {
+	svc, _, mem, blob := newBackupSvc(t)
+	ctx := context.Background()
+
+	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"} // applied under the OLD name
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	// Template renames "data" -> "pgdata" without the instance being
+	// re-applied. The real volume (pg-a-data, with real tar content set by
+	// newBackupSvc) is still on the host under its OLD applied name.
+	tmpl.Meta.Volumes = []render.Volume{
+		{Name: "pgdata", Backup: "s3; interval=24h"},
+		{Name: "logs", Backup: "none"},
+	}
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+
+	req := newBackupReq()
+	require.NoError(t, svc.Backup(ctx, req, func(string, string) {}))
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	assert.Equal(t, store.BackupComplete, b.State)
+	require.Len(t, b.Volumes, 1, "the renamed-but-still-present volume must be captured, not silently dropped")
+	assert.Equal(t, "pg-a-data", b.Volumes[0].Name)
+	assert.Greater(t, b.Volumes[0].SizeBytes, int64(0))
+
+	key := "h1/pg/a/" + req.BackupID + "/pg-a-data.tar"
+	rc, err := blob.Get(ctx, key)
+	require.NoError(t, err, "the renamed volume's data must actually be in the blob store")
+	_ = rc.Close()
+}
+
 // TestCheckBackupable_AppliedSetRenameWithPartialLossAccepts (revising #256's
 // original "rename + partial loss still refuses" design, round-2 review
 // finding 1): a rename of one applied volume proves the instance was actually

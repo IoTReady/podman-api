@@ -147,6 +147,43 @@ func TestReconcileSpecsOnHost_TemplateDeleted(t *testing.T) {
 	assert.Empty(t, fc.PlayCalls, "should not re-play when template is deleted")
 }
 
+// TestReconcileSpecsOnHost_RenamedAppliedVolumeSkipsReplayInsteadOfForkingData
+// (round-3 review, "related, same root cause" as critical finding 1): boot
+// converge replays the pod from the CURRENT template body, whose
+// persistentVolumeClaim.claimName is authored against the CURRENT declared
+// volume name. If the applied volume set names a volume the template no
+// longer declares, and that volume's real data still exists under its OLD
+// applied name, blindly replaying would bind a brand-new, empty volume under
+// the new claim name while the real data sits orphaned and untouched. This
+// must be refused, not silently forked.
+func TestReconcileSpecsOnHost_RenamedAppliedVolumeSkipsReplayInsteadOfForkingData(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	sp, err := st.GetSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"} // applied under the OLD name
+	require.NoError(t, st.PutSpec(ctx, sp))
+
+	// The real data lives under the OLD applied name.
+	fc.SetVolumeData("h1", "web-my-app-data", []byte("real data"))
+
+	// The template renames "data" -> "pgdata" without this instance being
+	// re-applied.
+	tmpl, err := st.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "pgdata"}}
+	require.NoError(t, st.PutTemplate(ctx, tmpl))
+
+	svc.ReconcileSpecsOnHost(ctx, "h1")
+
+	// PlayKube must NOT have run: replaying the current body would bind a
+	// fresh, empty volume under "web-my-app-pgdata" while "web-my-app-data"
+	// (the real data) sits untouched and unreferenced.
+	assert.Empty(t, fc.PlayCalls, "must not silently fork data by replaying under the renamed claim")
+}
+
 func TestReconcileSpecsOnHost_HostUnreachable(t *testing.T) {
 	svc, fc, st := specReconcileSvc(t)
 	ctx := context.Background()

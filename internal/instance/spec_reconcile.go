@@ -19,6 +19,22 @@ import (
 // text, distinguishing this from other transient (unreachable) failures.
 var errTemplateSkipped = errors.New("template not found — instance skipped")
 
+// errVolumeRenamePending is a sentinel returned by reconcileOneSpec when the
+// template's declared volumes have drifted from spec.AppliedVolumes in a way
+// that would fork real data: an applied (short) volume name the template no
+// longer declares still has a materialized volume on the host under its
+// applied name. Boot converge replays the CURRENT template body, whose
+// persistentVolumeClaim.claimName is authored against the CURRENT declared
+// name — so blindly calling PlayKube here would bind a brand-new, empty
+// volume under the new name while the real data sits untouched under the old
+// one, with spec.AppliedVolumes still (correctly) naming the old volume as
+// applied. Boot converge only ever REPLAYS what was already applied; a rename
+// is a template edit that has not actually been applied to this instance yet,
+// so it is not this path's job to decide how to reconcile it — that is what
+// an explicit re-Apply (which does have rename-vs-loss context, #256) is for.
+// The caller logs a human-readable message instead of the error text.
+var errVolumeRenamePending = errors.New("template volume renamed since last apply — instance skipped, re-apply required")
+
 // ReconcileSpecsOnHost checks every stored instance spec on host against real
 // pod state and re-converges any that are missing (not running), so managed
 // pods survive a reboot. Errors are logged per-instance and never propagated
@@ -68,6 +84,9 @@ func (s *Service) ReconcileSpecsOnHost(ctx context.Context, hostID string) {
 		if errors.Is(err, errTemplateSkipped) {
 			log.Printf("boot converge %s/%s/%s: template %q not found — skipping (spec not reaped)",
 				hostID, k.Template, k.Slug, k.Template)
+		} else if errors.Is(err, errVolumeRenamePending) {
+			log.Printf("boot converge %s/%s/%s: %v — pod left down, re-apply to reconcile the rename",
+				hostID, k.Template, k.Slug, err)
 		} else if err != nil {
 			log.Printf("boot converge %s/%s/%s: %v", hostID, k.Template, k.Slug, err)
 		} else if reconciled {
@@ -154,6 +173,33 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 			return false, errTemplateSkipped
 		}
 		return false, fmt.Errorf("get template %q: %w", tmpl, err)
+	}
+
+	// Step 3.5: refuse to silently fork a renamed applied volume's data. If an
+	// applied (short) name is no longer among the template's CURRENT declared
+	// volumes AND its OLD applied-name volume still exists on the host, the
+	// template was renamed since this instance was last actually applied —
+	// replaying the current body below would bind a fresh, empty volume under
+	// the new claim name while the real data sits orphaned under the old one.
+	// A volume that is simply gone (never checked here) is not this guard's
+	// concern; only a rename that would fork surviving data is.
+	if len(spec.AppliedVolumes) > 0 {
+		declaredShort := make(map[string]bool, len(tmplObj.Meta.Volumes))
+		for _, v := range tmplObj.Meta.Volumes {
+			declaredShort[v.Name] = true
+		}
+		for _, short := range spec.AppliedVolumes {
+			if declaredShort[short] {
+				continue
+			}
+			full := volumeName(tmpl, slug, short)
+			if _, ierr := s.client.VolumeInspect(ctx, hostID, full); ierr == nil {
+				return false, fmt.Errorf("%w: applied volume %q (%s) is no longer declared by template %q but still exists on %s",
+					errVolumeRenamePending, short, full, tmpl, hostID)
+			} else if !errors.Is(ierr, podman.ErrNotFound) {
+				return false, fmt.Errorf("inspect volume %q: %w", full, ierr)
+			}
+		}
 	}
 
 	// Step 4: apply defaults and validate.

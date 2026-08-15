@@ -226,14 +226,29 @@ func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, 
 		// pre-#257 behaviour below, unchanged, until their next Apply populates it.
 		var materialized int
 		var lost []string
+		var recovered []podman.Volume
 		if sp.AppliedVolumes != nil {
 			currentlyDeclared := make(map[string]bool, len(declared))
 			for short := range declared {
 				currentlyDeclared[volumeName(tmpl, slug, short)] = true
 			}
-			materialized, lost, err = s.appliedVolumeLoss(ctx, host, tmpl, slug, sp.AppliedVolumes, present, currentlyDeclared)
+			materialized, lost, recovered, err = s.appliedVolumeLoss(ctx, host, tmpl, slug, sp.AppliedVolumes, present, currentlyDeclared)
 			if err != nil {
 				return nil, err
+			}
+			// A rename appliedVolumeLoss confirmed present under its OLD applied
+			// name never shows up in `vols` on its own: `vols` came from
+			// InstanceVolumes, which walks only CURRENTLY declared names, so a
+			// renamed volume (declared differently now) is invisible to it. Fold
+			// the resolved volume(s) in here, under their applied name, so the
+			// export loop in Backup() — which walks exactly this list — actually
+			// captures them instead of silently completing without them (round-3
+			// review, critical finding 1).
+			if len(recovered) > 0 {
+				vols = append(vols, recovered...)
+				for _, v := range recovered {
+					present[v.Name] = true
+				}
 			}
 		}
 		// Total loss: the ENTIRE applied set is gone under both its applied and
@@ -387,7 +402,14 @@ func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, 
 // (review-round-2 minor finding: this used to cost up to 2N round trips for N
 // applied volumes; now only names the template no longer declares — a rename
 // or a drop — need their own VolumeInspect).
-func (s *Service) appliedVolumeLoss(ctx context.Context, host, tmpl, slug string, applied []string, present, currentlyDeclared map[string]bool) (materialized int, lost []string, err error) {
+//
+// recovered carries the resolved podman.Volume for every applied name found
+// ONLY under its old applied name (i.e. not already covered by `present`) —
+// the caller folds these into its export set, since InstanceVolumes never
+// looked for a name the template no longer declares (round-3 review, critical
+// finding 1: without this, a confirmed-surviving rename was never actually
+// backed up, only accepted).
+func (s *Service) appliedVolumeLoss(ctx context.Context, host, tmpl, slug string, applied []string, present, currentlyDeclared map[string]bool) (materialized int, lost []string, recovered []podman.Volume, err error) {
 	for _, short := range applied {
 		full := volumeName(tmpl, slug, short)
 		if present[full] {
@@ -404,16 +426,18 @@ func (s *Service) appliedVolumeLoss(ctx context.Context, host, tmpl, slug string
 		// a rename or a drop — so InstanceVolumes never looked for it. It needs
 		// its own inspect, under the name it was APPLIED with, to tell "moved"
 		// from "gone".
-		if _, ierr := s.client.VolumeInspect(ctx, host, full); ierr != nil {
+		v, ierr := s.client.VolumeInspect(ctx, host, full)
+		if ierr != nil {
 			if errors.Is(ierr, podman.ErrNotFound) {
 				lost = append(lost, short)
 				continue
 			}
-			return 0, nil, fmt.Errorf("inspect volume %q: %w", full, ierr)
+			return 0, nil, nil, fmt.Errorf("inspect volume %q: %w", full, ierr)
 		}
 		materialized++
+		recovered = append(recovered, v)
 	}
-	return materialized, lost, nil
+	return materialized, lost, recovered, nil
 }
 
 // Backup snapshots every volume of an instance into the blob store: stop,
