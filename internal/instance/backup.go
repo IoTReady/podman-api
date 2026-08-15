@@ -336,14 +336,19 @@ func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, 
 		// instance captured one of the now-missing volumes, which proves it
 		// existed and is therefore genuinely lost rather than never created.
 		if materialized == 0 && len(lost) > 0 && len(vols) == 0 {
-			existed, cerr := s.appliedLossCorroborated(ctx, host, tmpl, slug, lost)
+			// The message names only the volumes the evidence actually covers,
+			// not the whole `lost` list (#265 review round-2, minor finding):
+			// a lost volume with no earlier backup behind it may simply never
+			// have been created, and claiming a backup captured it misleads
+			// the operator about which volume to go looking for. The refusal
+			// still stands for the run as a whole.
+			corroborated, cerr := s.appliedLossCorroborated(ctx, host, tmpl, slug, lost)
 			if cerr != nil {
 				return nil, nil, cerr
 			}
-			if existed {
-				sort.Strings(lost)
+			if len(corroborated) > 0 {
 				return nil, nil, fmt.Errorf("%w: volume(s) %s of %s/%s were applied and captured by an earlier backup but no longer exist on %s (a host rebuild, `podman volume prune`, or an evacuation that did not complete) — this backup would silently miss them",
-					ErrInvalidBackupScope, strings.Join(lost, " "), tmpl, slug, host)
+					ErrInvalidBackupScope, strings.Join(corroborated, " "), tmpl, slug, host)
 			}
 		}
 		// A template edited down to zero declared volumes while the applied set
@@ -503,9 +508,10 @@ func anyExportableVolume(declared map[string]string, sp store.Spec) bool {
 	return false
 }
 
-// appliedLossCorroborated reports whether any of the given lost (short) applied
-// volume names is known to have EXISTED at some point, by looking for it in an
-// earlier COMPLETE backup of this instance.
+// appliedLossCorroborated returns WHICH of the given lost (short) applied
+// volume names are known to have EXISTED at some point, by looking each up in
+// an earlier COMPLETE backup of this instance. The result is sorted, and empty
+// when nothing corroborates any of them.
 //
 // This is the only evidence of prior existence this core holds.
 // store.Spec.AppliedVolumes records what the template DECLARED at apply time,
@@ -514,29 +520,43 @@ func anyExportableVolume(declared map[string]string, sp store.Spec) bool {
 // total-loss refusal needs this corroboration and the partial-loss path does
 // not refuse at all (#265 review finding 2).
 //
+// It reports the corroborated NAMES rather than a single bool for the whole
+// list (#265 review round-2, minor finding): the evidence is per volume, and
+// the caller's refusal message names what it was given. Collapsed to a bool,
+// a two-volume loss with evidence for one told the operator that BOTH were
+// "captured by an earlier backup" — misattributing proof of existence to a
+// volume that may never have been created at all. The refusal itself is
+// unchanged: any corroborated volume still refuses the whole run.
+//
 // A store failure is returned, not swallowed: it is the same class of error as
 // the GetSpec at the top of checkBackupable, and reporting it as "no evidence"
 // would silently downgrade a refusal.
-func (s *Service) appliedLossCorroborated(ctx context.Context, host, tmpl, slug string, lost []string) (bool, error) {
+func (s *Service) appliedLossCorroborated(ctx context.Context, host, tmpl, slug string, lost []string) ([]string, error) {
 	backups, err := s.store.ListBackups(ctx, host, tmpl, slug, store.MaxJobLimit)
 	if err != nil {
-		return false, fmt.Errorf("list backups of %s/%s on %s: %w", tmpl, slug, host, err)
+		return nil, fmt.Errorf("list backups of %s/%s on %s: %w", tmpl, slug, host, err)
 	}
-	want := make(map[string]bool, len(lost))
-	for _, short := range lost {
-		want[volumeName(tmpl, slug, short)] = true
+	short := make(map[string]string, len(lost))
+	for _, name := range lost {
+		short[volumeName(tmpl, slug, name)] = name
 	}
+	seen := map[string]bool{}
+	var corroborated []string
 	for _, b := range backups {
 		if b.State != store.BackupComplete {
 			continue
 		}
 		for _, v := range b.Volumes {
-			if want[v.Name] {
-				return true, nil
+			name, ok := short[v.Name]
+			if !ok || seen[name] {
+				continue
 			}
+			seen[name] = true
+			corroborated = append(corroborated, name)
 		}
 	}
-	return false, nil
+	sort.Strings(corroborated)
+	return corroborated, nil
 }
 
 // appliedVolumeLoss classifies a spec's applied volume set against the host:

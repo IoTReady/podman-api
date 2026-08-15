@@ -1803,6 +1803,40 @@ func TestCheckBackupable_AppliedSetTotalLossRefuses(t *testing.T) {
 	assert.Contains(t, err.Error(), "no longer exist")
 }
 
+// TestCheckBackupable_TotalLossNamesOnlyCorroboratedVolumes (#265 review,
+// round-2 minor finding): corroboration is a property of EACH lost volume, but
+// the refusal used to name the whole `lost` list as one group "applied and
+// captured by an earlier backup". With two lost volumes and evidence for only
+// one, the message attributed evidence to a volume that was never confirmed to
+// have existed at all (a lazily-created volume that simply never materialised).
+// The refusal outcome is unchanged; only the diagnostic must be accurate.
+func TestCheckBackupable_TotalLossNamesOnlyCorroboratedVolumes(t *testing.T) {
+	svc, f, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data", "logs"} // both declared, both absent
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	// Only `data` was ever captured; `logs` was never created at all.
+	prior := store.NewBackupID()
+	require.NoError(t, mem.CreateBackup(ctx, store.Backup{
+		ID: prior, Host: "h1", Template: "pg", Slug: "a", State: store.BackupCreating,
+	}))
+	ok, err := mem.CompleteBackup(ctx, prior, []store.BackupVolume{{Name: "pg-a-data", SizeBytes: 1}})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	require.NoError(t, f.VolumeRemove(ctx, "h1", "pg-a-data", true))
+
+	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
+	require.ErrorIs(t, err, ErrInvalidBackupScope)
+	assert.Contains(t, err.Error(), "data")
+	assert.NotContains(t, err.Error(), "logs",
+		"only the volumes an earlier backup actually captured may be named as corroborated")
+}
+
 // TestCheckBackupable_TotalLossWithoutPriorBackupAccepts (#265 review finding
 // 2): the same shape as the test above, but nothing ever corroborated that the
 // applied volume existed — no earlier backup captured it. That is exactly as

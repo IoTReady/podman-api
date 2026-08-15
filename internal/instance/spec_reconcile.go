@@ -78,6 +78,93 @@ func (s *Service) renameTargets(ctx context.Context, hostID, tmpl, slug string, 
 	return targets
 }
 
+// pendingRenames narrows a set of applied volume names that are "no longer
+// declared but still on the host" down to the ones a rename target can
+// actually account for — the only ones replaying could fork (#265 review
+// round-2, blocking finding).
+//
+// `renamed` and `targets` used to be two flat, uncorrelated lists: the guard
+// refused for the WHOLE `renamed` list as soon as ANY target existed anywhere
+// in the template. An instance applied with ["logs","cache"] whose template
+// drops `logs` outright (old volume left unpruned — routine and harmless) and
+// separately renames `cache` -> `cache2` therefore stayed down on every boot
+// sweep for `logs` too, which no target names and which cannot fork anything.
+//
+// The pairing rule, in the order it errs:
+//
+//  1. A renamed name is BLOCKED when some target plausibly IS its new name
+//     (plausibleRename below). That is the direct evidence of a fork.
+//  2. A rename is 1:1 — each target can absorb at most one applied volume — so
+//     any target left over once every plausibly-matched rename has claimed one
+//     is UNACCOUNTED FOR. A rename may change a name beyond all recognition
+//     (`logs` -> `journal`), so an unaccounted target could be the destination
+//     of any renamed name the heuristic did not match, and every one of them is
+//     blocked as well. This is the deliberate safe side: the guard exists to
+//     prevent data-forking, so an ambiguous target refuses rather than replays.
+//  3. Only with NO targets at all — or none left over, with nothing plausibly
+//     matched — does a renamed name fall through as an ordinary drop.
+//
+// The result is sorted, so the refusal message reads deterministically.
+func pendingRenames(renamed, targets []string) []string {
+	if len(targets) == 0 {
+		return nil
+	}
+	var matched []string
+	for _, r := range renamed {
+		if slices.ContainsFunc(targets, func(t string) bool { return plausibleRename(r, t) }) {
+			matched = append(matched, r)
+		}
+	}
+	if len(targets) > len(matched) {
+		// At least one target is unclaimed and could be any of them.
+		blocked := slices.Clone(renamed)
+		sort.Strings(blocked)
+		return blocked
+	}
+	sort.Strings(matched)
+	return matched
+}
+
+// plausibleRename reports whether the newly declared (short) volume name `to`
+// looks like what the applied (short) name `from` was renamed TO, judged from
+// the names alone — the only signal available, since nothing records a rename
+// as such.
+//
+// A rename in practice keeps a recognisable stem: `cache` -> `cache2`,
+// `data` -> `pgdata`, `wal` -> `pgwal`. Containment either way covers those,
+// and a shared prefix or suffix of three or more characters covers the
+// prefix/suffix swaps it misses (`pgdata` -> `pgdata_v2` is containment;
+// `db-data` -> `db-store` is a shared prefix). Anything shorter than three
+// characters matches far too much to mean anything.
+//
+// A false NEGATIVE here is caught by pendingRenames' leftover-target rule
+// above, which blocks the unmatched names anyway; a false positive only ever
+// makes the guard refuse, which is the safe direction. Neither can fork data.
+func plausibleRename(from, to string) bool {
+	a, b := strings.ToLower(from), strings.ToLower(to)
+	if a == "" || b == "" {
+		return false
+	}
+	if strings.Contains(a, b) || strings.Contains(b, a) {
+		return true
+	}
+	return commonAffix(a, b) >= 3
+}
+
+// commonAffix returns the longer of a and b's common prefix and common suffix
+// lengths, in bytes (volume names are restricted to ASCII by podman).
+func commonAffix(a, b string) int {
+	pre := 0
+	for pre < len(a) && pre < len(b) && a[pre] == b[pre] {
+		pre++
+	}
+	suf := 0
+	for suf < len(a) && suf < len(b) && a[len(a)-1-suf] == b[len(b)-1-suf] {
+		suf++
+	}
+	return max(pre, suf)
+}
+
 // ReconcileSpecsOnHost checks every stored instance spec on host against real
 // pod state and re-converges any that are missing (not running), so managed
 // pods survive a reboot. Errors are logged per-instance and never propagated
@@ -273,9 +360,18 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 			// have been renamed TO, and replaying now would create it empty
 			// while the real data sits orphaned. With no such target, no data
 			// can fork, so warn and let the pod come back up.
-			if targets := s.renameTargets(ctx, hostID, tmpl, slug, tmplObj.Meta.Volumes, spec.AppliedVolumes); len(targets) > 0 {
+			//
+			// The two lists are CORRELATED rather than gated on "any target
+			// exists anywhere" (#265 review round-2, blocking finding): one
+			// genuine rename used to block every unrelated dropped-and-unpruned
+			// volume that happened to share the applied set, leaving the pod
+			// down for a name no target could ever account for. pendingRenames
+			// pairs them, erring toward refusal wherever the pairing is
+			// ambiguous — see its doc comment for the rule.
+			targets := s.renameTargets(ctx, hostID, tmpl, slug, tmplObj.Meta.Volumes, spec.AppliedVolumes)
+			if blocked := pendingRenames(renamed, targets); len(blocked) > 0 {
 				return false, fmt.Errorf("%w: applied volume(s) %s no longer declared by template %q but still exist on %s (newly declared, not-yet-created volume(s) %s look like the rename target)",
-					errVolumeRenamePending, strings.Join(renamed, ", "), tmpl, hostID, strings.Join(targets, ", "))
+					errVolumeRenamePending, strings.Join(blocked, ", "), tmpl, hostID, strings.Join(targets, ", "))
 			}
 			log.Printf("boot converge %s/%s/%s: applied volume(s) %s are no longer declared by template %q but still exist on %s — no newly declared volume looks like a rename target, so this is treated as a dropped (unpruned) volume and the pod is replayed; prune them once you are sure",
 				hostID, tmpl, slug, strings.Join(renamed, ", "), tmpl, hostID)
