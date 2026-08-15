@@ -2,9 +2,7 @@ package api
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -43,10 +41,7 @@ func (h *handlers) postBackup(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Volumes *[]string `json:"volumes"`
 	}
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_request", Message: "body must be a JSON object with an optional \"volumes\" array: " + err.Error()})
+	if !decodeBodyErr(w, r, &body, "invalid_request", "body must be a JSON object with an optional \"volumes\" array: ") {
 		return
 	}
 	var volumes []string

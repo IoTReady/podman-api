@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"time"
 
 	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
@@ -27,6 +28,13 @@ func templateJSON(t store.Template) map[string]any {
 
 // templateBody is the decoded request body shared by create/update. The id is
 // only honoured on create; update forces it to the path id.
+//
+// Origin/Created/Updated are accepted but ignored: templateJSON() emits them
+// on every GET, so a client following the standard REST edit pattern (GET,
+// change one field, PUT the whole object back) sends them straight back in
+// the body. Without a field to decode them into, DisallowUnknownFields 400s
+// that request. They stay server-managed — a client-supplied value here never
+// overrides the store's own Origin/Created/Updated (#254 review finding 1).
 type templateBody struct {
 	ID         string            `json:"id"`
 	Body       string            `json:"body"`
@@ -36,6 +44,9 @@ type templateBody struct {
 	Volumes    []render.Volume   `json:"volumes"`
 	Ingress    *render.Ingress   `json:"ingress"`
 	PreBackup  *render.PreBackup `json:"pre_backup"`
+	Origin     string            `json:"origin,omitempty"`
+	Created    time.Time         `json:"created,omitempty"`
+	Updated    time.Time         `json:"updated,omitempty"`
 }
 
 // toTemplate builds a store.Template from the decoded body, forcing Meta.ID to id.

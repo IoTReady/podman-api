@@ -16,6 +16,14 @@ func (h *handlers) evacuate(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &req) {
 		return
 	}
+	// An absent/empty body decodes to FromHost=="", which ResolveEvacuation
+	// reports as ErrUnknownHost — a 404 "unknown_host" that reads as "host
+	// '' does not exist" rather than "from_host is required". Check here so
+	// a missing body still 400s (#254 review finding 2).
+	if req.FromHost == "" {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "from_host is required"})
+		return
+	}
 	if _, err := h.svc.ResolveEvacuation(r.Context(), req); err != nil {
 		WriteError(w, err)
 		return
@@ -44,6 +52,11 @@ func (h *handlers) evacuatePlan(w http.ResponseWriter, r *http.Request) {
 	}
 	var req instance.EvacuateRequest
 	if !decodeBody(w, r, &req) {
+		return
+	}
+	// Same absent-body check as evacuate(): see the comment there.
+	if req.FromHost == "" {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "from_host is required"})
 		return
 	}
 	plan, err := h.svc.PlanEvacuation(r.Context(), req)

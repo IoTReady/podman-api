@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -192,6 +193,41 @@ func TestUpdateTemplate(t *testing.T) {
 	assert.Contains(t, got["body"], "app2-")
 	// Origin is preserved from the seed.
 	assert.Equal(t, "seed", got["origin"])
+}
+
+// TestUpdateTemplate_GetEditPutRoundTrip locks the standard REST edit
+// pattern: GET the resource, change one field, PUT the whole object back
+// unmodified otherwise. templateJSON() emits "origin", "created", and
+// "updated" on every GET, so a client that round-trips them verbatim must
+// not 400 with "unknown field" (#254 review finding 1).
+func TestUpdateTemplate_GetEditPutRoundTrip(t *testing.T) {
+	srv, tok, _, _ := newSrvWithTmpl(t)
+
+	resp := authedReq(t, srv, tok, "GET", "/templates/app")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	resp.Body.Close()
+	require.Contains(t, got, "origin")
+	require.Contains(t, got, "created")
+	require.Contains(t, got, "updated")
+
+	// Change one field, then PUT the entire GET response back verbatim.
+	got["body"] = "kind: Pod\nname: app-edited-{{.slug}}\n"
+	buf, err := json.Marshal(got)
+	require.NoError(t, err)
+
+	resp = doReq(t, srv, tok, "PUT", "/templates/app", string(buf))
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	var updated map[string]any
+	require.NoError(t, json.Unmarshal(body, &updated))
+	assert.Equal(t, "kind: Pod\nname: app-edited-{{.slug}}\n", updated["body"])
+	// Origin remains server-managed: the client-supplied value is ignored,
+	// not honoured.
+	assert.Equal(t, "seed", updated["origin"])
 }
 
 func TestCloneTemplate(t *testing.T) {

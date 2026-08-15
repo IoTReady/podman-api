@@ -220,6 +220,16 @@ func (h *handlers) upgradeInstance(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &body) {
 		return
 	}
+	// An absent/empty body decodes to Image=="", which Service.Upgrade rejects
+	// with a plain error that classify() has no sentinel for — it would fall
+	// through to a 500 "internal" instead of a 400. Check here so a missing
+	// image stays a 400, the same status an empty body produced before
+	// decodeBody stopped treating an absent body as an error (#254 review
+	// finding 2).
+	if strings.TrimSpace(body.Image) == "" {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "image is required"})
+		return
+	}
 	req := instance.ApplyRequest{
 		Template:   tmpl,
 		Slug:       slug,
