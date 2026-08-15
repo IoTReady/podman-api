@@ -1787,33 +1787,103 @@ func TestCheckBackupable_AppliedSetTotalLossRefuses(t *testing.T) {
 	assert.Contains(t, err.Error(), "no longer exist")
 }
 
-// TestCheckBackupable_AppliedSetPartialLossRefusesEvenWithSomethingCaptureable
-// (#256): the spec says this instance was applied with {data, wal}; only
-// `data` still exists. Before #257/#256 this was UNGUARDED for an unscoped
-// request — the run would happily record a green backup containing `data`
-// alone, and retention would eventually age out the last backup that actually
-// held `wal`. It must now refuse, even though `data` alone would otherwise be
-// perfectly capturable.
-func TestCheckBackupable_AppliedSetPartialLossRefusesEvenWithSomethingCaptureable(t *testing.T) {
+// TestCheckBackupable_ZeroDeclaredWithMaterialisedAppliedVolumesRefuses
+// (round-2 review finding 2): a template edited down to declaring ZERO
+// volumes while the instance's applied set still names a volume that DOES
+// exist on the host. The pre-existing `len(declared) == 0` fast path used to
+// return nil, nil unconditionally, before the applied-set check ever ran —
+// so Backup would stop the pod, export nothing (the loop only ever walks
+// currently-declared names), and record a green `complete` row while `data`
+// sat untouched on the host. It must now refuse instead.
+func TestCheckBackupable_ZeroDeclaredWithMaterialisedAppliedVolumesRefuses(t *testing.T) {
+	svc, _, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"} // applied with `data`, which still exists
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = nil // edited down to zero declared volumes
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+
+	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
+	require.ErrorIs(t, err, ErrInvalidBackupScope)
+	assert.Contains(t, err.Error(), "pg")
+
+	req := newBackupReq()
+	err = svc.Backup(ctx, req, nil)
+	require.Error(t, err, "an unscoped backup that cannot capture declared-away data must not report success")
+	assert.ErrorIs(t, err, ErrInvalidBackupScope)
+
+	_, gerr := svc.store.GetBackup(ctx, req.BackupID)
+	require.ErrorIs(t, gerr, store.ErrNotFound, "rejected before anything happened: no row recorded")
+}
+
+// TestCheckBackupable_ZeroDeclaredWithNoAppliedVolumesStillAccepts pins the
+// fast path finding 2 must NOT regress: a template declaring zero volumes with
+// an applied set that is unknown (nil, pre-#257 spec) or known-empty is a
+// genuine no-op and must still accept without touching the host.
+func TestCheckBackupable_ZeroDeclaredWithNoAppliedVolumesStillAccepts(t *testing.T) {
+	svc, _, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	sp.AppliedVolumes = nil // unknown: pre-#257 spec
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = nil
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+
+	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil))
+
+	sp.AppliedVolumes = []string{} // known: applied with no volumes
+	require.NoError(t, mem.PutSpec(ctx, sp))
+	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil))
+}
+
+// TestCheckBackupable_AppliedSetPartialLossAcceptsCapturingWhatSurvives
+// (round-2 review finding 1, revising #256's original "partial loss refuses"
+// design): the spec says this instance was applied with {data, sidecar-cache};
+// `data` still exists, `sidecar-cache` never materialised (a template can
+// declare a volume some deployments simply never mount — an optional cache, a
+// lazily-created path). `AppliedVolumes` records what the template DECLARED at
+// apply time, not what podman actually created, so this state is
+// indistinguishable from real partial loss with the signals this codebase has
+// today. Refusing the whole backup on that ambiguity regressed the pre-#256
+// fallback for every template with such a volume, permanently. The backup must
+// proceed, capturing `data` alone.
+func TestCheckBackupable_AppliedSetPartialLossAcceptsCapturingWhatSurvives(t *testing.T) {
 	svc, _, mem, _ := newBackupSvc(t)
 	ctx := context.Background()
 
 	// `data` exists (from the newBackupSvc fixture) and stays exportable;
-	// `wal` is declared too, but never materialised on the host.
+	// `sidecar-cache` is declared too, but never materialised on the host.
 	tmpl, err := mem.GetTemplate(ctx, "pg")
 	require.NoError(t, err)
-	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "wal", Backup: "s3; interval=24h"})
+	tmpl.Meta.Volumes = append(tmpl.Meta.Volumes, render.Volume{Name: "sidecar-cache", Backup: "s3; interval=24h"})
 	require.NoError(t, mem.PutTemplate(ctx, tmpl))
 
 	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
 	require.NoError(t, err)
-	sp.AppliedVolumes = []string{"data", "wal"} // applied with BOTH
+	sp.AppliedVolumes = []string{"data", "sidecar-cache"} // applied with BOTH
 	require.NoError(t, mem.PutSpec(ctx, sp))
 
-	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
-	require.ErrorIs(t, err, ErrInvalidBackupScope)
-	assert.Contains(t, err.Error(), "wal", "must name the specific volume that is missing")
-	assert.NotContains(t, err.Error(), "data ", "must not implicate the volume that IS still present")
+	require.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil),
+		"a never-materialised applied volume must not permanently block backing up the one(s) that do exist")
+
+	req := newBackupReq()
+	require.NoError(t, svc.Backup(ctx, req, nil))
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	assert.Equal(t, store.BackupComplete, b.State)
+	require.Len(t, b.Volumes, 1, "only the volume that actually exists is captured")
+	assert.Equal(t, "pg-a-data", b.Volumes[0].Name)
 }
 
 // TestCheckBackupable_AppliedSetRenameIsNotLossAccepts (#256): the spec
@@ -1842,12 +1912,16 @@ func TestCheckBackupable_AppliedSetRenameIsNotLossAccepts(t *testing.T) {
 	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil))
 }
 
-// TestCheckBackupable_AppliedSetRenameWithPartialLossStillRefuses (#256): a
-// rename of one applied volume must not mask real loss of ANOTHER applied
-// volume. Applied set is {data, wal}; the template renames `data` to `pgdata`
-// (still present on the host under `data`, so not lost) while `wal` (name
-// unchanged) is genuinely gone.
-func TestCheckBackupable_AppliedSetRenameWithPartialLossStillRefuses(t *testing.T) {
+// TestCheckBackupable_AppliedSetRenameWithPartialLossAccepts (revising #256's
+// original "rename + partial loss still refuses" design, round-2 review
+// finding 1): a rename of one applied volume proves the instance was actually
+// deployed, but that does not make a DIFFERENT applied volume's absence
+// unambiguous loss — it is exactly as consistent with "never materialised" as
+// TestCheckBackupable_AppliedSetPartialLossAcceptsCapturingWhatSurvives.
+// Applied set is {data, wal}; the template renames `data` to `pgdata` (still
+// present on the host under `data`, so not lost) while `wal` (name unchanged)
+// was never created.
+func TestCheckBackupable_AppliedSetRenameWithPartialLossAccepts(t *testing.T) {
 	svc, _, mem, _ := newBackupSvc(t)
 	ctx := context.Background()
 
@@ -1864,9 +1938,7 @@ func TestCheckBackupable_AppliedSetRenameWithPartialLossStillRefuses(t *testing.
 	}
 	require.NoError(t, mem.PutTemplate(ctx, tmpl))
 
-	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
-	require.ErrorIs(t, err, ErrInvalidBackupScope)
-	assert.Contains(t, err.Error(), "wal")
+	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil))
 }
 
 // TestCheckBackupable_AppliedSetHostErrorNotMisclassified (#256): a transient

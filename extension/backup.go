@@ -65,8 +65,13 @@ type BackupInstance struct {
 // which is filtered out before projection so it never reaches a scheduler.
 // Every other value is opaque and belongs to the commercial marker grammar.
 type BackupVolumeMarker struct {
-	Name   string
-	Backup string // raw marker, e.g. "s3; interval=6h"; never empty here
+	Name string
+	// Backup is the raw marker, e.g. "s3; interval=6h" — or the empty string
+	// for a declared volume that carries no `backup:` marker at all. Since
+	// #255, unmarked volumes are projected here on the same footing as marked
+	// ones (only an explicit `none` is filtered out beforehand), so a consumer
+	// MUST treat "" as "eligible, no marker" rather than assume it can't occur.
+	Backup string
 }
 
 // BackupOptions narrows what a backup job captures. It is a struct rather than

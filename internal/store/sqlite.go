@@ -501,11 +501,12 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 	// distinction all the way back to the caller.
 	var appliedVolumes []string
 	if appliedVolumesRaw.Valid {
+		// PutSpec never marshals a nil slice into this column (it leaves the
+		// column NULL instead — see there), so the stored JSON is always a real
+		// array, "[]" at minimum, never "null". Unmarshalling it therefore
+		// always yields a non-nil slice; no fallback needed.
 		if err := json.Unmarshal([]byte(appliedVolumesRaw.String), &appliedVolumes); err != nil {
 			return Spec{}, fmt.Errorf("%w: applied_volumes: %v", ErrSpecCorrupt, err)
-		}
-		if appliedVolumes == nil {
-			appliedVolumes = []string{}
 		}
 	}
 	return Spec{
