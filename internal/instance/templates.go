@@ -102,6 +102,15 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 		}
 	}
 
+	// Same edit-time signal for shared networks: a pod's network membership is
+	// fixed at play time, so instances already running keep whatever set they
+	// were played with until their next reconcile (#243).
+	if networksChanged(existing.Meta.Networks, t.Meta.Networks) {
+		if n := s.countTemplateRefs(ctx, t.Meta.ID); n > 0 {
+			log.Printf("template %q networks changed but %d instance(s) reference it; their pods keep the previous network set until the next reconcile", t.Meta.ID, n)
+		}
+	}
+
 	if w := backupMarkerNoneWriteWarning(t); w != "" {
 		log.Printf("WARNING: %s", w)
 	}
@@ -164,6 +173,32 @@ func ingressChanged(old, new *render.Ingress) bool {
 		return true // ingress removed
 	}
 	return old.Container != new.Container || old.Port != new.Port
+}
+
+// networksChanged reports whether a template's shared-network set differs
+// between two revisions. Order is not compared: the pod joins the same set
+// either way, so a reordered declaration is not a change. Comparing by length
+// plus membership is exact here because ValidateNetworks rejects a list that
+// declares the same network twice.
+//
+// Unlike ingressChanged, BOTH directions matter. A removed network leaves live
+// instances still attached to it; an added one leaves them still detached. Each
+// is a divergence between what the template says and what is running, and
+// neither resolves until the instance's next reconcile.
+func networksChanged(old, new []string) bool {
+	if len(old) != len(new) {
+		return true
+	}
+	set := make(map[string]struct{}, len(old))
+	for _, n := range old {
+		set[n] = struct{}{}
+	}
+	for _, n := range new {
+		if _, ok := set[n]; !ok {
+			return true
+		}
+	}
+	return false
 }
 
 // countTemplateRefs counts instances on any host whose spec references template
@@ -296,6 +331,13 @@ func validateTemplate(t store.Template, stored *store.Template) error {
 	// before rendering. API-created templates build render.Meta directly and so
 	// skip ParseMeta's checks; this re-runs the same validation (#61).
 	if err := render.ValidateIngress(t.Meta.Ingress); err != nil {
+		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
+	}
+
+	// Likewise for shared networks: an API-created template skips ParseMeta, so
+	// without this an invalid network name is persisted and then fails
+	// NetworkEnsure on every deploy of every instance of it. (#243)
+	if err := render.ValidateNetworks(t.Meta); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
 

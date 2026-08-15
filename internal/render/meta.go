@@ -35,7 +35,13 @@ type Meta struct {
 	Secrets    Secrets    `yaml:"secrets" json:"secrets,omitempty"`
 	Volumes    []Volume   `yaml:"volumes" json:"volumes,omitempty"`
 	Ingress    *Ingress   `yaml:"ingress" json:"ingress,omitempty"`
-	PreBackup  *PreBackup `yaml:"pre_backup,omitempty" json:"pre_backup,omitempty"`
+	// Networks names shared podman networks the instance's pod joins, in
+	// addition to (and independent of) the ingress network. Two instances that
+	// name the same network resolve each other by pod DNS name with no host
+	// port published at all. Names are literal, not parameter-rendered, so a
+	// bad one fails at template registration rather than at deploy (#243).
+	Networks  []string   `yaml:"networks,omitempty" json:"networks,omitempty"`
+	PreBackup *PreBackup `yaml:"pre_backup,omitempty" json:"pre_backup,omitempty"`
 }
 
 // Display holds human-readable presentation metadata for a template.
@@ -155,6 +161,28 @@ func ValidateIngress(ing *Ingress) error {
 	}
 	if ing.Port <= 0 || ing.Port > 65535 {
 		return fmt.Errorf("template-meta: ingress.port %d out of range", ing.Port)
+	}
+	return nil
+}
+
+// ValidateNetworks checks a template's shared-network declarations: each name
+// non-empty, a valid podman network name (same charset as a template id), and
+// declared at most once. Rejecting at registration means a typo fails visibly
+// at the point the template is written, instead of surfacing as a NetworkEnsure
+// failure on every deploy of every instance of that template.
+func ValidateNetworks(m Meta) error {
+	seen := make(map[string]struct{}, len(m.Networks))
+	for _, n := range m.Networks {
+		if strings.TrimSpace(n) == "" {
+			return errors.New("template-meta: networks entries must not be empty")
+		}
+		if !ValidName(n) {
+			return fmt.Errorf("template-meta: networks: %q is not a valid network name", n)
+		}
+		if _, dup := seen[n]; dup {
+			return fmt.Errorf("template-meta: networks: %q declared twice", n)
+		}
+		seen[n] = struct{}{}
 	}
 	return nil
 }
@@ -392,6 +420,10 @@ func ParseMeta(src string) (Meta, string, error) {
 	}
 
 	if err := ValidateIngress(wrapper.Meta.Ingress); err != nil {
+		return Meta{}, "", err
+	}
+
+	if err := ValidateNetworks(wrapper.Meta); err != nil {
 		return Meta{}, "", err
 	}
 
