@@ -279,9 +279,34 @@ type invalidatingTransport struct {
 	onBroken func()
 }
 
+// RoundTrip evicts on two distinct signals, not one:
+//
+//   - connBroken(err): a raw transport error (dial refused, reset, an EOF) —
+//     the connection visibly died.
+//   - req.Context() itself having timed out: the ~30 operation methods that
+//     route through opCtxFor bound every call with a fixed callTimeout, and a
+//     wedged connection (the TCP socket accepts writes but the OS never
+//     surfaces a read error — the #252 incident) manifests as that deadline
+//     firing, not as a transport error. connBroken deliberately does not
+//     treat context.DeadlineExceeded as broken (ssh_pool.go's sshSession
+//     needs that: there ctx is the *caller's* short budget, and hitting it
+//     says nothing about the connection's health). Here it is different:
+//     req.Context() is opCtxFor's own callTimeout, already generous (10
+//     minutes) specifically so that reaching it means the call hung, not
+//     that it was merely slow. So the deadline firing here is itself the
+//     wedge signal, the same role sshWedgeGrace's watchdog plays for the SSH
+//     pool — no extra grace window is needed on top of a timeout that is
+//     already the grace window.
+//
+// Distinguishing "this call's own deadline fired" from "the caller gave up
+// early" matters: opCtxFor bridges the caller's cancellation into the derived
+// context via context.AfterFunc(parent, cancel), so a client disconnecting
+// mid-request cancels req.Context() before its deadline — that reports
+// context.Canceled, not context.DeadlineExceeded, and must not evict a
+// perfectly healthy connection just because its caller walked away.
 func (t *invalidatingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.next.RoundTrip(req)
-	if err != nil && connBroken(err) {
+	if err != nil && (connBroken(err) || errors.Is(req.Context().Err(), context.DeadlineExceeded)) {
 		t.onBroken()
 	}
 	return resp, err
