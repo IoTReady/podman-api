@@ -88,6 +88,15 @@ func TestBulk_RejectsEmpty(t *testing.T) {
 	assert.Equal(t, "invalid_body", got["code"])
 }
 
+// TestBulk_RejectsUnknownField asserts /bulk rejects an unknown top-level
+// field with a 400 rather than silently ignoring it (#254).
+func TestBulk_RejectsUnknownField(t *testing.T) {
+	srv, tok, _ := newSrvFull(t)
+	status, got := bulkPost(t, srv.URL, tok, `{"opps":[{"action":"stop","template":"app","slug":"aa"}]}`)
+	assert.Equal(t, http.StatusBadRequest, status)
+	assert.Equal(t, "invalid_body", got["code"])
+}
+
 func TestBulk_RejectsOversize(t *testing.T) {
 	srv, tok, _ := newSrvFull(t)
 	var ops []string

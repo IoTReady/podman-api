@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -54,9 +53,8 @@ func (h *handlers) getInstance(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) createInstance(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
-	req, err := decodeApply(r)
-	if err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	req, ok := decodeApplyRequest(w, r)
+	if !ok {
 		return
 	}
 	if !validInstancePath(w, req.Template, req.Slug) {
@@ -85,9 +83,8 @@ func (h *handlers) applyInstance(w http.ResponseWriter, r *http.Request) {
 	if !validInstancePath(w, pathTmpl, pathSlug) {
 		return
 	}
-	req, err := decodeApply(r)
-	if err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	req, ok := decodeApplyRequest(w, r)
+	if !ok {
 		return
 	}
 	if req.Template != "" && req.Template != pathTmpl {
@@ -135,12 +132,12 @@ func (h *handlers) deleteInstance(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func decodeApply(r *http.Request) (instance.ApplyRequest, error) {
+// decodeApplyRequest decodes an ApplyRequest with DisallowUnknownFields,
+// writing a 400 and returning false on failure.
+func decodeApplyRequest(w http.ResponseWriter, r *http.Request) (instance.ApplyRequest, bool) {
 	var req instance.ApplyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return req, err
-	}
-	return req, nil
+	ok := decodeBody(w, r, &req)
+	return req, ok
 }
 
 func queryBool(r *http.Request, key string) bool {
@@ -220,8 +217,7 @@ func (h *handlers) upgradeInstance(w http.ResponseWriter, r *http.Request) {
 		Parameters map[string]any    `json:"parameters"`
 		Secrets    map[string]string `json:"secrets"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &body) {
 		return
 	}
 	req := instance.ApplyRequest{
@@ -259,8 +255,7 @@ func (h *handlers) upgradeImageInstance(w http.ResponseWriter, r *http.Request) 
 	var body struct {
 		Image string `json:"image"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &body) {
 		return
 	}
 	if strings.TrimSpace(body.Image) == "" {
@@ -301,8 +296,7 @@ func (h *handlers) patchInstanceParameters(w http.ResponseWriter, r *http.Reques
 	var body struct {
 		Parameters map[string]any `json:"parameters"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &body) {
 		return
 	}
 	if len(body.Parameters) == 0 {
@@ -347,8 +341,7 @@ func (h *handlers) patchInstanceSecrets(w http.ResponseWriter, r *http.Request) 
 	var body struct {
 		Secrets map[string]string `json:"secrets"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &body) {
 		return
 	}
 	if len(body.Secrets) == 0 {
@@ -386,8 +379,7 @@ func (h *handlers) renameInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req instance.RenameRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &req) {
 		return
 	}
 	if req.NewSlug == "" {

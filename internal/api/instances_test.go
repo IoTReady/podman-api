@@ -99,6 +99,22 @@ func TestApplyAndGetInstance(t *testing.T) {
 	assert.Equal(t, "hello", got["slug"])
 }
 
+// TestApplyInstance_UnknownField asserts PUT .../instances/{template}/{slug}
+// rejects an unknown field with a 400 rather than silently ignoring it
+// (#254).
+func TestApplyInstance_UnknownField(t *testing.T) {
+	srv, tok, _ := newSrvFull(t)
+
+	body := `{"template":"app","slug":"hello","paramaters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/hello", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
 // #201 (API edge): the path/body slug reconciliation above never looked at
 // parameters["slug"], which is what actually renders metadata.name. A
 // disagreeing parameters.slug is rejected with the same 400 invalid_body shape

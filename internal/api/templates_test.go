@@ -161,6 +161,16 @@ func TestCreateTemplate_AndConflict(t *testing.T) {
 	assert.Equal(t, http.StatusConflict, resp.StatusCode)
 }
 
+// TestCreateTemplate_UnknownField asserts createTemplate rejects an unknown
+// field with a 400 rather than silently ignoring it (#254).
+func TestCreateTemplate_UnknownField(t *testing.T) {
+	srv, tok, _, _ := newSrvWithTmpl(t)
+	body := `{"id":"redis","body":"kind: Pod\nname: redis-{{.slug}}\n","volume":["data"]}`
+	resp := doReq(t, srv, tok, "POST", "/templates", body)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
 func TestCreateTemplate_InvalidBody(t *testing.T) {
 	srv, tok, _, _ := newSrvWithTmpl(t)
 	// References an undeclared parameter -> dry-run render fails (missingkey=error).

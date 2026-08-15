@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"github.com/iotready/podman-api/internal/render"
@@ -84,8 +83,7 @@ func (h *handlers) getTemplate(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) createTemplate(w http.ResponseWriter, r *http.Request) {
 	var b templateBody
-	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &b) {
 		return
 	}
 	if !validName(b.ID) {
@@ -111,8 +109,7 @@ func (h *handlers) updateTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var b templateBody
-	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &b) {
 		return
 	}
 	if err := h.svc.UpdateTemplate(r.Context(), b.toTemplate(id)); err != nil {
@@ -136,8 +133,7 @@ func (h *handlers) cloneTemplate(w http.ResponseWriter, r *http.Request) {
 	var b struct {
 		NewID string `json:"new_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &b) {
 		return
 	}
 	if !validName(b.NewID) {

@@ -125,6 +125,29 @@ func TestRenameHost(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp3.StatusCode)
 }
 
+// TestRenameHostUnknownField asserts renameHost rejects an unknown field
+// with a 400 rather than silently ignoring it (#254).
+func TestRenameHostUnknownField(t *testing.T) {
+	tok := "t"
+	hash, _ := config.HashToken(tok)
+	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"hosts:write", "hosts:read"}}}
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	svc := instance.NewService(fake.New(), hosts)
+	svc.SetStore(store.NewMemory())
+	renamer := &fakeHostRenamer{original: []byte("id: h1\n")}
+	srv := httptest.NewServer(NewRouter(svc, nil, auth.NewKeyStore(keys), nil, nil, nil, "", nil, WithHostRenamer(renamer)))
+	defer srv.Close()
+
+	req, err := http.NewRequest("POST", srv.URL+"/hosts/h1/rename", strings.NewReader(`{"new_i":"h2"}`))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	require.Empty(t, renamer.calledOld)
+}
+
 func TestRenameHostUnknownHost(t *testing.T) {
 	tok := "t"
 	hash, _ := config.HashToken(tok)

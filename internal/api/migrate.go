@@ -13,8 +13,7 @@ func (h *handlers) migrate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req instance.MigrateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &req) {
 		return
 	}
 	if err := h.svc.CheckMigratable(r.Context(), req); err != nil {

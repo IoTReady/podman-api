@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 
@@ -43,8 +42,7 @@ func (h *handlers) bulk(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 
 	var req bulkRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &req) {
 		return
 	}
 	if len(req.Ops) == 0 {

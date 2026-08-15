@@ -201,8 +201,7 @@ func (h *handlers) postPITRRestore(w http.ResponseWriter, r *http.Request) {
 		Timestamp string   `json:"timestamp"`
 		Volumes   []string `json:"volumes,omitempty"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &body) {
 		return
 	}
 	if strings.TrimSpace(body.Timestamp) == "" {

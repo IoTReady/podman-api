@@ -13,8 +13,7 @@ func (h *handlers) evacuate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req instance.EvacuateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &req) {
 		return
 	}
 	if _, err := h.svc.ResolveEvacuation(r.Context(), req); err != nil {
@@ -44,8 +43,7 @@ func (h *handlers) evacuatePlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req instance.EvacuateRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &req) {
 		return
 	}
 	plan, err := h.svc.PlanEvacuation(r.Context(), req)
