@@ -2010,6 +2010,114 @@ func TestCheckBackupable_AppliedSetHostErrorNotMisclassified(t *testing.T) {
 	assert.NotErrorIs(t, err, ErrInvalidBackupScope)
 }
 
+// TestCheckBackupable_RenamedVolumeBackupNoneVetoSurvivesRename (#256 review
+// round-4, blocking finding): the applied volume `data` was marked
+// `backup: none` at the apply that produced it. The template has since
+// renamed it to `pgdata` (still marked exportable there) without the
+// instance being re-applied. Before the fix, the recovered volume's marker
+// was looked up against the CURRENT template's declared map, which has no
+// entry for the OLD name `data` — reading back the zero value ("", not
+// vetoed) and silently losing the veto. With nothing else present or
+// declared-and-exportable, this must refuse rather than accept and later
+// export the vetoed volume.
+func TestCheckBackupable_RenamedVolumeBackupNoneVetoSurvivesRename(t *testing.T) {
+	svc, _, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"} // applied under the OLD name
+	sp.AppliedVolumeMeta = map[string]store.AppliedVolumeMarker{"data": {Backup: "none"}}
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	// Renamed to `pgdata`, and no longer marked `none` under its new name —
+	// exactly the situation a veto set before the rename must still block.
+	tmpl.Meta.Volumes = []render.Volume{{Name: "pgdata", Backup: "s3; interval=24h"}}
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+
+	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
+	require.Error(t, err, "the `backup: none` veto set before the rename must still block the backup")
+	assert.ErrorIs(t, err, ErrInvalidBackupScope)
+}
+
+// TestBackup_RenamedVolumeBackupNoneVetoIsSkippedNotExported (#256 review
+// round-4, blocking finding): companion to
+// TestCheckBackupable_RenamedVolumeBackupNoneVetoSurvivesRename at the
+// Backup() level, with a second, unrelated, currently-declared volume
+// (`logs`) also present so the run is accepted and actually executes the
+// export loop. The renamed `data` volume (marked `backup: none` at its
+// apply) must be skipped, not exported, even though the CURRENT template no
+// longer declares it under that name at all.
+func TestBackup_RenamedVolumeBackupNoneVetoIsSkippedNotExported(t *testing.T) {
+	svc, f, mem, blob := newBackupSvc(t)
+	ctx := context.Background()
+
+	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"} // applied under the OLD name
+	sp.AppliedVolumeMeta = map[string]store.AppliedVolumeMarker{"data": {Backup: "none"}}
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{
+		{Name: "pgdata", Backup: "s3; interval=24h"}, // renamed from `data`, not yet re-applied
+		{Name: "logs", Backup: "s3; interval=24h"},   // unrelated, currently declared, present
+	}
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	f.SetVolumeData("h1", "pg-a-logs", tarBytes(t, map[string]string{"app.log": "hi"}))
+
+	req := newBackupReq()
+	var steps []string
+	require.NoError(t, svc.Backup(ctx, req, recordSteps(&steps)))
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	assert.Equal(t, store.BackupComplete, b.State)
+	require.Len(t, b.Volumes, 1, "only the unrelated, unvetoed volume must be captured")
+	assert.Equal(t, "pg-a-logs", b.Volumes[0].Name)
+
+	key := "h1/pg/a/" + req.BackupID + "/pg-a-data.tar"
+	_, err = blob.Get(ctx, key)
+	assert.Error(t, err, "the veto'd renamed volume must never reach the blob store")
+
+	assert.Contains(t, steps, "skip-volume", "the renamed volume must be recorded as skipped for its veto, not silently omitted")
+}
+
+// TestCheckBackupable_TotalAppliedLossWithOtherPresentVolumeProceeds (#256
+// review round-4, addendum finding 1): the ENTIRE applied set is gone (a
+// genuine total loss), but the template also declares a DIFFERENT volume —
+// never part of the applied set — that already exists on the host (e.g. a
+// template edit that added a volume before the instance was re-applied for
+// it). InstanceVolumes already resolved that volume as present before the
+// total-loss check ever runs. Before the fix, the total-loss guard refused
+// the whole backup outright, discarding that already-fetched, genuinely
+// exportable volume along with the confirmed loss. It must instead proceed
+// and capture what does survive.
+func TestCheckBackupable_TotalAppliedLossWithOtherPresentVolumeProceeds(t *testing.T) {
+	svc, f, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	// `wal` was never declared by this fixture's template and never seeded on
+	// the host — guaranteed absent under both its applied and (nonexistent)
+	// current name, so this is unambiguous total loss of the applied set.
+	sp.AppliedVolumes = []string{"wal"}
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "cache", Backup: "s3; interval=24h"}}
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	f.SetVolumeData("h1", "pg-a-cache", tarBytes(t, map[string]string{"x": "y"}))
+
+	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
+	assert.NoError(t, err, "an unrelated, already-present, currently-declared volume must not be discarded by the applied set's total loss")
+}
+
 // TestBackup_ReusesTheUnderLockVolumeListing (review-5 finding 7): the recheck
 // under Backup's own lock is correct and stays — the handler's pre-lock check
 // may be arbitrarily stale — but recomputing the volume list from scratch for

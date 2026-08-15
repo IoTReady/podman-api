@@ -89,8 +89,37 @@ type Spec struct {
 	//
 	// Non-secret; stored in plaintext, same as Domains.
 	AppliedVolumes []string
-	Created        time.Time
-	Updated        time.Time
+	// AppliedVolumeMeta records, for each name in AppliedVolumes, the backup
+	// marker and exclude patterns the template declared for it AT THAT SAME
+	// APPLY — captured because a later template edit that renames a volume's
+	// short name leaves nothing under any CURRENTLY declared name for a
+	// marker/exclude lookup to find: `checkBackupable` and `Backup` recover a
+	// renamed-but-not-reapplied volume by its OLD applied full name, and a
+	// lookup keyed by the CURRENT template's declared names always misses
+	// that name, silently losing a `backup: none` veto and any exclude
+	// patterns the volume had (#256 review, blocking finding). This is the
+	// fact that closes that gap: it survives the rename because it was
+	// captured before the template changed, not reconstructed after.
+	//
+	// nil under the same "unknown/pre-existing row" rule as AppliedVolumes —
+	// a spec written before this field existed, or one whose last Apply
+	// predates it. Keyed by the same short names as AppliedVolumes; a name
+	// with no entry (e.g. a pre-existing AppliedVolumes row read back before
+	// this field's own Apply-time population) has unknown metadata, same as
+	// AppliedVolumeMeta == nil entirely.
+	//
+	// Non-secret; stored in plaintext, same as Domains and AppliedVolumes.
+	AppliedVolumeMeta map[string]AppliedVolumeMarker
+	Created           time.Time
+	Updated           time.Time
+}
+
+// AppliedVolumeMarker is one volume's backup marker and exclude patterns as
+// declared by the template at the moment it was applied. See
+// Spec.AppliedVolumeMeta.
+type AppliedVolumeMarker struct {
+	Backup  string
+	Exclude []string
 }
 
 // SpecKey identifies one stored instance without exposing its secrets. Used by

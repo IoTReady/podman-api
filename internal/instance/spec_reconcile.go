@@ -7,6 +7,8 @@ import (
 	"log"
 	"maps"
 	"slices"
+	"sort"
+	"strings"
 
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/render"
@@ -183,22 +185,39 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 	// the new claim name while the real data sits orphaned under the old one.
 	// A volume that is simply gone (never checked here) is not this guard's
 	// concern; only a rename that would fork surviving data is.
+	//
+	// Every applied name is evaluated before deciding anything (#256 review
+	// round-4, addendum finding 2): returning on the FIRST confirmed rename
+	// used to skip inspecting the rest of the set, so the refusal message
+	// named only one volume even when several had renamed. A TRANSIENT
+	// VolumeInspect error (anything but ErrNotFound) does not abort the whole
+	// reconcile either — it is logged and treated as "can't determine", not as
+	// a rename, matching this repo's general preference for treating a
+	// transient host error as retry-worthy rather than a hard block. Before
+	// this fix, ANY instance with a renamed volume depended on a live,
+	// error-free host round trip just to come back up on a routine restart.
 	if len(spec.AppliedVolumes) > 0 {
 		declaredShort := make(map[string]bool, len(tmplObj.Meta.Volumes))
 		for _, v := range tmplObj.Meta.Volumes {
 			declaredShort[v.Name] = true
 		}
+		var renamed []string
 		for _, short := range spec.AppliedVolumes {
 			if declaredShort[short] {
 				continue
 			}
 			full := volumeName(tmpl, slug, short)
 			if _, ierr := s.client.VolumeInspect(ctx, hostID, full); ierr == nil {
-				return false, fmt.Errorf("%w: applied volume %q (%s) is no longer declared by template %q but still exists on %s",
-					errVolumeRenamePending, short, full, tmpl, hostID)
+				renamed = append(renamed, short)
 			} else if !errors.Is(ierr, podman.ErrNotFound) {
-				return false, fmt.Errorf("inspect volume %q: %w", full, ierr)
+				log.Printf("boot converge %s/%s/%s: inspect volume %q: %v (transient — not blocking reconcile)",
+					hostID, tmpl, slug, full, ierr)
 			}
+		}
+		if len(renamed) > 0 {
+			sort.Strings(renamed)
+			return false, fmt.Errorf("%w: applied volume(s) %s no longer declared by template %q but still exist on %s",
+				errVolumeRenamePending, strings.Join(renamed, ", "), tmpl, hostID)
 		}
 	}
 
@@ -293,6 +312,10 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 		// applied set to match a template edit the operator has not actually
 		// re-applied, defeating #257's rename detection.
 		AppliedVolumes: slices.Clone(spec.AppliedVolumes),
+		// AppliedVolumeMeta is preserved for the same reason: it must keep
+		// naming what THIS spec was last actually applied with, not whatever
+		// the current template now declares.
+		AppliedVolumeMeta: maps.Clone(spec.AppliedVolumeMeta),
 	}
 	if err := s.store.PutSpec(ctx, sp); err != nil {
 		// Spec persist failed but the pod is already running. Log the error
