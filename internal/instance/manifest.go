@@ -2,6 +2,7 @@ package instance
 
 import (
 	"archive/tar"
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -67,9 +68,9 @@ func buildManifest(r io.Reader) (Manifest, error) {
 // themselves from w, for backup exclude patterns (#248). An excludePath entry
 // is still written to w.
 type tarOpts struct {
-	w     *tar.Writer                // nil = do not re-emit
-	drop  func(hdr *tar.Header) bool // nil = drop nothing
-	stats *dropStats                 // nil = do not count
+	w     *tar.Writer // nil = do not re-emit
+	drop  *dropFilter // nil = drop nothing
+	stats *dropStats  // nil = do not count
 }
 
 func parseTar(r io.Reader, m Manifest, opt tarOpts) error {
@@ -84,16 +85,38 @@ func parseTar(r io.Reader, m Manifest, opt tarOpts) error {
 		}
 		cleaned := path.Clean(hdr.Name)
 
-		if opt.drop != nil && opt.drop(hdr) {
-			n, err := io.Copy(io.Discard, tr)
-			if err != nil {
-				return err
+		var promotedBody []byte
+		if opt.drop != nil {
+			var drop, needsBuffer bool
+			drop, needsBuffer, promotedBody = opt.drop.decide(hdr, cleaned)
+			if opt.stats != nil && promotedBody != nil {
+				// This entry just promoted an earlier "dropped" target: its
+				// bytes ship intact under this entry's name, so undo the
+				// provisional count recorded when the target was first seen
+				// (#250 review finding 1).
+				opt.stats.Entries--
+				opt.stats.Bytes -= int64(len(promotedBody))
 			}
-			if opt.stats != nil {
-				opt.stats.Entries++
-				opt.stats.Bytes += n
+			if drop {
+				var n int64
+				if needsBuffer {
+					buf := bytes.NewBuffer(make([]byte, 0, hdr.Size))
+					n, err = io.Copy(buf, tr)
+					if err == nil {
+						opt.drop.storeBody(cleaned, buf.Bytes())
+					}
+				} else {
+					n, err = io.Copy(io.Discard, tr)
+				}
+				if err != nil {
+					return err
+				}
+				if opt.stats != nil {
+					opt.stats.Entries++
+					opt.stats.Bytes += n
+				}
+				continue
 			}
-			continue
 		}
 
 		excluded := excludePath(cleaned)
@@ -111,11 +134,21 @@ func parseTar(r io.Reader, m Manifest, opt tarOpts) error {
 		fi := fileInfo{typ: hdr.Typeflag}
 		switch hdr.Typeflag {
 		case tar.TypeReg:
-			if excluded {
+			switch {
+			case promotedBody != nil:
+				// A promoted hardlink: its content comes from the buffered
+				// target, not from tr (a TypeLink entry carries no body).
+				h := sha256.New()
+				if _, err := io.MultiWriter(h, body).Write(promotedBody); err != nil {
+					return err
+				}
+				fi.size = int64(len(promotedBody))
+				fi.sha256 = hex.EncodeToString(h.Sum(nil))
+			case excluded:
 				if _, err := io.Copy(body, tr); err != nil {
 					return err
 				}
-			} else {
+			default:
 				h := sha256.New()
 				n, err := io.Copy(io.MultiWriter(h, body), tr)
 				if err != nil {

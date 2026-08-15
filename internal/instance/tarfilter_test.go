@@ -238,10 +238,13 @@ func TestFilterTar_excludePathStillWrittenButOmittedFromManifest(t *testing.T) {
 	}
 }
 
-func TestFilterTar_dropsHardlinkToDroppedTarget(t *testing.T) {
+func TestFilterTar_dropsHardlinkToDroppedTargetWhenLinkItselfIsExcluded(t *testing.T) {
+	// The link lives INSIDE the excluded tree too (matched by the same
+	// pattern as its target), so dropping it is the intended outcome, not
+	// collateral damage — nothing is promoted.
 	src := makeTar(t, []tarEntry{
 		{name: "junk/big.bin", body: "BIG"},
-		{name: "keep/link.bin", typ: tar.TypeLink, link: "junk/big.bin"},
+		{name: "junk/link.bin", typ: tar.TypeLink, link: "junk/big.bin"},
 		{name: "keep/real.txt", body: "R"},
 	})
 	var out bytes.Buffer
@@ -251,10 +254,136 @@ func TestFilterTar_dropsHardlinkToDroppedTarget(t *testing.T) {
 	}
 	got := tarNames(t, out.Bytes())
 	if len(got) != 1 || got[0] != "keep/real.txt" {
-		t.Fatalf("entries = %v, want only keep/real.txt (link to a dropped target must go too)", got)
+		t.Fatalf("entries = %v, want only keep/real.txt", got)
 	}
 	if stats.Entries != 2 {
 		t.Fatalf("stats.Entries = %d, want 2 (the file and its link)", stats.Entries)
+	}
+}
+
+// TestFilterTar_promotesSurvivingHardlinkToExcludedTarget pins #250: a
+// hardlink whose TARGET was excluded, but whose own name is outside every
+// exclude pattern, must not be silently dropped — that would remove content
+// no pattern named. Instead the link is promoted: rewritten from TypeLink
+// into TypeReg carrying the target's actual bytes.
+func TestFilterTar_promotesSurvivingHardlinkToExcludedTarget(t *testing.T) {
+	src := makeTar(t, []tarEntry{
+		{name: "site/private/backups/db.sql.gz", body: "DUMPDUMP"},
+		{name: "site/exports/latest.sql.gz", typ: tar.TypeLink, link: "site/private/backups/db.sql.gz"},
+	})
+	var out bytes.Buffer
+	m, stats, err := filterTar(&out, bytes.NewReader(src), []string{"*/private/backups/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := tarNames(t, out.Bytes())
+	if len(got) != 1 || got[0] != "site/exports/latest.sql.gz" {
+		t.Fatalf("entries = %v, want only the promoted link", got)
+	}
+
+	tr := tar.NewReader(bytes.NewReader(out.Bytes()))
+	hdr, err := tr.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Typeflag != tar.TypeReg {
+		t.Fatalf("Typeflag = %v, want TypeReg (promoted from TypeLink)", hdr.Typeflag)
+	}
+	if hdr.Linkname != "" {
+		t.Fatalf("Linkname = %q, want empty on a promoted regular file", hdr.Linkname)
+	}
+	body, err := io.ReadAll(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "DUMPDUMP" {
+		t.Fatalf("body = %q, want the target's original content %q", body, "DUMPDUMP")
+	}
+
+	if _, ok := m["site/private/backups/db.sql.gz"]; ok {
+		t.Fatal("excluded target must not appear in the manifest under its own name")
+	}
+	fi, ok := m["site/exports/latest.sql.gz"]
+	if !ok {
+		t.Fatal("promoted entry missing from the manifest")
+	}
+	if fi.typ != tar.TypeReg || fi.size != int64(len("DUMPDUMP")) || fi.link != "" {
+		t.Fatalf("manifest entry = %+v, want a regular file carrying the content", fi)
+	}
+	if stats.Entries != 0 || stats.Bytes != 0 {
+		t.Fatalf("stats = %+v, want 0 entries / 0 bytes: the target's bytes shipped intact under the promoted link's name, so nothing was actually excluded (#250 review finding 1)", stats)
+	}
+}
+
+// TestFilterTar_promotedTargetBytesExcludedFromStatsAmongMixedDrops pins
+// finding 1 precisely: dropStats (and thus the persisted/API-exposed
+// store.ExcludedPaths) must count only bytes that were genuinely removed
+// from the output tar. A target that gets promoted via a surviving hardlink
+// ships its bytes intact under the link's name, so it must NOT be counted —
+// but a sibling excluded file with no surviving link is genuinely dropped
+// and must still be counted.
+func TestFilterTar_promotedTargetBytesExcludedFromStatsAmongMixedDrops(t *testing.T) {
+	src := makeTar(t, []tarEntry{
+		{name: "site/private/backups/db.sql.gz", body: "DUMPDUMP"},        // promoted (has a surviving link below)
+		{name: "site/private/backups/orphan.sql.gz", body: "ORPHANBYTES"}, // genuinely dropped, no link
+		{name: "site/exports/latest.sql.gz", typ: tar.TypeLink, link: "site/private/backups/db.sql.gz"},
+	})
+	var out bytes.Buffer
+	_, stats, err := filterTar(&out, bytes.NewReader(src), []string{"*/private/backups/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBytes := int64(len("ORPHANBYTES"))
+	if stats.Entries != 1 || stats.Bytes != wantBytes {
+		t.Fatalf("stats = %+v, want 1 entry / %d bytes (only the orphan, not the promoted target)", stats, wantBytes)
+	}
+}
+
+// TestFilterTar_laterHardlinksRedirectToThePromotedEntry covers the "let any
+// later links point at that new entry instead" half of #250: once one
+// surviving link has been promoted to carry the content, a second surviving
+// link to the same excluded target is NOT itself promoted (no duplicated
+// bytes) — it stays a TypeLink, just retargeted at the promoted entry's name.
+func TestFilterTar_laterHardlinksRedirectToThePromotedEntry(t *testing.T) {
+	src := makeTar(t, []tarEntry{
+		{name: "junk/big.bin", body: "BIG"},
+		{name: "keep/first.bin", typ: tar.TypeLink, link: "junk/big.bin"},
+		{name: "keep/second.bin", typ: tar.TypeLink, link: "junk/big.bin"},
+	})
+	var out bytes.Buffer
+	m, _, err := filterTar(&out, bytes.NewReader(src), []string{"junk/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tr := tar.NewReader(bytes.NewReader(out.Bytes()))
+	first, err := tr.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Name != "keep/first.bin" || first.Typeflag != tar.TypeReg {
+		t.Fatalf("first entry = %+v, want keep/first.bin as TypeReg", first)
+	}
+	body, err := io.ReadAll(tr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "BIG" {
+		t.Fatalf("first entry body = %q, want %q", body, "BIG")
+	}
+	second, err := tr.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Name != "keep/second.bin" || second.Typeflag != tar.TypeLink {
+		t.Fatalf("second entry = %+v, want keep/second.bin as TypeLink", second)
+	}
+	if second.Linkname != "keep/first.bin" {
+		t.Fatalf("second entry Linkname = %q, want redirected to the promoted entry %q", second.Linkname, "keep/first.bin")
+	}
+
+	if fi, ok := m["keep/second.bin"]; !ok || fi.link != "keep/first.bin" {
+		t.Fatalf("manifest[keep/second.bin] = %+v, want link redirected to keep/first.bin", fi)
 	}
 }
 
@@ -361,6 +490,41 @@ func TestFilterTar_manifestMatchesBuildManifestWhenNothingDropped(t *testing.T) 
 	}
 	if k, ok := got.firstDiff(want); !ok {
 		t.Fatalf("manifests differ at %q", k)
+	}
+}
+
+// TestFilterTar_cumulativeBufferCapStopsPromotingOverflow pins finding 2:
+// dropFilter must bound TOTAL cumulative buffered bytes across all pending
+// excluded entries, not just cap each entry individually. Once the running
+// total would exceed that bound, further excluded entries fall back to the
+// pre-#250 behaviour (dropped, no promotion opportunity) rather than being
+// buffered — so a backup with many small excluded files can't accumulate
+// unbounded RAM.
+func TestFilterTar_cumulativeBufferCapStopsPromotingOverflow(t *testing.T) {
+	old := maxTotalBufferedBytes
+	maxTotalBufferedBytes = 8 // tiny, for the test
+	defer func() { maxTotalBufferedBytes = old }()
+
+	src := makeTar(t, []tarEntry{
+		{name: "junk/a.bin", body: "12345"}, // 5 bytes: fits under the cap alone
+		{name: "junk/b.bin", body: "12345"}, // 5 more: 5+5=10 > 8, must NOT be buffered
+		{name: "keep/a.link", typ: tar.TypeLink, link: "junk/a.bin"},
+		{name: "keep/b.link", typ: tar.TypeLink, link: "junk/b.bin"},
+	})
+	var out bytes.Buffer
+	_, stats, err := filterTar(&out, bytes.NewReader(src), []string{"junk/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := tarNames(t, out.Bytes())
+	want := []string{"keep/a.link"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("entries = %v, want %v: a.link promoted (under cap), b.link's target overflowed the cumulative cap so b.link is dropped, not promoted", got, want)
+	}
+	// junk/b.bin and keep/b.link are genuinely dropped (2 entries); junk/a.bin
+	// was promoted and must not be counted (finding 1's fix, exercised here too).
+	if stats.Entries != 2 || stats.Bytes != int64(len("12345")) {
+		t.Fatalf("stats = %+v, want 2 entries / %d bytes (only junk/b.bin's overflowed content)", stats, len("12345"))
 	}
 }
 
