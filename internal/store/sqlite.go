@@ -436,27 +436,17 @@ func (s *SQLite) PutSpec(ctx context.Context, sp Spec) error {
 	if err != nil {
 		return err
 	}
-	// AppliedVolumes: nil stays NULL (unknown), matching the migration's
-	// backfill semantics. A non-nil slice (possibly empty) is marshalled as a
-	// JSON array, even when empty, so "known: applied with no volumes" round-trips
-	// as "[]", not NULL.
-	var appliedVolumes sql.NullString
-	if sp.AppliedVolumes != nil {
-		appliedJSON, err := json.Marshal(sp.AppliedVolumes)
-		if err != nil {
-			return err
-		}
-		appliedVolumes = sql.NullString{String: string(appliedJSON), Valid: true}
+	// AppliedVolumes / AppliedVolumeMeta: nil stays NULL (unknown), matching the
+	// migration's backfill semantics. A non-nil value (possibly empty) is
+	// marshalled as JSON even when empty, so "known: applied with no volumes"
+	// round-trips as "[]"/"{}", not NULL. See jsonOrNull / unmarshalNullable.
+	appliedVolumes, err := jsonOrNull(sp.AppliedVolumes)
+	if err != nil {
+		return err
 	}
-	// AppliedVolumeMeta follows the same nil-stays-NULL convention as
-	// AppliedVolumes.
-	var appliedVolumeMeta sql.NullString
-	if sp.AppliedVolumeMeta != nil {
-		metaJSON, err := json.Marshal(sp.AppliedVolumeMeta)
-		if err != nil {
-			return err
-		}
-		appliedVolumeMeta = sql.NullString{String: string(metaJSON), Valid: true}
+	appliedVolumeMeta, err := jsonOrNull(sp.AppliedVolumeMeta)
+	if err != nil {
+		return err
 	}
 	now := time.Now().Unix()
 	return s.write(ctx, func() error {
@@ -529,27 +519,20 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 	if err := json.Unmarshal([]byte(domainsJSON), &domains); err != nil {
 		return Spec{}, fmt.Errorf("%w: domains: %v", ErrSpecCorrupt, err)
 	}
-	// appliedVolumes stays nil when the column is NULL — a spec written before
-	// #257, or one never re-applied since. A non-NULL value unmarshals to a
-	// non-nil (possibly empty) slice, preserving the "unknown vs known-empty"
-	// distinction all the way back to the caller.
+	// appliedVolumes / appliedVolumeMeta stay nil when their column is NULL — a
+	// spec written before #257/#265, or one never re-applied since. A non-NULL
+	// value unmarshals to a non-nil (possibly empty) value, preserving the
+	// "unknown vs known-empty" distinction all the way back to the caller:
+	// PutSpec never marshals a nil into these columns (it leaves them NULL
+	// instead — see jsonOrNull), so the stored JSON is always a real array or
+	// object, never "null".
 	var appliedVolumes []string
-	if appliedVolumesRaw.Valid {
-		// PutSpec never marshals a nil slice into this column (it leaves the
-		// column NULL instead — see there), so the stored JSON is always a real
-		// array, "[]" at minimum, never "null". Unmarshalling it therefore
-		// always yields a non-nil slice; no fallback needed.
-		if err := json.Unmarshal([]byte(appliedVolumesRaw.String), &appliedVolumes); err != nil {
-			return Spec{}, fmt.Errorf("%w: applied_volumes: %v", ErrSpecCorrupt, err)
-		}
+	if err := unmarshalNullable(appliedVolumesRaw, &appliedVolumes, "applied_volumes"); err != nil {
+		return Spec{}, err
 	}
-	// appliedVolumeMeta follows the same NULL-vs-known-empty convention as
-	// appliedVolumes above.
 	var appliedVolumeMeta map[string]AppliedVolumeMarker
-	if appliedVolumeMetaRaw.Valid {
-		if err := json.Unmarshal([]byte(appliedVolumeMetaRaw.String), &appliedVolumeMeta); err != nil {
-			return Spec{}, fmt.Errorf("%w: applied_volume_meta: %v", ErrSpecCorrupt, err)
-		}
+	if err := unmarshalNullable(appliedVolumeMetaRaw, &appliedVolumeMeta, "applied_volume_meta"); err != nil {
+		return Spec{}, err
 	}
 	return Spec{
 		Host: host, Template: template, Slug: slug,
@@ -558,6 +541,37 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 		AppliedVolumeMeta: appliedVolumeMeta,
 		Created:           time.Unix(created, 0), Updated: time.Unix(updated, 0),
 	}, nil
+}
+
+// jsonOrNull marshals a nil-able spec field into a nullable column value: nil
+// stays NULL ("unknown"), while a non-nil value — empty included — marshals to
+// JSON ("known"). That distinction is what lets a spec written before a field
+// existed read back as unknown rather than as a confident empty set, and it is
+// load-bearing for every AppliedVolumes consumer, so both writer and reader
+// (unmarshalNullable) go through one implementation rather than repeating the
+// convention per field (#265 review, minor cleanup).
+func jsonOrNull[T []string | map[string]AppliedVolumeMarker](v T) (sql.NullString, error) {
+	if v == nil {
+		return sql.NullString{}, nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return sql.NullString{}, err
+	}
+	return sql.NullString{String: string(b), Valid: true}, nil
+}
+
+// unmarshalNullable is jsonOrNull's read side: a NULL column leaves *dst at its
+// zero value (nil, "unknown"); a non-NULL one unmarshals into it, reporting a
+// malformed value as ErrSpecCorrupt naming the column.
+func unmarshalNullable[T any](raw sql.NullString, dst *T, column string) error {
+	if !raw.Valid {
+		return nil
+	}
+	if err := json.Unmarshal([]byte(raw.String), dst); err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrSpecCorrupt, column, err)
+	}
+	return nil
 }
 
 func (s *SQLite) DeleteSpec(ctx context.Context, host, template, slug string) error {

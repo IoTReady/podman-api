@@ -35,7 +35,48 @@ var errTemplateSkipped = errors.New("template not found — instance skipped")
 // so it is not this path's job to decide how to reconcile it — that is what
 // an explicit re-Apply (which does have rename-vs-loss context, #256) is for.
 // The caller logs a human-readable message instead of the error text.
+//
+// It is returned only when a rename is CORROBORATED — the template also
+// declares a volume this instance was never applied with that does not yet
+// exist on the host, i.e. somewhere the old data could have been renamed to.
+// Without that, the same signature is just an ordinary dropped-and-unpruned
+// volume, which is replayed with a warning rather than blocked (#265 review
+// finding 3): a routine template cleanup must not leave pods down across every
+// reboot.
 var errVolumeRenamePending = errors.New("template volume renamed since last apply — instance skipped, re-apply required")
+
+// renameTargets returns the (short) names of volumes the CURRENT template
+// declares that this instance was never applied with AND that do not yet exist
+// on the host — the only shape a renamed applied volume could have been renamed
+// TO, and the corroborating evidence Step 3.5 requires before refusing to
+// replay (#265 review finding 3).
+//
+// A newly declared volume that ALREADY exists is not a target: replaying binds
+// the pod to real, existing data, forking nothing. A transient VolumeInspect
+// failure is logged and treated as "not a target", matching how Step 3.5's own
+// loop treats a transient error — an inconclusive host call must not be the
+// thing that keeps a pod down across reboots.
+func (s *Service) renameTargets(ctx context.Context, hostID, tmpl, slug string, declared []render.Volume, applied []string) []string {
+	appliedSet := make(map[string]bool, len(applied))
+	for _, short := range applied {
+		appliedSet[short] = true
+	}
+	var targets []string
+	for _, v := range declared {
+		if appliedSet[v.Name] {
+			continue
+		}
+		full := volumeName(tmpl, slug, v.Name)
+		if _, ierr := s.client.VolumeInspect(ctx, hostID, full); errors.Is(ierr, podman.ErrNotFound) {
+			targets = append(targets, v.Name)
+		} else if ierr != nil {
+			log.Printf("boot converge %s/%s/%s: inspect volume %q: %v (transient — not treated as a rename target)",
+				hostID, tmpl, slug, full, ierr)
+		}
+	}
+	sort.Strings(targets)
+	return targets
+}
 
 // ReconcileSpecsOnHost checks every stored instance spec on host against real
 // pod state and re-converges any that are missing (not running), so managed
@@ -216,8 +257,28 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 		}
 		if len(renamed) > 0 {
 			sort.Strings(renamed)
-			return false, fmt.Errorf("%w: applied volume(s) %s no longer declared by template %q but still exist on %s",
-				errVolumeRenamePending, strings.Join(renamed, ", "), tmpl, hostID)
+			// "Applied name no longer declared, but still on the host" is the
+			// signature of a rename AND of a volume that was simply DROPPED
+			// from the template while the old podman volume was never pruned —
+			// a routine, unremarkable template edit (#265 review finding 3).
+			// Blocking on that ambiguity left the pod down on every boot
+			// converge sweep until someone manually re-applied, turning a
+			// template cleanup into a fleet-wide outage where the pre-#256
+			// behaviour simply replayed PlayKube.
+			//
+			// A rename has one corroborating signal a drop does not: the NEW
+			// name. Only refuse when the template declares a volume this
+			// instance was never applied with AND that volume does not yet
+			// exist on the host — i.e. there is somewhere for the old data to
+			// have been renamed TO, and replaying now would create it empty
+			// while the real data sits orphaned. With no such target, no data
+			// can fork, so warn and let the pod come back up.
+			if targets := s.renameTargets(ctx, hostID, tmpl, slug, tmplObj.Meta.Volumes, spec.AppliedVolumes); len(targets) > 0 {
+				return false, fmt.Errorf("%w: applied volume(s) %s no longer declared by template %q but still exist on %s (newly declared, not-yet-created volume(s) %s look like the rename target)",
+					errVolumeRenamePending, strings.Join(renamed, ", "), tmpl, hostID, strings.Join(targets, ", "))
+			}
+			log.Printf("boot converge %s/%s/%s: applied volume(s) %s are no longer declared by template %q but still exist on %s — no newly declared volume looks like a rename target, so this is treated as a dropped (unpruned) volume and the pod is replayed; prune them once you are sure",
+				hostID, tmpl, slug, strings.Join(renamed, ", "), tmpl, hostID)
 		}
 	}
 

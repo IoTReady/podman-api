@@ -1770,6 +1770,13 @@ func TestCheckBackupable_AppliedSetEmptyIsBrandNewAccepts(t *testing.T) {
 // `podman volume prune`, an evacuation that never landed) — a first empty
 // backup this is not, and it must be refused rather than recorded as a green,
 // empty `complete` row that ages out the last backup that actually held data.
+//
+// Since #265 review finding 2 the refusal requires corroborating evidence that
+// the volume ever existed, because "applied but absent" alone is equally
+// consistent with "never materialised" (see
+// TestCheckBackupable_SingleNeverMaterialisedAppliedVolumeIsNotTotalLoss). An
+// earlier COMPLETE backup that captured `pg-a-data` is that evidence: the
+// volume demonstrably existed, so its absence now is genuine loss.
 func TestCheckBackupable_AppliedSetTotalLossRefuses(t *testing.T) {
 	svc, f, mem, _ := newBackupSvc(t)
 	ctx := context.Background()
@@ -1779,12 +1786,67 @@ func TestCheckBackupable_AppliedSetTotalLossRefuses(t *testing.T) {
 	sp.AppliedVolumes = []string{"data"} // applied with `data`
 	require.NoError(t, mem.PutSpec(ctx, sp))
 
+	// Proof `data` once existed: an earlier backup captured it.
+	prior := store.NewBackupID()
+	require.NoError(t, mem.CreateBackup(ctx, store.Backup{
+		ID: prior, Host: "h1", Template: "pg", Slug: "a", State: store.BackupCreating,
+	}))
+	ok, err := mem.CompleteBackup(ctx, prior, []store.BackupVolume{{Name: "pg-a-data", SizeBytes: 1}})
+	require.NoError(t, err)
+	require.True(t, ok)
+
 	require.NoError(t, f.VolumeRemove(ctx, "h1", "pg-a-data", true))
 
 	err = svc.CheckBackupable(ctx, "h1", "pg", "a", nil)
 	require.ErrorIs(t, err, ErrInvalidBackupScope)
 	assert.Contains(t, err.Error(), "data")
 	assert.Contains(t, err.Error(), "no longer exist")
+}
+
+// TestCheckBackupable_TotalLossWithoutPriorBackupAccepts (#265 review finding
+// 2): the same shape as the test above, but nothing ever corroborated that the
+// applied volume existed — no earlier backup captured it. That is exactly as
+// consistent with "the app never created it" as with "it was lost", and the
+// partial-loss branch already declines to refuse on that ambiguity. The
+// unscoped backup proceeds, capturing whatever the host does hold.
+func TestCheckBackupable_TotalLossWithoutPriorBackupAccepts(t *testing.T) {
+	svc, f, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"}
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	require.NoError(t, f.VolumeRemove(ctx, "h1", "pg-a-data", true))
+
+	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil))
+}
+
+// TestCheckBackupable_TotalLossEvidenceFromAFailedBackupDoesNotCount (#265
+// review finding 2): only a COMPLETE backup proves a volume existed. A failed
+// row's recorded volumes are not evidence — a backup can fail before capturing
+// anything — so it must not resurrect the refusal.
+func TestCheckBackupable_TotalLossEvidenceFromAFailedBackupDoesNotCount(t *testing.T) {
+	svc, f, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"}
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	prior := store.NewBackupID()
+	require.NoError(t, mem.CreateBackup(ctx, store.Backup{
+		ID: prior, Host: "h1", Template: "pg", Slug: "a", State: store.BackupCreating,
+	}))
+	ok, err := mem.FailBackup(ctx, prior)
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	require.NoError(t, f.VolumeRemove(ctx, "h1", "pg-a-data", true))
+
+	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil))
 }
 
 // TestCheckBackupable_ZeroDeclaredWithMaterialisedAppliedVolumesRefuses
@@ -2158,4 +2220,140 @@ func TestBackup_ReusesTheUnderLockVolumeListing(t *testing.T) {
 	}
 	assert.Equal(t, []string{"pg-a-data"}, names,
 		"the export loop must consume the volume list the under-lock check resolved, not re-list the host")
+}
+
+// metaDropStore serves the first GetSpec faithfully and every later one with
+// AppliedVolumeMeta stripped, standing in for a spec that changed (a
+// concurrent re-Apply) between two independent reads. Backup() and
+// Apply/Delete serialize under DIFFERENT locks (migrateLock vs instanceLock),
+// so nothing in the process prevents that interleaving.
+type metaDropStore struct {
+	*store.Memory
+	mu sync.Mutex
+	n  int
+}
+
+func (m *metaDropStore) GetSpec(ctx context.Context, host, template, slug string) (store.Spec, error) {
+	sp, err := m.Memory.GetSpec(ctx, host, template, slug)
+	if err != nil {
+		return sp, err
+	}
+	m.mu.Lock()
+	m.n++
+	first := m.n == 1
+	m.mu.Unlock()
+	if !first {
+		sp.AppliedVolumeMeta = nil
+	}
+	return sp, nil
+}
+
+// TestBackup_RenamedVolumeVetoSurvivesASecondDivergentSpecRead (#265 review
+// finding 1): Backup() used to re-fetch the spec through a SECOND, independent
+// GetSpec purely to fold AppliedVolumeMeta into its marker map, and silently
+// no-op'd whenever that read failed or observed anything different from the
+// one checkBackupable already made. A `backup: none` veto carried across a
+// rename then evaporated and the volume was exported anyway — the exact
+// veto-bypass the previous round fixed. The merged marker map must come from
+// checkBackupable itself, so there is no second read to diverge.
+func TestBackup_RenamedVolumeVetoSurvivesASecondDivergentSpecRead(t *testing.T) {
+	svc, f, mem, blob := newBackupSvc(t)
+	ctx := context.Background()
+
+	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"} // applied under the OLD name
+	sp.AppliedVolumeMeta = map[string]store.AppliedVolumeMarker{"data": {Backup: "none"}}
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{
+		{Name: "pgdata", Backup: "s3; interval=24h"}, // renamed from `data`
+		{Name: "logs", Backup: "s3; interval=24h"},   // unrelated, present
+	}
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+	f.SetVolumeData("h1", "pg-a-logs", tarBytes(t, map[string]string{"app.log": "hi"}))
+
+	svc.SetStore(&metaDropStore{Memory: mem})
+
+	req := newBackupReq()
+	require.NoError(t, svc.Backup(ctx, req, nil))
+
+	key := "h1/pg/a/" + req.BackupID + "/pg-a-data.tar"
+	_, err = blob.Get(ctx, key)
+	assert.Error(t, err, "the `backup: none` veto must not be lost to a second, divergent spec read")
+
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 1)
+	assert.Equal(t, "pg-a-logs", b.Volumes[0].Name)
+}
+
+// TestCheckBackupable_SingleNeverMaterialisedAppliedVolumeIsNotTotalLoss
+// (#265 review finding 2): an instance applied with exactly ONE volume that
+// has not materialised yet (an optional/lazily-created volume the app only
+// creates under some condition) hit the total-loss refusal, which treats
+// "the applied set never materialised" identically to "the applied set was
+// lost". That is the same ambiguity the partial-loss branch deliberately
+// refuses to refuse on — with a single-member applied set there is simply no
+// surviving sibling to make it "partial". A brand-new instance must not be
+// permanently blocked from taking its first backup.
+func TestCheckBackupable_SingleNeverMaterialisedAppliedVolumeIsNotTotalLoss(t *testing.T) {
+	svc, f, mem, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "wal", Backup: "s3; interval=24h"}}
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+
+	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"wal"} // applied with exactly one volume
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	// Nothing ever materialised: `wal` was never created, and the fixture's
+	// `data` volume is no longer declared either.
+	require.NoError(t, f.VolumeRemove(ctx, "h1", "pg-a-data", true))
+
+	assert.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil),
+		"a never-materialised single applied volume must not be misread as total loss")
+}
+
+// TestCheckBackupable_AllDeclaredVetoedStillRecoversARenamedVolume (#265
+// review finding 4): the all-declared-vetoed refusal used to fire before the
+// rename-recovery logic ever ran. Here the template renamed `data` to
+// `pgdata` and marked the new name `backup: none`, so every CURRENTLY
+// declared volume is vetoed — but the real, exportable data still sits on the
+// host under its applied name `data`, whose applied marker is NOT vetoed.
+// Refusing outright discards exactly the data this PR's rename recovery
+// exists to capture.
+func TestCheckBackupable_AllDeclaredVetoedStillRecoversARenamedVolume(t *testing.T) {
+	svc, _, mem, blob := newBackupSvc(t)
+	ctx := context.Background()
+
+	sp, err := mem.GetSpec(ctx, "h1", "pg", "a")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"} // applied under the OLD name
+	sp.AppliedVolumeMeta = map[string]store.AppliedVolumeMarker{"data": {Backup: "s3; interval=24h"}}
+	require.NoError(t, mem.PutSpec(ctx, sp))
+
+	tmpl, err := mem.GetTemplate(ctx, "pg")
+	require.NoError(t, err)
+	// Renamed AND newly vetoed under the new name.
+	tmpl.Meta.Volumes = []render.Volume{{Name: "pgdata", Backup: "none"}}
+	require.NoError(t, mem.PutTemplate(ctx, tmpl))
+
+	require.NoError(t, svc.CheckBackupable(ctx, "h1", "pg", "a", nil),
+		"recoverable data under the old applied name must be considered before refusing")
+
+	req := newBackupReq()
+	require.NoError(t, svc.Backup(ctx, req, nil))
+	b, err := svc.store.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 1)
+	assert.Equal(t, "pg-a-data", b.Volumes[0].Name)
+	_, err = blob.Get(ctx, "h1/pg/a/"+req.BackupID+"/pg-a-data.tar")
+	assert.NoError(t, err)
 }

@@ -419,3 +419,65 @@ func TestReconcileSpecsOnHost_InvalidatesInstanceCache(t *testing.T) {
 		t.Error("ListAllInstances hit stale cache after boot converge; expected invalidation + refetch")
 	}
 }
+
+// TestReconcileOneSpec_DroppedUnprunedVolumeDoesNotBlockReplay (#265 review
+// finding 3): "applied name no longer declared, but still on the host" is
+// the signature of a rename AND of an ordinary volume that was simply removed
+// from the template while the old podman volume was never pruned — a routine
+// template edit. The guard used to treat both as a pending rename and left
+// the pod down on every boot-reconcile sweep until someone manually
+// re-applied, converting a template cleanup into a fleet-wide outage. With no
+// corroborating rename target (no newly declared volume that is still absent
+// from the host), the replay must proceed.
+func TestReconcileOneSpec_DroppedUnprunedVolumeDoesNotBlockReplay(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	sp, err := st.GetSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"}
+	require.NoError(t, st.PutSpec(ctx, sp))
+
+	// The old volume was never pruned after the template dropped it.
+	fc.SetVolumeData("h1", "web-my-app-data", []byte("stale, unpruned"))
+
+	tmpl, err := st.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = nil // `data` dropped outright, nothing renamed to
+	require.NoError(t, st.PutTemplate(ctx, tmpl))
+
+	reconciled, err := svc.reconcileOneSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err, "a dropped-and-unpruned volume must not block boot converge")
+	assert.True(t, reconciled)
+	require.Len(t, fc.PlayCalls, 1, "the pod must come back up")
+}
+
+// TestReconcileOneSpec_DroppedVolumeWithOtherDeclaredVolumesPresentReplays
+// (#265 review finding 3): same shape, but the template still declares a
+// volume — one that ALREADY exists on the host, so it cannot be the target of
+// a rename from the dropped name. Still no evidence of a rename; still must
+// replay.
+func TestReconcileOneSpec_DroppedVolumeWithOtherDeclaredVolumesPresentReplays(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	sp, err := st.GetSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data", "cache"}
+	require.NoError(t, st.PutSpec(ctx, sp))
+
+	fc.SetVolumeData("h1", "web-my-app-data", []byte("stale, unpruned"))
+	fc.SetVolumeData("h1", "web-my-app-cache", []byte("still declared and present"))
+
+	tmpl, err := st.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "cache"}} // `data` dropped
+	require.NoError(t, st.PutTemplate(ctx, tmpl))
+
+	reconciled, err := svc.reconcileOneSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	assert.True(t, reconciled)
+	require.Len(t, fc.PlayCalls, 1)
+}
