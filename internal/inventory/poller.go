@@ -211,6 +211,16 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			// stats + loadavg + boot. The budget invariant this enables is
 			// checked at startup by server.statsBudgetWarning.
 			var sub sync.WaitGroup
+			// spawn launches fn on its own goroutine, tracked by sub: a
+			// one-line stand-in for the sub.Add(1)/defer sub.Done() pair each
+			// sampler below would otherwise repeat.
+			spawn := func(fn func()) {
+				sub.Add(1)
+				go func() {
+					defer sub.Done()
+					fn()
+				}()
+			}
 
 			// Sampled under its own state map — whatever it does, the
 			// reachability verdict above is already final — and under its own
@@ -260,9 +270,7 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			// starts, so reading it here concurrently with the loadavg/boot
 			// goroutines below is safe — it is never written again.
 			if p.Stats != nil {
-				sub.Add(1)
-				go func() {
-					defer sub.Done()
+				spawn(func() {
 					if err != nil {
 						p.Stats.DropHostStats(host)
 					} else {
@@ -270,7 +278,7 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 						p.logStatsTransition(host, p.Stats.RefreshHostStats(sctx, host))
 						scancel()
 					}
-				}()
+				})
 			}
 			// Own budget derived from ctx, own state map — and, like the boot
 			// probe below and unlike the stats sampler, run regardless of the
@@ -291,16 +299,14 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			// its own. There is no equivalent of a cumulative counter frozen at
 			// its last value.
 			if p.LoadAvg != nil {
-				sub.Add(1)
-				go func() {
-					defer sub.Done()
+				spawn(func() {
 					lctx, lcancel := context.WithTimeout(ctx, p.loadAvgTimeout())
 					sampled, lerr := p.LoadAvg.RefreshHostLoadAvg(lctx, host)
 					lcancel()
 					if sampled {
 						p.logLoadAvgTransition(host, lerr)
 					}
-				}()
+				})
 			}
 			// Independent of the refresh's own outcome (err above): a reboot
 			// probe is a different, lighter libpod call, and a host that just
@@ -311,13 +317,11 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 			// itself (the tick's own long-lived context, cancelled only on
 			// poller shutdown), never bctx: see BootTimeout's doc comment.
 			if p.Boot != nil {
-				sub.Add(1)
-				go func() {
-					defer sub.Done()
+				spawn(func() {
 					bctx, bcancel := context.WithTimeout(ctx, p.bootTimeout())
 					p.checkBoot(bctx, ctx, host)
 					bcancel()
-				}()
+				})
 			}
 			sub.Wait()
 		}(h)

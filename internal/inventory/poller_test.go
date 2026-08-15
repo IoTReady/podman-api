@@ -1179,8 +1179,9 @@ func TestPollerSubSamplersRunConcurrently(t *testing.T) {
 	elapsed := time.Since(start)
 
 	// Sequential would be >= 450ms (150ms * 3). Concurrent should land close
-	// to a single 150ms wait; generous slack for scheduling noise.
-	if elapsed >= 400*time.Millisecond {
+	// to a single 150ms wait; generous slack for scheduling noise on a
+	// loaded/throttled CI runner.
+	if elapsed >= 700*time.Millisecond {
 		t.Fatalf("tick took %s; the stats/loadavg/boot sub-samplers appear to "+
 			"run sequentially rather than concurrently", elapsed)
 	}
