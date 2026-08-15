@@ -437,7 +437,7 @@ func (r *Real) sshRun(ctx context.Context, hostID, cmd string) (string, config.H
 		return "", h, err
 	}
 	out, err := sshSession(ctx, e, cl, cmd)
-	if err == nil || !sshConnBroken(err) {
+	if err == nil || !connBroken(err) {
 		return out, h, err
 	}
 	e.invalidate(cl)
@@ -454,7 +454,7 @@ func (r *Real) sshRun(ctx context.Context, hostID, cmd string) (string, config.H
 		return "", h, err // an ordinary reconnect failure; the original is more informative
 	}
 	out, err = sshSession(ctx, e, cl, cmd)
-	if err != nil && sshConnBroken(err) {
+	if err != nil && connBroken(err) {
 		// The reconnect handshaked, but the session broke the same way: the
 		// replacement is no better than what it replaced. Evict it too. The
 		// command is not attempted a third time — but leaving the known-bad
@@ -515,7 +515,7 @@ func (r *Real) connectFresh(ctx context.Context, hostID string) (*sshPoolEntry, 
 		}
 		return nil, h, nil, err
 	}
-	return nil, h, nil, fmt.Errorf("host %q: %w", hostID, errRetiredHost)
+	panic("unreachable: every loop body path above returns")
 }
 
 // sshSession runs one command on an established client, bounded by ctx.
@@ -532,7 +532,7 @@ func (r *Real) connectFresh(ctx context.Context, hostID string) (*sshPoolEntry, 
 // NAT mapping this pool exists to survive) answers nothing at all, so a
 // deadline is the *only* symptom it ever produces. Left at that, a wedged
 // client would sit in the pool forever, failing every later call with a ctx
-// error that sshConnBroken deliberately does not treat as a transport fault,
+// error that connBroken deliberately does not treat as a transport fault,
 // and pinning this goroutine on a call that never returns.
 //
 // So the session gets sshWedgeGrace to finish after we stop waiting. If it
@@ -569,7 +569,7 @@ func sshSession(ctx context.Context, e *sshPoolEntry, cl *ssh.Client, cmd string
 				// still have broken. Nobody is left to act on that error, and
 				// leaving the client pooled makes the next caller rediscover it
 				// at the cost of its own round trip.
-				if res.err != nil && sshConnBroken(res.err) {
+				if res.err != nil && connBroken(res.err) {
 					e.invalidate(cl)
 				}
 			case <-t.C:
@@ -585,11 +585,17 @@ func sshSession(ctx context.Context, e *sshPoolEntry, cl *ssh.Client, cmd string
 	}
 }
 
-// sshConnBroken reports whether err means the connection itself is unusable,
+// connBroken reports whether err means the connection itself is unusable,
 // as opposed to the remote command having failed on a perfectly good one.
 // Only the former is worth a reconnect: retrying a command that exited 1
 // (say, `cat` on a file the host does not have) just fails twice as slowly.
-func sshConnBroken(err error) bool {
+//
+// Shared beyond this pool: real.go's libpod connection cache (ctxFor) uses it
+// too, via the same http.RoundTripper failure shape — a RoundTrip error is
+// always a transport failure (dial/write/read), never a decoded HTTP
+// response, so the same "everything but our own cancellation/deadline is the
+// transport" rule applies without change (#252).
+func connBroken(err error) bool {
 	if err == nil {
 		return false
 	}

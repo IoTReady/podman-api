@@ -234,8 +234,101 @@ func (r *Real) ctxFor(parent context.Context, id string) (context.Context, error
 	if err != nil {
 		return nil, fmt.Errorf("connect to host %q: %w", id, err)
 	}
+	r.wireInvalidation(c, id)
 	r.ctx[id] = c
 	return c, nil
+}
+
+// wireInvalidation wraps c's underlying HTTP transport so a transport-level
+// failure evicts the cached connection instead of being replayed on every
+// later call to id forever (#252).
+//
+// This is the only hook point that works for every operation method without
+// touching each of their ~30 call sites individually: the bindings library
+// stores one *http.Client on the connection context, and every PodList,
+// ContainerExec, HostInfo, etc. call funnels through it. A RoundTrip error is
+// always a transport failure — dial refused, connection reset, read timeout
+// on a wedged host — never an application error (a 404 or 409 comes back as
+// a normal *http.Response with a non-2xx status and a nil error), so
+// connBroken's classification applies unchanged.
+//
+// Best-effort: if the bindings package ever changes shape so GetClient or
+// Client is unavailable here, this silently does nothing rather than failing
+// the connection it was meant to protect.
+func (r *Real) wireInvalidation(c context.Context, id string) {
+	conn, err := bindings.GetClient(c)
+	if err != nil || conn == nil || conn.Client == nil {
+		return
+	}
+	next := conn.Client.Transport
+	if next == nil {
+		next = http.DefaultTransport
+	}
+	conn.Client.Transport = &invalidatingTransport{
+		next: next,
+		onBroken: func() {
+			r.invalidateConn(id, c)
+		},
+	}
+}
+
+// invalidatingTransport wraps an http.RoundTripper and reports every
+// transport-level failure to onBroken. See wireInvalidation.
+type invalidatingTransport struct {
+	next     http.RoundTripper
+	onBroken func()
+}
+
+// RoundTrip evicts on two distinct signals, not one:
+//
+//   - connBroken(err): a raw transport error (dial refused, reset, an EOF) —
+//     the connection visibly died.
+//   - req.Context() itself having timed out: the ~30 operation methods that
+//     route through opCtxFor bound every call with a fixed callTimeout, and a
+//     wedged connection (the TCP socket accepts writes but the OS never
+//     surfaces a read error — the #252 incident) manifests as that deadline
+//     firing, not as a transport error. connBroken deliberately does not
+//     treat context.DeadlineExceeded as broken (ssh_pool.go's sshSession
+//     needs that: there ctx is the *caller's* short budget, and hitting it
+//     says nothing about the connection's health). Here it is different:
+//     req.Context() is opCtxFor's own callTimeout, already generous (10
+//     minutes) specifically so that reaching it means the call hung, not
+//     that it was merely slow. So the deadline firing here is itself the
+//     wedge signal, the same role sshWedgeGrace's watchdog plays for the SSH
+//     pool — no extra grace window is needed on top of a timeout that is
+//     already the grace window.
+//
+// Distinguishing "this call's own deadline fired" from "the caller gave up
+// early" matters: opCtxFor bridges the caller's cancellation into the derived
+// context via context.AfterFunc(parent, cancel), so a client disconnecting
+// mid-request cancels req.Context() before its deadline — that reports
+// context.Canceled, not context.DeadlineExceeded, and must not evict a
+// perfectly healthy connection just because its caller walked away.
+func (t *invalidatingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.next.RoundTrip(req)
+	if err != nil && (connBroken(err) || errors.Is(req.Context().Err(), context.DeadlineExceeded)) {
+		t.onBroken()
+	}
+	return resp, err
+}
+
+// invalidateConn drops the cached libpod connection for id if it is still the
+// one that just failed. The identity check (dead is the exact context ctxFor
+// stored) matters the same way sshPoolEntry.invalidate's does: between this
+// failure and the invalidation running, a reload (SetHosts) or a concurrent
+// redial may already have replaced the cached connection with a good one, and
+// dropping that would turn one transport fault into a reconnect for every
+// concurrent caller instead of just the one that actually broke.
+func (r *Real) invalidateConn(id string, dead context.Context) {
+	r.mu.Lock()
+	if r.ctx[id] == dead {
+		delete(r.ctx, id)
+		// The version check is a property of the connection that just died,
+		// not of the host — a fresh connection must re-verify rather than
+		// inherit a pass recorded against the socket we just evicted.
+		delete(r.verified, id)
+	}
+	r.mu.Unlock()
 }
 
 // probeVersion fetches the podman version over an established connection ctx.
