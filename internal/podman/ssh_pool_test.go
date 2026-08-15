@@ -409,8 +409,8 @@ func TestSSHConnBroken(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := sshConnBroken(tc.err); got != tc.want {
-				t.Errorf("sshConnBroken(%v) = %v, want %v", tc.err, got, tc.want)
+			if got := connBroken(tc.err); got != tc.want {
+				t.Errorf("connBroken(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}
@@ -499,7 +499,7 @@ func (p *wedgeProxy) relay(dst, src net.Conn) {
 
 // The failure mode pooling introduces that dial-per-read could not have: a
 // half-open connection answers nothing, so it surfaces ONLY as the caller's
-// own ctx deadline — which sshConnBroken deliberately does not treat as a
+// own ctx deadline — which connBroken deliberately does not treat as a
 // transport fault. Left there, the dead client stays pooled and every later
 // call fails the same way forever, with no recovery short of a restart, while
 // the host itself is perfectly reachable via libpod.

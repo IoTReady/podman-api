@@ -234,8 +234,76 @@ func (r *Real) ctxFor(parent context.Context, id string) (context.Context, error
 	if err != nil {
 		return nil, fmt.Errorf("connect to host %q: %w", id, err)
 	}
+	r.wireInvalidation(c, id)
 	r.ctx[id] = c
 	return c, nil
+}
+
+// wireInvalidation wraps c's underlying HTTP transport so a transport-level
+// failure evicts the cached connection instead of being replayed on every
+// later call to id forever (#252).
+//
+// This is the only hook point that works for every operation method without
+// touching each of their ~30 call sites individually: the bindings library
+// stores one *http.Client on the connection context, and every PodList,
+// ContainerExec, HostInfo, etc. call funnels through it. A RoundTrip error is
+// always a transport failure — dial refused, connection reset, read timeout
+// on a wedged host — never an application error (a 404 or 409 comes back as
+// a normal *http.Response with a non-2xx status and a nil error), so
+// connBroken's classification applies unchanged.
+//
+// Best-effort: if the bindings package ever changes shape so GetClient or
+// Client is unavailable here, this silently does nothing rather than failing
+// the connection it was meant to protect.
+func (r *Real) wireInvalidation(c context.Context, id string) {
+	conn, err := bindings.GetClient(c)
+	if err != nil || conn == nil || conn.Client == nil {
+		return
+	}
+	next := conn.Client.Transport
+	if next == nil {
+		next = http.DefaultTransport
+	}
+	conn.Client.Transport = &invalidatingTransport{
+		next: next,
+		onBroken: func() {
+			r.invalidateConn(id, c)
+		},
+	}
+}
+
+// invalidatingTransport wraps an http.RoundTripper and reports every
+// transport-level failure to onBroken. See wireInvalidation.
+type invalidatingTransport struct {
+	next     http.RoundTripper
+	onBroken func()
+}
+
+func (t *invalidatingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.next.RoundTrip(req)
+	if err != nil && connBroken(err) {
+		t.onBroken()
+	}
+	return resp, err
+}
+
+// invalidateConn drops the cached libpod connection for id if it is still the
+// one that just failed. The identity check (dead is the exact context ctxFor
+// stored) matters the same way sshPoolEntry.invalidate's does: between this
+// failure and the invalidation running, a reload (SetHosts) or a concurrent
+// redial may already have replaced the cached connection with a good one, and
+// dropping that would turn one transport fault into a reconnect for every
+// concurrent caller instead of just the one that actually broke.
+func (r *Real) invalidateConn(id string, dead context.Context) {
+	r.mu.Lock()
+	if r.ctx[id] == dead {
+		delete(r.ctx, id)
+		// The version check is a property of the connection that just died,
+		// not of the host — a fresh connection must re-verify rather than
+		// inherit a pass recorded against the socket we just evicted.
+		delete(r.verified, id)
+	}
+	r.mu.Unlock()
 }
 
 // probeVersion fetches the podman version over an established connection ctx.
