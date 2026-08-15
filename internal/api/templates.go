@@ -1,8 +1,8 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
+	"time"
 
 	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
@@ -28,6 +28,13 @@ func templateJSON(t store.Template) map[string]any {
 
 // templateBody is the decoded request body shared by create/update. The id is
 // only honoured on create; update forces it to the path id.
+//
+// Origin/Created/Updated are accepted but ignored: templateJSON() emits them
+// on every GET, so a client following the standard REST edit pattern (GET,
+// change one field, PUT the whole object back) sends them straight back in
+// the body. Without a field to decode them into, DisallowUnknownFields 400s
+// that request. They stay server-managed — a client-supplied value here never
+// overrides the store's own Origin/Created/Updated (#254 review finding 1).
 type templateBody struct {
 	ID         string            `json:"id"`
 	Body       string            `json:"body"`
@@ -37,6 +44,9 @@ type templateBody struct {
 	Volumes    []render.Volume   `json:"volumes"`
 	Ingress    *render.Ingress   `json:"ingress"`
 	PreBackup  *render.PreBackup `json:"pre_backup"`
+	Origin     string            `json:"origin,omitempty"`
+	Created    time.Time         `json:"created,omitempty"`
+	Updated    time.Time         `json:"updated,omitempty"`
 }
 
 // toTemplate builds a store.Template from the decoded body, forcing Meta.ID to id.
@@ -84,12 +94,21 @@ func (h *handlers) getTemplate(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) createTemplate(w http.ResponseWriter, r *http.Request) {
 	var b templateBody
-	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &b) {
 		return
 	}
 	if !validName(b.ID) {
 		writeInvalidName(w, "template", b.ID)
+		return
+	}
+	// Same defect class as updateTemplate below: `{"id":"x"}` is a present
+	// body, so decodeBody accepts it, and neither RenderBody("", ...) nor
+	// validateTemplate rejects an empty Body. Without this guard the POST
+	// 201s and persists a template that is broken from birth, discoverable
+	// only when something later tries to render or deploy from it
+	// (#264 review).
+	if b.Body == "" {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "body is required"})
 		return
 	}
 	if err := h.svc.CreateTemplate(r.Context(), b.toTemplate(b.ID)); err != nil {
@@ -111,8 +130,18 @@ func (h *handlers) updateTemplate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var b templateBody
-	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &b) {
+		return
+	}
+	// decodeBody rejects an entirely absent body itself, but a present `{}`
+	// still decodes to b as templateBody{}; toTemplate(id) then builds a
+	// store.Template with an empty Body and zeroed Meta. Neither
+	// RenderBody("", ...) nor validateTemplate rejects an empty Body, so
+	// without this guard a `{}` PUT would 200 and silently wipe the stored
+	// template's body, display, parameters, secrets, volumes and ingress
+	// (#254 review).
+	if b.Body == "" {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "body is required"})
 		return
 	}
 	if err := h.svc.UpdateTemplate(r.Context(), b.toTemplate(id)); err != nil {
@@ -136,8 +165,7 @@ func (h *handlers) cloneTemplate(w http.ResponseWriter, r *http.Request) {
 	var b struct {
 		NewID string `json:"new_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&b); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &b) {
 		return
 	}
 	if !validName(b.NewID) {

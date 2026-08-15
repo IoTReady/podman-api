@@ -59,6 +59,21 @@ func seedEvac(t *testing.T, mem *store.Memory, slug string) {
 	}))
 }
 
+// TestEvacuate_API_UnknownField asserts /evacuate rejects an unknown field
+// with a 400 rather than silently ignoring it (#254).
+func TestEvacuate_API_UnknownField(t *testing.T) {
+	srv, tok, mem, _ := newEvacSrv(t)
+	seedEvac(t, mem, "db1")
+
+	req, _ := http.NewRequest("POST", srv.URL+"/evacuate", bytes.NewBufferString(`{"from_host":"h1","mapp":{"db1":"h2"}}`))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
 func TestEvacuate_API_Success(t *testing.T) {
 	srv, tok, mem, _ := newEvacSrv(t)
 	ctx := context.Background()

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -161,6 +162,16 @@ func TestCreateTemplate_AndConflict(t *testing.T) {
 	assert.Equal(t, http.StatusConflict, resp.StatusCode)
 }
 
+// TestCreateTemplate_UnknownField asserts createTemplate rejects an unknown
+// field with a 400 rather than silently ignoring it (#254).
+func TestCreateTemplate_UnknownField(t *testing.T) {
+	srv, tok, _, _ := newSrvWithTmpl(t)
+	body := `{"id":"redis","body":"kind: Pod\nname: redis-{{.slug}}\n","volume":["data"]}`
+	resp := doReq(t, srv, tok, "POST", "/templates", body)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
 func TestCreateTemplate_InvalidBody(t *testing.T) {
 	srv, tok, _, _ := newSrvWithTmpl(t)
 	// References an undeclared parameter -> dry-run render fails (missingkey=error).
@@ -168,6 +179,25 @@ func TestCreateTemplate_InvalidBody(t *testing.T) {
 	resp := doReq(t, srv, tok, "POST", "/templates", body)
 	defer resp.Body.Close()
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
+// TestCreateTemplate_EmptyBody_Rejected is the create-path sibling of
+// TestUpdateTemplate_EmptyBody_Rejected: `{"id":"empty"}` is a present body,
+// so decodeBody accepts it, and neither RenderBody("", ...) nor
+// validateTemplate rejects an empty Body — so without a guard the POST 201s
+// and persists a template that is broken from birth, discoverable only when
+// something later tries to render or deploy from it (#264 review).
+func TestCreateTemplate_EmptyBody_Rejected(t *testing.T) {
+	srv, tok, mem, _ := newSrvWithTmpl(t)
+
+	resp := doReq(t, srv, tok, "POST", "/templates", `{"id":"empty"}`)
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, string(respBody))
+
+	// Nothing may be persisted.
+	_, err := mem.GetTemplate(context.Background(), "empty")
+	assert.Error(t, err)
 }
 
 func TestUpdateTemplate(t *testing.T) {
@@ -182,6 +212,78 @@ func TestUpdateTemplate(t *testing.T) {
 	assert.Contains(t, got["body"], "app2-")
 	// Origin is preserved from the seed.
 	assert.Equal(t, "seed", got["origin"])
+}
+
+// TestUpdateTemplate_GetEditPutRoundTrip locks the standard REST edit
+// pattern: GET the resource, change one field, PUT the whole object back
+// unmodified otherwise. templateJSON() emits "origin", "created", and
+// "updated" on every GET, so a client that round-trips them verbatim must
+// not 400 with "unknown field" (#254 review finding 1).
+func TestUpdateTemplate_GetEditPutRoundTrip(t *testing.T) {
+	srv, tok, _, _ := newSrvWithTmpl(t)
+
+	resp := authedReq(t, srv, tok, "GET", "/templates/app")
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	resp.Body.Close()
+	require.Contains(t, got, "origin")
+	require.Contains(t, got, "created")
+	require.Contains(t, got, "updated")
+
+	// Change one field, then PUT the entire GET response back verbatim.
+	got["body"] = "kind: Pod\nname: app-edited-{{.slug}}\n"
+	buf, err := json.Marshal(got)
+	require.NoError(t, err)
+
+	resp = doReq(t, srv, tok, "PUT", "/templates/app", string(buf))
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	require.Equal(t, http.StatusOK, resp.StatusCode, string(body))
+
+	var updated map[string]any
+	require.NoError(t, json.Unmarshal(body, &updated))
+	assert.Equal(t, "kind: Pod\nname: app-edited-{{.slug}}\n", updated["body"])
+	// Origin remains server-managed: the client-supplied value is ignored,
+	// not honoured.
+	assert.Equal(t, "seed", updated["origin"])
+}
+
+// TestUpdateTemplate_EmptyBody_Rejected guards against a bodyless (or
+// `{}`) PUT silently wiping a stored template. decodeBody itself now rejects
+// an entirely absent body, but a present `{}` still decodes successfully to
+// b as templateBody{}; b.toTemplate(id) then builds a store.Template with
+// Body:"" and all Meta fields zeroed, and neither RenderBody("", ...) nor
+// validateTemplate rejects an empty Body, so the zero value would otherwise
+// be persisted over a stored, possibly production, template (#254 review).
+func TestUpdateTemplate_EmptyBody_Rejected(t *testing.T) {
+	srv, tok, mem, _ := newSrvWithTmpl(t)
+
+	resp := doReq(t, srv, tok, "PUT", "/templates/app", "")
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, string(respBody))
+
+	// The stored template must be untouched.
+	stored, err := mem.GetTemplate(context.Background(), "app")
+	require.NoError(t, err)
+	assert.Equal(t, "kind: Pod\nname: app-{{.slug}}\n", stored.Body)
+	assert.NotEmpty(t, stored.Meta.Parameters)
+}
+
+// TestUpdateTemplate_EmptyJSONObject_Rejected is the `{}` variant of the
+// above: a body that decodes successfully but supplies no fields.
+func TestUpdateTemplate_EmptyJSONObject_Rejected(t *testing.T) {
+	srv, tok, mem, _ := newSrvWithTmpl(t)
+
+	resp := doReq(t, srv, tok, "PUT", "/templates/app", "{}")
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, string(respBody))
+
+	stored, err := mem.GetTemplate(context.Background(), "app")
+	require.NoError(t, err)
+	assert.Equal(t, "kind: Pod\nname: app-{{.slug}}\n", stored.Body)
 }
 
 func TestCloneTemplate(t *testing.T) {

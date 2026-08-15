@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 )
 
@@ -33,8 +32,7 @@ func (h *handlers) putSecret(w http.ResponseWriter, r *http.Request) {
 		Value   string `json:"value"`
 		Persist *bool  `json:"persist"` // optional; defaults to true
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &body) {
 		return
 	}
 	if body.Value == "" {

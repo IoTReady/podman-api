@@ -1,7 +1,6 @@
 package api
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
 	"strings"
@@ -54,9 +53,8 @@ func (h *handlers) getInstance(w http.ResponseWriter, r *http.Request) {
 
 func (h *handlers) createInstance(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
-	req, err := decodeApply(r)
-	if err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	req, ok := decodeApplyRequest(w, r)
+	if !ok {
 		return
 	}
 	if !validInstancePath(w, req.Template, req.Slug) {
@@ -85,9 +83,8 @@ func (h *handlers) applyInstance(w http.ResponseWriter, r *http.Request) {
 	if !validInstancePath(w, pathTmpl, pathSlug) {
 		return
 	}
-	req, err := decodeApply(r)
-	if err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	req, ok := decodeApplyRequest(w, r)
+	if !ok {
 		return
 	}
 	if req.Template != "" && req.Template != pathTmpl {
@@ -100,6 +97,24 @@ func (h *handlers) applyInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Template = pathTmpl
 	req.Slug = pathSlug
+	// An absent/empty PUT body decodes to a zero-value ApplyRequest
+	// (Parameters, Secrets, and Domains all nil). applyInstance always runs
+	// with Replace:true, so — unlike createInstance, where a genuinely empty
+	// Template/Slug is already rejected by validInstancePath above —
+	// forwarding that zero value here would silently discard every
+	// previously-set optional parameter, every configured ingress domain,
+	// and any per-instance secret, then re-render/restart the pod from
+	// template defaults alone. render.Validate only catches this when the
+	// template happens to declare a required parameter or per-instance
+	// secret; it says nothing about domains and nothing about an
+	// all-optional template. There is no sane "no body" interpretation for a
+	// PUT against an existing instance, so reject it explicitly here rather
+	// than relying on validation happening to catch it downstream (#254
+	// review).
+	if len(req.Parameters) == 0 && len(req.Secrets) == 0 && len(req.Domains) == 0 {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "body is required: at least one of parameters, secrets, or domains must be set"})
+		return
+	}
 	if !validSlugParameter(w, req.Parameters, req.Slug) {
 		return
 	}
@@ -135,12 +150,12 @@ func (h *handlers) deleteInstance(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func decodeApply(r *http.Request) (instance.ApplyRequest, error) {
+// decodeApplyRequest decodes an ApplyRequest with DisallowUnknownFields,
+// writing a 400 and returning false on failure.
+func decodeApplyRequest(w http.ResponseWriter, r *http.Request) (instance.ApplyRequest, bool) {
 	var req instance.ApplyRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		return req, err
-	}
-	return req, nil
+	ok := decodeBody(w, r, &req)
+	return req, ok
 }
 
 func queryBool(r *http.Request, key string) bool {
@@ -220,8 +235,16 @@ func (h *handlers) upgradeInstance(w http.ResponseWriter, r *http.Request) {
 		Parameters map[string]any    `json:"parameters"`
 		Secrets    map[string]string `json:"secrets"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	// decodeBody rejects an entirely absent body itself, but a present-but-
+	// empty body (`{}`) still decodes to Image=="", which Service.Upgrade
+	// rejects with a plain error that classify() has no sentinel for — it
+	// would fall through to a 500 "internal" instead of a 400. Check here so
+	// a missing image always stays a 400 (#254 review finding 2).
+	if strings.TrimSpace(body.Image) == "" {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "image is required"})
 		return
 	}
 	req := instance.ApplyRequest{
@@ -259,8 +282,7 @@ func (h *handlers) upgradeImageInstance(w http.ResponseWriter, r *http.Request) 
 	var body struct {
 		Image string `json:"image"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &body) {
 		return
 	}
 	if strings.TrimSpace(body.Image) == "" {
@@ -301,8 +323,7 @@ func (h *handlers) patchInstanceParameters(w http.ResponseWriter, r *http.Reques
 	var body struct {
 		Parameters map[string]any `json:"parameters"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &body) {
 		return
 	}
 	if len(body.Parameters) == 0 {
@@ -347,8 +368,7 @@ func (h *handlers) patchInstanceSecrets(w http.ResponseWriter, r *http.Request) 
 	var body struct {
 		Secrets map[string]string `json:"secrets"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &body) {
 		return
 	}
 	if len(body.Secrets) == 0 {
@@ -386,8 +406,7 @@ func (h *handlers) renameInstance(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req instance.RenameRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &req) {
 		return
 	}
 	if req.NewSlug == "" {

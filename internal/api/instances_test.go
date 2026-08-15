@@ -99,6 +99,22 @@ func TestApplyAndGetInstance(t *testing.T) {
 	assert.Equal(t, "hello", got["slug"])
 }
 
+// TestApplyInstance_UnknownField asserts PUT .../instances/{template}/{slug}
+// rejects an unknown field with a 400 rather than silently ignoring it
+// (#254).
+func TestApplyInstance_UnknownField(t *testing.T) {
+	srv, tok, _ := newSrvFull(t)
+
+	body := `{"template":"app","slug":"hello","paramaters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/hello", bytes.NewBufferString(body))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
 // #201 (API edge): the path/body slug reconciliation above never looked at
 // parameters["slug"], which is what actually renders metadata.name. A
 // disagreeing parameters.slug is rejected with the same 400 invalid_body shape
@@ -257,6 +273,122 @@ func TestApplyInstanceRejectsBadDomain(t *testing.T) {
 	var got map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
 	require.Equal(t, "invalid_domains", got["code"])
+}
+
+// TestApplyInstance_EmptyBody_RejectedAgainstExisting reproduces #254 review
+// finding: a PUT with an empty/absent body decodes to a zero-value
+// ApplyRequest (Parameters/Domains/Secrets all nil). applyInstance runs with
+// Replace:true, so without a guard that zero-value request would silently
+// discard every previously-set optional parameter and secret and re-render
+// the pod from template defaults alone. Confirmed red (200 + parameters
+// wiped) before the fix; must be 400 + parameters untouched after.
+func TestApplyInstance_EmptyBody_RejectedAgainstExisting(t *testing.T) {
+	srv, tok, f := newSrvFull(t)
+
+	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	resp := postJSON(t, srv, tok, "PUT", "/hosts/h1/instances/app/hello", body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	callsBefore := len(f.PlayCalls)
+
+	// Empty body.
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/app/hello", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "an empty PUT body against an existing instance must be rejected")
+	assert.Equal(t, callsBefore, len(f.PlayCalls), "a rejected body must not reach the host")
+
+	// `{}` is indistinguishable from absent once decoded and must be rejected
+	// the same way.
+	resp = postJSON(t, srv, tok, "PUT", "/hosts/h1/instances/app/hello", `{}`)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "an empty JSON object PUT body against an existing instance must be rejected")
+	assert.Equal(t, callsBefore, len(f.PlayCalls), "a rejected body must not reach the host")
+
+	// The original parameters must survive untouched.
+	got := authedReq(t, srv, tok, "GET", "/hosts/h1/instances/app/hello")
+	defer got.Body.Close()
+	require.Equal(t, http.StatusOK, got.StatusCode)
+	var out map[string]any
+	require.NoError(t, json.NewDecoder(got.Body).Decode(&out))
+	params, ok := out["parameters"].(map[string]any)
+	require.True(t, ok, "parameters must still be present: %v", out)
+	assert.Equal(t, "i:1", params["image"])
+}
+
+// TestApplyInstance_EmptyBody_RejectedEvenWithNoRequiredFields isolates the
+// exact gap the #254 review found: the "app" fixture template above has
+// required parameters AND a required per-instance secret, so
+// render.Validate's own "missing required parameter/secret" check already
+// 400s an empty PUT against it independently of any handler-level guard.
+// That does NOT hold for a template with no required parameters and no
+// declared per-instance secrets — nothing downstream of the handler rejects
+// a zero-value ApplyRequest for one of those, so a bodyless PUT against an
+// existing instance of such a template would (pre-fix) silently reset every
+// optional parameter to its template default. Confirmed red (200 OK + the
+// stored "note" parameter reset to its default) before the handler-level
+// guard was added; must be 400 + the parameter left untouched after.
+func TestApplyInstance_EmptyBody_RejectedEvenWithNoRequiredFields(t *testing.T) {
+	tmpl := store.Template{
+		Meta: render.Meta{
+			ID: "opt",
+			Parameters: []render.ParamDef{
+				{Name: "note", Type: "string", Required: false, Default: "unset"},
+			},
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: opt-fixed
+  labels:
+    podman-api/template: opt
+    podman-api/slug: fixed
+spec:
+  containers:
+    - name: app
+      image: busybox
+      env:
+        - name: NOTE
+          value: "{{.note}}"
+`,
+		Origin: "seed",
+	}
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	f := fake.New()
+	mem := store.NewMemory()
+	require.NoError(t, mem.PutTemplate(context.Background(), tmpl))
+	svc := instance.NewService(f, hosts)
+	svc.SetStore(mem)
+	tok := "t"
+	hash, _ := config.HashToken(tok)
+	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*"}}}
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil, "", nil))
+	t.Cleanup(srv.Close)
+
+	body := `{"template":"opt","slug":"fixed","parameters":{"note":"custom-value"}}`
+	resp := postJSON(t, srv, tok, "PUT", "/hosts/h1/instances/opt/fixed", body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	callsBefore := len(f.PlayCalls)
+
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/instances/opt/fixed", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, "an empty PUT body against an existing instance must be rejected even when the template has no required fields")
+	assert.Equal(t, callsBefore, len(f.PlayCalls), "a rejected body must not reach the host")
+
+	got := authedReq(t, srv, tok, "GET", "/hosts/h1/instances/opt/fixed")
+	defer got.Body.Close()
+	require.Equal(t, http.StatusOK, got.StatusCode)
+	var out map[string]any
+	require.NoError(t, json.NewDecoder(got.Body).Decode(&out))
+	params, ok := out["parameters"].(map[string]any)
+	require.True(t, ok, "parameters must still be present: %v", out)
+	assert.Equal(t, "custom-value", params["note"], "the previously-set optional parameter must survive a rejected empty PUT")
 }
 
 func TestRenameInstance(t *testing.T) {

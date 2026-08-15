@@ -2,7 +2,6 @@ package api
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -134,8 +133,7 @@ func (h *handlers) renameHost(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		NewID string `json:"new_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: err.Error()})
+	if !decodeBody(w, r, &req) {
 		return
 	}
 	if req.NewID == "" {

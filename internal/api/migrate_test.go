@@ -103,6 +103,18 @@ func TestMigrate_API_MalformedBody(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
+// TestMigrate_API_UnknownField asserts /migrate rejects an unknown field with
+// a 400 rather than silently ignoring it (#254).
+func TestMigrate_API_UnknownField(t *testing.T) {
+	srv, tok, _, _ := newMigrateSrv(t)
+	req, _ := http.NewRequest("POST", srv.URL+"/migrate", bytes.NewBufferString(`{"from_host":"h1","to_hst":"h2","template":"postgres","slug":"db1"}`))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
 func TestMigrate_API_StoreDisabled_501(t *testing.T) {
 	tok := "t"
 	hash, err := config.HashToken(tok)

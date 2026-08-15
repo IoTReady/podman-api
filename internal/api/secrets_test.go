@@ -42,6 +42,19 @@ func TestPutSecret_PersistField(t *testing.T) {
 	}
 }
 
+// TestPutSecret_UnknownField asserts putSecret rejects an unknown field with
+// a 400 rather than silently ignoring it (#254).
+func TestPutSecret_UnknownField(t *testing.T) {
+	srv, tok := newSrvWithSecrets(t)
+	req, _ := http.NewRequest("PUT", srv.URL+"/hosts/h1/secrets/s1", bytes.NewBufferString(`{"value":"v","persit":false}`))
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+}
+
 func TestPutAndDeleteSecret(t *testing.T) {
 	srv, tok := newSrvWithSecrets(t)
 
