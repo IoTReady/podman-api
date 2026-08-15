@@ -123,6 +123,16 @@ func (h *handlers) updateTemplate(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &b) {
 		return
 	}
+	// decodeBody treats an absent body as success (io.EOF is not an error),
+	// leaving b as templateBody{}; toTemplate(id) then builds a store.Template
+	// with an empty Body and zeroed Meta. Neither RenderBody("", ...) nor
+	// validateTemplate rejects an empty Body, so without this guard a bodyless
+	// (or `{}`) PUT would 200 and silently wipe the stored template's body,
+	// display, parameters, secrets, volumes and ingress (#254 review).
+	if b.Body == "" {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "body is required"})
+		return
+	}
 	if err := h.svc.UpdateTemplate(r.Context(), b.toTemplate(id)); err != nil {
 		WriteError(w, err)
 		return

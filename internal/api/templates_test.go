@@ -230,6 +230,43 @@ func TestUpdateTemplate_GetEditPutRoundTrip(t *testing.T) {
 	assert.Equal(t, "seed", updated["origin"])
 }
 
+// TestUpdateTemplate_EmptyBody_Rejected guards against a bodyless (or
+// `{}`) PUT silently wiping a stored template. decodeBody treats an absent
+// body as success (io.EOF is not an error), leaving b as templateBody{}; b.
+// toTemplate(id) then builds a store.Template with Body:"" and all Meta
+// fields zeroed, and neither RenderBody("", ...) nor validateTemplate
+// rejects an empty Body, so the zero value would otherwise be persisted
+// over a stored, possibly production, template (#254 review).
+func TestUpdateTemplate_EmptyBody_Rejected(t *testing.T) {
+	srv, tok, mem, _ := newSrvWithTmpl(t)
+
+	resp := doReq(t, srv, tok, "PUT", "/templates/app", "")
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, string(respBody))
+
+	// The stored template must be untouched.
+	stored, err := mem.GetTemplate(context.Background(), "app")
+	require.NoError(t, err)
+	assert.Equal(t, "kind: Pod\nname: app-{{.slug}}\n", stored.Body)
+	assert.NotEmpty(t, stored.Meta.Parameters)
+}
+
+// TestUpdateTemplate_EmptyJSONObject_Rejected is the `{}` variant of the
+// above: a body that decodes successfully but supplies no fields.
+func TestUpdateTemplate_EmptyJSONObject_Rejected(t *testing.T) {
+	srv, tok, mem, _ := newSrvWithTmpl(t)
+
+	resp := doReq(t, srv, tok, "PUT", "/templates/app", "{}")
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, string(respBody))
+
+	stored, err := mem.GetTemplate(context.Background(), "app")
+	require.NoError(t, err)
+	assert.Equal(t, "kind: Pod\nname: app-{{.slug}}\n", stored.Body)
+}
+
 func TestCloneTemplate(t *testing.T) {
 	srv, tok, _, _ := newSrvWithTmpl(t)
 	resp := doReq(t, srv, tok, "POST", "/templates/app/clone", `{"new_id":"appcopy"}`)
