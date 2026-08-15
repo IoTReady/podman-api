@@ -1519,29 +1519,40 @@ func (r *Real) HostBoundPorts(ctx context.Context, id, protocol string) ([]int, 
 // would fail a deploy that had nothing wrong with it. Looking again yields the
 // local branch, which is where the answer now lives.
 //
+// The re-dispatch covers every way a read can lose that race, not just the one
+// this branch chose wrongly for. isReloadRace names all three (#266): the host
+// became local under us (errHostReconfigured), the pool entry was retired
+// mid-dial past what connectFresh's own single re-resolution absorbs
+// (errRetiredHost), or the host was gone when the read resolved it
+// (errUnknownHost). All three say the same thing — a reload moved the host, not
+// that anything is wrong with it — so all three deserve the same second look.
+// Recognizing only the first left a double reload aborting a deploy over a
+// config edit.
+//
 // Exactly one re-dispatch, matching connectFresh: a second one means reloads are
 // arriving faster than reads complete, and looping there is indistinguishable
-// from a hang.
+// from a hang. A host that is genuinely gone resolves to the same answer on the
+// second look and fails there, so self-healing never hides a removal.
 func (r *Real) readHostProc(id string, local, remote func() (string, error)) (string, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		r.mu.Lock()
 		h, ok := r.hosts[id]
 		r.mu.Unlock()
 		if !ok {
-			return "", fmt.Errorf("unknown host %q", id)
+			// Wrapped, not spelled out: this is the same condition sshRun reports
+			// from the pool, and callers classify it with isReloadRace.
+			return "", fmt.Errorf("%q: %w", id, errUnknownHost)
 		}
 		if h.Addr == "unix" {
 			return local()
 		}
 		raw, err := remote()
-		if errors.Is(err, errHostReconfigured) && attempt == 0 {
-			// The only way sshRun reports this: the host became local while we
-			// were connecting to it.
+		if isReloadRace(err) && attempt == 0 {
 			continue
 		}
 		return raw, err
 	}
-	return "", fmt.Errorf("host %q: %w", id, errHostReconfigured)
+	panic("unreachable: every loop body path above returns")
 }
 
 // readProcNetPortsLocal reads /proc/net/<protocol> (required — its absence is
