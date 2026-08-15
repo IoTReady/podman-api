@@ -97,6 +97,24 @@ func (h *handlers) applyInstance(w http.ResponseWriter, r *http.Request) {
 	}
 	req.Template = pathTmpl
 	req.Slug = pathSlug
+	// An absent/empty PUT body decodes to a zero-value ApplyRequest
+	// (Parameters, Secrets, and Domains all nil). applyInstance always runs
+	// with Replace:true, so — unlike createInstance, where a genuinely empty
+	// Template/Slug is already rejected by validInstancePath above —
+	// forwarding that zero value here would silently discard every
+	// previously-set optional parameter, every configured ingress domain,
+	// and any per-instance secret, then re-render/restart the pod from
+	// template defaults alone. render.Validate only catches this when the
+	// template happens to declare a required parameter or per-instance
+	// secret; it says nothing about domains and nothing about an
+	// all-optional template. There is no sane "no body" interpretation for a
+	// PUT against an existing instance, so reject it explicitly here rather
+	// than relying on validation happening to catch it downstream (#254
+	// review).
+	if len(req.Parameters) == 0 && len(req.Secrets) == 0 && len(req.Domains) == 0 {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "body is required: at least one of parameters, secrets, or domains must be set"})
+		return
+	}
 	if !validSlugParameter(w, req.Parameters, req.Slug) {
 		return
 	}
@@ -220,12 +238,11 @@ func (h *handlers) upgradeInstance(w http.ResponseWriter, r *http.Request) {
 	if !decodeBody(w, r, &body) {
 		return
 	}
-	// An absent/empty body decodes to Image=="", which Service.Upgrade rejects
-	// with a plain error that classify() has no sentinel for — it would fall
-	// through to a 500 "internal" instead of a 400. Check here so a missing
-	// image stays a 400, the same status an empty body produced before
-	// decodeBody stopped treating an absent body as an error (#254 review
-	// finding 2).
+	// decodeBody rejects an entirely absent body itself, but a present-but-
+	// empty body (`{}`) still decodes to Image=="", which Service.Upgrade
+	// rejects with a plain error that classify() has no sentinel for — it
+	// would fall through to a 500 "internal" instead of a 400. Check here so
+	// a missing image always stays a 400 (#254 review finding 2).
 	if strings.TrimSpace(body.Image) == "" {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "image is required"})
 		return

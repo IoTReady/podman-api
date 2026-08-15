@@ -231,12 +231,12 @@ func TestUpdateTemplate_GetEditPutRoundTrip(t *testing.T) {
 }
 
 // TestUpdateTemplate_EmptyBody_Rejected guards against a bodyless (or
-// `{}`) PUT silently wiping a stored template. decodeBody treats an absent
-// body as success (io.EOF is not an error), leaving b as templateBody{}; b.
-// toTemplate(id) then builds a store.Template with Body:"" and all Meta
-// fields zeroed, and neither RenderBody("", ...) nor validateTemplate
-// rejects an empty Body, so the zero value would otherwise be persisted
-// over a stored, possibly production, template (#254 review).
+// `{}`) PUT silently wiping a stored template. decodeBody itself now rejects
+// an entirely absent body, but a present `{}` still decodes successfully to
+// b as templateBody{}; b.toTemplate(id) then builds a store.Template with
+// Body:"" and all Meta fields zeroed, and neither RenderBody("", ...) nor
+// validateTemplate rejects an empty Body, so the zero value would otherwise
+// be persisted over a stored, possibly production, template (#254 review).
 func TestUpdateTemplate_EmptyBody_Rejected(t *testing.T) {
 	srv, tok, mem, _ := newSrvWithTmpl(t)
 
