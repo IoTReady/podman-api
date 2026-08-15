@@ -181,6 +181,25 @@ func TestCreateTemplate_InvalidBody(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 }
 
+// TestCreateTemplate_EmptyBody_Rejected is the create-path sibling of
+// TestUpdateTemplate_EmptyBody_Rejected: `{"id":"empty"}` is a present body,
+// so decodeBody accepts it, and neither RenderBody("", ...) nor
+// validateTemplate rejects an empty Body — so without a guard the POST 201s
+// and persists a template that is broken from birth, discoverable only when
+// something later tries to render or deploy from it (#264 review).
+func TestCreateTemplate_EmptyBody_Rejected(t *testing.T) {
+	srv, tok, mem, _ := newSrvWithTmpl(t)
+
+	resp := doReq(t, srv, tok, "POST", "/templates", `{"id":"empty"}`)
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode, string(respBody))
+
+	// Nothing may be persisted.
+	_, err := mem.GetTemplate(context.Background(), "empty")
+	assert.Error(t, err)
+}
+
 func TestUpdateTemplate(t *testing.T) {
 	srv, tok, _, _ := newSrvWithTmpl(t)
 	body := `{"body":"kind: Pod\nname: app2-{{.slug}}\n","parameters":[{"name":"slug","type":"string","required":true}]}`

@@ -101,6 +101,16 @@ func (h *handlers) createTemplate(w http.ResponseWriter, r *http.Request) {
 		writeInvalidName(w, "template", b.ID)
 		return
 	}
+	// Same defect class as updateTemplate below: `{"id":"x"}` is a present
+	// body, so decodeBody accepts it, and neither RenderBody("", ...) nor
+	// validateTemplate rejects an empty Body. Without this guard the POST
+	// 201s and persists a template that is broken from birth, discoverable
+	// only when something later tries to render or deploy from it
+	// (#264 review).
+	if b.Body == "" {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "body is required"})
+		return
+	}
 	if err := h.svc.CreateTemplate(r.Context(), b.toTemplate(b.ID)); err != nil {
 		WriteError(w, err)
 		return
