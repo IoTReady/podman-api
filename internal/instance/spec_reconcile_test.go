@@ -494,6 +494,47 @@ func TestReconcileOneSpec_DropMixedWithGenuineRenameBlocksOnlyTheRename(t *testi
 	assert.Empty(t, fc.PlayCalls)
 }
 
+// TestReconcileOneSpec_CoincidentalNameMatchStillRefusesAndLogsTheAmbiguity
+// (#265 review, round-5 finding): the pairing is name-similarity, not a true
+// bipartite match, so a coincidental match can claim the target that a
+// genuinely renamed volume needed. Applied ["cache","data"], `cache` dropped
+// outright and `data` renamed to `cache2`: `plausibleRename("cache","cache2")`
+// is true on containment alone, `plausibleRename("data","cache2")` is false, so
+// the counts pair cleanly on the WRONG volume.
+//
+// This is indistinguishable by name from the round-4 case above (`logs`
+// dropped, `cache` -> `cache2`), so no heuristic gets both right. What must
+// hold: the refusal still fires — nothing forks — and the volume the heuristic
+// could not account for is surfaced, so the operator is not left acting on a
+// confidently-named but mismatched volume.
+func TestReconcileOneSpec_CoincidentalNameMatchStillRefusesAndLogsTheAmbiguity(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	sp, err := st.GetSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"cache", "data"}
+	require.NoError(t, st.PutSpec(ctx, sp))
+
+	fc.SetVolumeData("h1", "web-my-app-cache", []byte("stale, unpruned"))
+	fc.SetVolumeData("h1", "web-my-app-data", []byte("the real data"))
+
+	// `cache` dropped outright; `data` renamed to `cache2` (not yet created).
+	tmpl, err := st.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "cache2"}}
+	require.NoError(t, st.PutTemplate(ctx, tmpl))
+
+	logs := captureLog(t, func() {
+		_, err = svc.reconcileOneSpec(ctx, "h1", "web", "my-app")
+	})
+	require.ErrorIs(t, err, errVolumeRenamePending, "the refusal must still fire — `data` genuinely could fork")
+	assert.Empty(t, fc.PlayCalls)
+	assert.Contains(t, logs, "data",
+		"the volume the heuristic could not account for must be surfaced, since it is the one that was actually renamed")
+}
+
 // TestReconcileOneSpec_UnmatchableTargetStillBlocksEveryRename (#265 review,
 // round-2 blocking finding, safe side): when a target cannot be paired with
 // any renamed name by the name heuristic, it could be the destination of ANY

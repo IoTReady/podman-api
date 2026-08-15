@@ -104,25 +104,43 @@ func (s *Service) renameTargets(ctx context.Context, hostID, tmpl, slug string, 
 //  3. Only with NO targets at all — or none left over, with nothing plausibly
 //     matched — does a renamed name fall through as an ordinary drop.
 //
-// The result is sorted, so the refusal message reads deterministically.
-func pendingRenames(renamed, targets []string) []string {
+// Two lists come back. `blocked` is the heuristic's best answer: the applied
+// names it believes were renamed. `ambiguous` is every other name
+// in `renamed` — undeclared and still present, but matched to no target. The
+// split exists because the pairing is name-similarity, NOT a true bipartite
+// match, so `blocked` can name the wrong volume (#265 review round-5): applied
+// ["cache","data"], `cache` dropped and `data` renamed to `cache2`, pairs
+// `cache` with `cache2` on containment alone and never names `data`. That case
+// is indistinguishable by name from the round-4 one this pairing exists to fix
+// (`logs` dropped, `cache` -> `cache2`), so no heuristic can get both right.
+// Surfacing `ambiguous` keeps the diagnostic honest without giving up the
+// precision the round-4 fix bought: the refusal is whole-set either way and the
+// remedy — re-apply — is the same whichever of the two it was, so the caller
+// logs the caveat rather than naming these in the error.
+//
+// Both results are sorted, so the refusal message reads deterministically.
+func pendingRenames(renamed, targets []string) (blocked, ambiguous []string) {
 	if len(targets) == 0 {
-		return nil
+		return nil, nil
 	}
-	var matched []string
+	var matched, unmatched []string
 	for _, r := range renamed {
 		if slices.ContainsFunc(targets, func(t string) bool { return plausibleRename(r, t) }) {
 			matched = append(matched, r)
+		} else {
+			unmatched = append(unmatched, r)
 		}
 	}
 	if len(targets) > len(matched) {
-		// At least one target is unclaimed and could be any of them.
-		blocked := slices.Clone(renamed)
+		// At least one target is unclaimed and could be any of them, so every
+		// name is blocked outright and nothing is left merely ambiguous.
+		blocked = slices.Clone(renamed)
 		sort.Strings(blocked)
-		return blocked
+		return blocked, nil
 	}
 	sort.Strings(matched)
-	return matched
+	sort.Strings(unmatched)
+	return matched, unmatched
 }
 
 // plausibleRename reports whether the newly declared (short) volume name `to`
@@ -140,6 +158,11 @@ func pendingRenames(renamed, targets []string) []string {
 // A false NEGATIVE here is caught by pendingRenames' leftover-target rule
 // above, which blocks the unmatched names anyway; a false positive only ever
 // makes the guard refuse, which is the safe direction. Neither can fork data.
+//
+// What a false POSITIVE does cost is attribution: it can let a coincidentally
+// similar name claim the target that a genuinely renamed volume needed, so the
+// refusal names the wrong volume. That is why pendingRenames reports the names
+// it did not match as `ambiguous` rather than dropping them silently.
 func plausibleRename(from, to string) bool {
 	a, b := strings.ToLower(from), strings.ToLower(to)
 	if a == "" || b == "" {
@@ -369,7 +392,18 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 			// pairs them, erring toward refusal wherever the pairing is
 			// ambiguous — see its doc comment for the rule.
 			targets := s.renameTargets(ctx, hostID, tmpl, slug, tmplObj.Meta.Volumes, spec.AppliedVolumes)
-			if blocked := pendingRenames(renamed, targets); len(blocked) > 0 {
+			if blocked, ambiguous := pendingRenames(renamed, targets); len(blocked) > 0 {
+				if len(ambiguous) > 0 {
+					// The pairing is a name heuristic, so a coincidental match
+					// can claim the target a genuinely renamed volume needed and
+					// leave the refusal naming the wrong one (#265 review
+					// round-5). The error stays precise — naming an unmatched
+					// name there is exactly what round-4 fixed — but the
+					// ambiguity is worth a log line, since the operator reads it
+					// to decide what to re-apply.
+					log.Printf("boot converge %s/%s/%s: applied volume(s) %s are also no longer declared but still present, matched to no rename target; the pairing is a name heuristic, so if the rename was actually one of those, the refusal below names the wrong volume — re-applying covers either way",
+						hostID, tmpl, slug, strings.Join(ambiguous, ", "))
+				}
 				return false, fmt.Errorf("%w: applied volume(s) %s no longer declared by template %q but still exist on %s (newly declared, not-yet-created volume(s) %s look like the rename target)",
 					errVolumeRenamePending, strings.Join(blocked, ", "), tmpl, hostID, strings.Join(targets, ", "))
 			}
