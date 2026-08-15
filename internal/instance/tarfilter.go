@@ -160,13 +160,13 @@ func (f *dropFilter) matches(cleaned string, typ byte) bool {
 // entry's body (via storeBody) instead of discarding it, because a later
 // link may still promote it.
 //
-// unwindStats reports how many previously-recorded dropStats entries/bytes
-// parseTar must subtract because this decide call just promoted them: a
-// promoted target's bytes ship intact in the output under the surviving
-// link's name, so they were never actually excluded (#250 review finding 1)
-// even though parseTar provisionally counted them as dropped when the
-// target itself was seen, before it knew a later link would rescue it.
-func (f *dropFilter) decide(hdr *tar.Header, cleaned string) (drop, needsBuffer bool, promotedBody []byte, unwindEntries int, unwindBytes int64) {
+// A non-nil promotedBody also tells parseTar to unwind the one dropStats
+// entry/len(promotedBody) bytes it provisionally recorded when the promoted
+// target itself was seen: that target's bytes ship intact in the output
+// under the surviving link's name, so they were never actually excluded
+// (#250 review finding 1), even though parseTar counted them as dropped
+// before it knew a later link would rescue it.
+func (f *dropFilter) decide(hdr *tar.Header, cleaned string) (drop, needsBuffer bool, promotedBody []byte) {
 	match := f.matches(cleaned, hdr.Typeflag)
 
 	if !match && hdr.Typeflag == tar.TypeLink {
@@ -186,8 +186,6 @@ func (f *dropFilter) decide(hdr *tar.Header, cleaned string) (drop, needsBuffer 
 				promotedBody = body
 				delete(f.bodies, target) // later links redirect via f.promoted now
 				f.buffered -= int64(len(body))
-				unwindEntries = 1
-				unwindBytes = int64(len(body))
 			} else {
 				// Target's body was never buffered (not a regular file, over
 				// maxPromotableLinkTarget, or the cumulative buffer cap was
@@ -204,7 +202,7 @@ func (f *dropFilter) decide(hdr *tar.Header, cleaned string) (drop, needsBuffer 
 			hdr.Size <= maxPromotableLinkTarget &&
 			f.buffered+hdr.Size <= maxTotalBufferedBytes
 	}
-	return match, needsBuffer, promotedBody, unwindEntries, unwindBytes
+	return match, needsBuffer, promotedBody
 }
 
 // storeBody records the buffered body of a dropped regular file, keyed by

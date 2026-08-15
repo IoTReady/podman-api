@@ -88,22 +88,20 @@ func parseTar(r io.Reader, m Manifest, opt tarOpts) error {
 		var promotedBody []byte
 		if opt.drop != nil {
 			var drop, needsBuffer bool
-			var unwindEntries int
-			var unwindBytes int64
-			drop, needsBuffer, promotedBody, unwindEntries, unwindBytes = opt.drop.decide(hdr, cleaned)
-			if opt.stats != nil && unwindEntries != 0 {
+			drop, needsBuffer, promotedBody = opt.drop.decide(hdr, cleaned)
+			if opt.stats != nil && promotedBody != nil {
 				// This entry just promoted an earlier "dropped" target: its
 				// bytes ship intact under this entry's name, so undo the
 				// provisional count recorded when the target was first seen
 				// (#250 review finding 1).
-				opt.stats.Entries -= unwindEntries
-				opt.stats.Bytes -= unwindBytes
+				opt.stats.Entries--
+				opt.stats.Bytes -= int64(len(promotedBody))
 			}
 			if drop {
 				var n int64
 				if needsBuffer {
-					var buf bytes.Buffer
-					n, err = io.Copy(&buf, tr)
+					buf := bytes.NewBuffer(make([]byte, 0, hdr.Size))
+					n, err = io.Copy(buf, tr)
 					if err == nil {
 						opt.drop.storeBody(cleaned, buf.Bytes())
 					}
