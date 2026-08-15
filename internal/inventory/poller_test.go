@@ -889,3 +889,252 @@ func TestPollerStartVolumeUsageLogsRealTimeout(t *testing.T) {
 		return strings.Contains(buf.String(), "host h1 volume usage walk failed")
 	})
 }
+
+// loadRec records RefreshHostLoadAvg calls (and each call's remaining context
+// budget, to pin which context the poller derives the loadavg timeout from)
+// and returns a fixed error.
+type loadRec struct {
+	mu        sync.Mutex
+	hosts     []string
+	remaining []time.Duration
+	err       error
+	skipped   bool // report that no sample was taken
+}
+
+func (l *loadRec) RefreshHostLoadAvg(ctx context.Context, host string) (bool, error) {
+	var left time.Duration
+	if dl, ok := ctx.Deadline(); ok {
+		left = time.Until(dl)
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.hosts = append(l.hosts, host)
+	l.remaining = append(l.remaining, left)
+	return !l.skipped, l.err
+}
+
+func (l *loadRec) calls() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.hosts)
+}
+
+func (l *loadRec) called(host string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, h := range l.hosts {
+		if h == host {
+			return true
+		}
+	}
+	return false
+}
+
+// The point of sampling on the poller (#258): every host gets its loadavg read
+// on the poller's schedule, so GET /hosts never pays for it inside its own
+// per-host budget — where it sat last and was reliably starved.
+func TestPollerSamplesLoadAvgOnTick(t *testing.T) {
+	f := newFakeRefresher()
+	lr := &loadRec{}
+	p := &Poller{Svc: f, LoadAvg: lr, Interval: time.Hour, Timeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx, func() []string { return []string{"h1", "h2"} })
+	waitFor(t, "both hosts sampled", func() bool { return lr.calls() == 2 })
+	cancel()
+	p.Wait()
+}
+
+// A nil LoadAvg means the sampler is off — a daemon can run without it and
+// still report loadavg, lazily, from the client's own cache. The tick must not
+// panic, mirroring the nil-Stats contract.
+func TestPollerNilLoadAvgIsInert(t *testing.T) {
+	f := newFakeRefresher()
+	p := &Poller{Svc: f, Interval: time.Hour, Timeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx, func() []string { return []string{"h1"} })
+	waitFor(t, "h1 refreshed", func() bool { return f.count("h1") > 0 })
+	cancel()
+	p.Wait()
+}
+
+// Same contract as the stats sampler: a side-channel read failing says nothing
+// about whether the host is reachable, and the alert rules gate on
+// podman_api_host_reachable.
+func TestPollerLoadAvgErrorDoesNotAffectReachability(t *testing.T) {
+	f := newFakeRefresher()
+	lr := &loadRec{err: errors.New("loadavg boom")}
+	p := &Poller{Svc: f, LoadAvg: lr, Interval: time.Hour, Timeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx, func() []string { return []string{"h1"} })
+	waitFor(t, "h1 sampled", func() bool { return lr.calls() == 1 })
+	cancel()
+	p.Wait()
+
+	p.mu.Lock()
+	reachable, seen := p.state["h1"]
+	loadOK, loadSeen := p.loadState["h1"]
+	p.mu.Unlock()
+	if !seen || !reachable {
+		t.Fatalf("loadavg failure leaked into reachability state: seen=%v reachable=%v", seen, reachable)
+	}
+	if !loadSeen || loadOK {
+		t.Fatalf("loadavg failure not recorded in loadState: seen=%v ok=%v", loadSeen, loadOK)
+	}
+}
+
+// Deliberately NOT gated on the refresh, unlike the stats sampler: the two use
+// different transports and fail independently. A host whose container sweep
+// times out — a big store, a slow libpod — can still answer a one-line `cat`
+// over SSH instantly, and skipping it there is what let its cache go stale and
+// pushed the read back onto the request path (#258).
+func TestPollerSamplesLoadAvgEvenWhenTheRefreshFailed(t *testing.T) {
+	f := newFakeRefresher()
+	f.failOn["libpod-slow"] = true
+	lr := &loadRec{}
+	p := &Poller{Svc: f, LoadAvg: lr, Interval: time.Hour, Timeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx, func() []string { return []string{"libpod-slow"} })
+	waitFor(t, "the host to be sampled despite its failed refresh", func() bool {
+		return lr.called("libpod-slow")
+	})
+	cancel()
+	p.Wait()
+}
+
+// And the loadavg outcome must not leak into reachability, which is the verdict
+// the alert rules gate on — the same separation the stats sampler keeps.
+func TestPollerLoadAvgOutcomeIsIndependentOfReachability(t *testing.T) {
+	f := newFakeRefresher()
+	f.failOn["dead"] = true
+	lr := &loadRec{}
+	p := &Poller{Svc: f, LoadAvg: lr, Interval: time.Hour, Timeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx, func() []string { return []string{"dead"} })
+	waitFor(t, "the host to be sampled", func() bool { return lr.called("dead") })
+	cancel()
+	p.Wait()
+
+	p.mu.Lock()
+	reachable, seen := p.state["dead"]
+	loadOK, loadSeen := p.loadState["dead"]
+	p.mu.Unlock()
+	if !seen || reachable {
+		t.Fatalf("refresh failure not recorded as unreachable: seen=%v reachable=%v", seen, reachable)
+	}
+	// The fake sampler succeeds, so the loadavg verdict differs from the
+	// reachability one — which is the whole point of separate state.
+	if !loadSeen || !loadOK {
+		t.Fatalf("loadavg outcome not recorded independently: seen=%v ok=%v", loadSeen, loadOK)
+	}
+}
+
+// #212's lesson, applied to this sampler: its budget must come from the tick's
+// own context, not from the refresh's already-spent hctx. A slow-but-successful
+// refresh would otherwise cancel the sample the instant it started — which is
+// how loadavg went missing on exactly the busiest hosts in the first place.
+func TestPollerLoadAvgBudgetIsIndependentOfTheRefresh(t *testing.T) {
+	f := newFakeRefresher()
+	f.delay = 150 * time.Millisecond
+	lr := &loadRec{}
+	p := &Poller{
+		Svc: f, LoadAvg: lr, Interval: time.Hour,
+		Timeout: 200 * time.Millisecond, LoadAvgTimeout: 5 * time.Second,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx, func() []string { return []string{"h1"} })
+	waitFor(t, "h1 sampled", func() bool { return lr.calls() == 1 })
+	cancel()
+	p.Wait()
+
+	lr.mu.Lock()
+	left := lr.remaining[0]
+	lr.mu.Unlock()
+	// Had it shared the refresh's hctx, ~50ms of the 200ms budget would remain.
+	if left < 4*time.Second {
+		t.Fatalf("loadavg sample had %s left; it is sharing the refresh's budget, not its own", left)
+	}
+}
+
+func TestEffectiveLoadAvgTimeout(t *testing.T) {
+	tests := []struct {
+		name string
+		in   time.Duration
+		want time.Duration
+	}{
+		// A bare -0 must not mean "no budget" (an unbounded call hangs the
+		// whole poll loop, since tick blocks the ticker) nor "expire
+		// instantly" (which would never sample anything at all).
+		{"zero means the default", 0, defaultLoadAvgTimeout},
+		{"negative means the default", -time.Second, defaultLoadAvgTimeout},
+		{"a set value is honoured", 2 * time.Second, 2 * time.Second},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := EffectiveLoadAvgTimeout(tc.in); got != tc.want {
+				t.Errorf("EffectiveLoadAvgTimeout(%s) = %s, want %s", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// Host churn (SIGHUP reloads) must not grow the sampler's state map forever,
+// same as the inventory and stats state it sits alongside.
+func TestPollerPrunesLoadAvgState(t *testing.T) {
+	f := newFakeRefresher()
+	lr := &loadRec{}
+	p := &Poller{Svc: f, LoadAvg: lr, Interval: time.Hour, Timeout: time.Second}
+	p.state = map[string]bool{}
+	p.statsState = map[string]bool{}
+	p.loadState = map[string]bool{"gone": true, "stays": true}
+	p.bootUptime = map[string]time.Duration{}
+
+	p.pruneState([]string{"stays"})
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.loadState["gone"]; ok {
+		t.Error("removed host's loadavg state was not pruned")
+	}
+	if _, ok := p.loadState["stays"]; !ok {
+		t.Error("active host's loadavg state was pruned")
+	}
+}
+
+// A tick where no sample was taken is not an outcome. Recorded as one it would
+// flip a host sitting in "failing" to "recovered" and announce it, on a tick
+// that read nothing at all — the inverse of the silence #258 was about, and
+// just as misleading.
+func TestPollerIgnoresASkippedLoadAvgSample(t *testing.T) {
+	f := newFakeRefresher()
+	lr := &loadRec{err: errors.New("loadavg boom")}
+	p := &Poller{Svc: f, LoadAvg: lr, Interval: time.Hour, Timeout: time.Second}
+	ctx, cancel := context.WithCancel(context.Background())
+	p.Start(ctx, func() []string { return []string{"h1"} })
+	waitFor(t, "the failing sample to be recorded", func() bool {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		ok, seen := p.loadState["h1"]
+		return seen && !ok
+	})
+	cancel()
+	p.Wait()
+
+	// Now the host is skipped rather than sampled: the recorded failure must
+	// survive, not be overwritten with a recovery nobody observed.
+	lr.mu.Lock()
+	lr.skipped, lr.err = true, nil
+	lr.mu.Unlock()
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	p.Start(ctx2, func() []string { return []string{"h1"} })
+	waitFor(t, "the second tick", func() bool { return lr.calls() >= 2 })
+	cancel2()
+	p.Wait()
+
+	p.mu.Lock()
+	ok, seen := p.loadState["h1"]
+	p.mu.Unlock()
+	if !seen || ok {
+		t.Errorf("loadState = (ok=%v seen=%v); a skipped tick overwrote the last real verdict", ok, seen)
+	}
+}

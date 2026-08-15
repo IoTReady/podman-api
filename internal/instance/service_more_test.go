@@ -169,6 +169,36 @@ func TestService_HostLoad_PassesThrough(t *testing.T) {
 	assert.Equal(t, 75.0, got.MemUsedPct)
 }
 
+// --- RefreshHostLoadAvg -----------------------------------------------------
+
+func TestService_RefreshHostLoadAvg_UnknownHostIsNotAnOutcome(t *testing.T) {
+	svc, f := newSvc(t)
+	// Not an error: the host list the poller walked is one reload behind this
+	// map, and reporting it would log an outage for a clean removal.
+	sampled, err := svc.RefreshHostLoadAvg(context.Background(), "nope")
+	assert.NoError(t, err)
+	assert.False(t, sampled, "an unknown host is not an outcome")
+	assert.Empty(t, f.SampleLoadAvgHosts, "an unknown host must not reach the client")
+}
+
+func TestService_RefreshHostLoadAvg_PassesThrough(t *testing.T) {
+	svc, f := newSvc(t)
+	sampled, err := svc.RefreshHostLoadAvg(context.Background(), "h1")
+	require.NoError(t, err)
+	assert.True(t, sampled)
+	assert.Equal(t, []string{"h1"}, f.SampleLoadAvgHosts)
+}
+
+func TestService_RefreshHostLoadAvg_PropagatesError(t *testing.T) {
+	svc, f := newSvc(t)
+	f.SampleLoadAvgErr = errors.New("ssh boom")
+	// The poller logs this; swallowing it here would restore exactly the
+	// silence #258 was about.
+	sampled, err := svc.RefreshHostLoadAvg(context.Background(), "h1")
+	assert.Error(t, err)
+	assert.True(t, sampled, "a failed read is still an outcome")
+}
+
 // --- HostUptime ---------------------------------------------------------------
 
 func TestService_HostUptime_UnknownHost(t *testing.T) {

@@ -1673,6 +1673,23 @@ func (s *Service) HostUptime(ctx context.Context, host string) (time.Duration, b
 	return s.client.HostUptime(ctx, host)
 }
 
+// RefreshHostLoadAvg samples the host's load averages into the podman client's
+// cache, so a later HostLoad serves them without paying for the read (see
+// podman.Client.SampleLoadAvg). Called by the inventory poller; not exposed
+// over the API — the values it warms surface through HostLoad like any other.
+//
+// sampled is false when nothing was read and the outcome says nothing about
+// the host (see podman.Client.SampleLoadAvg); the poller uses it to leave its
+// last real verdict standing rather than inventing one.
+func (s *Service) RefreshHostLoadAvg(ctx context.Context, host string) (sampled bool, err error) {
+	if _, ok := s.host(host); !ok {
+		// Not an outcome either: the host list the poller walked is one reload
+		// behind this map.
+		return false, nil
+	}
+	return s.client.SampleLoadAvg(ctx, host)
+}
+
 // PortsInUse returns all currently-bound host ports on hostID.
 func (s *Service) PortsInUse(ctx context.Context, host string) ([]podman.PortMapping, error) {
 	if _, ok := s.host(host); !ok {

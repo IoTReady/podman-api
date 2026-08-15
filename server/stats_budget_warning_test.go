@@ -6,20 +6,22 @@ import (
 	"time"
 )
 
-// The stats sample gets its own budget (#212) and the boot-reboot probe gets
-// its own budget too (#231), so a host's worst-case per-tick cost is
-// -inventory-refresh-timeout + boot-probe-timeout + -container-stats-timeout
-// (the last only when the sampler is enabled). tick blocks the ticker, so once
+// The stats sample gets its own budget (#212), the boot-reboot probe gets its
+// own budget too (#231), and so does the loadavg sample (#258), so a host's
+// worst-case per-tick cost is -inventory-refresh-timeout + boot-probe-timeout +
+// loadavg-sample-timeout + -container-stats-timeout (the last only when the
+// sampler is enabled; the loadavg one, like the boot probe, is wired
+// unconditionally with the poller). tick blocks the ticker, so once
 // that sum reaches -inventory-refresh-interval a slow host stretches the whole
 // fleet's poll cadence. Nothing structurally prevents an operator tuning into
 // that state — this warning is what makes the invariant visible, and it must
 // stay a warning: a deliberately long timeout should not refuse to start.
 func TestStatsBudgetWarning(t *testing.T) {
 	tests := []struct {
-		name                               string
-		interval, timeout, statsTO, bootTO time.Duration
-		statsEnabled                       bool
-		want                               []string // substrings that must appear; empty means want ""
+		name                                       string
+		interval, timeout, statsTO, bootTO, loadTO time.Duration
+		statsEnabled                               bool
+		want                                       []string // substrings that must appear; empty means want ""
 	}{
 		{
 			// #231 review finding #2: the shipped defaults (20s refresh + 5s
@@ -29,63 +31,67 @@ func TestStatsBudgetWarning(t *testing.T) {
 			// 30s, AT the interval, which must now warn.
 			name:     "shipped defaults are actually at budget once the boot probe is counted",
 			interval: 30 * time.Second, timeout: 20 * time.Second, statsTO: 5 * time.Second,
-			bootTO: 0, statsEnabled: true,
+			bootTO: 0, loadTO: 0, statsEnabled: true,
 			want: []string{
-				"-inventory-refresh-timeout", "boot-reboot-probe", "-container-stats-timeout",
-				"-inventory-refresh-interval", "20s", "30s",
+				"-inventory-refresh-timeout", "boot-reboot-probe", "loadavg-sample",
+				"-container-stats-timeout", "-inventory-refresh-interval", "20s", "30s",
 			},
 		},
 		{
-			// Genuinely small budgets across all three terms fit comfortably.
-			name:     "small budgets across all three terms are silent",
-			interval: 30 * time.Second, timeout: 10 * time.Second, statsTO: 5 * time.Second,
-			bootTO: 5 * time.Second, statsEnabled: true,
+			// Genuinely small budgets across all four terms fit comfortably.
+			name:     "small budgets across all four terms are silent",
+			interval: 40 * time.Second, timeout: 10 * time.Second, statsTO: 5 * time.Second,
+			bootTO: 5 * time.Second, loadTO: 5 * time.Second, statsEnabled: true,
 		},
 		{
 			// An operator who raised the refresh timeout without looking at the
 			// interval — the tuning the old shared budget made impossible.
 			name: "sum over the interval warns", interval: 30 * time.Second,
-			timeout: 45 * time.Second, statsTO: 5 * time.Second, bootTO: 5 * time.Second, statsEnabled: true,
+			timeout: 45 * time.Second, statsTO: 5 * time.Second, bootTO: 5 * time.Second,
+			loadTO: 5 * time.Second, statsEnabled: true,
 			want: []string{"-inventory-refresh-timeout", "poll cadence"},
 		},
 		{
 			// A bare -container-stats-timeout=0 does NOT mean zero budget: the
 			// poller spends its 5s default. A raw-value check computes 28+0=28,
-			// stays silent, and the poller then spends 28+5(boot)+5(stats)=38s
-			// against a 30s interval — the hole this whole function exists to
-			// close. The message must name the effective 5s, not the flag's
-			// literal 0.
+			// stays silent, and the poller then spends
+			// 28+5(boot)+5(load)+5(stats)=43s against a 30s interval — the hole
+			// this whole function exists to close. The message must name the
+			// effective 5s, not the flag's literal 0.
 			name: "zero stats timeout is normalised to the default", interval: 30 * time.Second,
-			timeout: 28 * time.Second, statsTO: 0, bootTO: 5 * time.Second, statsEnabled: true,
-			want: []string{"-container-stats-timeout (5s)", "38s", "30s"},
+			timeout: 28 * time.Second, statsTO: 0, bootTO: 5 * time.Second,
+			loadTO: 5 * time.Second, statsEnabled: true,
+			want: []string{"-container-stats-timeout (5s)", "43s", "30s"},
 		},
 		{
 			// flag.Duration parses -1s happily; same normalisation applies.
 			name: "negative stats timeout is normalised to the default", interval: 30 * time.Second,
-			timeout: 28 * time.Second, statsTO: -1 * time.Second, bootTO: 5 * time.Second, statsEnabled: true,
-			want: []string{"-container-stats-timeout (5s)", "38s"},
+			timeout: 28 * time.Second, statsTO: -1 * time.Second, bootTO: 5 * time.Second,
+			loadTO: 5 * time.Second, statsEnabled: true,
+			want: []string{"-container-stats-timeout (5s)", "43s"},
 		},
 		{
 			// The boot-probe term is normalised the same way, and independently
 			// of the stats term: a zero/negative BootTimeout means the 5s
 			// default is what's actually spent, not zero.
 			name: "zero boot timeout is normalised to the default", interval: 30 * time.Second,
-			timeout: 20 * time.Second, statsTO: 5 * time.Second, bootTO: 0, statsEnabled: true,
-			want: []string{"boot-reboot-probe timeout (5s)", "30s"},
+			timeout: 20 * time.Second, statsTO: 5 * time.Second, bootTO: 0,
+			loadTO: 5 * time.Second, statsEnabled: true,
+			want: []string{"boot-reboot-probe timeout (5s)", "35s"},
 		},
 		{
 			// The normalisation must not manufacture a warning where the
-			// effective sum genuinely fits: 10s + 5s(boot) + 5s(stats) < 30s.
+			// effective sum genuinely fits: 10 + 5(boot) + 5(load) + 5(stats) < 30.
 			name: "zero timeouts still silent when the defaults fit", interval: 30 * time.Second,
-			timeout: 10 * time.Second, statsTO: 0, bootTO: 0, statsEnabled: true,
+			timeout: 10 * time.Second, statsTO: 0, bootTO: 0, loadTO: 0, statsEnabled: true,
 		},
 		{
 			// No sampler, no second budget to spend: warning here would be noise
 			// UNLESS the refresh + boot-probe terms alone already reach the
 			// interval — proven by the next case.
 			name:     "sampler disabled and remaining budget fits is silent",
-			interval: 30 * time.Second, timeout: 20 * time.Second, statsTO: 5 * time.Second,
-			bootTO: 5 * time.Second, statsEnabled: false,
+			interval: 30 * time.Second, timeout: 15 * time.Second, statsTO: 5 * time.Second,
+			bootTO: 5 * time.Second, loadTO: 5 * time.Second, statsEnabled: false,
 		},
 		{
 			// #231 review finding #2, isolated: the boot probe alone (no
@@ -93,20 +99,31 @@ func TestStatsBudgetWarning(t *testing.T) {
 			// gated by a flag the way the stats sampler is.
 			name:     "boot probe alone can push the budget over with stats disabled",
 			interval: 30 * time.Second, timeout: 26 * time.Second, statsTO: 5 * time.Second,
-			bootTO: 5 * time.Second, statsEnabled: false,
-			want: []string{"boot-reboot-probe", "31s", "30s"},
+			bootTO: 5 * time.Second, loadTO: 5 * time.Second, statsEnabled: false,
+			want: []string{"boot-reboot-probe", "36s", "30s"},
+		},
+		{
+			// The loadavg sampler is not gated by a flag either (#258), so like
+			// the boot probe it can push a host over budget on its own — the
+			// refresh + boot terms here fit at 25s and only the loadavg term
+			// takes the sum to the interval.
+			name:     "loadavg sample alone can push the budget over with stats disabled",
+			interval: 30 * time.Second, timeout: 20 * time.Second, statsTO: 5 * time.Second,
+			bootTO: 5 * time.Second, loadTO: 5 * time.Second, statsEnabled: false,
+			want: []string{"loadavg-sample timeout (5s)", "30s"},
 		},
 		{
 			// The poller is off entirely; pollerDisabledMetricsWarning owns that
 			// case and nothing ticks, so there is no cadence to stretch.
 			name: "poller disabled is silent", interval: 0,
-			timeout: 45 * time.Second, statsTO: 5 * time.Second, bootTO: 5 * time.Second, statsEnabled: true,
+			timeout: 45 * time.Second, statsTO: 5 * time.Second, bootTO: 5 * time.Second,
+			loadTO: 5 * time.Second, statsEnabled: true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := statsBudgetWarning(tc.interval, tc.timeout, tc.statsTO, tc.bootTO, tc.statsEnabled)
+			got := statsBudgetWarning(tc.interval, tc.timeout, tc.statsTO, tc.bootTO, tc.loadTO, tc.statsEnabled)
 			if len(tc.want) == 0 {
 				if got != "" {
 					t.Fatalf("want no warning, got %q", got)

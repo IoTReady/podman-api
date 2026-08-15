@@ -5,6 +5,7 @@ package inventory
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"sync"
 	"time"
@@ -27,6 +28,25 @@ type StatsRefresher interface {
 	// DropHostStats discards the host's cached samples. Called when the host is
 	// not going to be sampled at all. No context: it does no I/O.
 	DropHostStats(host string)
+}
+
+// LoadAvgRefresher samples one host's /proc/loadavg into the podman client's
+// cache. Implemented by *instance.Service.RefreshHostLoadAvg.
+//
+// This exists because the read is an SSH round trip on a remote host, and
+// paying for it at the tail of a per-host request budget meant it was reliably
+// the thing that got starved — silently, since the metric renders by omission
+// (#258). There is nothing to retire on failure, unlike the stats sampler: the
+// cache entry expires on age, so a host that stops being sampled stops
+// reporting loadavg rather than repeating its last value forever.
+type LoadAvgRefresher interface {
+	// sampled is false when no read was attempted against the host as it is
+	// currently configured — it was removed or re-addressed mid-read, or
+	// another caller held the per-host read lock and this call ran out of
+	// budget waiting. That is not an outcome, and recording it as one would
+	// announce a recovery (or an outage) that never happened, so the tick
+	// leaves the last real verdict standing.
+	RefreshHostLoadAvg(ctx context.Context, host string) (sampled bool, err error)
 }
 
 // VolumeUsageRefresher sizes one host's volumes.
@@ -76,6 +96,19 @@ type Poller struct {
 	// why this is a separate budget rather than a share of Timeout (#212).
 	StatsTimeout time.Duration
 
+	// LoadAvg, when non-nil, samples each host's load averages on every tick,
+	// keeping GET /hosts's load.loadavg served from cache instead of from a
+	// live SSH read inside the request's own budget (#258). nil disables it
+	// entirely: the read then happens lazily on the request path, which still
+	// works — the podman client caches either way — it just pays for a read
+	// once per host per cache TTL.
+	LoadAvg LoadAvgRefresher
+
+	// LoadAvgTimeout bounds one host's loadavg sample, independently of
+	// Timeout — mirrors StatsTimeout/BootTimeout, for the same #212 reason.
+	// Zero means defaultLoadAvgTimeout.
+	LoadAvgTimeout time.Duration
+
 	// Boot, when non-nil, probes each host's uptime on every tick and
 	// re-converges stored specs for a host whose uptime resets — i.e. it
 	// rebooted while podman-api kept running (#231). nil disables the check
@@ -104,6 +137,7 @@ type Poller struct {
 	mu         sync.Mutex
 	state      map[string]bool          // host -> last-known reachable, for transition logging
 	statsState map[string]bool          // host -> last-known stats-sampler outcome (never reachability)
+	loadState  map[string]bool          // host -> last-known loadavg-sampler outcome (never reachability)
 	bootUptime map[string]time.Duration // host -> last-observed kernel uptime, for reboot (uptime reset) detection
 	wg         sync.WaitGroup
 }
@@ -117,6 +151,9 @@ func (p *Poller) Start(ctx context.Context, hostsFn func() []string) {
 	}
 	if p.statsState == nil {
 		p.statsState = map[string]bool{}
+	}
+	if p.loadState == nil {
+		p.loadState = map[string]bool{}
 	}
 	if p.bootUptime == nil {
 		p.bootUptime = map[string]time.Duration{}
@@ -213,6 +250,32 @@ func (p *Poller) tick(ctx context.Context, hosts []string) {
 					scancel()
 				}
 			}
+			// Own budget derived from ctx, own state map — and, like the boot
+			// probe below and unlike the stats sampler, run regardless of the
+			// refresh's outcome.
+			//
+			// The stats sampler skips a failed host because it asks libpod the
+			// same question the refresh just failed to answer. This does not:
+			// it reads /proc over SSH, a different transport entirely, and the
+			// two fail independently. A host whose container sweep times out
+			// (a big store, a slow libpod) can answer a one-line `cat`
+			// instantly — and gating on the sweep meant that host's cache went
+			// stale and its loadavg fell back to a live read inside a request's
+			// own budget, which is the arrangement this whole change exists to
+			// get rid of.
+			//
+			// Nothing is dropped when a sample fails, unlike Stats: a loadavg
+			// entry expires on age, so an unsampled host's value falls out on
+			// its own. There is no equivalent of a cumulative counter frozen at
+			// its last value.
+			if p.LoadAvg != nil {
+				lctx, lcancel := context.WithTimeout(ctx, p.loadAvgTimeout())
+				sampled, lerr := p.LoadAvg.RefreshHostLoadAvg(lctx, host)
+				lcancel()
+				if sampled {
+					p.logLoadAvgTransition(host, lerr)
+				}
+			}
 			// Independent of the refresh's own outcome (err above): a reboot
 			// probe is a different, lighter libpod call, and a host that just
 			// failed its container sweep may still answer it (or vice versa).
@@ -245,10 +308,21 @@ const defaultBootTimeout = 5 * time.Second
 // (statsBudgetWarning) has to reason about the same effective value the
 // poller uses, not the raw (possibly zero) configured one.
 func EffectiveBootTimeout(d time.Duration) time.Duration {
-	if d <= 0 {
-		return defaultBootTimeout
+	return effectiveTimeout(d, defaultBootTimeout)
+}
+
+// effectiveTimeout maps a configured per-host sub-budget to what the poller
+// will actually spend. Anything <= 0 means the default — never "no timeout"
+// (tick blocks the ticker, so an unbounded call hangs the whole poll loop) and
+// never "expire instantly" (which would sample nothing, ever).
+//
+// One implementation for all three sub-budgets: the rule is identical, and
+// three copies meant a fix to it could land in one and be missed in the others.
+func effectiveTimeout(configured, def time.Duration) time.Duration {
+	if configured <= 0 {
+		return def
 	}
-	return d
+	return configured
 }
 
 // bootTimeout is BootTimeout normalised through EffectiveBootTimeout.
@@ -349,14 +423,29 @@ const defaultStatsTimeout = 5 * time.Second
 // effective value, or a bare -container-stats-timeout=0 passes a check the
 // poller then violates by 5s.
 func EffectiveStatsTimeout(d time.Duration) time.Duration {
-	if d <= 0 {
-		return defaultStatsTimeout
-	}
-	return d
+	return effectiveTimeout(d, defaultStatsTimeout)
 }
 
 // statsTimeout is StatsTimeout normalised through EffectiveStatsTimeout.
 func (p *Poller) statsTimeout() time.Duration { return EffectiveStatsTimeout(p.StatsTimeout) }
+
+// defaultLoadAvgTimeout bounds one host's loadavg sample when LoadAvgTimeout is
+// unset. Over a pooled SSH connection the read is a single short exec — the
+// ~2.9s handshake it used to pay is gone (see podman/ssh_pool.go) — so this is
+// headroom for a cold reconnect, not a tuned value.
+const defaultLoadAvgTimeout = 5 * time.Second
+
+// EffectiveLoadAvgTimeout maps a configured loadavg timeout to the value the
+// poller will actually spend: anything <= 0 means defaultLoadAvgTimeout, never
+// "no timeout" and never "expire instantly". Exported for the same reason
+// EffectiveStatsTimeout is — server's startup budget check has to reason about
+// the effective value, not the raw configured one.
+func EffectiveLoadAvgTimeout(d time.Duration) time.Duration {
+	return effectiveTimeout(d, defaultLoadAvgTimeout)
+}
+
+// loadAvgTimeout is LoadAvgTimeout normalised through EffectiveLoadAvgTimeout.
+func (p *Poller) loadAvgTimeout() time.Duration { return EffectiveLoadAvgTimeout(p.LoadAvgTimeout) }
 
 // pruneState drops transition-log state for hosts no longer in the active set
 // (e.g. removed via SIGHUP), so the map can't grow unbounded over host churn.
@@ -388,6 +477,11 @@ func (p *Poller) pruneState(hosts []string) {
 			delete(p.statsState, h)
 		}
 	}
+	for h := range p.loadState {
+		if !keep[h] {
+			delete(p.loadState, h)
+		}
+	}
 	for h := range p.bootUptime {
 		if !keep[h] {
 			delete(p.bootUptime, h)
@@ -396,28 +490,43 @@ func (p *Poller) pruneState(hosts []string) {
 	p.mu.Unlock()
 }
 
-// logTransition logs only when a host's reachability changes (or is first seen
-// unreachable), so a persistently-down host doesn't flood the log every tick.
-func (p *Poller) logTransition(host string, err error) {
-	reachable := err == nil
+// logStateTransition logs only when a host's outcome for one concern changes,
+// so a persistently-failing host doesn't flood the log every tick. bad is the
+// message logged on a failure (it takes the host and the error), good the one
+// logged on recovery (it takes the host).
+//
+// state is the caller's own map, and keeping them separate is the point: a
+// side-channel sampler failing says nothing about whether the host is
+// reachable, and must never be able to influence — or be mistaken for — that
+// verdict.
+func (p *Poller) logStateTransition(state map[string]bool, host string, err error, bad func(string, error) string, good func(string) string) {
+	ok := err == nil
 	p.mu.Lock()
-	prev, seen := p.state[host]
-	p.state[host] = reachable
+	prev, seen := state[host]
+	state[host] = ok
 	p.mu.Unlock()
 
 	switch {
-	case !seen && !reachable:
-		log.Printf("inventory: host %s unreachable: %v", host, err)
-	case seen && prev && !reachable:
-		log.Printf("inventory: host %s unreachable: %v", host, err)
-	case seen && !prev && reachable:
-		log.Printf("inventory: host %s reachable again", host)
+	case !seen && !ok:
+		log.Print(bad(host, err))
+	case seen && prev && !ok:
+		log.Print(bad(host, err))
+	case seen && !prev && ok:
+		log.Print(good(host))
 	}
 }
 
-// logStatsTransition logs stats-sampler failures only when the outcome changes,
-// mirroring logTransition. Kept separate from the inventory state so a stats
-// failure can never be mistaken for — or influence — host reachability.
+// logTransition logs only when a host's reachability changes (or is first seen
+// unreachable). This is the verdict the four Grafana alert rules gate on, via
+// podman_api_host_reachable — the sampler transitions below deliberately do not
+// feed it.
+func (p *Poller) logTransition(host string, err error) {
+	p.logStateTransition(p.state, host, err,
+		func(h string, e error) string { return fmt.Sprintf("inventory: host %s unreachable: %v", h, e) },
+		func(h string) string { return fmt.Sprintf("inventory: host %s reachable again", h) })
+}
+
+// logStatsTransition logs stats-sampler failures only when the outcome changes.
 //
 // Sampling has its own budget (StatsTimeout, see tick), so these messages no
 // longer track the inventory refresh's leftover time — until #212 they did, and
@@ -427,20 +536,25 @@ func (p *Poller) logTransition(host string, err error) {
 // is -container-stats-timeout, not -inventory-refresh-timeout. The metrics stay
 // honest either way: a missed sample renders absent, never stale.
 func (p *Poller) logStatsTransition(host string, err error) {
-	ok := err == nil
-	p.mu.Lock()
-	prev, seen := p.statsState[host]
-	p.statsState[host] = ok
-	p.mu.Unlock()
+	p.logStateTransition(p.statsState, host, err,
+		func(h string, e error) string {
+			return fmt.Sprintf("inventory: host %s container stats unavailable: %v", h, e)
+		},
+		func(h string) string { return fmt.Sprintf("inventory: host %s container stats available again", h) })
+}
 
-	switch {
-	case !seen && !ok:
-		log.Printf("inventory: host %s container stats unavailable: %v", host, err)
-	case seen && prev && !ok:
-		log.Printf("inventory: host %s container stats unavailable: %v", host, err)
-	case seen && !prev && ok:
-		log.Printf("inventory: host %s container stats available again", host)
-	}
+// logLoadAvgTransition logs loadavg-sampler failures only when the outcome
+// changes.
+//
+// It logs at all because the silence was the bug. A nil loadavg used to be
+// indistinguishable from a host that simply had no loadavg to give, and
+// diagnosing it took a hand-built table of per-host latencies (#258). It logs
+// only on a transition because the other half of that bug was a permanently
+// broken host emitting a line on every tick, which is its own kind of silence.
+func (p *Poller) logLoadAvgTransition(host string, err error) {
+	p.logStateTransition(p.loadState, host, err,
+		func(h string, e error) string { return fmt.Sprintf("inventory: host %s loadavg unavailable: %v", h, e) },
+		func(h string) string { return fmt.Sprintf("inventory: host %s loadavg available again", h) })
 }
 
 // StartVolumeUsage runs a separate, much slower loop that sizes each host's

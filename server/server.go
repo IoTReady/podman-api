@@ -474,6 +474,13 @@ func RunWithFlags(opts ...Option) error {
 			// only covers podman-api's own restart, not a managed host's
 			// (#231).
 			Boot: svc,
+			// Keeps GET /hosts's load.loadavg served from the podman client's
+			// cache instead of a live SSH read inside the request's own
+			// per-host budget, where it sat last and was reliably starved
+			// (#258). Always on when the poller is: it is one short exec over
+			// an already-open connection, and the alternative is not "cheaper"
+			// but "the same read, billed to a request".
+			LoadAvg: svc,
 		}
 		if *containerStats {
 			invPoller.Stats = svc
@@ -484,7 +491,7 @@ func RunWithFlags(opts ...Option) error {
 		// sampler's own wiring lives. invPoller.BootTimeout is passed (not a
 		// literal 0) so this stays correct if a flag for it is ever added;
 		// today it is always the zero value, i.e. always the 5s default.
-		if w := statsBudgetWarning(*inventoryInterval, *inventoryTimeout, *containerStatsTO, invPoller.BootTimeout, *containerStats); w != "" {
+		if w := statsBudgetWarning(*inventoryInterval, *inventoryTimeout, *containerStatsTO, invPoller.BootTimeout, invPoller.LoadAvgTimeout, *containerStats); w != "" {
 			log.Printf("WARNING: %s", w)
 		}
 		invPoller.Start(runnerCtx, hostIDs)
@@ -945,13 +952,16 @@ func diffNewlySeenHosts(seen map[string]bool, current []config.Host) (newlySeen 
 // pre-existing sharp edge (a refresh timeout of 0 fails every refresh
 // immediately, loudly and on every host) and squarely outside #212; the honest
 // sum for that case is the one computed here.
-func statsBudgetWarning(interval, timeout, statsTimeout, bootTimeout time.Duration, statsEnabled bool) string {
+func statsBudgetWarning(interval, timeout, statsTimeout, bootTimeout, loadAvgTimeout time.Duration, statsEnabled bool) string {
 	if interval <= 0 {
 		return ""
 	}
 	effBoot := inventory.EffectiveBootTimeout(bootTimeout)
-	sum := timeout + effBoot
-	terms := fmt.Sprintf("-inventory-refresh-timeout (%s) + boot-reboot-probe timeout (%s)", timeout, effBoot)
+	// The loadavg sampler is wired unconditionally alongside the poller, so
+	// unlike the stats term this one is always part of the worst-case tick.
+	effLoad := inventory.EffectiveLoadAvgTimeout(loadAvgTimeout)
+	sum := timeout + effBoot + effLoad
+	terms := fmt.Sprintf("-inventory-refresh-timeout (%s) + boot-reboot-probe timeout (%s) + loadavg-sample timeout (%s)", timeout, effBoot, effLoad)
 	if statsEnabled {
 		effStats := inventory.EffectiveStatsTimeout(statsTimeout)
 		sum += effStats

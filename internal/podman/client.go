@@ -117,6 +117,26 @@ type Client interface {
 	// this is meant to be probed on every inventory tick, for every host, to
 	// detect a host reboot.
 	HostUptime(ctx context.Context, hostID string) (uptime time.Duration, ok bool, err error)
+	// SampleLoadAvg reads hostID's /proc/loadavg and caches it for HostInfo to
+	// serve. Called by the inventory poller so the cost of the read — an SSH
+	// round trip for a remote host — is paid on the poller's own budget rather
+	// than at the tail of a request's, where it was reliably starved (#258).
+	// Calling it is an optimization, never a requirement: HostInfo still reads
+	// through on a cache miss, so a daemon with polling disabled reports
+	// loadavg too.
+	//
+	// sampled reports whether a read was actually attempted against the host
+	// as it is currently configured. It is false when nothing was read and the
+	// result says nothing about the host: it was removed or re-addressed
+	// mid-read, or another caller already held the per-host read lock and this
+	// one ran out of budget waiting. Callers deriving a health verdict must
+	// treat sampled=false as "no outcome" and leave their last one standing —
+	// a nil error there would announce a recovery that never happened, just as
+	// a non-nil one would announce an outage that never happened.
+	//
+	// When sampled is true, err means the read itself failed, and callers may
+	// report it as such.
+	SampleLoadAvg(ctx context.Context, hostID string) (sampled bool, err error)
 	// Knows reports whether hostID is a registered host this client can reach.
 	// The host set is updated at construction and whenever SetHosts is called
 	// (e.g. after a SIGHUP host-config reload).

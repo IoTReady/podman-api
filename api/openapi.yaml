@@ -134,7 +134,14 @@ components:
               items: {type: number}
               minItems: 3
               maxItems: 3
-              description: "1/5/15-minute load average; omitted when unavailable"
+              description: >-
+                1/5/15-minute load average. Read from the host's /proc/loadavg over a
+                side channel, not from podman, and served from a cache up to 60s old —
+                its shortest component is already a 1-minute average, so a live read
+                would carry no more information while costing a round trip inside the
+                request. An expired sample is refreshed, not dropped, so the field is
+                omitted only when the value is genuinely unavailable: nothing cached
+                and the read itself failing. For an instantaneous reading use cpu_pct.
             disk:
               type: object
               properties:

@@ -50,16 +50,63 @@ type Real struct {
 	mu       sync.Mutex
 	ctx      map[string]context.Context // hostID -> connection-bearing ctx
 	verified map[string]bool            // hostID -> passed the MinPodmanVersion check
+	// sshPool caches one live SSH client per host for the /proc side channels
+	// (loadavg, uptime, net ports), which libpod does not serve. See
+	// ssh_pool.go: the handshake it removes was ~2.9s per read (#258).
+	sshPool map[string]*sshPoolEntry
+	// loadavg caches each host's last successful /proc/loadavg read, so the
+	// metric survives a request budget that the libpod prelude has already
+	// mostly spent. Kept warm by the inventory poller via SampleLoadAvg.
+	loadavg map[string]loadSample
+	// loadGate single-flights the request-path read-through, one gate per host,
+	// so a burst arriving after the TTL lapses costs one round trip and not one
+	// each.
+	loadGate map[string]chan struct{}
+
+	// hooks is nil in production. It exists because the reload races this file
+	// guards against cannot be interleaved from outside — they live between a
+	// lock being released and the I/O that follows — and a guard nobody can
+	// test is a guard nobody can trust. Kept as one field rather than four so
+	// the seam is visible as a seam.
+	hooks *testHooks
 
 	// versionProbe overrides the version lookup in tests; nil means
 	// system.Info over the supplied connection ctx.
 	versionProbe func(context.Context) (string, error)
 }
 
+// testHooks is the test-only seam described on Real.hooks.
+type testHooks struct {
+	// now overrides the clock; nil means time.Now.
+	now func() time.Time
+	// wedgeGrace overrides sshWedgeGrace for pool entries created after it is
+	// set; zero means the default.
+	wedgeGrace time.Duration
+	// afterLoadRead runs between a loadavg read completing and the sample being
+	// committed to the cache.
+	afterLoadRead func()
+	// beforeLoadResolve runs after the loadavg path has snapshotted the host but
+	// before the read resolves it for itself — the other window a reload can
+	// land in.
+	beforeLoadResolve func()
+	// readCap overrides sshReadCap; zero means the default.
+	readCap time.Duration
+	// beforeConnect runs after a read has resolved its host and pool entry but
+	// before it connects — the window a reload has to retire that entry.
+	beforeConnect func()
+}
+
 // NewReal validates host configs and registers them. Connections are not
 // opened here; first use opens them.
 func NewReal(hosts []config.Host) (*Real, error) {
-	r := &Real{hosts: map[string]config.Host{}, ctx: map[string]context.Context{}, verified: map[string]bool{}}
+	r := &Real{
+		hosts:    map[string]config.Host{},
+		ctx:      map[string]context.Context{},
+		verified: map[string]bool{},
+		sshPool:  map[string]*sshPoolEntry{},
+		loadavg:  map[string]loadSample{},
+		loadGate: map[string]chan struct{}{},
+	}
 	for _, h := range hosts {
 		if h.ID == "" {
 			return nil, fmt.Errorf("host with empty id")
@@ -104,15 +151,23 @@ func (r *Real) SetHosts(hosts []config.Host) {
 			delete(r.hosts, id)
 			delete(r.ctx, id)
 			delete(r.verified, id)
+			delete(r.loadavg, id)
+			delete(r.loadGate, id)
+			r.dropSSHLocked(id)
 		}
 	}
 
 	// Add or update hosts.
 	for id, h := range newMap {
 		if old, exists := r.hosts[id]; exists && !hostConnEq(old, h) {
-			// Connection params changed: invalidate cached state.
+			// Connection params changed: invalidate cached state. The pooled
+			// SSH client and the cached loadavg go too — they describe the old
+			// endpoint, and a sample from it must not be served as the new
+			// host's.
 			delete(r.ctx, id)
 			delete(r.verified, id)
+			delete(r.loadavg, id)
+			r.dropSSHLocked(id)
 		}
 		r.hosts[id] = h
 	}
@@ -1321,23 +1376,13 @@ func parseProcUptime(s string) (time.Duration, bool) {
 // network backend, CPU utilization, lock manager, etc. — just to read one
 // uptime string; /proc/uptime is the one-line read that's actually needed.
 func (r *Real) HostUptime(ctx context.Context, id string) (time.Duration, bool, error) {
-	r.mu.Lock()
-	h, ok := r.hosts[id]
-	r.mu.Unlock()
-	if !ok {
-		return 0, false, fmt.Errorf("unknown host %q", id)
-	}
-	var raw string
-	var err error
-	if h.Addr == "unix" {
-		var b []byte
-		b, err = os.ReadFile("/proc/uptime")
-		if err == nil {
-			raw = string(b)
-		}
-	} else {
-		raw, err = sshReadUptime(ctx, h)
-	}
+	raw, err := r.readHostProc(id,
+		func() (string, error) {
+			b, err := os.ReadFile("/proc/uptime")
+			return string(b), err
+		},
+		func() (string, error) { return r.sshReadUptime(ctx, id) },
+	)
 	if err != nil {
 		return 0, false, err
 	}
@@ -1357,23 +1402,53 @@ func (r *Real) HostUptime(ctx context.Context, id string) (time.Duration, bool, 
 // present on every Linux kernel with CONFIG_PROC_FS, which podman itself
 // already requires.
 func (r *Real) HostBoundPorts(ctx context.Context, id, protocol string) ([]int, error) {
-	r.mu.Lock()
-	h, ok := r.hosts[id]
-	r.mu.Unlock()
-	if !ok {
-		return nil, fmt.Errorf("unknown host %q", id)
-	}
-	var raw string
-	var err error
-	if h.Addr == "unix" {
-		raw, err = readProcNetPortsLocal(protocol)
-	} else {
-		raw, err = sshReadProcNetPorts(ctx, h, protocol)
-	}
+	raw, err := r.readHostProc(id,
+		func() (string, error) { return readProcNetPortsLocal(protocol) },
+		func() (string, error) { return r.sshReadProcNetPorts(ctx, id, protocol) },
+	)
 	if err != nil {
 		return nil, err
 	}
 	return parseProcNetPorts(raw), nil
+}
+
+// readHostProc reads one /proc file from id by whichever path its current
+// address calls for — locally for a unix host, over SSH for a remote one —
+// and re-dispatches once if a reload moved the host under the read.
+//
+// The re-dispatch is the point. Choosing the branch means reading r.hosts, and
+// the read that follows resolves it again for itself (see sshRun on why it must),
+// so a SIGHUP landing between the two makes the branch and the read disagree.
+// sshRun refuses that rather than dialing "unix:22", and for the loadavg path
+// refusing is enough — it skips a cycle and the cache still holds. It is not
+// enough here: HostBoundPorts feeds a deploy's port-conflict precheck where
+// every error aborts the deploy, so a host edited to local at the wrong instant
+// would fail a deploy that had nothing wrong with it. Looking again yields the
+// local branch, which is where the answer now lives.
+//
+// Exactly one re-dispatch, matching connectFresh: a second one means reloads are
+// arriving faster than reads complete, and looping there is indistinguishable
+// from a hang.
+func (r *Real) readHostProc(id string, local, remote func() (string, error)) (string, error) {
+	for attempt := 0; attempt < 2; attempt++ {
+		r.mu.Lock()
+		h, ok := r.hosts[id]
+		r.mu.Unlock()
+		if !ok {
+			return "", fmt.Errorf("unknown host %q", id)
+		}
+		if h.Addr == "unix" {
+			return local()
+		}
+		raw, err := remote()
+		if errors.Is(err, errHostReconfigured) && attempt == 0 {
+			// The only way sshRun reports this: the host became local while we
+			// were connecting to it.
+			continue
+		}
+		return raw, err
+	}
+	return "", fmt.Errorf("host %q: %w", id, errHostReconfigured)
 }
 
 // readProcNetPortsLocal reads /proc/net/<protocol> (required — its absence is
@@ -1428,33 +1503,362 @@ func parseProcNetPorts(raw string) []int {
 	return out
 }
 
-// hostLoadAvg reads /proc/loadavg for a host, returning the 1/5/15-minute
-// averages, or nil if it cannot be read. For a unix (local) host it reads the
-// daemon's own /proc/loadavg; for an SSH host it execs `cat /proc/loadavg`
-// over a short-lived SSH session bounded by ctx. Any error yields nil so the
-// metric is absent.
+// loadSample is one host's /proc/loadavg reading and when it was taken. A
+// sample with ok=false records a *failed* read: the failure is cached too, so
+// a host whose side channel is broken does not cost every single request a
+// fresh dial to rediscover that (the trust-divergence case in
+// sshReadLoadAvg's doc comment fails exactly this way, on every read, forever).
+type loadSample struct {
+	val [3]float64
+	at  time.Time
+	ok  bool
+	// seq increments on every commit for this host, so a caller that waited on
+	// the read-through gate can tell whether someone else refreshed the entry
+	// while it queued. A timestamp cannot answer that: two commits can share
+	// one clock reading.
+	seq uint64
+}
+
+// loadAvgTTL is how long a sample is served before a reader takes a fresh one.
+// It is deliberately longer than the default inventory interval (30s), so on a
+// poller-enabled daemon the poller is the only thing that ever pays for the
+// read and the request path is pure cache. A daemon running with polling
+// disabled still gets the fix — it just refreshes lazily, one read per host
+// per TTL instead of one per request.
+//
+// The staleness this admits is bounded by TTL and harmless for what the metric
+// is: loadavg's shortest component is already a 1-minute average, so a sample
+// up to a minute old carries essentially the same information as a live one.
+// Anything wanting an instantaneous reading wants cpu_pct, not this.
+const loadAvgTTL = 60 * time.Second
+
+// loadAvgFailTTL is how long a failed read suppresses the next request-path
+// attempt. Shorter than loadAvgTTL so a host that recovers starts reporting
+// again promptly on a daemon with no poller; the poller itself ignores both
+// TTLs, so a polled daemon retries every tick regardless.
+const loadAvgFailTTL = 30 * time.Second
+
+// errHostReconfigured means a read completed but described a host that had
+// been reconfigured or removed while it was in flight, so the result was
+// discarded. It is not a host fault: nothing is wrong with the host, the
+// sample simply belongs to an endpoint that is no longer this host's.
+// SampleLoadAvg swallows it for exactly that reason — surfaced to the poller
+// it would be logged as "loadavg unavailable", which is the false-positive
+// this change exists to remove.
+// Not "…while reading loadavg": readHostProc reports it for uptime and port
+// reads too, where it is recoverable rather than merely benign.
+var errHostReconfigured = errors.New("host was reconfigured while reading")
+
+// errUnknownHost marks a read for a host that is no longer configured. On the
+// poller's path that always means "removed since the tick started", never a
+// bad id: the poller only ever passes ids it took off the host list.
+var errUnknownHost = errors.New("unknown host")
+
+func (r *Real) now() time.Time {
+	if r.hooks != nil && r.hooks.now != nil {
+		return r.hooks.now()
+	}
+	return time.Now()
+}
+
+// hostLoadAvg returns a host's 1/5/15-minute load averages, or nil if they
+// cannot be obtained. A cached sample younger than loadAvgTTL is served as-is;
+// otherwise it reads through and caches the result.
+//
+// Reading through is what used to happen on every single request, at the tail
+// of a 5s per-host budget that libpod had usually already eaten — so the
+// metric silently vanished for exactly the busiest hosts (#258).
 func (r *Real) hostLoadAvg(ctx context.Context, id string) *[3]float64 {
+	if la, done := r.servableLoadAvg(id); done {
+		return la
+	}
+	// Single-flight the read-through. Without this, N requests arriving on the
+	// same host after the TTL lapses each pay their own SSH round trip — which
+	// is the cost this whole change exists to remove, just moved from "every
+	// request" to "every request in the first burst after each expiry". Only
+	// one of them needs to go and ask.
+	//
+	// ctx-aware, for the same reason the pool's dial gate is: a caller that
+	// waited out someone else's read and only then started its own would have
+	// spent its budget to arrive exactly where it began.
+	gate, known := r.loadGateFor(id)
+	if !known {
+		return nil
+	}
+	release, acquired := acquireGate(ctx, gate)
+	if !acquired {
+		return nil
+	}
+	defer release()
+	// The winner of that race has filled the cache (or recorded a failure) by
+	// the time we get here, so re-check before reading through.
+	if la, done := r.servableLoadAvg(id); done {
+		return la
+	}
+
+	la, logWorthy, err := r.sampleLoadAvg(ctx, id)
+	if err != nil {
+		// Logged, not swallowed: this failure mode was previously diagnosed by
+		// bisecting a table of hosts by hand, which it should never have taken.
+		// Gated on the transition, like the poller gates its own: a host that
+		// is permanently broken would otherwise emit a line on every scrape.
+		if logWorthy {
+			log.Printf("podman: loadavg unavailable for host %q: %v", id, err)
+		}
+		return nil
+	}
+	return la
+}
+
+// servableLoadAvg answers from cache where it can. done reports whether the
+// cache settled the question: either a fresh sample to serve, or a recent
+// failure that means "absent, and not worth another round trip yet" — the
+// poller, or the next request after loadAvgFailTTL, is what retries.
+func (r *Real) servableLoadAvg(id string) (la *[3]float64, done bool) {
+	if s, ok := r.cachedLoadAvg(id); ok {
+		v := s
+		return &v, true
+	}
+	if r.recentLoadAvgFailure(id) {
+		return nil, true
+	}
+	return nil, false
+}
+
+// loadGateFor returns hostID's capacity-1 read-through gate, creating it on
+// first use. ok is false for a host that is not configured.
+//
+// That check is what actually keeps the map bounded, and it is the same guard
+// sshEntryFor carries: SetHosts's removal loop has already run by the time a
+// racing request gets here, so creating on demand without it would leave a
+// gate behind for a host nothing will ever remove again.
+func (r *Real) loadGateFor(id string) (chan struct{}, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, known := r.hosts[id]; !known {
+		return nil, false
+	}
+	if r.loadGate == nil {
+		r.loadGate = map[string]chan struct{}{}
+	}
+	g, ok := r.loadGate[id]
+	if !ok {
+		g = make(chan struct{}, 1)
+		r.loadGate[id] = g
+	}
+	return g, true
+}
+
+// cachedLoadAvg returns the host's cached sample if it is a successful read
+// younger than loadAvgTTL.
+func (r *Real) cachedLoadAvg(id string) ([3]float64, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.loadavg[id]
+	if !ok || !s.ok || r.now().Sub(s.at) >= loadAvgTTL {
+		return [3]float64{}, false
+	}
+	return s.val, true
+}
+
+// recentLoadAvgFailure reports whether the host's last read failed, recently
+// enough that retrying on the request path is not worth the round trip.
+func (r *Real) recentLoadAvgFailure(id string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.loadavg[id]
+	return ok && !s.ok && r.now().Sub(s.at) < loadAvgFailTTL
+}
+
+// markLoadAvgFailure records a failed read against the host as it looked when
+// the read started, and reports whether this is a transition — i.e. whether
+// the previous state was anything other than already-failing. Callers use the
+// return value to decide whether to log.
+//
+// A read that raced a SetHosts reload records nothing: the failure describes
+// an endpoint that is no longer this host's, and writing it would both
+// resurrect a cache entry for a host that may have been removed and suppress
+// reads of the new endpoint for a full loadAvgFailTTL.
+func (r *Real) markLoadAvgFailure(id string, h config.Host) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cur, ok := r.hosts[id]; !ok || !hostConnEq(cur, h) {
+		return false
+	}
+	prev, seen := r.loadavg[id]
+	r.loadavg[id] = loadSample{at: r.now(), seq: prev.seq + 1}
+	return !seen || prev.ok
+}
+
+// SampleLoadAvg reads the host's load averages and caches them, ignoring the
+// TTL. This is the inventory poller's entry point: it moves the cost of the
+// read off the request path entirely, onto a loop that already visits every
+// host on a schedule and whose budget is its own.
+//
+// It does not log: the poller logs its own per-host tick outcomes, with the
+// same transition gating, and one event logged twice at two layers is worse
+// than the silence this whole change is about removing. The request path,
+// which has no such caller, logs for itself in hostLoadAvg.
+func (r *Real) SampleLoadAvg(ctx context.Context, id string) (sampled bool, err error) {
+	gate, ok := r.loadGateFor(id)
+	if !ok {
+		// The host went away between the poller picking it off the host list
+		// and this call. That is a clean removal mid-tick, not an outage —
+		// and it is reachable on every reload, because applyHosts updates the
+		// client before the service, so the service's existence check can pass
+		// against a map the client has already swept. Reordering those two
+		// calls only moves the window: client-first is what an *added* host
+		// needs, service-first is what a removed one needs, and there is no
+		// single order that satisfies both. So the tolerance belongs here.
+		return false, nil
+	}
+	// The sampler ignores the TTL, but it must not ignore a read that is
+	// happening right now: a tick landing on top of a request's read-through
+	// would otherwise put two SSH reads on one host at one moment, which is
+	// precisely what the gate exists to prevent. Sequence, not timestamp,
+	// because two commits can share a clock reading.
+	before := r.loadSeq(id)
+	release, acquired := acquireGate(ctx, gate)
+	if !acquired {
+		// Someone else is mid-read on this host and we ran out of budget
+		// waiting. That is not an outage — a read is in flight and the cache
+		// is about to be updated — and reporting it would log one, since a
+		// request-path holder can legitimately outlast this tick's budget
+		// (getHost passes a context with no deadline at all).
+		//
+		// Reported as success it would be worse than reported as failure: the
+		// caller derives its state from err == nil, so a host sitting in
+		// "failing" would be flipped to "recovered" and announced as such on a
+		// tick where nothing was read at all. sampled=false says the only true
+		// thing — no outcome — and leaves the last real one standing.
+		return false, nil
+	}
+	defer release()
+	if _, fresh := r.cachedLoadAvg(id); fresh && r.loadSeq(id) != before {
+		//nolint:nestif // the comment below is the point
+		// Someone finished a real, *successful* read while we queued. That is
+		// this tick's sample — at most one gate-wait old and genuinely read
+		// from the host — so going out again would buy nothing.
+		//
+		// The freshness check is not redundant with the sequence check: a
+		// failed read bumps the sequence too, and adopting that would report
+		// success for a host whose read just failed, silently corrupting the
+		// poller's transition state and swallowing the outage it exists to
+		// report. A failure is not something to adopt; we go and read for
+		// ourselves.
+		return true, nil
+	}
+
+	_, _, err = r.sampleLoadAvg(ctx, id)
+	if isReloadRace(err) {
+		// A benign race with a config reload, not a host fault, and not an
+		// outcome either: nothing was read against a host that still exists as
+		// it was. The next tick resamples against the new endpoint.
+		return false, nil
+	}
+	return true, err
+}
+
+// isReloadRace reports whether err is one of the ways a read can lose a race
+// with a host-config reload rather than actually fail.
+//
+// There are three, at three different depths, and they have to be classified
+// together: the sample is discarded at commit time (errHostReconfigured), the
+// pool entry is retired mid-dial (errRetiredHost), or the host is gone by the
+// time the read resolves it (errUnknownHost). Only the first is caught by the
+// commit-time check, so treating that one alone as benign left the other two
+// logging outages for hosts that had simply been reconfigured.
+func isReloadRace(err error) bool {
+	return errors.Is(err, errHostReconfigured) ||
+		errors.Is(err, errRetiredHost) ||
+		errors.Is(err, errUnknownHost)
+}
+
+// loadSeq returns the host's current cache generation; 0 if it has none.
+func (r *Real) loadSeq(id string) uint64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.loadavg[id].seq
+}
+
+// sampleLoadAvg does the live read and caches the outcome, success or failure.
+// For a unix (local) host it reads the daemon's own /proc/loadavg; for an SSH
+// host it execs `cat /proc/loadavg` over the host's pooled connection, bounded
+// by ctx.
+//
+// logWorthy reports whether a failure is a transition worth logging; it is
+// meaningless when err is nil. Only the request path uses it — the poller logs
+// its own tick outcomes.
+func (r *Real) sampleLoadAvg(ctx context.Context, id string) (la *[3]float64, logWorthy bool, err error) {
 	r.mu.Lock()
 	h, ok := r.hosts[id]
 	r.mu.Unlock()
 	if !ok {
-		return nil
+		return nil, false, fmt.Errorf("%q: %w", id, errUnknownHost)
+	}
+	// Every failure exit below records the failure against h, so a broken host
+	// costs one round trip per TTL rather than one per request.
+	//
+	// Except a reload race, which is not a failure of anything. It has to be
+	// excluded here rather than by markLoadAvgFailure's own guard, because
+	// that guard asks "is h still current" — and after a race the answer can
+	// be yes: sshRun reports the *new* config it resolved, so a host switched
+	// to a unix socket mid-read comes back with h equal to r.hosts[id], sails
+	// past the guard, and is recorded as failing on a read that was never
+	// attempted. That poisons the cache for a host whose local /proc read
+	// would have succeeded instantly, and logs an outage for it.
+	fail := func(err error) (*[3]float64, bool, error) {
+		if isReloadRace(err) {
+			return nil, false, err
+		}
+		return nil, r.markLoadAvgFailure(id, h), err
 	}
 	var raw string
 	if h.Addr == "unix" {
-		b, err := os.ReadFile("/proc/loadavg")
-		if err != nil {
-			return nil
+		b, rerr := os.ReadFile("/proc/loadavg")
+		if rerr != nil {
+			return fail(rerr)
 		}
 		raw = string(b)
 	} else {
-		out, err := sshReadLoadAvg(ctx, h)
-		if err != nil {
-			return nil
+		if r.hooks != nil && r.hooks.beforeLoadResolve != nil {
+			r.hooks.beforeLoadResolve()
+		}
+		out, used, rerr := r.sshReadLoadAvg(ctx, id)
+		// The read resolves the host itself, so it may have run against a
+		// newer config than the snapshot above. Judge the outcome by what
+		// produced it, and do so before the error check: comparing a *failure*
+		// against the stale snapshot finds a mismatch, concludes the reload
+		// invalidated it, and drops a real ongoing outage — neither cached nor
+		// logged, which is the silence this whole change is about.
+		if used.ID != "" {
+			h = used
+		}
+		if rerr != nil {
+			return fail(rerr)
 		}
 		raw = out
 	}
-	return parseLoadAvg(raw)
+	sampled := parseLoadAvg(raw)
+	if sampled == nil {
+		return fail(fmt.Errorf("unparseable /proc/loadavg %q", strings.TrimSpace(raw)))
+	}
+	if r.hooks != nil && r.hooks.afterLoadRead != nil {
+		r.hooks.afterLoadRead()
+	}
+	// Commit only if this is still the same host at the same endpoint. The read
+	// happened with r.mu released, so a SIGHUP reload may have reconfigured or
+	// removed the host meanwhile — and storing this would resurrect a sample
+	// taken against an endpoint the operator has already moved away from,
+	// which is the exact invariant SetHosts's own comment promises.
+	r.mu.Lock()
+	if cur, ok := r.hosts[id]; !ok || !hostConnEq(cur, h) {
+		r.mu.Unlock()
+		return nil, false, fmt.Errorf("%q: %w", id, errHostReconfigured)
+	}
+	r.loadavg[id] = loadSample{val: *sampled, at: r.now(), ok: true, seq: r.loadavg[id].seq + 1}
+	r.mu.Unlock()
+	return sampled, false, nil
 }
 
 // parseLoadAvg extracts the first three space-separated floats from a

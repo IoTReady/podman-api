@@ -136,6 +136,12 @@ type Fake struct {
 	HostUptimeErr error
 	// HostUptimeCalls counts HostUptime invocations.
 	HostUptimeCalls int
+	// SampleLoadAvgHosts records the hosts SampleLoadAvg was called with.
+	SampleLoadAvgHosts []string
+	// SampleLoadAvgErr, if non-nil, makes SampleLoadAvg return this error.
+	SampleLoadAvgErr error
+	// SampleLoadAvgSkipped makes SampleLoadAvg report that no sample was taken.
+	SampleLoadAvgSkipped bool
 
 	// ContainerStatsVal is returned by ContainerStats, keyed by host ID.
 	ContainerStatsVal map[string][]podman.ContainerStats
@@ -655,6 +661,15 @@ func (f *Fake) HostUptime(_ context.Context, _ string) (time.Duration, bool, err
 		return 0, false, f.HostUptimeErr
 	}
 	return f.HostUptimeVal, f.HostUptimeOK, nil
+}
+
+// SampleLoadAvgHosts records the host ids SampleLoadAvg was called with, in
+// call order.
+func (f *Fake) SampleLoadAvg(_ context.Context, h string) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.SampleLoadAvgHosts = append(f.SampleLoadAvgHosts, h)
+	return !f.SampleLoadAvgSkipped, f.SampleLoadAvgErr
 }
 
 func (f *Fake) ContainerStats(_ context.Context, h string) ([]podman.ContainerStats, error) {
