@@ -32,6 +32,23 @@ type dropStats struct {
 // worth avoiding.
 const maxPromotableLinkTarget = 64 * 1024 * 1024 // 64MiB
 
+// maxTotalBufferedBytes bounds the SUM of every excluded regular file's body
+// dropFilter is holding onto at once, across the whole tar stream — not just
+// a single entry (that's maxPromotableLinkTarget's job). Without this, a
+// backup with many excluded files each individually under the per-entry cap
+// still accumulates all of that content in RAM for the duration of parseTar
+// (#250 review finding 2), and a control plane running several such backups
+// concurrently can hit real memory pressure. Volumes routinely stream in the
+// hundreds-of-MB-to-low-GB range (#223); 512MiB sits below a single volume's
+// typical size (so it can't itself dominate a backup's footprint) while
+// still comfortably covering the common case (a handful of promotable
+// hardlink targets, not thousands). Once buffering a newly-dropped entry
+// would push the running total over this bound, that entry falls back to
+// the pre-#250 behaviour instead: dropped, without a chance at promotion.
+// That is a var, not a const, so tests can shrink it rather than construct
+// gigabytes of tar data.
+var maxTotalBufferedBytes int64 = 512 * 1024 * 1024 // 512MiB
+
 // dropFilter compiles exclude patterns into a stateful, stream-order decision
 // maker for filterTar/parseTar. It returns nil (not an error) when patterns
 // is empty, so callers can test for "no filtering" with a nil check.
@@ -86,6 +103,7 @@ type dropFilter struct {
 	dropped  map[string]bool   // cleaned path -> true once that entry has been dropped
 	promoted map[string]string // original (dropped) target path -> path of the entry now carrying its content
 	bodies   map[string][]byte // original (dropped) target path -> buffered content, pending a possible promotion
+	buffered int64             // sum of len(bodies[*]) currently held, bounded by maxTotalBufferedBytes
 }
 
 func newDropper(patterns []string) (*dropFilter, error) {
@@ -141,7 +159,14 @@ func (f *dropFilter) matches(cleaned string, typ byte) bool {
 // When drop is true, needsBuffer tells parseTar whether it must capture the
 // entry's body (via storeBody) instead of discarding it, because a later
 // link may still promote it.
-func (f *dropFilter) decide(hdr *tar.Header, cleaned string) (drop, needsBuffer bool, promotedBody []byte) {
+//
+// unwindStats reports how many previously-recorded dropStats entries/bytes
+// parseTar must subtract because this decide call just promoted them: a
+// promoted target's bytes ship intact in the output under the surviving
+// link's name, so they were never actually excluded (#250 review finding 1)
+// even though parseTar provisionally counted them as dropped when the
+// target itself was seen, before it knew a later link would rescue it.
+func (f *dropFilter) decide(hdr *tar.Header, cleaned string) (drop, needsBuffer bool, promotedBody []byte, unwindEntries int, unwindBytes int64) {
 	match := f.matches(cleaned, hdr.Typeflag)
 
 	if !match && hdr.Typeflag == tar.TypeLink {
@@ -160,10 +185,14 @@ func (f *dropFilter) decide(hdr *tar.Header, cleaned string) (drop, needsBuffer 
 				f.promoted[target] = cleaned
 				promotedBody = body
 				delete(f.bodies, target) // later links redirect via f.promoted now
+				f.buffered -= int64(len(body))
+				unwindEntries = 1
+				unwindBytes = int64(len(body))
 			} else {
-				// Target's body was never buffered (not a regular file, or
-				// over maxPromotableLinkTarget) — fall back to dropping,
-				// the pre-#250 behaviour.
+				// Target's body was never buffered (not a regular file, over
+				// maxPromotableLinkTarget, or the cumulative buffer cap was
+				// already full) — fall back to dropping, the pre-#250
+				// behaviour.
 				match = true
 			}
 		}
@@ -171,15 +200,18 @@ func (f *dropFilter) decide(hdr *tar.Header, cleaned string) (drop, needsBuffer 
 
 	if match {
 		f.dropped[cleaned] = true
-		needsBuffer = hdr.Typeflag == tar.TypeReg && hdr.Size <= maxPromotableLinkTarget
+		needsBuffer = hdr.Typeflag == tar.TypeReg &&
+			hdr.Size <= maxPromotableLinkTarget &&
+			f.buffered+hdr.Size <= maxTotalBufferedBytes
 	}
-	return match, needsBuffer, promotedBody
+	return match, needsBuffer, promotedBody, unwindEntries, unwindBytes
 }
 
 // storeBody records the buffered body of a dropped regular file, keyed by
 // its cleaned path, so a later surviving hardlink can promote it.
 func (f *dropFilter) storeBody(cleaned string, body []byte) {
 	f.bodies[cleaned] = body
+	f.buffered += int64(len(body))
 }
 
 // filterTar copies src to dst, omitting entries matched by patterns, and

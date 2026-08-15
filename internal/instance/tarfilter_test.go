@@ -310,8 +310,32 @@ func TestFilterTar_promotesSurvivingHardlinkToExcludedTarget(t *testing.T) {
 	if fi.typ != tar.TypeReg || fi.size != int64(len("DUMPDUMP")) || fi.link != "" {
 		t.Fatalf("manifest entry = %+v, want a regular file carrying the content", fi)
 	}
-	if stats.Entries != 1 || stats.Bytes != int64(len("DUMPDUMP")) {
-		t.Fatalf("stats = %+v, want 1 entry / 8 bytes (only the excluded target itself counted as dropped)", stats)
+	if stats.Entries != 0 || stats.Bytes != 0 {
+		t.Fatalf("stats = %+v, want 0 entries / 0 bytes: the target's bytes shipped intact under the promoted link's name, so nothing was actually excluded (#250 review finding 1)", stats)
+	}
+}
+
+// TestFilterTar_promotedTargetBytesExcludedFromStatsAmongMixedDrops pins
+// finding 1 precisely: dropStats (and thus the persisted/API-exposed
+// store.ExcludedPaths) must count only bytes that were genuinely removed
+// from the output tar. A target that gets promoted via a surviving hardlink
+// ships its bytes intact under the link's name, so it must NOT be counted —
+// but a sibling excluded file with no surviving link is genuinely dropped
+// and must still be counted.
+func TestFilterTar_promotedTargetBytesExcludedFromStatsAmongMixedDrops(t *testing.T) {
+	src := makeTar(t, []tarEntry{
+		{name: "site/private/backups/db.sql.gz", body: "DUMPDUMP"},        // promoted (has a surviving link below)
+		{name: "site/private/backups/orphan.sql.gz", body: "ORPHANBYTES"}, // genuinely dropped, no link
+		{name: "site/exports/latest.sql.gz", typ: tar.TypeLink, link: "site/private/backups/db.sql.gz"},
+	})
+	var out bytes.Buffer
+	_, stats, err := filterTar(&out, bytes.NewReader(src), []string{"*/private/backups/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBytes := int64(len("ORPHANBYTES"))
+	if stats.Entries != 1 || stats.Bytes != wantBytes {
+		t.Fatalf("stats = %+v, want 1 entry / %d bytes (only the orphan, not the promoted target)", stats, wantBytes)
 	}
 }
 
@@ -466,6 +490,41 @@ func TestFilterTar_manifestMatchesBuildManifestWhenNothingDropped(t *testing.T) 
 	}
 	if k, ok := got.firstDiff(want); !ok {
 		t.Fatalf("manifests differ at %q", k)
+	}
+}
+
+// TestFilterTar_cumulativeBufferCapStopsPromotingOverflow pins finding 2:
+// dropFilter must bound TOTAL cumulative buffered bytes across all pending
+// excluded entries, not just cap each entry individually. Once the running
+// total would exceed that bound, further excluded entries fall back to the
+// pre-#250 behaviour (dropped, no promotion opportunity) rather than being
+// buffered — so a backup with many small excluded files can't accumulate
+// unbounded RAM.
+func TestFilterTar_cumulativeBufferCapStopsPromotingOverflow(t *testing.T) {
+	old := maxTotalBufferedBytes
+	maxTotalBufferedBytes = 8 // tiny, for the test
+	defer func() { maxTotalBufferedBytes = old }()
+
+	src := makeTar(t, []tarEntry{
+		{name: "junk/a.bin", body: "12345"}, // 5 bytes: fits under the cap alone
+		{name: "junk/b.bin", body: "12345"}, // 5 more: 5+5=10 > 8, must NOT be buffered
+		{name: "keep/a.link", typ: tar.TypeLink, link: "junk/a.bin"},
+		{name: "keep/b.link", typ: tar.TypeLink, link: "junk/b.bin"},
+	})
+	var out bytes.Buffer
+	_, stats, err := filterTar(&out, bytes.NewReader(src), []string{"junk/**"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := tarNames(t, out.Bytes())
+	want := []string{"keep/a.link"}
+	if len(got) != len(want) || got[0] != want[0] {
+		t.Fatalf("entries = %v, want %v: a.link promoted (under cap), b.link's target overflowed the cumulative cap so b.link is dropped, not promoted", got, want)
+	}
+	// junk/b.bin and keep/b.link are genuinely dropped (2 entries); junk/a.bin
+	// was promoted and must not be counted (finding 1's fix, exercised here too).
+	if stats.Entries != 2 || stats.Bytes != int64(len("12345")) {
+		t.Fatalf("stats = %+v, want 2 entries / %d bytes (only junk/b.bin's overflowed content)", stats, len("12345"))
 	}
 }
 
