@@ -1003,6 +1003,62 @@ func TestSSHRun_RemovedHostStillFails(t *testing.T) {
 	}
 }
 
+// connectFresh re-resolves once and then gives up with errRetiredHost. That is
+// deliberate at its level, but it is not the whole retry budget: readHostProc
+// dispatches the read, so a second retirement is one more thing it can look
+// again for. Without that, two reloads arriving during one deploy's
+// port-conflict precheck abort the deploy over a host that was only edited
+// (#266).
+func TestHostBoundPorts_SelfHealsWhenTheEntryIsRetiredTwice(t *testing.T) {
+	// 0x1F90 = 8080, in a line shaped like a real /proc/net/tcp listener.
+	const procNetTCP = `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 12345 1 0000000000000000 100 0 0 10 0
+`
+	s1 := newTestSSHServer(t, procNetTCP)
+	r, h := sshTestHost(t, s1)
+
+	s2 := newTestSSHServer(t, "wrong endpoint\n")
+	appendKnownHost(t, s2)
+	moved := config.Host{ID: h.ID, Addr: "tester@" + s2.addr(), SSHKey: h.SSHKey}
+
+	// Retire the entry in the window between resolving it and connecting, twice
+	// in a row — once past what connectFresh alone can absorb. The third
+	// resolution finds the host back where it started, and must read it.
+	var calls int
+	r.hooks = &testHooks{beforeConnect: func() {
+		calls++
+		switch calls {
+		case 1:
+			r.SetHosts([]config.Host{moved})
+		case 2:
+			r.SetHosts([]config.Host{h})
+		}
+	}}
+
+	got, err := r.HostBoundPorts(context.Background(), h.ID, "tcp")
+	if err != nil {
+		t.Fatalf("HostBoundPorts: %v; two reloads mid-read must not fail the read", err)
+	}
+	if len(got) != 1 || got[0] != 8080 {
+		t.Errorf("got %v, want [8080] read from the host's current endpoint", got)
+	}
+}
+
+// The retry must not paper over a host that is genuinely gone: looking again
+// yields the same answer, and the deploy path is right to abort on it. It is
+// reported as errUnknownHost so callers can tell it from a host fault.
+func TestHostUptime_RemovedHostStillFails(t *testing.T) {
+	s := newTestSSHServer(t, "12345.67 98765.43\n")
+	r, h := sshTestHost(t, s)
+
+	r.hooks = &testHooks{beforeConnect: func() { r.SetHosts(nil) }}
+
+	_, _, err := r.HostUptime(context.Background(), h.ID)
+	if !errors.Is(err, errUnknownHost) {
+		t.Fatalf("got %v, want errUnknownHost for a host that no longer exists", err)
+	}
+}
+
 // A host edited from remote to local mid-read must be read locally, not
 // refused. sshRun is right to refuse the endpoint it was handed — it would
 // otherwise dial "unix:22" — but the caller's answer has simply moved to the
