@@ -293,6 +293,96 @@ func TestSQLite_InjectorSecrets_EncryptedAtRest(t *testing.T) {
 	}
 }
 
+// TestSQLite_AppliedVolumes_RoundTrip (#257): a known, non-empty applied set
+// round-trips exactly.
+func TestSQLite_AppliedVolumes_RoundTrip(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	sp := sampleSpec()
+	sp.AppliedVolumes = []string{"data", "logs"}
+	require.NoError(t, s.PutSpec(ctx, sp))
+
+	got, err := s.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	require.Equal(t, []string{"data", "logs"}, got.AppliedVolumes)
+}
+
+// TestSQLite_AppliedVolumes_KnownEmptyRoundTripsNonNil (#257): a spec applied
+// against a template declaring no volumes must read back as a known, EMPTY set
+// ([]string{}), not as nil (unknown) — those two mean different things to
+// CheckBackupable.
+func TestSQLite_AppliedVolumes_KnownEmptyRoundTripsNonNil(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	sp := sampleSpec()
+	sp.AppliedVolumes = []string{}
+	require.NoError(t, s.PutSpec(ctx, sp))
+
+	got, err := s.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	require.NotNil(t, got.AppliedVolumes)
+	require.Empty(t, got.AppliedVolumes)
+}
+
+// TestSQLite_AppliedVolumes_UnsetIsNil (#257): a spec never given an applied
+// set (the zero value, as every caller before #257 would produce) must read
+// back nil (unknown), not an empty slice — the two are not interchangeable.
+func TestSQLite_AppliedVolumes_UnsetIsNil(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, NewKeyStore(testKey(0x11)))
+	require.NoError(t, s.PutSpec(ctx, sampleSpec())) // AppliedVolumes left as the zero value (nil)
+
+	got, err := s.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	require.Nil(t, got.AppliedVolumes)
+}
+
+// TestMigrateAddsAppliedVolumesColumn (#257): a pre-v9 DB has no
+// applied_volumes column; migrating it in must backfill existing rows with
+// NULL (unknown), and the column must then work for new writes.
+func TestMigrateAddsAppliedVolumesColumn(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/old.db"
+	raw, err := sql.Open("sqlite", "file:"+path)
+	require.NoError(t, err)
+	_, err = raw.Exec(`CREATE TABLE specs (
+  host TEXT NOT NULL, template TEXT NOT NULL, slug TEXT NOT NULL,
+  parameters TEXT NOT NULL, secrets BLOB, injector_secrets BLOB,
+  domains TEXT NOT NULL DEFAULT '[]',
+  created INTEGER NOT NULL, updated INTEGER NOT NULL,
+  PRIMARY KEY (host, template, slug));`)
+	require.NoError(t, err)
+	_, err = raw.Exec(`INSERT INTO specs (host, template, slug, parameters, domains, created, updated)
+VALUES ('h', 'pre-existing', 'x', '{}', '[]', 0, 0)`)
+	require.NoError(t, err)
+	_, err = raw.Exec(`PRAGMA user_version = 8`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	keys := NewKeyStore(testKey(0x11))
+	s, err := OpenSQLite(path, keys)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+
+	// The pre-existing row, never touched by this migration's writer, must
+	// read back as unknown.
+	got, err := s.GetSpec(ctx, "h", "pre-existing", "x")
+	require.NoError(t, err)
+	require.Nil(t, got.AppliedVolumes)
+
+	// A fresh write on the migrated DB round-trips normally.
+	require.NoError(t, s.PutSpec(ctx, Spec{
+		Host: "h", Template: "web", Slug: "x",
+		Parameters: map[string]any{}, Secrets: map[string]string{},
+		AppliedVolumes: []string{"data"},
+	}))
+	got, err = s.GetSpec(ctx, "h", "web", "x")
+	require.NoError(t, err)
+	require.Equal(t, []string{"data"}, got.AppliedVolumes)
+}
+
 func TestSQLiteRenameHost(t *testing.T) {
 	s := openTestStore(t, NewKeyStore(testKey(0x11)))
 	ctx := context.Background()

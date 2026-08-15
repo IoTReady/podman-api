@@ -240,6 +240,13 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 		Secrets:         maps.Clone(spec.Secrets),
 		InjectorSecrets: slices.Clone(spec.InjectorSecrets),
 		Domains:         slices.Clone(spec.Domains),
+		// AppliedVolumes is preserved as-is, not re-derived from tmplObj.Meta.Volumes:
+		// boot converge re-creates the pod from what was already applied, it does
+		// not itself constitute a new Apply of (possibly changed) template
+		// declarations. Re-deriving here would silently update the recorded
+		// applied set to match a template edit the operator has not actually
+		// re-applied, defeating #257's rename detection.
+		AppliedVolumes: slices.Clone(spec.AppliedVolumes),
 	}
 	if err := s.store.PutSpec(ctx, sp); err != nil {
 		// Spec persist failed but the pod is already running. Log the error

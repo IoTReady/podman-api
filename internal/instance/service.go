@@ -321,6 +321,18 @@ func volumeName(tmpl, slug, short string) string { return volumeNamePrefix(tmpl,
 // (rename) that must strip it off an existing name to recover the short name.
 func volumeNamePrefix(tmpl, slug string) string { return podName(tmpl, slug) + "-" }
 
+// appliedVolumeNames returns the (short) volume names a template declares, for
+// recording in store.Spec.AppliedVolumes at Apply time (#257). Always non-nil
+// so an empty declaration round-trips as "known: no volumes" rather than
+// "unknown" (nil) — see the Spec field doc.
+func appliedVolumeNames(vols []render.Volume) []string {
+	names := make([]string, 0, len(vols))
+	for _, v := range vols {
+		names = append(names, v.Name)
+	}
+	return names
+}
+
 func instanceSecretName(tmpl, slug, name string) string {
 	return extension.InstanceSecretName(tmpl, slug, name)
 }
@@ -642,6 +654,13 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 		Secrets:         secretsCopy,
 		InjectorSecrets: injectorSecrets,
 		Domains:         domainsCopy,
+		// AppliedVolumes records exactly what THIS apply declared, not what
+		// exists on the host — same relationship InjectorSecrets has to the
+		// injector's declared output. #257: this is what later lets
+		// CheckBackupable tell a template rename (declared differently now,
+		// but still present under the name it was applied with) from real
+		// loss (present under neither name).
+		AppliedVolumes: appliedVolumeNames(tmpl.Meta.Volumes),
 	}
 	// Recheck the template still exists, then persist the spec — both under the
 	// template read lock so a concurrent DeleteTemplate (write lock) cannot slip

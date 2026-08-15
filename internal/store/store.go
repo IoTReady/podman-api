@@ -72,8 +72,25 @@ type Spec struct {
 	// Domains are the public hostnames the ingress layer routes to this
 	// instance. Empty for non-web instances. Non-secret; stored in plaintext.
 	Domains []string
-	Created time.Time
-	Updated time.Time
+	// AppliedVolumes is the set of (short) volume names the template declared
+	// at the time of the last successful Apply — not what currently exists on
+	// the host, and not what the template declares NOW. It is the one fact
+	// #256/#257 needed and did not have: comparing it against what a template
+	// declares today distinguishes a volume rename from real loss; comparing it
+	// against what exists on the host distinguishes a brand-new instance (never
+	// applied with that volume) from one whose data went missing.
+	//
+	// nil means UNKNOWN — a spec written before this field existed. Backup
+	// admission must fail open for those rows (fall back to the pre-#257
+	// behaviour) until the instance is next applied, at which point Apply
+	// populates it. A non-nil (possibly empty) slice means the set is known:
+	// empty means the instance was applied against a template declaring no
+	// volumes at that time.
+	//
+	// Non-secret; stored in plaintext, same as Domains.
+	AppliedVolumes []string
+	Created        time.Time
+	Updated        time.Time
 }
 
 // SpecKey identifies one stored instance without exposing its secrets. Used by

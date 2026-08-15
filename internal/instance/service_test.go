@@ -556,6 +556,61 @@ func TestService_Apply_PersistsSpec(t *testing.T) {
 	assert.Equal(t, "docker.io/library/postgres:16", sp.Parameters["image"])
 }
 
+// TestService_Apply_RecordsAppliedVolumes (#257): Apply must record the
+// template's declared (short) volume names in the persisted spec, independent
+// of whether anything materialised on the host and independent of `backup:
+// none` markers — AppliedVolumes is what was DECLARED at apply time, not what
+// is exportable.
+func TestService_Apply_RecordsAppliedVolumes(t *testing.T) {
+	svc, _, mem := newSvcMem(t)
+	ctx := context.Background()
+
+	require.NoError(t, svc.Apply(ctx, "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+
+	sp, err := mem.GetSpec(ctx, "h1", "postgres", "demo")
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"data", "logs"}, sp.AppliedVolumes)
+}
+
+// TestService_Apply_RecordsAppliedVolumes_EmptyForVolumelessTemplate (#257): a
+// template declaring no volumes must persist a known-EMPTY applied set (a
+// non-nil empty slice), not leave it nil/unknown — an instance re-applied
+// after this must be able to tell "genuinely never had volumes" apart from
+// "applied before #257 shipped".
+func TestService_Apply_RecordsAppliedVolumes_EmptyForVolumelessTemplate(t *testing.T) {
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	f := fake.New()
+	volumeless := store.Template{
+		Meta: render.Meta{
+			ID:         "volumeless",
+			Parameters: requiredParams("slug", "image"),
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: volumeless-{{.slug}}
+spec:
+  containers:
+    - name: app
+      image: {{.image}}
+`,
+		Origin: "seed",
+	}
+	svc, mem := newSvcWith(t, f, hosts, volumeless)
+	ctx := context.Background()
+
+	req := ApplyRequest{
+		Template: "volumeless", Slug: "x",
+		Parameters: map[string]any{"slug": "x", "image": "docker.io/library/alpine:3"},
+	}
+	require.NoError(t, svc.Apply(ctx, "h1", req, ApplyOptions{Replace: true}))
+
+	sp, err := mem.GetSpec(ctx, "h1", "volumeless", "x")
+	require.NoError(t, err)
+	require.NotNil(t, sp.AppliedVolumes)
+	assert.Empty(t, sp.AppliedVolumes)
+}
+
 func TestService_Apply_PlayKubeFail_NoSpec(t *testing.T) {
 	svc, f, mem := newSvcMem(t)
 	f.PlayKubeErr = errors.New("boom")
