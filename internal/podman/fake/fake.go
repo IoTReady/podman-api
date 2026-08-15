@@ -115,6 +115,12 @@ type Fake struct {
 	// VolumeInspectErr, if non-nil, makes VolumeInspect return this error (use a
 	// non-ErrNotFound error to exercise the transient-failure path).
 	VolumeInspectErr error
+	// volumeInspectErrFor maps a volume name to an error VolumeInspect should
+	// return for that name only. Guarded by mu. Set via FailVolumeInspectFor.
+	// Lets a test fail one specific host call (e.g. the one checkBackupable's
+	// applied-volume-set comparison makes) without breaking every other
+	// VolumeInspect in the same code path.
+	volumeInspectErrFor map[string]error
 	// SecretCreateErr, if non-nil, makes SecretCreate return this error
 	// instead of recording the secret.
 	SecretCreateErr error
@@ -493,11 +499,25 @@ func (f *Fake) SecretRemove(_ context.Context, h, name string) error {
 	return nil
 }
 
+// FailVolumeInspectFor makes VolumeInspect return err whenever it is called
+// with this exact volume name, leaving every other name unaffected. Test-only.
+func (f *Fake) FailVolumeInspectFor(name string, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.volumeInspectErrFor == nil {
+		f.volumeInspectErrFor = map[string]error{}
+	}
+	f.volumeInspectErrFor[name] = err
+}
+
 func (f *Fake) VolumeInspect(_ context.Context, h, name string) (podman.Volume, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.VolumeInspectErr != nil {
 		return podman.Volume{}, f.VolumeInspectErr
+	}
+	if err, ok := f.volumeInspectErrFor[name]; ok {
+		return podman.Volume{}, err
 	}
 	v, ok := f.hostVolumes(h)[name]
 	if !ok {

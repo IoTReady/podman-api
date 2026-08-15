@@ -19,15 +19,17 @@ import (
 
 const schemaSQL = `
 CREATE TABLE IF NOT EXISTS specs (
-  host             TEXT NOT NULL,
-  template         TEXT NOT NULL,
-  slug             TEXT NOT NULL,
-  parameters       TEXT NOT NULL,
-  secrets          BLOB,
-  injector_secrets BLOB,
-  domains          TEXT NOT NULL DEFAULT '[]',
-  created          INTEGER NOT NULL,
-  updated          INTEGER NOT NULL,
+  host                TEXT NOT NULL,
+  template            TEXT NOT NULL,
+  slug                TEXT NOT NULL,
+  parameters          TEXT NOT NULL,
+  secrets             BLOB,
+  injector_secrets    BLOB,
+  domains             TEXT NOT NULL DEFAULT '[]',
+  applied_volumes     TEXT,
+  applied_volume_meta TEXT,
+  created             INTEGER NOT NULL,
+  updated             INTEGER NOT NULL,
   PRIMARY KEY (host, template, slug)
 );
 CREATE TABLE IF NOT EXISTS jobs (
@@ -208,6 +210,11 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 // v4 added specs.domains. v5 added the templates table.
 // v6 made specs.secrets nullable (NULL = no secrets; key-less open allowed).
 // v7 added the backups table + backups_instance index.
+// v8 added specs.injector_secrets.
+// v9 added specs.applied_volumes (nullable: NULL = unknown/pre-#257 row,
+// distinct from a JSON '[]' meaning "known: applied with no volumes").
+// v10 added specs.applied_volume_meta (nullable, same unknown-vs-known-empty
+// convention as applied_volumes; #256 review round-4).
 // Each step is guarded by user_version so OpenSQLite is idempotent.
 func migrateSchema(db *sql.DB) error {
 	var v int
@@ -333,6 +340,46 @@ func migrateSchema(db *sql.DB) error {
 		}
 		v = 8
 	}
+	if v < 9 {
+		// applied_volumes column — added by schemaSQL on a fresh DB but absent on
+		// a pre-v9 DB. Add it only when missing. Deliberately nullable with no
+		// default: a pre-existing row must read back AppliedVolumes == nil
+		// (unknown), not an empty slice (known: no volumes) — see the Spec field
+		// doc. `ALTER TABLE ADD COLUMN` with no DEFAULT clause backfills existing
+		// rows with NULL, which is exactly that.
+		has, err := columnExists(db, "specs", "applied_volumes")
+		if err != nil {
+			return fmt.Errorf("migrateSchema: check applied_volumes column: %w", err)
+		}
+		if !has {
+			if _, err := db.Exec(`ALTER TABLE specs ADD COLUMN applied_volumes TEXT`); err != nil {
+				return fmt.Errorf("migrateSchema: add applied_volumes column: %w", err)
+			}
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 9`); err != nil {
+			return fmt.Errorf("migrateSchema v9: set user_version: %w", err)
+		}
+		v = 9
+	}
+	if v < 10 {
+		// applied_volume_meta column — added by schemaSQL on a fresh DB but
+		// absent on a pre-v10 DB. Add it only when missing. Nullable with no
+		// default, same convention as applied_volumes: a pre-existing row must
+		// read back AppliedVolumeMeta == nil (unknown), not an empty map.
+		has, err := columnExists(db, "specs", "applied_volume_meta")
+		if err != nil {
+			return fmt.Errorf("migrateSchema: check applied_volume_meta column: %w", err)
+		}
+		if !has {
+			if _, err := db.Exec(`ALTER TABLE specs ADD COLUMN applied_volume_meta TEXT`); err != nil {
+				return fmt.Errorf("migrateSchema: add applied_volume_meta column: %w", err)
+			}
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 10`); err != nil {
+			return fmt.Errorf("migrateSchema v10: set user_version: %w", err)
+		}
+		v = 10
+	}
 	return nil
 }
 
@@ -389,34 +436,50 @@ func (s *SQLite) PutSpec(ctx context.Context, sp Spec) error {
 	if err != nil {
 		return err
 	}
+	// AppliedVolumes / AppliedVolumeMeta: nil stays NULL (unknown), matching the
+	// migration's backfill semantics. A non-nil value (possibly empty) is
+	// marshalled as JSON even when empty, so "known: applied with no volumes"
+	// round-trips as "[]"/"{}", not NULL. See jsonOrNull / unmarshalNullable.
+	appliedVolumes, err := jsonOrNull(sp.AppliedVolumes)
+	if err != nil {
+		return err
+	}
+	appliedVolumeMeta, err := jsonOrNull(sp.AppliedVolumeMeta)
+	if err != nil {
+		return err
+	}
 	now := time.Now().Unix()
 	return s.write(ctx, func() error {
 		_, err := s.db.ExecContext(ctx, `
-INSERT INTO specs (host, template, slug, parameters, secrets, injector_secrets, domains, created, updated)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO specs (host, template, slug, parameters, secrets, injector_secrets, domains, applied_volumes, applied_volume_meta, created, updated)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(host, template, slug) DO UPDATE SET
-  parameters        = excluded.parameters,
-  secrets           = excluded.secrets,
-  injector_secrets  = excluded.injector_secrets,
-  domains           = excluded.domains,
-  updated           = excluded.updated`,
-			sp.Host, sp.Template, sp.Slug, string(params), blob, injBlob, string(domJSON), now, now)
+  parameters          = excluded.parameters,
+  secrets             = excluded.secrets,
+  injector_secrets    = excluded.injector_secrets,
+  domains             = excluded.domains,
+  applied_volumes     = excluded.applied_volumes,
+  applied_volume_meta = excluded.applied_volume_meta,
+  updated             = excluded.updated`,
+			sp.Host, sp.Template, sp.Slug, string(params), blob, injBlob, string(domJSON), appliedVolumes, appliedVolumeMeta, now, now)
 		return err
 	})
 }
 
 func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT parameters, secrets, injector_secrets, domains, created, updated FROM specs WHERE host=? AND template=? AND slug=?`,
+		`SELECT parameters, secrets, injector_secrets, domains, applied_volumes, applied_volume_meta, created, updated FROM specs WHERE host=? AND template=? AND slug=?`,
 		host, template, slug)
 	var (
-		paramsJSON       string
-		blob             []byte
-		injBlob          []byte
-		domainsJSON      string
-		created, updated int64
+		paramsJSON           string
+		blob                 []byte
+		injBlob              []byte
+		domainsJSON          string
+		appliedVolumesRaw    sql.NullString
+		appliedVolumeMetaRaw sql.NullString
+		created, updated     int64
 	)
-	if err := row.Scan(&paramsJSON, &blob, &injBlob, &domainsJSON, &created, &updated); err != nil {
+	if err := row.Scan(&paramsJSON, &blob, &injBlob, &domainsJSON, &appliedVolumesRaw, &appliedVolumeMetaRaw, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Spec{}, ErrNotFound
 		}
@@ -456,11 +519,59 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 	if err := json.Unmarshal([]byte(domainsJSON), &domains); err != nil {
 		return Spec{}, fmt.Errorf("%w: domains: %v", ErrSpecCorrupt, err)
 	}
+	// appliedVolumes / appliedVolumeMeta stay nil when their column is NULL — a
+	// spec written before #257/#265, or one never re-applied since. A non-NULL
+	// value unmarshals to a non-nil (possibly empty) value, preserving the
+	// "unknown vs known-empty" distinction all the way back to the caller:
+	// PutSpec never marshals a nil into these columns (it leaves them NULL
+	// instead — see jsonOrNull), so the stored JSON is always a real array or
+	// object, never "null".
+	var appliedVolumes []string
+	if err := unmarshalNullable(appliedVolumesRaw, &appliedVolumes, "applied_volumes"); err != nil {
+		return Spec{}, err
+	}
+	var appliedVolumeMeta map[string]AppliedVolumeMarker
+	if err := unmarshalNullable(appliedVolumeMetaRaw, &appliedVolumeMeta, "applied_volume_meta"); err != nil {
+		return Spec{}, err
+	}
 	return Spec{
 		Host: host, Template: template, Slug: slug,
 		Parameters: params, Secrets: secrets, InjectorSecrets: injectorSecrets, Domains: domains,
-		Created: time.Unix(created, 0), Updated: time.Unix(updated, 0),
+		AppliedVolumes:    appliedVolumes,
+		AppliedVolumeMeta: appliedVolumeMeta,
+		Created:           time.Unix(created, 0), Updated: time.Unix(updated, 0),
 	}, nil
+}
+
+// jsonOrNull marshals a nil-able spec field into a nullable column value: nil
+// stays NULL ("unknown"), while a non-nil value — empty included — marshals to
+// JSON ("known"). That distinction is what lets a spec written before a field
+// existed read back as unknown rather than as a confident empty set, and it is
+// load-bearing for every AppliedVolumes consumer, so both writer and reader
+// (unmarshalNullable) go through one implementation rather than repeating the
+// convention per field (#265 review, minor cleanup).
+func jsonOrNull[T []string | map[string]AppliedVolumeMarker](v T) (sql.NullString, error) {
+	if v == nil {
+		return sql.NullString{}, nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return sql.NullString{}, err
+	}
+	return sql.NullString{String: string(b), Valid: true}, nil
+}
+
+// unmarshalNullable is jsonOrNull's read side: a NULL column leaves *dst at its
+// zero value (nil, "unknown"); a non-NULL one unmarshals into it, reporting a
+// malformed value as ErrSpecCorrupt naming the column.
+func unmarshalNullable[T any](raw sql.NullString, dst *T, column string) error {
+	if !raw.Valid {
+		return nil
+	}
+	if err := json.Unmarshal([]byte(raw.String), dst); err != nil {
+		return fmt.Errorf("%w: %s: %v", ErrSpecCorrupt, column, err)
+	}
+	return nil
 }
 
 func (s *SQLite) DeleteSpec(ctx context.Context, host, template, slug string) error {

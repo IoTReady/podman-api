@@ -72,8 +72,54 @@ type Spec struct {
 	// Domains are the public hostnames the ingress layer routes to this
 	// instance. Empty for non-web instances. Non-secret; stored in plaintext.
 	Domains []string
-	Created time.Time
-	Updated time.Time
+	// AppliedVolumes is the set of (short) volume names the template declared
+	// at the time of the last successful Apply — not what currently exists on
+	// the host, and not what the template declares NOW. It is the one fact
+	// #256/#257 needed and did not have: comparing it against what a template
+	// declares today distinguishes a volume rename from real loss; comparing it
+	// against what exists on the host distinguishes a brand-new instance (never
+	// applied with that volume) from one whose data went missing.
+	//
+	// nil means UNKNOWN — a spec written before this field existed. Backup
+	// admission must fail open for those rows (fall back to the pre-#257
+	// behaviour) until the instance is next applied, at which point Apply
+	// populates it. A non-nil (possibly empty) slice means the set is known:
+	// empty means the instance was applied against a template declaring no
+	// volumes at that time.
+	//
+	// Non-secret; stored in plaintext, same as Domains.
+	AppliedVolumes []string
+	// AppliedVolumeMeta records, for each name in AppliedVolumes, the backup
+	// marker and exclude patterns the template declared for it AT THAT SAME
+	// APPLY — captured because a later template edit that renames a volume's
+	// short name leaves nothing under any CURRENTLY declared name for a
+	// marker/exclude lookup to find: `checkBackupable` and `Backup` recover a
+	// renamed-but-not-reapplied volume by its OLD applied full name, and a
+	// lookup keyed by the CURRENT template's declared names always misses
+	// that name, silently losing a `backup: none` veto and any exclude
+	// patterns the volume had (#256 review, blocking finding). This is the
+	// fact that closes that gap: it survives the rename because it was
+	// captured before the template changed, not reconstructed after.
+	//
+	// nil under the same "unknown/pre-existing row" rule as AppliedVolumes —
+	// a spec written before this field existed, or one whose last Apply
+	// predates it. Keyed by the same short names as AppliedVolumes; a name
+	// with no entry (e.g. a pre-existing AppliedVolumes row read back before
+	// this field's own Apply-time population) has unknown metadata, same as
+	// AppliedVolumeMeta == nil entirely.
+	//
+	// Non-secret; stored in plaintext, same as Domains and AppliedVolumes.
+	AppliedVolumeMeta map[string]AppliedVolumeMarker
+	Created           time.Time
+	Updated           time.Time
+}
+
+// AppliedVolumeMarker is one volume's backup marker and exclude patterns as
+// declared by the template at the moment it was applied. See
+// Spec.AppliedVolumeMeta.
+type AppliedVolumeMarker struct {
+	Backup  string
+	Exclude []string
 }
 
 // SpecKey identifies one stored instance without exposing its secrets. Used by

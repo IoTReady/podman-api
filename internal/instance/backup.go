@@ -30,6 +30,17 @@ type BackupRequest struct {
 	Volumes []string `json:"volumes,omitempty"`
 }
 
+// volMeta bundles a volume's backup marker and exclude patterns — the two
+// pieces of template metadata both checkBackupable's vetoed-check and
+// Backup's export loop need per volume. Shared by both so a renamed/recovered
+// volume's metadata (sourced from store.Spec.AppliedVolumeMeta rather than
+// the CURRENT template, which no longer declares it under its old name) is
+// represented identically to a currently-declared volume's.
+type volMeta struct {
+	marker  string
+	exclude []string
+}
+
 // backupBlobKey is the blob layout: <host>/<template>/<slug>/<backup-id>/<volume>.tar
 func backupBlobKey(host, tmpl, slug, id, volume string) string {
 	return host + "/" + tmpl + "/" + slug + "/" + id + "/" + volume + ".tar"
@@ -60,23 +71,48 @@ func backupBlobPrefix(host, tmpl, slug, id string) string {
 // nothing. Caught here it is a synchronous 400 with the instance still serving.
 // A host error is wrapped as a host error, never reported as an invalid scope.
 //
-// An UNSCOPED request IS existence-checked here too, but only far enough to
-// close the same outage loop the explicit-scope check exists for: when at least
-// one volume EXISTS on the host and every one of those that exists is skipped
-// because it is `none`-vetoed, the run would stop the pod, deliberately skip
-// real data and capture nothing. That is refused here.
+// An UNSCOPED request IS existence-checked here too, for two independent
+// reasons (#256, on top of #257's store.Spec.AppliedVolumes):
 //
-// Nothing is inferred beyond that. An instance with NO materialised volumes is
-// accepted unconditionally: whether that means "brand new, nothing written yet"
-// or "the volumes are under names this template no longer declares" or "they are
-// gone" is NOT decidable from anything this function can observe, and four
-// review rounds of heuristics over backup history / scope presence / "did
-// anything materialise" each turned out to misclassify a real state. Telling
-// those apart needs the spec's APPLIED volume set, which store.Spec does not
-// carry today; until it does, the core does not guess. Tracked as #257, which
-// also records what each removed heuristic broke.
+//  1. Materialised-but-vetoed: at least one volume EXISTS on the host under a
+//     CURRENTLY declared name, and every one of those that exists is skipped
+//     because it is `none`-vetoed. Stopping the pod, deliberately skipping
+//     real data and capturing nothing is refused regardless of anything else.
+//  2. Applied-vs-host loss: when the spec's applied volume set is known (a
+//     spec written by an Apply since #257), every volume that set names is
+//     checked for existence under the name it was APPLIED with — not the name
+//     the template declares now. A volume missing under both names is refused
+//     ONLY when it is the LAST applied volume standing — total loss, the
+//     unambiguous case (a host rebuild, `podman volume prune`, a half-landed
+//     evacuation with nothing left of what was applied). When at least one
+//     OTHER applied volume is still confirmed present, a missing one is NOT
+//     refused: `AppliedVolumes` records what the template DECLARED at apply
+//     time, not what podman actually created, so a volume some deployments
+//     never mount (an optional sidecar cache, a lazily-created path) looks
+//     identical here to one that genuinely went missing, and there is no
+//     signal in this codebase today to tell them apart (round-2 review
+//     finding 1). The backup proceeds with whatever the host does hold. A
+//     volume missing under the CURRENT name but present under its applied
+//     name is a template-meta rename the instance has not been re-applied
+//     for — not loss either way.
+//
+// A template edited down to declaring ZERO volumes does not, by itself, skip
+// this: if the spec's applied set still names volumes that materialise on the
+// host, an unscoped backup would silently capture nothing (the export loop
+// only ever walks currently-declared names) while real data sits untouched —
+// refused rather than recorded as an empty `complete` row (round-2 review
+// finding 2). Only a template with NO declared volumes AND an applied set that
+// is unknown or known-empty short-circuits without touching the host.
+//
+// For a spec written before #257 (AppliedVolumes == nil, unknown rather than
+// empty), check 2 does not run: an instance with NO materialised volumes under
+// a currently-declared name is accepted unconditionally, exactly as before —
+// whether that means "brand new" or "renamed" or "lost" is not decidable
+// without the applied set, and four review rounds of heuristics guessing at it
+// each misclassified a real state (see #257 for what each one broke). That
+// fallback clears itself the next time the instance is applied.
 func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, volumes []string) error {
-	_, err := s.checkBackupable(ctx, host, tmpl, slug, volumes, false)
+	_, _, err := s.checkBackupable(ctx, host, tmpl, slug, volumes, false)
 	return err
 }
 
@@ -99,36 +135,52 @@ func (s *Service) CheckBackupable(ctx context.Context, host, tmpl, slug string, 
 // CheckBackupable can still refuse the run. Call this to fail early, then
 // CheckBackupable before enqueuing.
 func (s *Service) CheckBackupScopeDeclared(ctx context.Context, host, tmpl, slug string, volumes []string) error {
-	_, err := s.checkBackupable(ctx, host, tmpl, slug, volumes, true)
+	_, _, err := s.checkBackupable(ctx, host, tmpl, slug, volumes, true)
 	return err
 }
 
 // checkBackupable is CheckBackupable's implementation, additionally returning
-// the instance's volumes as resolved on the host. Backup calls this under its
-// own lock and reuses the list for the export loop, so one backup costs one
-// InstanceVolumes round trip there rather than two (review-5 finding 7).
+// the instance's volumes as resolved on the host AND the per-volume
+// marker/exclude metadata that applies to each of them, keyed by FULL podman
+// volume name. Backup calls this under its own lock and reuses both for the
+// export loop, so one backup costs one InstanceVolumes round trip there rather
+// than two (review-5 finding 7), and — since #265 review finding 1 — one SPEC
+// read rather than two.
 //
-// The list is nil when the check short-circuited before touching the host, which
-// happens only when the template declares no volumes at all — in which case
-// InstanceVolumes would return an empty list anyway, since it iterates exactly
-// the declared names.
-func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, volumes []string, declaredOnly bool) ([]podman.Volume, error) {
+// The metadata map is authoritative and must be the only source Backup consults:
+// it merges the CURRENT template's declared markers with the applied-time
+// markers of any volume recovered under an old (renamed) applied name. Backup
+// used to rebuild the second half itself from a SECOND, independent GetSpec,
+// silently skipping the merge on any error and — because Backup and
+// Apply/Delete serialize under different locks — potentially observing a
+// DIFFERENT spec than this function did. Either way a `backup: none` veto
+// carried across a rename evaporated and the volume was exported. There is now
+// exactly one read, and its result is returned rather than re-derived.
+//
+// The volume list is nil when the check short-circuited before touching the
+// host, which happens only when the template declares no volumes at all — in
+// which case InstanceVolumes would return an empty list anyway, since it
+// iterates exactly the declared names.
+func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, volumes []string, declaredOnly bool) ([]podman.Volume, map[string]volMeta, error) {
 	if s.blobs == nil {
-		return nil, ErrBackupsDisabled
+		return nil, nil, ErrBackupsDisabled
 	}
 	t, err := s.lookup(ctx, host, tmpl)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if _, err := s.store.GetSpec(ctx, host, tmpl, slug); err != nil {
+	sp, err := s.store.GetSpec(ctx, host, tmpl, slug)
+	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
-			return nil, ErrInstanceNotFound
+			return nil, nil, ErrInstanceNotFound
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	declared := make(map[string]string, len(t.Meta.Volumes))
+	meta := make(map[string]volMeta, len(t.Meta.Volumes))
 	for _, v := range t.Meta.Volumes {
 		declared[v.Name] = v.Backup
+		meta[volumeName(tmpl, slug, v.Name)] = volMeta{marker: v.Backup, exclude: v.Exclude}
 	}
 	if len(volumes) == 0 {
 		// An empty scope means "every declared volume not marked `none`". If the
@@ -137,64 +189,150 @@ func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, 
 		// nothing: a green row, a real stop/restart outage, and no data. Reject
 		// it here, synchronously.
 		//
-		// A template declaring NO volumes at all is a different case and is
-		// ACCEPTED: a stateless template (the bundled `basic-web`) has nothing to
-		// back up, that is a valid no-op, and rejecting it would regress every
-		// caller that backs one up today.
+		// A template declaring NO volumes at all, AND an applied set that is
+		// either unknown or known-empty, is a different case and is ACCEPTED: a
+		// stateless template (the bundled `basic-web`) has nothing to back up,
+		// that is a valid no-op, and rejecting it would regress every caller
+		// that backs one up today. This is the only path that avoids touching
+		// the host at all — every other combination below needs at least one
+		// host round trip to tell a real no-op from a template edited down to
+		// zero volumes while the instance still holds real applied data
+		// (review-#256/#257-round-2 finding 2).
 		//
 		// A declared volume that does not yet exist on the host is neither case —
 		// this check is over what the template declares, not over what currently
 		// exists (a brand-new instance must be able to take its first, empty
 		// backup).
-		if len(declared) == 0 {
-			return nil, nil
+		if len(declared) == 0 && len(sp.AppliedVolumes) == 0 {
+			return nil, meta, nil
 		}
-		anyDeclaredExportable := false
-		for _, marker := range declared {
-			if !IsBackupMarkerNone(marker) {
-				anyDeclaredExportable = true
-				break
-			}
-		}
-		if !anyDeclaredExportable {
-			return nil, fmt.Errorf("%w: template %s declares volumes but every one of them is marked `backup: none`", ErrInvalidBackupScope, tmpl)
+		// #265 review finding 4: this refusal used to be stated over the
+		// CURRENTLY declared markers alone, and fired BEFORE the rename-recovery
+		// logic below ever ran. A volume renamed by a template edit that also
+		// marked its NEW name `backup: none` therefore refused the whole run,
+		// even though the real, unvetoed data was still recoverable on the host
+		// under its OLD applied name — precisely the case rename recovery
+		// exists for. anyExportableVolume considers the applied set's own
+		// markers too, so recovery is no longer pre-empted; when the recovered
+		// volume IS vetoed at its apply, the refusal still stands.
+		//
+		// It stays here, ahead of the host round trip, rather than moving after
+		// recovery: it is answerable from the store alone, and
+		// CheckBackupScopeDeclared (declaredOnly) — which must never contact a
+		// host — depends on it to reject a fully vetoed template early. Anything
+		// it now lets through is decided by the materialised-and-vetoed check at
+		// the end of this branch, which sees the recovered volumes.
+		if len(declared) > 0 && !anyExportableVolume(declared, sp) {
+			return nil, nil, fmt.Errorf("%w: template %s declares volumes but every one of them is marked `backup: none`", ErrInvalidBackupScope, tmpl)
 		}
 		if declaredOnly {
-			return nil, nil
+			return nil, meta, nil
 		}
-		// At least one declared volume is exportable in principle. Whether an
-		// unscoped run can actually capture anything depends on what is
-		// MATERIALISED on the host, so resolve that now — same InstanceVolumes
-		// call, same cost, as the explicit-scope branch below.
-		vols, err := s.InstanceVolumes(ctx, host, tmpl, slug)
-		if err != nil {
-			return nil, fmt.Errorf("list volumes on %s: %w", host, err)
-		}
-		// The ONE guard, and it needs no inference: a volume EXISTS on the host
-		// and we would deliberately skip it because it is `none`-vetoed, and
-		// there is nothing else to capture. Stopping the pod, walking past real
-		// data on purpose and recording a `complete` row with zero volumes is a
-		// lie dressed as a backup — retention counts that green row and ages out
-		// the last one that actually held data. Every term here is something the
-		// runner directly observed: the volume was inspected on the host, and the
-		// veto is read from the template meta.
+		// At least one declared volume is exportable in principle (or none are
+		// declared at all but the applied set is non-trivial and needs
+		// resolving below). Whether an unscoped run can actually capture
+		// anything depends on what is MATERIALISED on the host, so resolve the
+		// whole picture — host listing, applied-set classification, rename
+		// recovery and its metadata — in ONE step, and let every guard below
+		// read that one value.
 		//
-		// Note what is NOT asserted: when NOTHING is materialised, `vetoed` is
-		// zero and the request is accepted. Whether that instance is new, renamed
-		// or emptied is exactly the question this branch used to guess at, and
-		// each guess broke a real case (review-5). It is answerable only from the
-		// spec's applied volume set, tracked as #257.
-		markerByFullName := make(map[string]string, len(declared))
-		for short, marker := range declared {
-			markerByFullName[volumeName(tmpl, slug, short)] = marker
+		// It used to be inline: five locals (vols/present/materialized/lost/
+		// recovered plus meta) built and mutated in sequence, with each
+		// subsequent guard depending on exactly how far that sequence had
+		// progressed. Three of the last four review rounds found an ordering
+		// bug in it. Bundling the result makes the guards a linear pipeline
+		// over an immutable classification rather than a chain of mutations
+		// (#265 review round-2 cleanup) — this is a pure refactor, no
+		// behaviour changes with it.
+		c, err := s.classifyVolumes(ctx, host, tmpl, slug, declared, meta, sp)
+		if err != nil {
+			return nil, nil, err
 		}
+		// Total loss: the ENTIRE applied set is gone under both its applied and
+		// current names — nothing survives to prove the instance ever ran with
+		// data on this host, so this cannot be misread as "declared but never
+		// materialised" the way a partial miss can (see below). Refuse rather
+		// than record a green row with nothing in it.
+		//
+		// BUT only when there is nothing else exportable either: `c.vols`
+		// already carries every CURRENTLY declared volume InstanceVolumes
+		// found present on the host, whether or not it was ever part of the
+		// applied set (e.g. a template edited to add a new volume the instance
+		// has not been re-applied for yet, but which already materialised). That
+		// set was resolved before this check ever ran, so discarding it on a
+		// hard refusal here would throw away real, already-fetched, exportable
+		// data that has nothing to do with the applied set's loss (#256 review
+		// round-4, addendum finding 1). Only refuse when NOTHING survives at
+		// all — the applied set AND every other currently-declared volume.
+		//
+		// AND only with CORROBORATING EVIDENCE that the applied set ever
+		// materialised in the first place (#265 review finding 2). "Nothing
+		// applied survives" is not on its own distinguishable from "nothing
+		// applied was ever created": `AppliedVolumes` records what the template
+		// DECLARED at apply time, not what podman actually created — the exact
+		// ambiguity the partial-loss branch below deliberately refuses to refuse
+		// on. With a single-member applied set there is no surviving sibling to
+		// make the miss "partial", so an instance applied with one optional or
+		// lazily-created volume that has not materialised yet took the total-loss
+		// refusal and was permanently blocked from ever taking its first backup.
+		// The two cases must be treated alike, so the refusal is narrowed to the
+		// case where the ambiguity is resolved: a prior COMPLETE backup of this
+		// instance captured one of the now-missing volumes, which proves it
+		// existed and is therefore genuinely lost rather than never created.
+		if c.totalLoss() {
+			// The message names only the volumes the evidence actually covers,
+			// not the whole `lost` list (#265 review round-2, minor finding):
+			// a lost volume with no earlier backup behind it may simply never
+			// have been created, and claiming a backup captured it misleads
+			// the operator about which volume to go looking for. The refusal
+			// still stands for the run as a whole.
+			corroborated, cerr := s.appliedLossCorroborated(ctx, host, tmpl, slug, c.lost)
+			if cerr != nil {
+				return nil, nil, cerr
+			}
+			if len(corroborated) > 0 {
+				return nil, nil, fmt.Errorf("%w: volume(s) %s of %s/%s were applied and captured by an earlier backup but no longer exist on %s (a host rebuild, `podman volume prune`, or an evacuation that did not complete) — this backup would silently miss them",
+					ErrInvalidBackupScope, strings.Join(corroborated, " "), tmpl, slug, host)
+			}
+		}
+		// A template edited down to zero declared volumes while the applied set
+		// still names volumes that DO materialise on the host: an unscoped
+		// backup can never capture them (the export loop only ever walks
+		// currently-declared names), so silently returning nil, nil here would
+		// stop the pod for nothing and, worse, let the caller record a green
+		// `complete` row with an empty volume list while real data sits
+		// untouched on the host (review-round-2 finding 2 — "lying green").
+		// Refuse instead; an operator who genuinely wants to stop backing this
+		// template's volumes up can pass an explicit empty-of-real-intent scope
+		// or delete/re-apply the instance to clear AppliedVolumes.
+		if len(declared) == 0 {
+			if c.materialized > 0 {
+				return nil, nil, fmt.Errorf("%w: template %s no longer declares any volumes, but %s/%s was applied with volume(s) that still exist on %s — an unscoped backup would capture nothing while real data remains on the host",
+					ErrInvalidBackupScope, tmpl, tmpl, slug, host)
+			}
+			return nil, c.meta, nil
+		}
+
+		// The ONE guard that survives from before #257, stated over direct
+		// observation only: a volume EXISTS on the host under the CURRENTLY
+		// declared name, and we would deliberately skip it because it is
+		// `none`-vetoed, and there is nothing else to capture. Stopping the pod,
+		// walking past real data on purpose and recording a `complete` row with
+		// zero volumes is a lie dressed as a backup — retention counts that
+		// green row and ages out the last one that actually held data. Every
+		// term here is something the runner directly observed: the volume was
+		// inspected on the host, and the veto is read from the template meta.
+		// `c.meta` already merges the current template's declared markers with
+		// the applied-time markers of every recovered/renamed volume (see
+		// classifyVolumes), so this reads the SAME marker the export loop in
+		// Backup will.
 		var vetoed []string
-		for _, v := range vols {
-			if IsBackupMarkerNone(markerByFullName[v.Name]) {
+		for _, v := range c.vols {
+			if IsBackupMarkerNone(c.meta[v.Name].marker) {
 				vetoed = append(vetoed, v.Name)
 				continue
 			}
-			return vols, nil // something exportable exists
+			return c.vols, c.meta, nil // something exportable exists
 		}
 		if len(vetoed) > 0 {
 			// Reaching here means every MATERIALISED volume is vetoed while some
@@ -209,13 +347,9 @@ func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, 
 			// and record a `complete` row with nothing in it — worth refusing on
 			// the outage alone, before the lying green row is even considered.
 			sort.Strings(vetoed)
-			present := make(map[string]bool, len(vols))
-			for _, v := range vols {
-				present[v.Name] = true
-			}
 			absent := make([]string, 0, len(declared))
 			for short, marker := range declared {
-				if !IsBackupMarkerNone(marker) && !present[volumeName(tmpl, slug, short)] {
+				if !IsBackupMarkerNone(marker) && !c.present[volumeName(tmpl, slug, short)] {
 					absent = append(absent, short)
 				}
 			}
@@ -225,22 +359,43 @@ func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, 
 				detail = fmt.Sprintf("; the exportable volume(s) %s are declared but do not exist on %s — if the instance has not created them yet, this resolves itself once it does",
 					strings.Join(absent, " "), host)
 			}
-			return nil, fmt.Errorf("%w: every volume of %s/%s present on %s is marked `backup: none` (%s), so this backup would stop the pod and capture nothing%s",
+			return nil, nil, fmt.Errorf("%w: every volume of %s/%s present on %s is marked `backup: none` (%s), so this backup would stop the pod and capture nothing%s",
 				ErrInvalidBackupScope, tmpl, slug, host, strings.Join(vetoed, " "), detail)
 		}
-		return vols, nil
+		// Nothing currently materialises under a declared name that is not
+		// vetoed, and (above) either nothing was applied, everything applied
+		// still materialises (directly or under a rename), or SOME applied
+		// volume is confirmed lost while at least one OTHER applied volume is
+		// not — a shape this function deliberately does not refuse.
+		//
+		// That last case is a genuine, acknowledged gap, not an oversight: a
+		// template can legitimately declare a volume that some deployments
+		// never mount (an optional sidecar cache, a lazily-created path a
+		// container only touches under a feature flag), and nothing this core
+		// observes distinguishes "this specific applied volume was never
+		// materialised" from "it existed once and is now gone" — `AppliedVolumes`
+		// records what the template DECLARED at apply time, not what podman
+		// actually created (review-round-2 finding 1). Refusing the whole
+		// backup on that ambiguity would permanently 400 every future unscoped
+		// backup of an instance with any such volume, for volumes that were
+		// never expected to exist — a regression against the pre-#256 fallback,
+		// which accepted whatever the host held. Total loss carries the same
+		// ambiguity unless an earlier backup corroborates that the volumes
+		// existed (see the total-loss branch above): the corroborated case is
+		// refused, the ambiguous one is not, wherever it appears.
+		return c.vols, c.meta, nil
 	}
 	for _, name := range volumes {
 		marker, ok := declared[name]
 		if !ok {
-			return nil, fmt.Errorf("%w: %q is not declared by template %s", ErrInvalidBackupScope, name, tmpl)
+			return nil, nil, fmt.Errorf("%w: %q is not declared by template %s", ErrInvalidBackupScope, name, tmpl)
 		}
 		if IsBackupMarkerNone(marker) {
-			return nil, fmt.Errorf("%w: %q is marked `backup: none`", ErrInvalidBackupScope, name)
+			return nil, nil, fmt.Errorf("%w: %q is marked `backup: none`", ErrInvalidBackupScope, name)
 		}
 	}
 	if declaredOnly {
-		return nil, nil
+		return nil, meta, nil
 	}
 	// Existence, resolved through the same volumeName() the pod manifest and
 	// Backup itself use, so the two cannot drift. InstanceVolumes returns only
@@ -248,7 +403,7 @@ func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, 
 	// loud on anything else), which is exactly the set wanted here.
 	vols, err := s.InstanceVolumes(ctx, host, tmpl, slug)
 	if err != nil {
-		return nil, fmt.Errorf("list volumes on %s: %w", host, err)
+		return nil, nil, fmt.Errorf("list volumes on %s: %w", host, err)
 	}
 	present := make(map[string]bool, len(vols))
 	for _, v := range vols {
@@ -261,9 +416,280 @@ func (s *Service) checkBackupable(ctx context.Context, host, tmpl, slug string, 
 		}
 	}
 	if len(missing) > 0 {
-		return nil, fmt.Errorf("%w: requested volumes %v are declared by template %s but do not exist on %s (the instance predates the declaration — re-apply it first)", ErrInvalidBackupScope, missing, tmpl, host)
+		return nil, nil, fmt.Errorf("%w: requested volumes %v are declared by template %s but do not exist on %s (the instance predates the declaration — re-apply it first)", ErrInvalidBackupScope, missing, tmpl, host)
 	}
-	return vols, nil
+	return vols, meta, nil
+}
+
+// volumeClassification is the resolved answer to "what does this instance
+// actually hold on the host, and what may be exported from it" for an UNSCOPED
+// backup — everything checkBackupable's guards need, computed once, in one
+// place, and read-only thereafter (#265 review round-2 cleanup).
+//
+// It replaces the five sequentially-mutated locals those guards used to share
+// (vols/present/materialized/lost/recovered, plus a meta map folded into
+// mid-flight). Each guard's meaning depended on how far that mutation sequence
+// had run by the time it was reached, which is how three of the last four
+// review rounds each found a fresh ordering bug in this one function.
+type volumeClassification struct {
+	// vols is the export set: every CURRENTLY declared volume that exists on
+	// the host, plus every applied volume recovered under its OLD (pre-rename)
+	// name. Backup's export loop walks exactly this list.
+	vols []podman.Volume
+	// present is the full names in vols, for existence lookups.
+	present map[string]bool
+	// meta is the authoritative marker/exclude map keyed by FULL volume name:
+	// the current template's declared metadata merged with the applied-time
+	// metadata of every recovered volume.
+	meta map[string]volMeta
+	// materialized counts applied volumes confirmed to exist — under their
+	// applied name or, for a rename, their old one.
+	materialized int
+	// lost names the applied (short) volumes confirmed absent under BOTH their
+	// applied name and, when still declared, their current one.
+	lost []string
+	// recovered is the subset of vols found only under an old applied name.
+	recovered []podman.Volume
+}
+
+// totalLoss reports the one unambiguous shape: the ENTIRE applied set is gone
+// AND nothing else survives to export either. See checkBackupable's use of it
+// for why each term is needed — in particular why a surviving,
+// never-applied-but-declared volume disqualifies it.
+func (c *volumeClassification) totalLoss() bool {
+	return c.materialized == 0 && len(c.lost) > 0 && len(c.vols) == 0
+}
+
+// classifyVolumes resolves an instance's volumes on the host into a
+// volumeClassification: it lists what currently materialises under the
+// CURRENTLY declared names, classifies the spec's applied set against that,
+// folds any rename-recovered volume into the export set, and merges that
+// volume's applied-time metadata into the marker map.
+//
+// declared is the current template's short name -> backup marker; meta is the
+// marker/exclude map already built from it, keyed by full name — it is
+// extended here, not replaced, and returned inside the classification.
+//
+// #256/#257: when the spec's applied volume set is KNOWN (a spec written by an
+// Apply after #257 shipped), it settles new/renamed/lost directly instead of
+// guessing from what currently materialises under the CURRENTLY declared
+// names. For each volume the instance was actually APPLIED with, existence is
+// checked under the name it was applied under — which is what lets a template
+// rename (declared differently now, but still present under its old name) read
+// as "still here" rather than "gone".
+//
+// sp.AppliedVolumes == nil means the spec predates #257 (or has not been
+// re-applied since) — unknown, not empty. Those rows classify as zero
+// materialized, nothing lost, nothing recovered, and the caller's guards fall
+// through to the pre-#257 behaviour, unchanged, until their next Apply
+// populates it.
+func (s *Service) classifyVolumes(ctx context.Context, host, tmpl, slug string, declared map[string]string, meta map[string]volMeta, sp store.Spec) (*volumeClassification, error) {
+	// Safe to call even when declared is empty: InstanceVolumes then iterates
+	// nothing and returns nil. Same call, same cost, as the explicit-scope
+	// branch of checkBackupable.
+	vols, err := s.InstanceVolumes(ctx, host, tmpl, slug)
+	if err != nil {
+		return nil, fmt.Errorf("list volumes on %s: %w", host, err)
+	}
+	c := &volumeClassification{
+		vols:    vols,
+		present: make(map[string]bool, len(vols)),
+		meta:    meta,
+	}
+	for _, v := range vols {
+		c.present[v.Name] = true
+	}
+	if sp.AppliedVolumes == nil {
+		return c, nil
+	}
+
+	currentlyDeclared := make(map[string]bool, len(declared))
+	for short := range declared {
+		currentlyDeclared[volumeName(tmpl, slug, short)] = true
+	}
+	materialized, lost, recovered, recoveredMeta, err := s.appliedVolumeLoss(ctx, host, tmpl, slug, sp.AppliedVolumes, sp.AppliedVolumeMeta, c.present, currentlyDeclared)
+	if err != nil {
+		return nil, err
+	}
+	c.materialized, c.lost, c.recovered = materialized, lost, recovered
+
+	// A rename appliedVolumeLoss confirmed present under its OLD applied name
+	// never shows up in `vols` on its own: `vols` came from InstanceVolumes,
+	// which walks only CURRENTLY declared names, so a renamed volume (declared
+	// differently now) is invisible to it. Fold the resolved volume(s) in here,
+	// under their applied name, so the export loop in Backup() — which walks
+	// exactly this list — actually captures them instead of silently completing
+	// without them (round-3 review, critical finding 1).
+	for _, v := range recovered {
+		c.vols = append(c.vols, v)
+		c.present[v.Name] = true
+	}
+	// A recovered/renamed volume's full name is NOT a key in the declared
+	// `meta` — the CURRENT template no longer declares it under that name, that
+	// is exactly what makes it "recovered" rather than "materialized" (see
+	// appliedVolumeLoss). Without this, both checkBackupable's vetoed-check and
+	// Backup's export loop read its marker back as the zero value ("", i.e. not
+	// vetoed) and its exclude patterns as none, regardless of what it was
+	// actually marked — silently dropping a `backup: none` veto across a rename
+	// (#256 review round-4, blocking finding). recoveredMeta is sourced from
+	// store.Spec.AppliedVolumeMeta — captured at the apply that is still in
+	// effect for this volume — not guessed from the current template.
+	for name, m := range recoveredMeta {
+		if _, ok := c.meta[name]; !ok {
+			c.meta[name] = m
+		}
+	}
+	return c, nil
+}
+
+// anyExportableVolume reports whether an unscoped backup of this instance could
+// export anything at all, judged from the store alone — no host contact.
+//
+// It is true when any CURRENTLY declared volume is not `backup: none`, and also
+// when the spec's applied set names a volume the template no longer declares
+// whose APPLIED marker is not `none`: such a volume may still exist on the host
+// under its old applied name and is exactly what checkBackupable's rename
+// recovery goes looking for (#265 review finding 4). An applied name with no
+// recorded marker (a spec whose last Apply predates AppliedVolumeMeta) counts
+// as possibly exportable — the unknown must not manufacture a veto.
+//
+// Only the refusal is decided here. Whether such a volume actually exists is
+// left to the host round trip that follows.
+func anyExportableVolume(declared map[string]string, sp store.Spec) bool {
+	for _, marker := range declared {
+		if !IsBackupMarkerNone(marker) {
+			return true
+		}
+	}
+	for _, short := range sp.AppliedVolumes {
+		if _, stillDeclared := declared[short]; stillDeclared {
+			continue
+		}
+		if m, ok := sp.AppliedVolumeMeta[short]; ok && IsBackupMarkerNone(m.Backup) {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+// appliedLossCorroborated returns WHICH of the given lost (short) applied
+// volume names are known to have EXISTED at some point, by looking each up in
+// an earlier COMPLETE backup of this instance. The result is sorted, and empty
+// when nothing corroborates any of them.
+//
+// This is the only evidence of prior existence this core holds.
+// store.Spec.AppliedVolumes records what the template DECLARED at apply time,
+// not what podman actually created, so "applied but absent" alone cannot tell
+// genuine loss from a volume that was never materialised — which is why the
+// total-loss refusal needs this corroboration and the partial-loss path does
+// not refuse at all (#265 review finding 2).
+//
+// It reports the corroborated NAMES rather than a single bool for the whole
+// list (#265 review round-2, minor finding): the evidence is per volume, and
+// the caller's refusal message names what it was given. Collapsed to a bool,
+// a two-volume loss with evidence for one told the operator that BOTH were
+// "captured by an earlier backup" — misattributing proof of existence to a
+// volume that may never have been created at all. The refusal itself is
+// unchanged: any corroborated volume still refuses the whole run.
+//
+// A store failure is returned, not swallowed: it is the same class of error as
+// the GetSpec at the top of checkBackupable, and reporting it as "no evidence"
+// would silently downgrade a refusal.
+func (s *Service) appliedLossCorroborated(ctx context.Context, host, tmpl, slug string, lost []string) ([]string, error) {
+	backups, err := s.store.ListBackups(ctx, host, tmpl, slug, store.MaxJobLimit)
+	if err != nil {
+		return nil, fmt.Errorf("list backups of %s/%s on %s: %w", tmpl, slug, host, err)
+	}
+	short := make(map[string]string, len(lost))
+	for _, name := range lost {
+		short[volumeName(tmpl, slug, name)] = name
+	}
+	seen := map[string]bool{}
+	var corroborated []string
+	for _, b := range backups {
+		if b.State != store.BackupComplete {
+			continue
+		}
+		for _, v := range b.Volumes {
+			name, ok := short[v.Name]
+			if !ok || seen[name] {
+				continue
+			}
+			seen[name] = true
+			corroborated = append(corroborated, name)
+		}
+	}
+	sort.Strings(corroborated)
+	return corroborated, nil
+}
+
+// appliedVolumeLoss classifies a spec's applied volume set against the host:
+// for each applied (short) name it decides whether the volume is confirmed
+// present — "materialized", counted — or confirmed absent under BOTH its
+// applied name and, when still declared, its current name — "lost", named in
+// the returned slice.
+//
+// present is the set of full volume names InstanceVolumes already resolved as
+// existing under a CURRENTLY declared name; currentlyDeclared is the full set
+// of full names the template declares NOW (present or not). Together they let
+// this function skip a second host round trip for any applied name that maps
+// to a currently-declared name: InstanceVolumes already inspected every one of
+// those (it iterates exactly t.Meta.Volumes), so a currently-declared name
+// missing from `present` is confirmed absent without asking the host again
+// (review-round-2 minor finding: this used to cost up to 2N round trips for N
+// applied volumes; now only names the template no longer declares — a rename
+// or a drop — need their own VolumeInspect).
+//
+// recovered carries the resolved podman.Volume for every applied name found
+// ONLY under its old applied name (i.e. not already covered by `present`) —
+// the caller folds these into its export set, since InstanceVolumes never
+// looked for a name the template no longer declares (round-3 review, critical
+// finding 1: without this, a confirmed-surviving rename was never actually
+// backed up, only accepted).
+//
+// appliedMeta is sp.AppliedVolumeMeta — the marker/exclude each applied
+// (short) name carried at the apply that produced it. recoveredMeta returns
+// that metadata keyed by each recovered volume's OLD full name, since neither
+// caller can look it up any other way once the volume is folded into `vols`
+// under that name: the CURRENT template's declared map has no entry for a
+// name it no longer declares. appliedMeta may be nil (a spec whose last Apply
+// predates this field) — recoveredMeta is then simply empty, and both callers
+// fall back to their pre-existing zero-value behaviour, unchanged (#256
+// review round-4, blocking finding).
+func (s *Service) appliedVolumeLoss(ctx context.Context, host, tmpl, slug string, applied []string, appliedMeta map[string]store.AppliedVolumeMarker, present, currentlyDeclared map[string]bool) (materialized int, lost []string, recovered []podman.Volume, recoveredMeta map[string]volMeta, err error) {
+	recoveredMeta = map[string]volMeta{}
+	for _, short := range applied {
+		full := volumeName(tmpl, slug, short)
+		if present[full] {
+			materialized++
+			continue
+		}
+		if currentlyDeclared[full] {
+			// Already inspected (and found absent) by the InstanceVolumes call
+			// that produced `present` — no need to ask again.
+			lost = append(lost, short)
+			continue
+		}
+		// The template no longer declares this short name under itself — either
+		// a rename or a drop — so InstanceVolumes never looked for it. It needs
+		// its own inspect, under the name it was APPLIED with, to tell "moved"
+		// from "gone".
+		v, ierr := s.client.VolumeInspect(ctx, host, full)
+		if ierr != nil {
+			if errors.Is(ierr, podman.ErrNotFound) {
+				lost = append(lost, short)
+				continue
+			}
+			return 0, nil, nil, nil, fmt.Errorf("inspect volume %q: %w", full, ierr)
+		}
+		materialized++
+		recovered = append(recovered, v)
+		if m, ok := appliedMeta[short]; ok {
+			recoveredMeta[full] = volMeta{marker: m.Backup, exclude: m.Exclude}
+		}
+	}
+	return materialized, lost, recovered, recoveredMeta, nil
 }
 
 // Backup snapshots every volume of an instance into the blob store: stop,
@@ -284,8 +710,15 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 	// check may be arbitrarily stale by now — but its resolved volume list is
 	// reused for the export loop below rather than being recomputed from
 	// scratch, so a backup costs one InstanceVolumes round trip here, not two
-	// (review-5 finding 7).
-	vols, err := s.checkBackupable(ctx, req.Host, req.Template, req.Slug, req.Volumes, false)
+	// (review-5 finding 7). `volMetas` is the merged marker/exclude map that
+	// same call built, keyed by full volume name: the current template's
+	// declared metadata plus the applied-time metadata of any volume recovered
+	// under an old (renamed) applied name. Backup used to rebuild the latter
+	// half from a SECOND, independent GetSpec that could fail or observe a
+	// different spec, silently dropping a `backup: none` veto across a rename
+	// (#265 review finding 1). There is exactly one spec read now, and the
+	// export loop below consumes its result.
+	vols, volMetas, err := s.checkBackupable(ctx, req.Host, req.Template, req.Slug, req.Volumes, false)
 	if err != nil {
 		return err
 	}
@@ -345,27 +778,9 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 	}
 	step("stop", req.Host)
 
-	// Template metadata is needed before the volume loop: it carries both the
-	// `none` veto and the declared exclude patterns. Declared exclude patterns
-	// are keyed by the template's short volume name; InstanceVolumes returns
-	// podman's full <template>-<slug>-<vol> names. Resolve through the same
-	// volumeName() the pod manifest uses, so the two cannot drift.
-	tpl, err := s.lookup(ctx, req.Host, req.Template)
-	if err != nil {
-		restart()
-		return fail(fmt.Errorf("lookup template: %w", err))
-	}
-	type volMeta struct {
-		marker  string
-		exclude []string
-	}
-	declared := map[string]volMeta{}
-	for _, v := range tpl.Meta.Volumes {
-		declared[volumeName(req.Template, req.Slug, v.Name)] = volMeta{marker: v.Backup, exclude: v.Exclude}
-	}
-
-	// `vols` was resolved by the under-lock checkBackupable above; it is not
-	// re-listed here.
+	// `vols` and `volMetas` were both resolved by the under-lock
+	// checkBackupable above; neither the host nor the store is consulted again
+	// for them here.
 
 	// Scope in declared short names, resolved through the same volumeName() the
 	// pod manifest uses. Empty scope means "everything not vetoed".
@@ -377,7 +792,7 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 	var bvols []store.BackupVolume
 	exported := map[string]bool{}
 	for _, v := range vols {
-		m := declared[v.Name]
+		m := volMetas[v.Name]
 		if IsBackupMarkerNone(m.marker) {
 			// State the absence rather than leaving it to be inferred from a
 			// backup that silently lacks a volume.

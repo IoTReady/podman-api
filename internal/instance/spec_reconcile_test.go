@@ -147,6 +147,113 @@ func TestReconcileSpecsOnHost_TemplateDeleted(t *testing.T) {
 	assert.Empty(t, fc.PlayCalls, "should not re-play when template is deleted")
 }
 
+// TestReconcileSpecsOnHost_RenamedAppliedVolumeSkipsReplayInsteadOfForkingData
+// (round-3 review, "related, same root cause" as critical finding 1): boot
+// converge replays the pod from the CURRENT template body, whose
+// persistentVolumeClaim.claimName is authored against the CURRENT declared
+// volume name. If the applied volume set names a volume the template no
+// longer declares, and that volume's real data still exists under its OLD
+// applied name, blindly replaying would bind a brand-new, empty volume under
+// the new claim name while the real data sits orphaned and untouched. This
+// must be refused, not silently forked.
+func TestReconcileSpecsOnHost_RenamedAppliedVolumeSkipsReplayInsteadOfForkingData(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	sp, err := st.GetSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"} // applied under the OLD name
+	require.NoError(t, st.PutSpec(ctx, sp))
+
+	// The real data lives under the OLD applied name.
+	fc.SetVolumeData("h1", "web-my-app-data", []byte("real data"))
+
+	// The template renames "data" -> "pgdata" without this instance being
+	// re-applied.
+	tmpl, err := st.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "pgdata"}}
+	require.NoError(t, st.PutTemplate(ctx, tmpl))
+
+	svc.ReconcileSpecsOnHost(ctx, "h1")
+
+	// PlayKube must NOT have run: replaying the current body would bind a
+	// fresh, empty volume under "web-my-app-pgdata" while "web-my-app-data"
+	// (the real data) sits untouched and unreferenced.
+	assert.Empty(t, fc.PlayCalls, "must not silently fork data by replaying under the renamed claim")
+}
+
+// TestReconcileOneSpec_MixedAppliedSetReportsEveryRenamedVolume (#256 review
+// round-4, addendum finding 2): the applied set names TWO volumes the
+// template no longer declares, and BOTH are still present on the host under
+// their old applied names (both genuinely renamed, not lost). Before the
+// fix, reconcileOneSpec's guard returned on the FIRST confirmed rename and
+// never inspected the rest of the set, so the refusal message named only one
+// of the two renamed volumes even though evaluating the whole set was cheap
+// and already in progress. This pins that the message covers every renamed
+// volume, not just the first one found.
+func TestReconcileOneSpec_MixedAppliedSetReportsEveryRenamedVolume(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	sp, err := st.GetSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data", "wal"} // both applied under OLD names
+	require.NoError(t, st.PutSpec(ctx, sp))
+
+	// Both volumes' real data still exist on the host under their old applied
+	// names — neither was actually lost.
+	fc.SetVolumeData("h1", "web-my-app-data", []byte("real data"))
+	fc.SetVolumeData("h1", "web-my-app-wal", []byte("real wal"))
+
+	// The template renames both "data" and "wal" without this instance being
+	// re-applied.
+	tmpl, err := st.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "pgdata"}, {Name: "pgwal"}}
+	require.NoError(t, st.PutTemplate(ctx, tmpl))
+
+	_, err = svc.reconcileOneSpec(ctx, "h1", "web", "my-app")
+	require.ErrorIs(t, err, errVolumeRenamePending)
+	assert.Contains(t, err.Error(), "data", "must name every renamed volume, not just the first found")
+	assert.Contains(t, err.Error(), "wal", "must name every renamed volume, not just the first found")
+	assert.Empty(t, fc.PlayCalls, "must not replay while any renamed volume is pending re-apply")
+}
+
+// TestReconcileOneSpec_TransientInspectErrorDoesNotBlockReconcile (#256
+// review round-4, addendum finding 2): a TRANSIENT VolumeInspect error (not
+// ErrNotFound) on an applied volume the template no longer declares must not
+// hard-abort the whole reconcile. Before the fix, any instance with a renamed
+// volume depended on a live, error-free VolumeInspect round trip just to come
+// back up after a routine restart; a flaky host call would leave the
+// instance down indefinitely instead of just being unable to confirm this
+// one ambiguous volume.
+func TestReconcileOneSpec_TransientInspectErrorDoesNotBlockReconcile(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	sp, err := st.GetSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"} // applied under the OLD name
+	require.NoError(t, st.PutSpec(ctx, sp))
+
+	// The template renames "data" -> "pgdata" without this instance being
+	// re-applied, and inspecting the old volume name transiently fails.
+	tmpl, err := st.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "pgdata"}}
+	require.NoError(t, st.PutTemplate(ctx, tmpl))
+	fc.FailVolumeInspectFor("web-my-app-data", assert.AnError)
+
+	reconciled, err := svc.reconcileOneSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err, "a transient inspect error must not hard-abort the reconcile")
+	assert.True(t, reconciled)
+	require.Len(t, fc.PlayCalls, 1, "reconcile must proceed despite the undetermined rename")
+}
+
 func TestReconcileSpecsOnHost_HostUnreachable(t *testing.T) {
 	svc, fc, st := specReconcileSvc(t)
 	ctx := context.Background()
@@ -311,4 +418,179 @@ func TestReconcileSpecsOnHost_InvalidatesInstanceCache(t *testing.T) {
 	if after := fc.PodListCallCount(); after == before {
 		t.Error("ListAllInstances hit stale cache after boot converge; expected invalidation + refetch")
 	}
+}
+
+// TestReconcileOneSpec_DroppedUnprunedVolumeDoesNotBlockReplay (#265 review
+// finding 3): "applied name no longer declared, but still on the host" is
+// the signature of a rename AND of an ordinary volume that was simply removed
+// from the template while the old podman volume was never pruned — a routine
+// template edit. The guard used to treat both as a pending rename and left
+// the pod down on every boot-reconcile sweep until someone manually
+// re-applied, converting a template cleanup into a fleet-wide outage. With no
+// corroborating rename target (no newly declared volume that is still absent
+// from the host), the replay must proceed.
+func TestReconcileOneSpec_DroppedUnprunedVolumeDoesNotBlockReplay(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	sp, err := st.GetSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data"}
+	require.NoError(t, st.PutSpec(ctx, sp))
+
+	// The old volume was never pruned after the template dropped it.
+	fc.SetVolumeData("h1", "web-my-app-data", []byte("stale, unpruned"))
+
+	tmpl, err := st.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = nil // `data` dropped outright, nothing renamed to
+	require.NoError(t, st.PutTemplate(ctx, tmpl))
+
+	reconciled, err := svc.reconcileOneSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err, "a dropped-and-unpruned volume must not block boot converge")
+	assert.True(t, reconciled)
+	require.Len(t, fc.PlayCalls, 1, "the pod must come back up")
+}
+
+// TestReconcileOneSpec_DropMixedWithGenuineRenameBlocksOnlyTheRename (#265
+// review, round-2 blocking finding): `renamed` and `targets` used to be two
+// flat, uncorrelated lists, and the guard refused for the WHOLE `renamed` list
+// as soon as ANY target existed anywhere. So one genuine rename elsewhere in
+// the same template blocked an unrelated, harmless drop that shared the
+// applied set: `logs` dropped outright (old volume left unpruned) plus
+// `cache` -> `cache2` renamed left the pod down on every boot sweep and named
+// `logs` in the refusal, for which no target exists at all.
+//
+// The refusal itself is still correct — `cache` genuinely could fork — but it
+// must name only the volumes an available target can account for.
+func TestReconcileOneSpec_DropMixedWithGenuineRenameBlocksOnlyTheRename(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	sp, err := st.GetSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"logs", "cache"}
+	require.NoError(t, st.PutSpec(ctx, sp))
+
+	// Both old volumes still exist on the host: `logs` because nobody pruned
+	// it after the template dropped it, `cache` because the rename target has
+	// not been created yet.
+	fc.SetVolumeData("h1", "web-my-app-logs", []byte("stale, unpruned"))
+	fc.SetVolumeData("h1", "web-my-app-cache", []byte("real cache"))
+
+	// `logs` dropped outright; `cache` renamed to `cache2` (not yet created).
+	tmpl, err := st.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "cache2"}}
+	require.NoError(t, st.PutTemplate(ctx, tmpl))
+
+	_, err = svc.reconcileOneSpec(ctx, "h1", "web", "my-app")
+	require.ErrorIs(t, err, errVolumeRenamePending)
+	assert.Contains(t, err.Error(), "cache", "the genuine rename must still be refused")
+	assert.NotContains(t, err.Error(), "logs",
+		"a dropped volume with no plausible rename target must not be blocked by an unrelated rename")
+	assert.Empty(t, fc.PlayCalls)
+}
+
+// TestReconcileOneSpec_CoincidentalNameMatchStillRefusesAndLogsTheAmbiguity
+// (#265 review, round-5 finding): the pairing is name-similarity, not a true
+// bipartite match, so a coincidental match can claim the target that a
+// genuinely renamed volume needed. Applied ["cache","data"], `cache` dropped
+// outright and `data` renamed to `cache2`: `plausibleRename("cache","cache2")`
+// is true on containment alone, `plausibleRename("data","cache2")` is false, so
+// the counts pair cleanly on the WRONG volume.
+//
+// This is indistinguishable by name from the round-4 case above (`logs`
+// dropped, `cache` -> `cache2`), so no heuristic gets both right. What must
+// hold: the refusal still fires — nothing forks — and the volume the heuristic
+// could not account for is surfaced, so the operator is not left acting on a
+// confidently-named but mismatched volume.
+func TestReconcileOneSpec_CoincidentalNameMatchStillRefusesAndLogsTheAmbiguity(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	sp, err := st.GetSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"cache", "data"}
+	require.NoError(t, st.PutSpec(ctx, sp))
+
+	fc.SetVolumeData("h1", "web-my-app-cache", []byte("stale, unpruned"))
+	fc.SetVolumeData("h1", "web-my-app-data", []byte("the real data"))
+
+	// `cache` dropped outright; `data` renamed to `cache2` (not yet created).
+	tmpl, err := st.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "cache2"}}
+	require.NoError(t, st.PutTemplate(ctx, tmpl))
+
+	logs := captureLog(t, func() {
+		_, err = svc.reconcileOneSpec(ctx, "h1", "web", "my-app")
+	})
+	require.ErrorIs(t, err, errVolumeRenamePending, "the refusal must still fire — `data` genuinely could fork")
+	assert.Empty(t, fc.PlayCalls)
+	assert.Contains(t, logs, "data",
+		"the volume the heuristic could not account for must be surfaced, since it is the one that was actually renamed")
+}
+
+// TestReconcileOneSpec_UnmatchableTargetStillBlocksEveryRename (#265 review,
+// round-2 blocking finding, safe side): when a target cannot be paired with
+// any renamed name by the name heuristic, it could be the destination of ANY
+// of them — a rename is free to change a name beyond recognition. The guard's
+// whole purpose is refusing to fork data, so an unaccounted-for target must
+// still block every otherwise-unmatched renamed volume.
+func TestReconcileOneSpec_UnmatchableTargetStillBlocksEveryRename(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	sp, err := st.GetSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"logs"}
+	require.NoError(t, st.PutSpec(ctx, sp))
+
+	fc.SetVolumeData("h1", "web-my-app-logs", []byte("real logs"))
+
+	// `logs` -> `journal`: nothing in the names correlates them, but the
+	// target exists and is not yet created, so the rename is plausible.
+	tmpl, err := st.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "journal"}}
+	require.NoError(t, st.PutTemplate(ctx, tmpl))
+
+	_, err = svc.reconcileOneSpec(ctx, "h1", "web", "my-app")
+	require.ErrorIs(t, err, errVolumeRenamePending)
+	assert.Contains(t, err.Error(), "logs")
+	assert.Empty(t, fc.PlayCalls)
+}
+
+// TestReconcileOneSpec_DroppedVolumeWithOtherDeclaredVolumesPresentReplays
+// (#265 review finding 3): same shape, but the template still declares a
+// volume — one that ALREADY exists on the host, so it cannot be the target of
+// a rename from the dropped name. Still no evidence of a rename; still must
+// replay.
+func TestReconcileOneSpec_DroppedVolumeWithOtherDeclaredVolumesPresentReplays(t *testing.T) {
+	svc, fc, st := specReconcileSvc(t)
+	ctx := context.Background()
+
+	seedBootSpec(t, st, "h1", "web", "my-app", nil)
+	sp, err := st.GetSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	sp.AppliedVolumes = []string{"data", "cache"}
+	require.NoError(t, st.PutSpec(ctx, sp))
+
+	fc.SetVolumeData("h1", "web-my-app-data", []byte("stale, unpruned"))
+	fc.SetVolumeData("h1", "web-my-app-cache", []byte("still declared and present"))
+
+	tmpl, err := st.GetTemplate(ctx, "web")
+	require.NoError(t, err)
+	tmpl.Meta.Volumes = []render.Volume{{Name: "cache"}} // `data` dropped
+	require.NoError(t, st.PutTemplate(ctx, tmpl))
+
+	reconciled, err := svc.reconcileOneSpec(ctx, "h1", "web", "my-app")
+	require.NoError(t, err)
+	assert.True(t, reconciled)
+	require.Len(t, fc.PlayCalls, 1)
 }
