@@ -49,6 +49,7 @@ type statsRec struct {
 	remaining []time.Duration
 	dropped   []string
 	err       error
+	delay     time.Duration // simulated sample cost, for concurrency tests
 }
 
 func (s *statsRec) DropHostStats(host string) {
@@ -69,6 +70,9 @@ func (s *statsRec) wasDropped(host string) bool {
 }
 
 func (s *statsRec) RefreshHostStats(ctx context.Context, host string) error {
+	if s.delay > 0 {
+		time.Sleep(s.delay)
+	}
 	var left time.Duration
 	if dl, ok := ctx.Deadline(); ok {
 		left = time.Until(dl)
@@ -118,6 +122,8 @@ type bootRec struct {
 	reconciled  []string                 // one entry per ReconcileSpecsOnHost call, in order
 	reconcileDL map[string]time.Duration // host -> time left on the ctx passed to ReconcileSpecsOnHost
 	reconcileHD map[string]bool          // host -> whether that ctx had a deadline at all
+
+	delay time.Duration // simulated HostUptime cost, for concurrency tests
 }
 
 func newBootRec() *bootRec {
@@ -128,6 +134,9 @@ func newBootRec() *bootRec {
 }
 
 func (b *bootRec) HostUptime(_ context.Context, host string) (time.Duration, bool, error) {
+	if b.delay > 0 {
+		time.Sleep(b.delay)
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.uptime[host], b.ok[host], b.err[host]
@@ -898,10 +907,14 @@ type loadRec struct {
 	hosts     []string
 	remaining []time.Duration
 	err       error
-	skipped   bool // report that no sample was taken
+	skipped   bool          // report that no sample was taken
+	delay     time.Duration // simulated sample cost, for concurrency tests
 }
 
 func (l *loadRec) RefreshHostLoadAvg(ctx context.Context, host string) (bool, error) {
+	if l.delay > 0 {
+		time.Sleep(l.delay)
+	}
 	var left time.Duration
 	if dl, ok := ctx.Deadline(); ok {
 		left = time.Until(dl)
@@ -1136,5 +1149,74 @@ func TestPollerIgnoresASkippedLoadAvgSample(t *testing.T) {
 	p.mu.Unlock()
 	if !seen || ok {
 		t.Errorf("loadState = (ok=%v seen=%v); a skipped tick overwrote the last real verdict", ok, seen)
+	}
+}
+
+// The stats, loadavg and boot-probe sub-samplers must fan out concurrently
+// after the refresh, not run one after another (#260). Sequentially, three
+// 150ms samplers would push one host's tick past 450ms; concurrently, the
+// worst case is one 150ms wait, not their sum.
+func TestPollerSubSamplersRunConcurrently(t *testing.T) {
+	f := newFakeRefresher()
+	st := &statsRec{delay: 150 * time.Millisecond}
+	lr := &loadRec{delay: 150 * time.Millisecond}
+	b := newBootRec()
+	b.delay = 150 * time.Millisecond
+	// A known uptime with no prior baseline: HostUptime is still called (and
+	// still pays its delay), but this is a first observation so no reconcile
+	// runs and the sample cost is exactly the HostUptime delay.
+	b.setUptime("h1", 10000*time.Second)
+	p := &Poller{
+		Svc: f, Stats: st, LoadAvg: lr, Boot: b, Interval: time.Hour,
+		Timeout: time.Second, StatsTimeout: 5 * time.Second,
+		LoadAvgTimeout: 5 * time.Second, BootTimeout: 5 * time.Second,
+		state: map[string]bool{}, statsState: map[string]bool{},
+		loadState: map[string]bool{}, bootUptime: map[string]time.Duration{},
+	}
+
+	start := time.Now()
+	p.tick(context.Background(), []string{"h1"})
+	elapsed := time.Since(start)
+
+	// Sequential would be >= 450ms (150ms * 3). Concurrent should land close
+	// to a single 150ms wait; generous slack for scheduling noise.
+	if elapsed >= 400*time.Millisecond {
+		t.Fatalf("tick took %s; the stats/loadavg/boot sub-samplers appear to "+
+			"run sequentially rather than concurrently", elapsed)
+	}
+	if st.calls() != 1 || lr.calls() != 1 || b.reconcileCount("h1") != 0 {
+		t.Fatalf("unexpected sample counts: stats=%d loadavg=%d reconciles=%d",
+			st.calls(), lr.calls(), b.reconcileCount("h1"))
+	}
+}
+
+// The stats sampler's skip-and-drop gating on the refresh outcome must
+// survive the fan-out: even running concurrently with loadavg and boot, a
+// failed refresh must still skip (and drop) the stats sample for that host,
+// while loadavg and boot are unaffected.
+func TestPollerConcurrentFanOutPreservesStatsGating(t *testing.T) {
+	f := newFakeRefresher()
+	f.failOn["h1"] = true
+	st := &statsRec{}
+	lr := &loadRec{}
+	b := newBootRec()
+	b.setUptime("h1", 10000*time.Second)
+	p := &Poller{
+		Svc: f, Stats: st, LoadAvg: lr, Boot: b, Interval: time.Hour,
+		Timeout: time.Second, StatsTimeout: 5 * time.Second,
+		LoadAvgTimeout: 5 * time.Second, BootTimeout: 5 * time.Second,
+		state: map[string]bool{}, statsState: map[string]bool{},
+		loadState: map[string]bool{}, bootUptime: map[string]time.Duration{},
+	}
+	p.tick(context.Background(), []string{"h1"})
+
+	if st.calls() != 0 {
+		t.Errorf("stats sampled a host whose refresh failed: %d calls", st.calls())
+	}
+	if !st.wasDropped("h1") {
+		t.Errorf("stats for a failed-refresh host were not dropped")
+	}
+	if lr.calls() != 1 {
+		t.Errorf("loadavg was not sampled despite the refresh failing: %d calls", lr.calls())
 	}
 }
