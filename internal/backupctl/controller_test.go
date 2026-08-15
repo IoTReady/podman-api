@@ -75,6 +75,12 @@ func tmpl(id string, vols ...render.Volume) store.Template {
 	return store.Template{Meta: render.Meta{ID: id, Volumes: vols}}
 }
 
+// TestListBackupInstances_filtersToBackupMarkedVolumes: eligibility is
+// per-INSTANCE ("does this template declare at least one non-`none` volume"),
+// not per-marker — an unmarked volume ("cache") is eligible too (#255) and is
+// projected alongside an explicitly marked one, carrying its raw (empty)
+// marker unchanged. "plain" declares only a `none`-marked volume, so it alone
+// is excluded.
 func TestListBackupInstances_filtersToBackupMarkedVolumes(t *testing.T) {
 	svc := &fakeSvc{
 		hosts: []config.Host{{ID: "h1"}},
@@ -87,7 +93,7 @@ func TestListBackupInstances_filtersToBackupMarkedVolumes(t *testing.T) {
 		},
 		templates: map[string]store.Template{
 			"web":   tmpl("web", render.Volume{Name: "data", Backup: "s3; interval=6h"}, render.Volume{Name: "cache"}),
-			"plain": tmpl("plain", render.Volume{Name: "d"}),
+			"plain": tmpl("plain", render.Volume{Name: "d", Backup: "none"}),
 		},
 	}
 	c := &Controller{Svc: svc, Jobs: store.NewMemory()}
@@ -95,18 +101,56 @@ func TestListBackupInstances_filtersToBackupMarkedVolumes(t *testing.T) {
 	got, err := c.ListBackupInstances(context.Background())
 	require.NoError(t, err)
 
-	// plain/c has no backup-marked volume → excluded. web/a and web/b included,
-	// each carrying only the marked "data" volume with its raw marker.
+	// plain/c's only declared volume is `none`-vetoed → excluded. web/a and
+	// web/b included, each carrying BOTH declared volumes: "data" with its raw
+	// marker, and the unmarked "cache" with an empty one.
 	require.Len(t, got, 2)
 	for _, bi := range got {
 		assert.Equal(t, "h1", bi.Host)
 		assert.Equal(t, "web", bi.Template)
-		require.Len(t, bi.Volumes, 1)
-		assert.Equal(t, "data", bi.Volumes[0].Name)
-		assert.Equal(t, "s3; interval=6h", bi.Volumes[0].Backup)
+		require.Len(t, bi.Volumes, 2)
+		names := []string{bi.Volumes[0].Name, bi.Volumes[1].Name}
+		assert.ElementsMatch(t, []string{"data", "cache"}, names)
+		for _, v := range bi.Volumes {
+			if v.Name == "data" {
+				assert.Equal(t, "s3; interval=6h", v.Backup)
+			} else {
+				assert.Equal(t, "", v.Backup, "an unmarked volume must project an empty (not synthesised) marker")
+			}
+		}
 	}
 	slugs := []string{got[0].Slug, got[1].Slug}
 	assert.ElementsMatch(t, []string{"a", "b"}, slugs)
+}
+
+// TestListBackupInstances_UnmarkedVolumeMakesInstanceEligible pins #255: a
+// template shaped `[data: none, logs: unmarked]` used to be entirely invisible
+// to ListBackupInstances (both volumes were dropped before the eligibility
+// test), while CheckBackupable's unscoped-empty-scope guard would gladly admit
+// an unscoped backup of the same instance — "logs" is declared and not
+// `none`-vetoed, which is exactly what that guard accepts. The two halves of
+// the core must agree.
+func TestListBackupInstances_UnmarkedVolumeMakesInstanceEligible(t *testing.T) {
+	svc := &fakeSvc{
+		hosts: []config.Host{{ID: "h1"}},
+		instances: map[string][]instance.Observed{
+			"h1": {{Template: "app", Slug: "a"}},
+		},
+		templates: map[string]store.Template{
+			"app": tmpl("app",
+				render.Volume{Name: "data", Backup: "none"},
+				render.Volume{Name: "logs"}), // unmarked
+		},
+	}
+	c := &Controller{Svc: svc, Jobs: store.NewMemory()}
+
+	got, err := c.ListBackupInstances(context.Background())
+	require.NoError(t, err)
+
+	require.Len(t, got, 1, "an instance with an unmarked, non-vetoed volume must be eligible")
+	require.Len(t, got[0].Volumes, 1, "the `none`-vetoed volume must still be excluded")
+	assert.Equal(t, "logs", got[0].Volumes[0].Name)
+	assert.Equal(t, "", got[0].Volumes[0].Backup)
 }
 
 func TestLastBackupAt_newestComplete(t *testing.T) {
@@ -254,8 +298,9 @@ func TestEnqueueBackup_propagatesCheckError(t *testing.T) {
 
 // TestListBackupInstances_DropsNoneMarkedVolumes: the core now interprets `none`, so
 // a vetoed volume must not be projected to a scheduler that would then have to
-// re-derive the same veto — and an instance whose ONLY marked volume is `none`
-// is not backup-eligible at all.
+// re-derive the same veto — and an instance whose ONLY declared volume is
+// `none` is not backup-eligible at all. An unmarked volume is NOT vetoed
+// (#255) and stays projected alongside a marked one.
 func TestListBackupInstances_DropsNoneMarkedVolumes(t *testing.T) {
 	svc := &fakeSvc{
 		hosts: []config.Host{{ID: "h1"}},
@@ -270,7 +315,7 @@ func TestListBackupInstances_DropsNoneMarkedVolumes(t *testing.T) {
 				render.Volume{Name: "sites", Backup: "s3; interval=24h"},
 				render.Volume{Name: "logs", Backup: "none"},
 				render.Volume{Name: "cache"}),
-			// Every marked volume is vetoed: not backup-eligible at all.
+			// Every declared volume is `none`-vetoed: not backup-eligible at all.
 			"vetoed": tmpl("vetoed", render.Volume{Name: "logs", Backup: "none"}),
 		},
 	}
@@ -279,11 +324,11 @@ func TestListBackupInstances_DropsNoneMarkedVolumes(t *testing.T) {
 	got, err := c.ListBackupInstances(context.Background())
 	require.NoError(t, err)
 
-	require.Len(t, got, 1, "an instance whose only marker is `none` is not eligible")
+	require.Len(t, got, 1, "an instance whose only declared volume is `none`-vetoed is not eligible")
 	assert.Equal(t, "web", got[0].Template)
-	require.Len(t, got[0].Volumes, 1, "a `none` marker must not be projected")
-	assert.Equal(t, "sites", got[0].Volumes[0].Name)
-	assert.Equal(t, "s3; interval=24h", got[0].Volumes[0].Backup)
+	require.Len(t, got[0].Volumes, 2, "a `none` marker must not be projected, but the unmarked volume must be")
+	names := []string{got[0].Volumes[0].Name, got[0].Volumes[1].Name}
+	assert.ElementsMatch(t, []string{"sites", "cache"}, names)
 }
 
 // TestEnqueueBackup_ExplicitlyEmptyScopeIsAnError (re-review F): a scheduler

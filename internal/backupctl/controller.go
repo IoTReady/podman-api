@@ -33,9 +33,23 @@ type Controller struct {
 }
 
 // ListBackupInstances walks every known host, lists its live instances, and
-// returns those whose template declares at least one backup-marked volume. A
-// per-host listing failure is logged and skipped rather than aborting the whole
-// sweep, so one unreachable host doesn't starve backups on the others.
+// returns those eligible for a backup: at least one declared volume that is
+// not vetoed by a `none` marker. That is deliberately the SAME predicate
+// CheckBackupable's unscoped-empty-scope guard uses (#255) — an UNMARKED
+// volume counts as eligible here exactly as it does there, not just a
+// volume carrying an explicit non-`none` marker. Before #255 this dropped
+// unmarked volumes too, so a template shaped `[data: none, logs: unmarked]`
+// was invisible to ListBackupInstances while CheckBackupable would gladly
+// admit an unscoped backup of it — a disagreement any BackupScheduler
+// implementation is entitled to assume does not exist, and one this OSS
+// module must not leave resting on a downstream filter it cannot see (the
+// one BackupScheduler that exists, podman-api-pro's, happens to separately
+// skip any marker string that doesn't parse into a schedulable interval,
+// which is why the disagreement was invisible in practice — but that is an
+// implementation detail of a component this package does not import).
+//
+// A per-host listing failure is logged and skipped rather than aborting the
+// whole sweep, so one unreachable host doesn't starve backups on the others.
 func (c *Controller) ListBackupInstances(ctx context.Context) ([]extension.BackupInstance, error) {
 	markersByTmpl := map[string][]extension.BackupVolumeMarker{}
 	var out []extension.BackupInstance
@@ -65,8 +79,9 @@ func (c *Controller) ListBackupInstances(ctx context.Context) ([]extension.Backu
 	return out, nil
 }
 
-// backupMarkers projects a template's backup-marked volumes. An unknown template
-// (or one with no marked volumes) yields an empty slice.
+// backupMarkers projects a template's backup-ELIGIBLE volumes: every declared
+// volume that is not vetoed by a `none` marker, unmarked ones included (#255).
+// An unknown template (or one with no eligible volumes) yields an empty slice.
 func (c *Controller) backupMarkers(ctx context.Context, template string) []extension.BackupVolumeMarker {
 	t, err := c.Svc.GetTemplate(ctx, template)
 	if err != nil {
@@ -75,11 +90,15 @@ func (c *Controller) backupMarkers(ctx context.Context, template string) []exten
 	}
 	var markers []extension.BackupVolumeMarker
 	for _, v := range t.Meta.Volumes {
-		// `none` is the one marker the core interprets: the volume is never
-		// backed up, so projecting it would only make a scheduler re-derive the
-		// same veto — and an instance whose only marked volume is `none` is not
-		// backup-eligible at all.
-		if v.Backup == "" || instance.IsBackupMarkerNone(v.Backup) {
+		// `none` is the one marker the core interprets as a veto: the volume is
+		// never backed up, so projecting it would only make a scheduler
+		// re-derive the same veto — and an instance whose only declared volume
+		// is `none`-marked is not backup-eligible at all. Every other marker,
+		// INCLUDING no marker, is eligible: this must agree with
+		// CheckBackupable's own "at least one declared volume not vetoed" test,
+		// or an instance CheckBackupable would gladly admit an unscoped backup
+		// of would silently never appear in this projection (#255).
+		if instance.IsBackupMarkerNone(v.Backup) {
 			continue
 		}
 		markers = append(markers, extension.BackupVolumeMarker{Name: v.Name, Backup: v.Backup})
