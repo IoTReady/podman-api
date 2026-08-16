@@ -40,8 +40,33 @@ type Meta struct {
 	// name the same network resolve each other by pod DNS name with no host
 	// port published at all. Names are literal, not parameter-rendered, so a
 	// bad one fails at template registration rather than at deploy (#243).
-	Networks  []string   `yaml:"networks,omitempty" json:"networks,omitempty"`
+	Networks  []Network  `yaml:"networks,omitempty" json:"networks,omitempty"`
 	PreBackup *PreBackup `yaml:"pre_backup,omitempty" json:"pre_backup,omitempty"`
+}
+
+// Network is one shared-network membership: the network name, plus optional
+// extra DNS names the pod answers to on it (#269).
+//
+// Without an alias a peer must address the pod by its podman DNS name —
+// "<template>-<slug>", e.g. "mariadb-vedanta" — which encodes the slug in every
+// consumer's configuration. An alias lets the template say "the database on this
+// network" once: peers resolve "mariadb" regardless of which slug backs it, so a
+// rename or a restore under a different slug does not break them.
+//
+// Aliases are a claim on a shared namespace, and podman does not police it: two
+// pods answering to the same alias on the same network is a silent, arbitrary
+// resolution. Uniqueness is enforced instead by the daemon, scoped to
+// (host, network, name) — see Service.validateNetworkAliases.
+//
+// That enforcement covers the names the daemon knows: declared aliases and pod
+// DNS names. It does NOT cover the aliases podman adds on its own — kube play
+// registers every container name in the played YAML as an alias on every joined
+// network, so two instances of a template whose container is named "db" already
+// both answer to "db" on a shared network, with or without this field (#272).
+// Pick container names as carefully as aliases.
+type Network struct {
+	Name    string   `yaml:"name" json:"name"`
+	Aliases []string `yaml:"aliases,omitempty" json:"aliases,omitempty"`
 }
 
 // Display holds human-readable presentation metadata for a template.
@@ -170,19 +195,40 @@ func ValidateIngress(ing *Ingress) error {
 // declared at most once. Rejecting at registration means a typo fails visibly
 // at the point the template is written, instead of surfacing as a NetworkEnsure
 // failure on every deploy of every instance of that template.
+//
+// Aliases get the same treatment, plus one scoping rule: an alias must be unique
+// within its own network, but the SAME alias on two different networks is legal
+// — podman resolves per-network, so "db" on frappe-shared and "db" on metrics are
+// distinct names, not a collision.
 func ValidateNetworks(m Meta) error {
 	seen := make(map[string]struct{}, len(m.Networks))
 	for _, n := range m.Networks {
-		if strings.TrimSpace(n) == "" {
+		if strings.TrimSpace(n.Name) == "" {
 			return errors.New("template-meta: networks entries must not be empty")
 		}
-		if !ValidName(n) {
-			return fmt.Errorf("template-meta: networks: %q is not a valid network name", n)
+		if !ValidName(n.Name) {
+			return fmt.Errorf("template-meta: networks: %q is not a valid network name", n.Name)
 		}
-		if _, dup := seen[n]; dup {
-			return fmt.Errorf("template-meta: networks: %q declared twice", n)
+		if _, dup := seen[n.Name]; dup {
+			return fmt.Errorf("template-meta: networks: %q declared twice", n.Name)
 		}
-		seen[n] = struct{}{}
+		seen[n.Name] = struct{}{}
+
+		aliases := make(map[string]struct{}, len(n.Aliases))
+		for _, a := range n.Aliases {
+			if strings.TrimSpace(a) == "" {
+				return fmt.Errorf("template-meta: networks: %q: aliases entries must not be empty", n.Name)
+			}
+			// An alias becomes a DNS name podman registers for the pod, so it
+			// carries the same charset constraint as the network name itself.
+			if !ValidName(a) {
+				return fmt.Errorf("template-meta: networks: %q: %q is not a valid alias", n.Name, a)
+			}
+			if _, dup := aliases[a]; dup {
+				return fmt.Errorf("template-meta: networks: %q: alias %q declared twice", n.Name, a)
+			}
+			aliases[a] = struct{}{}
+		}
 	}
 	return nil
 }

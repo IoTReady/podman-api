@@ -472,6 +472,12 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 	if err != nil {
 		return false, err
 	}
+	// Converge does not REFUSE a duplicate DNS claim the way apply does — an
+	// instance that stays down after a reboot is worse than one whose alias is
+	// contended, and by this point the conflicting state already exists on disk.
+	// It must not be silent either: this is exactly the arbitrary-resolution
+	// failure aliases exist to prevent, so name both instances in the log (#269).
+	s.warnOnNetworkNameConflict(ctx, hostID, tmpl, slug, tmplObj.Meta)
 
 	// Step 8: play kube. replace=true when the pod exists (non-Running) so
 	// podman replaces the stale pod; replace=false when the pod is absent.

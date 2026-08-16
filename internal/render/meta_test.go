@@ -379,18 +379,44 @@ func TestValidateVolumesUpdate_GrandfathersStoredNearMiss(t *testing.T) {
 func TestValidateNetworks(t *testing.T) {
 	cases := []struct {
 		name     string
-		networks []string
+		networks []Network
 		wantErr  string
 	}{
 		{name: "no networks", networks: nil},
-		{name: "single network", networks: []string{"frappe-shared"}},
-		{name: "several networks", networks: []string{"frappe-shared", "metrics"}},
-		{name: "empty name", networks: []string{""}, wantErr: "must not be empty"},
-		{name: "whitespace name", networks: []string{"  "}, wantErr: "must not be empty"},
-		{name: "uppercase rejected", networks: []string{"Frappe"}, wantErr: "is not a valid network name"},
-		{name: "underscore rejected", networks: []string{"frappe_shared"}, wantErr: "is not a valid network name"},
-		{name: "leading dash rejected", networks: []string{"-shared"}, wantErr: "is not a valid network name"},
-		{name: "duplicate rejected", networks: []string{"shared", "shared"}, wantErr: "declared twice"},
+		{name: "single network", networks: []Network{{Name: "frappe-shared"}}},
+		{name: "several networks", networks: []Network{{Name: "frappe-shared"}, {Name: "metrics"}}},
+		{name: "empty name", networks: []Network{{Name: ""}}, wantErr: "must not be empty"},
+		{name: "whitespace name", networks: []Network{{Name: "  "}}, wantErr: "must not be empty"},
+		{name: "uppercase rejected", networks: []Network{{Name: "Frappe"}}, wantErr: "is not a valid network name"},
+		{name: "underscore rejected", networks: []Network{{Name: "frappe_shared"}}, wantErr: "is not a valid network name"},
+		{name: "leading dash rejected", networks: []Network{{Name: "-shared"}}, wantErr: "is not a valid network name"},
+		{name: "duplicate rejected", networks: []Network{{Name: "shared"}, {Name: "shared"}}, wantErr: "declared twice"},
+
+		{name: "aliases accepted", networks: []Network{{Name: "shared", Aliases: []string{"mariadb", "db"}}}},
+		{
+			name:     "same alias on two networks is fine",
+			networks: []Network{{Name: "shared", Aliases: []string{"db"}}, {Name: "metrics", Aliases: []string{"db"}}},
+		},
+		{
+			name:     "empty alias rejected",
+			networks: []Network{{Name: "shared", Aliases: []string{""}}},
+			wantErr:  "aliases entries must not be empty",
+		},
+		{
+			name:     "whitespace alias rejected",
+			networks: []Network{{Name: "shared", Aliases: []string{"  "}}},
+			wantErr:  "aliases entries must not be empty",
+		},
+		{
+			name:     "invalid alias rejected",
+			networks: []Network{{Name: "shared", Aliases: []string{"Maria_DB"}}},
+			wantErr:  "is not a valid alias",
+		},
+		{
+			name:     "duplicate alias within a network rejected",
+			networks: []Network{{Name: "shared", Aliases: []string{"db", "db"}}},
+			wantErr:  "declared twice",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -412,14 +438,46 @@ func TestParseMeta_Networks(t *testing.T) {
 	src := `# template-meta:
 #   id: frappe-app
 #   networks:
-#     - frappe-shared
+#     - name: frappe-shared
 ---
 apiVersion: v1
 kind: Pod
 `
 	meta, _, err := ParseMeta(src)
 	require.NoError(t, err)
-	require.Equal(t, []string{"frappe-shared"}, meta.Networks)
+	require.Equal(t, []Network{{Name: "frappe-shared"}}, meta.Networks)
+}
+
+// The #269 spelling: a network entry carrying slug-independent DNS names.
+func TestParseMeta_NetworkAliases(t *testing.T) {
+	src := `# template-meta:
+#   id: mariadb
+#   networks:
+#     - name: frappe-shared
+#       aliases: [mariadb, db]
+---
+apiVersion: v1
+kind: Pod
+`
+	meta, _, err := ParseMeta(src)
+	require.NoError(t, err)
+	require.Equal(t, []Network{{Name: "frappe-shared", Aliases: []string{"mariadb", "db"}}}, meta.Networks)
+}
+
+// Networks are objects now; the pre-#269 bare-string spelling is a clean break
+// rather than a silently-accepted alternative, so a template written the old
+// way fails loudly at registration.
+func TestParseMeta_RejectsBareStringNetwork(t *testing.T) {
+	src := `# template-meta:
+#   id: frappe-app
+#   networks:
+#     - frappe-shared
+---
+apiVersion: v1
+kind: Pod
+`
+	_, _, err := ParseMeta(src)
+	require.Error(t, err)
 }
 
 func TestParseMeta_NoNetworks(t *testing.T) {
@@ -438,7 +496,7 @@ func TestParseMeta_RejectsBadNetwork(t *testing.T) {
 	src := `# template-meta:
 #   id: frappe-app
 #   networks:
-#     - Not_Valid
+#     - name: Not_Valid
 ---
 apiVersion: v1
 kind: Pod

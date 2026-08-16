@@ -151,7 +151,11 @@ func (s *Service) Rename(ctx context.Context, host, tmpl, slug string, req Renam
 		Parameters: params,
 		Secrets:    spec.Secrets,
 		Domains:    domains,
-	}, ApplyOptions{Replace: false}); err != nil {
+		// The old spec is still in the store — it is deleted only after the new
+		// pod verifies, so a failed apply can roll back to a registered
+		// instance. Name it as superseded so its domains and shared-network DNS
+		// names are not read as conflicts with the instance replacing it.
+	}, ApplyOptions{Replace: false, SupersededSlug: slug}); err != nil {
 		rbctx := context.WithoutCancel(ctx)
 		if _, rerr := s.Start(rbctx, host, tmpl, slug); rerr != nil {
 			step("rollback-restart-old-failed", rerr.Error())

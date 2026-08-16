@@ -78,6 +78,18 @@ type ApplyOptions struct {
 	// the stored spec, so the reconcile path never replays it. Only the
 	// point-in-time restore trigger sets this; ordinary deploys leave it nil.
 	RestoreIntent *extension.RestoreIntent
+	// SupersededSlug names an instance of the SAME template on the same host
+	// that this apply replaces and whose spec is about to be deleted — the old
+	// slug of a rename. Its claims on host-scoped namespaces (ingress domains,
+	// shared-network DNS names) are therefore not conflicts: they are being
+	// handed over, not contended.
+	//
+	// Rename applies the new slug BEFORE deleting the old spec (so a failed
+	// apply can roll back to a still-registered instance), which means the old
+	// instance is present in the store during the new one's validation. Without
+	// this, renaming any instance carrying a domain or an alias is impossible.
+	// Only rename sets it.
+	SupersededSlug string
 }
 
 // ApplyRequest is the body of POST /instances and PUT /instances/{...}.
@@ -212,34 +224,70 @@ func (s *Service) ingressEnabled() bool { return s.ingressNet != "" }
 // This is the ONE place the join list is assembled; both the apply path and the
 // boot-converge path call it, so they cannot drift on what a pod is attached to.
 func (s *Service) ensureNetworks(ctx context.Context, hostID string, m render.Meta) ([]string, error) {
-	var want []string
+	joins := s.joinNetworks(m)
+	out := make([]string, 0, len(joins))
+	for _, j := range joins {
+		if err := s.client.NetworkEnsure(ctx, hostID, j.Name); err != nil {
+			return nil, fmt.Errorf("ensure network %q on %s: %w", j.Name, hostID, err)
+		}
+		out = append(out, networkArg(j))
+	}
+	return out, nil
+}
+
+// joinNetworks resolves the exact set of networks an instance of a template
+// joins, in join order, with each network's aliases merged. It is pure: no host
+// IO, so the apply-time uniqueness check (validateNetworkAliases) can ask "what
+// would this pod be called on which networks" without touching podman, and
+// cannot drift from what ensureNetworks actually plays.
+//
+// De-duplication merges rather than drops: a template that names the ingress
+// network explicitly, with aliases, keeps those aliases instead of losing them
+// to the bare ingress entry that leads the list.
+func (s *Service) joinNetworks(m render.Meta) []render.Network {
+	var want []render.Network
 	if s.ingressEnabled() && m.Ingress != nil {
-		want = append(want, s.ingressNet)
+		want = append(want, render.Network{Name: s.ingressNet})
 	}
 	want = append(want, m.Networks...)
 
-	out := make([]string, 0, len(want))
-	seen := make(map[string]struct{}, len(want))
+	out := make([]render.Network, 0, len(want))
+	at := make(map[string]int, len(want))
 	for _, n := range want {
-		if _, dup := seen[n]; dup {
+		i, dup := at[n.Name]
+		if !dup {
+			at[n.Name] = len(out)
+			out = append(out, render.Network{Name: n.Name, Aliases: append([]string(nil), n.Aliases...)})
 			continue
 		}
-		seen[n] = struct{}{}
-		if err := s.client.NetworkEnsure(ctx, hostID, n); err != nil {
-			return nil, fmt.Errorf("ensure network %q on %s: %w", n, hostID, err)
+		for _, a := range n.Aliases {
+			if !slices.Contains(out[i].Aliases, a) {
+				out[i].Aliases = append(out[i].Aliases, a)
+			}
 		}
-		out = append(out, n)
 	}
-	return out, nil
+	return out
+}
+
+// networkArg formats one membership as podman's --network value. The
+// "name:alias=a,alias=b" spelling is parsed server-side by kube play
+// (specgen.ParseNetworkFlag → parseBridgeNetworkOptions), so aliases need no
+// separate API call — they ride along with the join.
+func networkArg(n render.Network) string {
+	if len(n.Aliases) == 0 {
+		return n.Name
+	}
+	return n.Name + ":alias=" + strings.Join(n.Aliases, ",alias=")
 }
 
 // validateIngress enforces the ingress rules for a request carrying domains
 // BEFORE the pod is played or the spec is persisted: ingress must be enabled,
 // the template must declare ingress:, and each domain must be unclaimed by any
-// other instance on the host. Enforcing them up front keeps an invalid spec out
+// other instance on the host — bar the one this apply supersedes, if any (see
+// ApplyOptions.SupersededSlug). Enforcing them up front keeps an invalid spec out
 // of the store; otherwise it would poison deriveRoutes and fail every later
 // reconcile on the host. A request with no domains is always allowed.
-func (s *Service) validateIngress(ctx context.Context, host string, req ApplyRequest, tmpl store.Template) error {
+func (s *Service) validateIngress(ctx context.Context, host string, req ApplyRequest, tmpl store.Template, opts ApplyOptions) error {
 	if len(req.Domains) == 0 {
 		return nil
 	}
@@ -258,8 +306,10 @@ func (s *Service) validateIngress(ctx context.Context, host string, req ApplyReq
 		want[d] = true
 	}
 	for _, k := range keys {
-		if k.Template == req.Template && k.Slug == req.Slug {
-			continue // the instance being (re)applied — its own domains don't conflict
+		if k.Template == req.Template && (k.Slug == req.Slug || k.Slug == opts.SupersededSlug) {
+			// The instance being (re)applied, or the one it supersedes (rename):
+			// neither holds a domain against it.
+			continue
 		}
 		other, err := s.store.GetSpec(ctx, host, k.Template, k.Slug)
 		if err != nil {
@@ -268,6 +318,230 @@ func (s *Service) validateIngress(ctx context.Context, host string, req ApplyReq
 		for _, d := range other.Domains {
 			if want[d] {
 				return fmt.Errorf("ingress: domain %q already claimed by %s/%s on %s", d, k.Template, k.Slug, host)
+			}
+		}
+	}
+	return nil
+}
+
+// netClaim is one instance's claim on shared-network DNS names: which networks
+// its pod joins and, for each, the names it answers to on that network.
+type netClaim struct {
+	template string
+	slug     string
+	joins    []render.Network
+}
+
+// names returns every DNS name the claim registers on network net: the pod's own
+// podman DNS name plus the template's declared aliases. It reports false when
+// the claim does not join that network at all.
+//
+// NOTE this is the set the daemon KNOWS about, not everything podman registers.
+// kube play additionally aliases each pod by the container names in its YAML
+// (podman 5.8.2, pkg/domain/infra/abi/play.go: "Add the original container names
+// from the kube yaml as aliases"), which the daemon cannot see without rendering
+// every peer's body. Container-name collisions are therefore NOT caught here —
+// see the wiki's shared-networks section and #272.
+func (c netClaim) names(net string) ([]string, bool) {
+	for _, j := range c.joins {
+		if j.Name != net {
+			continue
+		}
+		out := make([]string, 0, len(j.Aliases)+1)
+		out = append(out, podName(c.template, c.slug))
+		out = append(out, j.Aliases...)
+		return out, true
+	}
+	return nil, false
+}
+
+// firstNameConflictFor returns the first DNS name on which subject collides with
+// one of peers, or nil if subject's names are all free.
+//
+// Podman does not police this: two pods claiming "mariadb" on frappe-shared both
+// register, and resolution picks one arbitrarily. That failure is silent and
+// looks like an application bug, so the daemon refuses to create it — the same
+// way validateIngress refuses a domain already claimed.
+//
+// Both directions of clash are caught, because a name can be claimed two ways:
+//
+//   - alias vs alias — the common case. Note aliases come from the TEMPLATE, so
+//     this necessarily forbids a second instance of an aliased template on the
+//     same host and network. That is the intended reading of "the database on
+//     this network": one instance answers to it.
+//   - alias vs pod DNS name — an alias equal to another instance's
+//     "<template>-<slug>" would shadow that instance, and a new instance whose
+//     pod name collides with an existing alias would be shadowed by it.
+//
+// It is deliberately SUBJECT-SCOPED, not "is this host conflict-free": a clash
+// between two OTHER instances is not this subject's problem, and reporting it
+// here would block every unrelated deploy on the host until someone cleaned it
+// up. That state is reachable and transient by design — rename holds the old and
+// new spec simultaneously for up to verifyTimeout — so a host-wide reading would
+// fail unrelated applies for minutes at a time, on any network, and would also
+// contradict converge, which tolerates the same state and merely warns
+// (#269 re-review finding 1).
+//
+// It is pure, so the three callers that must agree — apply
+// (validateNetworkAliases), template edit (checkTemplateNetworkConflicts) and
+// boot converge (warnOnNetworkNameConflict) — cannot drift on what counts as a
+// conflict.
+func firstNameConflictFor(subject netClaim, peers []netClaim) error {
+	for _, j := range subject.joins {
+		mine, _ := subject.names(j.Name)
+		claimed := make(map[string]struct{}, len(mine))
+		for _, n := range mine {
+			claimed[n] = struct{}{}
+		}
+		for _, p := range peers {
+			theirs, joined := p.names(j.Name)
+			if !joined {
+				continue
+			}
+			for _, n := range theirs {
+				if _, clash := claimed[n]; clash {
+					return fmt.Errorf("networks: DNS name %q on network %q is claimed by both %s/%s and %s/%s",
+						n, j.Name, subject.template, subject.slug, p.template, p.slug)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// hostClaims builds the DNS-name claims of every instance on host. metaFor lets
+// a caller substitute a template's meta — the template-edit check asks "what
+// would the claims be if this edit landed" without persisting it first.
+//
+// It reads no specs: SpecKey carries template+slug, which is all a pod name and
+// (via the template) an alias set needs. Templates are cached, so a host of N
+// instances costs one ListSpecKeys plus one GetTemplate per DISTINCT template.
+//
+// An instance whose template is gone is skipped: its pod's membership is
+// unknowable from here, and a lingering orphan must not block every apply.
+func (s *Service) hostClaims(ctx context.Context, host string, metaFor map[string]render.Meta) ([]netClaim, error) {
+	keys, err := s.store.ListSpecKeys(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	cache := make(map[string]render.Meta, len(metaFor))
+	maps.Copy(cache, metaFor)
+	out := make([]netClaim, 0, len(keys))
+	for _, k := range keys {
+		meta, ok := cache[k.Template]
+		if !ok {
+			t, err := s.store.GetTemplate(ctx, k.Template)
+			if errors.Is(err, store.ErrNotFound) {
+				continue
+			}
+			if err != nil {
+				return nil, err
+			}
+			meta = t.Meta
+			cache[k.Template] = meta
+		}
+		out = append(out, netClaim{template: k.Template, slug: k.Slug, joins: s.joinNetworks(meta)})
+	}
+	return out, nil
+}
+
+// validateNetworkAliases refuses an apply whose pod would answer to a DNS name
+// another instance on the host already claims on a shared network, BEFORE the
+// pod is played or the spec is persisted (#269) — the same "keep the invalid
+// state out of the store" reasoning validateIngress applies to domains.
+//
+// Peers are measured against their template's CURRENT meta, which is what the
+// next reconcile will play them with, not necessarily what they are running now
+// — the same divergence networksChanged warns about at edit time.
+//
+// opts.SupersededSlug names an instance being replaced by this apply (rename),
+// whose claims are therefore about to be released; see ApplyOptions.
+func (s *Service) validateNetworkAliases(ctx context.Context, host string, req ApplyRequest, tmpl store.Template, opts ApplyOptions) error {
+	mine := netClaim{template: req.Template, slug: req.Slug, joins: s.joinNetworks(tmpl.Meta)}
+	if len(mine.joins) == 0 {
+		return nil
+	}
+	peers, err := s.hostClaims(ctx, host, map[string]render.Meta{req.Template: tmpl.Meta})
+	if err != nil {
+		return fmt.Errorf("networks: check alias uniqueness on %s: %w", host, err)
+	}
+	if err := firstNameConflictFor(mine, excluding(peers, req.Template, req.Slug, opts.SupersededSlug)); err != nil {
+		return fmt.Errorf("%w on %s", err, host)
+	}
+	return nil
+}
+
+// excluding drops the named instances of tmpl from claims: the instance being
+// applied (it does not conflict with itself) and, when set, the one it
+// supersedes. An empty slug matches nothing.
+func excluding(claims []netClaim, tmpl string, slugs ...string) []netClaim {
+	out := make([]netClaim, 0, len(claims))
+	for _, c := range claims {
+		if c.template == tmpl && slices.Contains(slugs, c.slug) {
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// warnOnNetworkNameConflict logs when the instance about to be converged shares
+// a shared-network DNS name with another instance on the host. The boot path
+// plays it anyway — see the call site — so this is the operator's only signal
+// that two pods are answering to one name.
+//
+// Never fails the converge: a store hiccup here must not keep an instance down.
+func (s *Service) warnOnNetworkNameConflict(ctx context.Context, host, tmpl, slug string, meta render.Meta) {
+	if len(meta.Networks) == 0 {
+		return
+	}
+	// NOTE this costs a ListSpecKeys plus a GetTemplate per distinct template,
+	// per converged instance — O(N) host scans over a boot of N instances, and
+	// one log line per instance for a conflict that involves two. Cheap enough at
+	// current fleet sizes; hoist the claim set to the caller if that changes.
+	claims, err := s.hostClaims(ctx, host, map[string]render.Meta{tmpl: meta})
+	if err != nil {
+		return
+	}
+	subject := netClaim{template: tmpl, slug: slug, joins: s.joinNetworks(meta)}
+	if err := firstNameConflictFor(subject, excluding(claims, tmpl, slug)); err != nil {
+		log.Printf("WARNING: converge %s/%s on %s: %v; podman will resolve it arbitrarily", tmpl, slug, host, err)
+	}
+}
+
+// checkTemplateNetworkConflicts refuses a template edit that would make two
+// LIVE instances claim one DNS name on one network (#269 review finding 2).
+//
+// Apply-time validation alone is not enough, because an edit introduces the
+// conflict everywhere at once without going through apply: two instances of a
+// template that gains an alias would each be refused every later apply — and
+// applyLocked is also the upgrade, secret-rotation and parameter-update path, so
+// both instances become permanently un-upgradeable, each error naming the other,
+// with no in-product way out but reverting the template. Refusing the edit keeps
+// that state unreachable.
+//
+// It only inspects hosts, never podman, and only for templates that declare
+// networks — a template with none cannot introduce a conflict.
+func (s *Service) checkTemplateNetworkConflicts(ctx context.Context, t store.Template) error {
+	if len(t.Meta.Networks) == 0 {
+		return nil
+	}
+	for _, h := range s.hostsSnap() {
+		claims, err := s.hostClaims(ctx, h.ID, map[string]render.Meta{t.Meta.ID: t.Meta})
+		if err != nil {
+			// A host that cannot be read cannot be cleared either. Fail the edit
+			// rather than let a conflict through on a store blip.
+			return fmt.Errorf("networks: check alias uniqueness on %s: %w", h.ID, err)
+		}
+		// Only THIS template's instances are subjects: a pre-existing clash
+		// between two unrelated instances is not this edit's doing, and failing
+		// the edit for it would make an unrelated mess un-editable.
+		for _, c := range claims {
+			if c.template != t.Meta.ID {
+				continue
+			}
+			if err := firstNameConflictFor(c, excluding(claims, c.template, c.slug)); err != nil {
+				return fmt.Errorf("%w on %s", err, h.ID)
 			}
 		}
 	}
@@ -519,7 +793,12 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 	// rejected request never leaves a poison spec in the store — a persisted spec
 	// that violates these rules would fail every later reconcile on the host.
 	// deriveRoutes re-checks the same rules at reconcile time as a backstop.
-	if err := s.validateIngress(ctx, host, req, tmpl); err != nil {
+	if err := s.validateIngress(ctx, host, req, tmpl, opts); err != nil {
+		return err
+	}
+	// Same reasoning for shared-network DNS names (#269): a duplicate alias is
+	// silent at the podman layer, so it must be refused before the pod is played.
+	if err := s.validateNetworkAliases(ctx, host, req, tmpl, opts); err != nil {
 		return err
 	}
 
@@ -691,8 +970,14 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 	if err != nil {
 		return err
 	}
-	if len(networks) > 0 {
-		log.Printf("apply: ensured networks %v on %s", networks, host)
+	if joins := s.joinNetworks(tmpl.Meta); len(joins) > 0 {
+		// Log the network NAMES, not the join arguments: what was ensured is
+		// "frappe-shared", not "frappe-shared:alias=mariadb".
+		names := make([]string, 0, len(joins))
+		for _, j := range joins {
+			names = append(names, j.Name)
+		}
+		log.Printf("apply: ensured networks %v on %s", names, host)
 	}
 	log.Printf("apply: play kube on %s", host)
 	if err := s.client.PlayKube(ctx, host, yaml, opts.Replace, networks...); err != nil {

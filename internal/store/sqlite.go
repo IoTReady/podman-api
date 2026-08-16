@@ -1249,7 +1249,10 @@ func scanTemplate(sc rowScanner) (Template, error) {
 	}
 	var meta render.Meta
 	if err := json.Unmarshal([]byte(metaJSON), &meta); err != nil {
-		return Template{}, err
+		// Name the row: ListTemplates aborts on the first bad one, so an
+		// unqualified decode error reads as "templates are broken" rather than
+		// "template %q is", and the operator has nothing to re-register.
+		return Template{}, fmt.Errorf("template %q: decode meta: %w", id, err)
 	}
 	return Template{
 		Meta:    meta,

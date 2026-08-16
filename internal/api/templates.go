@@ -44,7 +44,7 @@ type templateBody struct {
 	Secrets    render.Secrets    `json:"secrets"`
 	Volumes    []render.Volume   `json:"volumes"`
 	Ingress    *render.Ingress   `json:"ingress"`
-	Networks   []string          `json:"networks"`
+	Networks   []render.Network  `json:"networks"`
 	PreBackup  *render.PreBackup `json:"pre_backup"`
 	Origin     string            `json:"origin,omitempty"`
 	Created    time.Time         `json:"created,omitempty"`

@@ -464,21 +464,44 @@ func TestCloneTemplate_TimestampsNonZero(t *testing.T) {
 }
 
 func TestNetworksChanged(t *testing.T) {
+	nets := func(names ...string) []render.Network {
+		out := make([]render.Network, 0, len(names))
+		for _, n := range names {
+			out = append(out, render.Network{Name: n})
+		}
+		return out
+	}
 	cases := []struct {
 		name     string
-		old, new []string
+		old, new []render.Network
 		want     bool
 	}{
 		{"none-to-none", nil, nil, false},
-		{"unchanged", []string{"a", "b"}, []string{"a", "b"}, false},
+		{"unchanged", nets("a", "b"), nets("a", "b"), false},
 		// Order is not meaningful — the pod joins the same set either way, so a
 		// reordered declaration must not warn about a change that isn't one.
-		{"reordered", []string{"a", "b"}, []string{"b", "a"}, false},
+		{"reordered", nets("a", "b"), nets("b", "a"), false},
 		// Both directions warn: a removed network leaves live instances still
 		// attached, an added one leaves them still detached, until reconcile.
-		{"added", nil, []string{"a"}, true},
-		{"removed", []string{"a"}, nil, true},
-		{"swapped", []string{"a"}, []string{"b"}, true},
+		{"added", nil, nets("a"), true},
+		{"removed", nets("a"), nil, true},
+		{"swapped", nets("a"), nets("b"), true},
+		// Aliases are part of the set: peers keep resolving the old name until
+		// the instance reconciles, so an edited alias list warns too (#269).
+		{
+			"aliases unchanged",
+			[]render.Network{{Name: "a", Aliases: []string{"x", "y"}}},
+			[]render.Network{{Name: "a", Aliases: []string{"y", "x"}}},
+			false,
+		},
+		{"alias added", nets("a"), []render.Network{{Name: "a", Aliases: []string{"x"}}}, true},
+		{"alias removed", []render.Network{{Name: "a", Aliases: []string{"x"}}}, nets("a"), true},
+		{
+			"alias renamed",
+			[]render.Network{{Name: "a", Aliases: []string{"x"}}},
+			[]render.Network{{Name: "a", Aliases: []string{"z"}}},
+			true,
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -495,7 +518,7 @@ func TestNetworksChanged(t *testing.T) {
 // instance of the template. (#243)
 func TestValidateTemplate_rejectsBadNetworkName(t *testing.T) {
 	tpl := webTemplate()
-	tpl.Meta.Networks = []string{"Not_Valid"}
+	tpl.Meta.Networks = []render.Network{{Name: "Not_Valid"}}
 	err := ValidateTemplate(tpl)
 	if err == nil || !errors.Is(err, ErrInvalidTemplate) {
 		t.Fatalf("want ErrInvalidTemplate, got %v", err)
@@ -504,6 +527,6 @@ func TestValidateTemplate_rejectsBadNetworkName(t *testing.T) {
 
 func TestValidateTemplate_acceptsNetworks(t *testing.T) {
 	tpl := webTemplate()
-	tpl.Meta.Networks = []string{"frappe-shared"}
+	tpl.Meta.Networks = []render.Network{{Name: "frappe-shared"}}
 	require.NoError(t, ValidateTemplate(tpl))
 }

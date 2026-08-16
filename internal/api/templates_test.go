@@ -366,9 +366,21 @@ func TestTemplateWriteRejectsReadOnlyKey(t *testing.T) {
 // ingress and pre_backup — and must accept it back on a create/update, or the
 // standard GET-edit-PUT round trip silently drops the declaration. (#243)
 func TestTemplateJSON_RoundTripsNetworks(t *testing.T) {
-	tpl := store.Template{Meta: render.Meta{ID: "db", Networks: []string{"frappe-shared"}}}
-	require.Equal(t, []string{"frappe-shared"}, templateJSON(tpl)["networks"])
+	tpl := store.Template{Meta: render.Meta{ID: "db", Networks: []render.Network{{Name: "frappe-shared"}}}}
+	require.Equal(t, []render.Network{{Name: "frappe-shared"}}, templateJSON(tpl)["networks"])
 
-	body := templateBody{Networks: []string{"frappe-shared"}}
-	require.Equal(t, []string{"frappe-shared"}, body.toTemplate("db").Meta.Networks)
+	body := templateBody{Networks: []render.Network{{Name: "frappe-shared"}}}
+	require.Equal(t, []render.Network{{Name: "frappe-shared"}}, body.toTemplate("db").Meta.Networks)
+}
+
+// Aliases must survive the same round trip: a UI that GETs a template, edits an
+// unrelated field and PUTs it back must not silently strip the DNS names its
+// peers resolve. (#269)
+func TestTemplateJSON_RoundTripsNetworkAliases(t *testing.T) {
+	nets := []render.Network{{Name: "frappe-shared", Aliases: []string{"mariadb", "db"}}}
+	tpl := store.Template{Meta: render.Meta{ID: "db", Networks: nets}}
+	require.Equal(t, nets, templateJSON(tpl)["networks"])
+
+	body := templateBody{Networks: nets}
+	require.Equal(t, nets, body.toTemplate("db").Meta.Networks)
 }

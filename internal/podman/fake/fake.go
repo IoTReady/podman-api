@@ -282,7 +282,12 @@ func (f *Fake) PlayKube(_ context.Context, hostID, raw string, replace bool, net
 	// Model real podman: a pod cannot join a network that does not exist, so the
 	// network must have been created (NetworkEnsure) first. This lets unit tests
 	// catch ordering bugs where an app pod is played before its network exists.
-	for _, n := range networks {
+	for _, spec := range networks {
+		// A join argument may carry per-network options — "name:alias=db"
+		// (#269) — which podman parses off before looking the network up. Model
+		// the same split, or every aliased join would look like a missing
+		// network here.
+		n, _, _ := strings.Cut(spec, ":")
 		if !f.networkEnsuredLocked(hostID, n) {
 			return fmt.Errorf("unable to find network with name or ID %s: network not found", n)
 		}

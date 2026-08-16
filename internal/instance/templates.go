@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -85,6 +86,15 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 		return gerr
 	}
 	t.Origin = existing.Origin
+
+	// An alias edit is not just informational: unlike ingress, it can make two
+	// LIVE instances claim one DNS name, wedging both against every later apply.
+	// Refuse rather than warn (#269).
+	if networksChanged(existing.Meta.Networks, t.Meta.Networks) {
+		if err := s.checkTemplateNetworkConflicts(ctx, t); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
+		}
+	}
 
 	// Edit-time signal: if this edit removes or changes the ingress declaration
 	// while instances still reference the template, those instances' routes will
@@ -176,26 +186,33 @@ func ingressChanged(old, new *render.Ingress) bool {
 }
 
 // networksChanged reports whether a template's shared-network set differs
-// between two revisions. Order is not compared: the pod joins the same set
+// between two revisions. Order is not compared — neither of networks nor of a
+// network's aliases: the pod joins the same set and answers to the same names
 // either way, so a reordered declaration is not a change. Comparing by length
 // plus membership is exact here because ValidateNetworks rejects a list that
-// declares the same network twice.
+// declares the same network (or the same alias within one) twice.
 //
 // Unlike ingressChanged, BOTH directions matter. A removed network leaves live
-// instances still attached to it; an added one leaves them still detached. Each
-// is a divergence between what the template says and what is running, and
-// neither resolves until the instance's next reconcile.
-func networksChanged(old, new []string) bool {
+// instances still attached to it; an added one leaves them still detached. An
+// edited alias set is the same kind of divergence: peers resolving the old name
+// keep resolving it until the instance's next reconcile (#269).
+func networksChanged(old, new []render.Network) bool {
 	if len(old) != len(new) {
 		return true
 	}
-	set := make(map[string]struct{}, len(old))
+	set := make(map[string][]string, len(old))
 	for _, n := range old {
-		set[n] = struct{}{}
+		set[n.Name] = n.Aliases
 	}
 	for _, n := range new {
-		if _, ok := set[n]; !ok {
+		was, ok := set[n.Name]
+		if !ok || len(was) != len(n.Aliases) {
 			return true
+		}
+		for _, a := range n.Aliases {
+			if !slices.Contains(was, a) {
+				return true
+			}
 		}
 	}
 	return false
