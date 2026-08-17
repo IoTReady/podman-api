@@ -50,7 +50,7 @@ func stubReal(t *testing.T, probe func(context.Context) (string, error)) *Real {
 	r, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}})
 	require.NoError(t, err)
 	// Pre-seed before any concurrent use; no lock needed.
-	r.ctx["h1"] = context.Background()
+	r.ctx["h1"] = &connEntry{ctx: context.Background()}
 	r.versionProbe = probe
 	return r
 }
@@ -147,8 +147,8 @@ func TestPreflight_AggregatesAllOldHosts(t *testing.T) {
 	})
 	require.NoError(t, err)
 	// Pre-seed both connection contexts so ctxFor does not dial.
-	r.ctx["h1"] = context.Background()
-	r.ctx["h2"] = context.Background()
+	r.ctx["h1"] = &connEntry{ctx: context.Background()}
+	r.ctx["h2"] = &connEntry{ctx: context.Background()}
 	r.versionProbe = func(context.Context) (string, error) { return "5.4.2", nil }
 
 	err = r.Preflight(context.Background())

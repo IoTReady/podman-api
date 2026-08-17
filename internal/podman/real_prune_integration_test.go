@@ -70,7 +70,7 @@ func TestReal_VolumePrune_ProtectLabel_LocalOnly(t *testing.T) {
 	c, err := NewReal([]config.Host{{ID: "local", Addr: "unix", Socket: sock}})
 	require.NoError(t, err)
 	ctx := context.Background()
-	conn, err := c.ctxFor(ctx, "local")
+	conn, err := c.ctxFor("local")
 	require.NoError(t, err)
 
 	const plain = "podman-api-itest-prune-vol-plain"
@@ -133,7 +133,7 @@ func TestReal_Prune_HostWide_LocalOnly(t *testing.T) {
 	c, err := NewReal([]config.Host{{ID: "local", Addr: "unix", Socket: sock}})
 	require.NoError(t, err)
 	ctx := context.Background()
-	conn, err := c.ctxFor(ctx, "local")
+	conn, err := c.ctxFor("local")
 	require.NoError(t, err)
 
 	const img = "docker.io/library/alpine:latest"

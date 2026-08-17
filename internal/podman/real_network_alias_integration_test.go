@@ -31,9 +31,9 @@ spec:
 
 // aliasProbeYAML is a one-shot pod that resolves a name and exits with the
 // result. Resolution is asserted through the pod's EXIT CODE rather than an
-// exec, because ContainerExec panics against a real host (#273) — and a probe
-// pod is the more honest test anyway: it exercises the same DNS path a real
-// peer container would use, with no attach/upgrade machinery in between.
+// exec: a probe pod exercises the same DNS path a real peer container would
+// use, with no attach/upgrade machinery in between. (It also predates the #273
+// fix, when ContainerExec still panicked against a real host.)
 func aliasProbeYAML(name, host string) string {
 	return fmt.Sprintf(`
 apiVersion: v1

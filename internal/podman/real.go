@@ -9,11 +9,13 @@ import (
 	"io"
 	"log"
 	"math"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/containers/podman/v5/libpod/define"
@@ -48,8 +50,8 @@ type Real struct {
 	hosts map[string]config.Host
 
 	mu       sync.Mutex
-	ctx      map[string]context.Context // hostID -> connection-bearing ctx
-	verified map[string]bool            // hostID -> passed the MinPodmanVersion check
+	ctx      map[string]*connEntry // hostID -> cached connection
+	verified map[string]bool       // hostID -> passed the MinPodmanVersion check
 	// sshPool caches one live SSH client per host for the /proc side channels
 	// (loadavg, uptime, net ports), which libpod does not serve. See
 	// ssh_pool.go: the handshake it removes was ~2.9s per read (#258).
@@ -62,6 +64,15 @@ type Real struct {
 	// so a burst arriving after the TTL lapses costs one round trip and not one
 	// each.
 	loadGate map[string]chan struct{}
+	// execCtx is the exec-only connection per host. See execEntryFor: podman's
+	// attaching exec takes over the connection it runs on, so it gets one that
+	// nothing else uses.
+	execCtx map[string]*connEntry
+	// execGate serialises exec per host. See ContainerExec: podman's
+	// newUpgradeRequest mutates shared state on the connection, and says so
+	// itself ("FIXME: This is one giant race condition"). A one-slot channel
+	// rather than a sync.Mutex because the wait for it must be cancellable.
+	execGate map[string]chan struct{}
 
 	// hooks is nil in production. It exists because the reload races this file
 	// guards against cannot be interleaved from outside — they live between a
@@ -73,6 +84,23 @@ type Real struct {
 	// versionProbe overrides the version lookup in tests; nil means
 	// system.Info over the supplied connection ctx.
 	versionProbe func(context.Context) (string, error)
+}
+
+// connEntry is one cached libpod connection: the connection-bearing context
+// bindings hands back, plus the transport wireInvalidation installed on it.
+//
+// The transport is recorded here rather than read back off the connection when
+// it is needed, because it is not always there to read: podman's exec replaces
+// conn.Client.Transport for the whole duration of an exec (attach.go:611), so a
+// close that reads the field mid-exec closes podman's throwaway and leaves the
+// hooked transport's pooled sockets — and net/http's read and write goroutine
+// per socket — alive with nothing left holding a reference to them. Reading it
+// there would also race newUpgradeRequest's unsynchronised write. A nil hooked
+// means wireInvalidation found no *http.Transport to hook, in which case there
+// is nothing of ours to close either.
+type connEntry struct {
+	ctx    context.Context
+	hooked *http.Transport
 }
 
 // testHooks is the test-only seam described on Real.hooks.
@@ -101,11 +129,13 @@ type testHooks struct {
 func NewReal(hosts []config.Host) (*Real, error) {
 	r := &Real{
 		hosts:    map[string]config.Host{},
-		ctx:      map[string]context.Context{},
+		ctx:      map[string]*connEntry{},
 		verified: map[string]bool{},
 		sshPool:  map[string]*sshPoolEntry{},
 		loadavg:  map[string]loadSample{},
 		loadGate: map[string]chan struct{}{},
+		execCtx:  map[string]*connEntry{},
+		execGate: map[string]chan struct{}{},
 	}
 	for _, h := range hosts {
 		if h.ID == "" {
@@ -142,34 +172,62 @@ func (r *Real) SetHosts(hosts []config.Host) {
 		}
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// Remove hosts that were deleted.
-	for id := range r.hosts {
-		if _, keep := newMap[id]; !keep {
-			delete(r.hosts, id)
-			delete(r.ctx, id)
-			delete(r.verified, id)
-			delete(r.loadavg, id)
-			delete(r.loadGate, id)
-			r.dropSSHLocked(id)
+	// Connections dropped below are collected rather than closed inline: the
+	// same invariant invalidateConn states applies here — nothing else holds a
+	// dropped connection, so its pooled sockets and their per-socket goroutines
+	// would live for the process lifetime — but closing them is I/O and must
+	// not happen under r.mu. The locked section is a closure so the unlock stays
+	// a defer: a panic inside it (dropSSHLocked is the only non-trivial call)
+	// would otherwise leave r.mu held for the process lifetime, wedging every
+	// host operation rather than failing one reload.
+	dropped := func() []*connEntry {
+		var dropped []*connEntry
+		drop := func(id string) {
+			if e, ok := r.ctx[id]; ok {
+				dropped = append(dropped, e)
+				delete(r.ctx, id)
+			}
+			if e, ok := r.execCtx[id]; ok {
+				dropped = append(dropped, e)
+				delete(r.execCtx, id)
+			}
 		}
-	}
 
-	// Add or update hosts.
-	for id, h := range newMap {
-		if old, exists := r.hosts[id]; exists && !hostConnEq(old, h) {
-			// Connection params changed: invalidate cached state. The pooled
-			// SSH client and the cached loadavg go too — they describe the old
-			// endpoint, and a sample from it must not be served as the new
-			// host's.
-			delete(r.ctx, id)
-			delete(r.verified, id)
-			delete(r.loadavg, id)
-			r.dropSSHLocked(id)
+		r.mu.Lock()
+		defer r.mu.Unlock()
+
+		// Remove hosts that were deleted.
+		for id := range r.hosts {
+			if _, keep := newMap[id]; !keep {
+				delete(r.hosts, id)
+				drop(id)
+				delete(r.verified, id)
+				delete(r.loadavg, id)
+				delete(r.loadGate, id)
+				delete(r.execGate, id)
+				r.dropSSHLocked(id)
+			}
 		}
-		r.hosts[id] = h
+
+		// Add or update hosts.
+		for id, h := range newMap {
+			if old, exists := r.hosts[id]; exists && !hostConnEq(old, h) {
+				// Connection params changed: invalidate cached state. The
+				// pooled SSH client and the cached loadavg go too — they
+				// describe the old endpoint, and a sample from it must not be
+				// served as the new host's.
+				drop(id)
+				delete(r.verified, id)
+				delete(r.loadavg, id)
+				r.dropSSHLocked(id)
+			}
+			r.hosts[id] = h
+		}
+		return dropped
+	}()
+
+	for _, e := range dropped {
+		e.closeIdleConns()
 	}
 }
 
@@ -203,10 +261,63 @@ func (r *Real) uriForLocked(id string) (string, error) {
 // on first use. The connection context is rooted at context.Background() so
 // it outlives any individual request context — per-request cancellation must
 // not kill the cached long-lived connection.
-func (r *Real) ctxFor(parent context.Context, id string) (context.Context, error) {
+//
+// It deliberately takes no caller context. It used to take one and ignore it,
+// which read as if the caller's deadline bounded the dial; it does not, and
+// cannot — see connFor.
+func (r *Real) ctxFor(id string) (context.Context, error) {
+	e, err := r.entryFor(id)
+	if err != nil {
+		return nil, err
+	}
+	return e.ctx, nil
+}
+
+// entryFor is ctxFor for callers that also need the connection itself — the
+// ones that can evict it (callCtx) and so must be able to close exactly what
+// they dropped.
+func (r *Real) entryFor(id string) (*connEntry, error) {
+	return r.connFor(id, r.ctx, r.invalidateConn)
+}
+
+// execEntryFor is entryFor for the exec-only connection: a second cached
+// connection per host, used by nothing but ContainerExec.
+//
+// It exists because podman's attaching exec is not a guest on the connection
+// it runs over, it takes it over: newUpgradeRequest replaces
+// conn.Client.Transport with one of its own for the whole duration of the exec
+// (attach.go:611) and never puts it back. On a shared connection that is both
+// an unsynchronised write against every concurrent PodList/Ping/health poll on
+// that host, and a leak — a request that lands on podman's temporary transport
+// parks its keep-alive socket in a pool with IdleConnTimeout: 0 that becomes
+// unreachable as soon as the transport is swapped back. Serialising exec
+// against exec (execLock) cannot close either; only a connection nothing else
+// touches can.
+//
+// The cost is one extra connection per host that has ever run an exec —
+// pre_backup hooks and registry blob GC — kept for the same lifetime as the
+// primary one.
+func (r *Real) execEntryFor(id string) (*connEntry, error) {
+	return r.connFor(id, r.execCtx, r.invalidateExecConn)
+}
+
+// connFor is the shared body of entryFor and execEntryFor: return the cached
+// connection from cache, or dial, wire invalidation, and cache one. invalidate
+// is how a transport failure on this connection drops it from that same cache.
+//
+// It takes no caller context, because there is none it could honour: the dial
+// is bindings.NewConnection, whose SSH path (bindings/connection.go sshClient)
+// calls ssh.Dial with no context and no deadline of its own, and the context it
+// does take becomes the *connection's* lifetime — which must outlive any one
+// request. So the dial is unbounded, and it runs under r.mu: a blackholed host
+// (SYN dropped rather than refused) parks every operation on every host behind
+// it until the kernel's TCP timeout. Callers cannot shorten that, and the
+// signature no longer suggests they can. Bounding it properly means dialing off
+// the lock — a larger change than #273, tracked in #277.
+func (r *Real) connFor(id string, cache map[string]*connEntry, invalidate invalidator) (*connEntry, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if c, ok := r.ctx[id]; ok {
+	if c, ok := cache[id]; ok {
 		return c, nil
 	}
 	h, ok := r.hosts[id]
@@ -234,94 +345,310 @@ func (r *Real) ctxFor(parent context.Context, id string) (context.Context, error
 	if err != nil {
 		return nil, fmt.Errorf("connect to host %q: %w", id, err)
 	}
-	r.wireInvalidation(c, id)
-	r.ctx[id] = c
-	return c, nil
+	e := &connEntry{ctx: c}
+	r.wireInvalidation(e, id, invalidate)
+	cache[id] = e
+	return e, nil
 }
 
-// wireInvalidation wraps c's underlying HTTP transport so a transport-level
+// wireInvalidation hooks c's underlying HTTP transport so a transport-level
 // failure evicts the cached connection instead of being replayed on every
 // later call to id forever (#252).
 //
-// This is the only hook point that works for every operation method without
-// touching each of their ~30 call sites individually: the bindings library
-// stores one *http.Client on the connection context, and every PodList,
-// ContainerExec, HostInfo, etc. call funnels through it. A RoundTrip error is
-// always a transport failure — dial refused, connection reset, read timeout
-// on a wedged host — never an application error (a 404 or 409 comes back as
-// a normal *http.Response with a non-2xx status and a nil error), so
-// connBroken's classification applies unchanged.
+// The hook goes *below* the RoundTripper, on the transport's dialer, rather
+// than around it. Wrapping conn.Client.Transport in a custom RoundTripper is
+// the obvious shape and was the original one, but it panics the daemon (#273):
+// podman's newUpgradeRequest — reached by every ExecStartAndAttach, i.e. every
+// attaching exec — does
 //
-// Best-effort: if the bindings package ever changes shape so GetClient or
-// Client is unavailable here, this silently does nothing rather than failing
-// the connection it was meant to protect.
-func (r *Real) wireInvalidation(c context.Context, id string) {
-	conn, err := bindings.GetClient(c)
+//	conn.Client.Transport.(*http.Transport).DialContext
+//
+// with no comma-ok, so anything but a real *http.Transport there is a panic,
+// not an error. Wrapping DialContext keeps the concrete type podman asserts on
+// while still seeing every byte of every request: the ~30 operation methods
+// route through this one *http.Client, and exec's hijacked connection is
+// dialed by this very DialContext, so it is covered too.
+//
+// A read/write error on the connection is always a transport failure — dial
+// refused, connection reset, read timeout on a wedged host — never an
+// application error (a 404 or 409 arrives as a normal HTTP response over a
+// perfectly healthy socket), so connBroken's classification applies unchanged.
+// The complementary wedge signal — a call that hangs until its own callTimeout
+// fires, with no error ever surfacing at the socket — is caught by
+// opCtxForTimeout instead; see the comment there.
+//
+// The hook is installed on a *clone*, not on the transport bindings built:
+// bindings.NewConnection pings the host as part of connecting, so by the time
+// this runs the original transport has already served a request and may hold
+// an idle connection with live read/write goroutines — and http.Transport
+// documents that its fields must not be modified after first use. The clone
+// starts empty, so the original's now-orphaned idle connection is closed
+// rather than stranded.
+//
+// Best-effort: if the bindings package ever changes shape so GetClient, Client
+// or the *http.Transport is unavailable here, this silently does nothing
+// rather than failing (or panicking) the connection it was meant to protect.
+func (r *Real) wireInvalidation(e *connEntry, id string, invalidate invalidator) {
+	conn, err := bindings.GetClient(e.ctx)
 	if err != nil || conn == nil || conn.Client == nil {
 		return
 	}
-	next := conn.Client.Transport
-	if next == nil {
-		next = http.DefaultTransport
+	tr, ok := conn.Client.Transport.(*http.Transport)
+	if !ok || tr == nil {
+		return
 	}
-	conn.Client.Transport = &invalidatingTransport{
-		next: next,
-		onBroken: func() {
-			r.invalidateConn(id, c)
-		},
+	dial := tr.DialContext
+	if dial == nil {
+		var d net.Dialer
+		dial = d.DialContext
+	}
+	hooked := tr.Clone()
+	// Invalidation runs on its own goroutine, never inline. report is called
+	// from net/http's per-connection readLoop/writeLoop, and eviction needs
+	// r.mu — which connFor holds across a whole bindings.NewConnection, an SSH
+	// handshake plus a ping. Evicting inline would park that readLoop behind an
+	// unrelated host's dial, hanging every in-flight request on a healthy
+	// connection until its own callTimeout. The identity check inside the
+	// invalidators already makes a late eviction safe.
+	onBroken := func() { go invalidate(id, e) }
+	hooked.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		nc, err := dial(ctx, network, addr)
+		if err != nil {
+			// A dial that fails is the clearest possible statement that the
+			// cached connection is no longer usable: for the SSH transport the
+			// dialer rides the multiplexed SSH client, so a refused dial means
+			// that client is gone, not merely that one socket was unlucky.
+			if connBroken(err) {
+				onBroken()
+			}
+			return nil, err
+		}
+		return newInvalidatingConn(nc, onBroken), nil
+	}
+	conn.Client.Transport = hooked
+	// Recorded on the entry so every close site has it without reading the
+	// field back off the connection; see connEntry.
+	e.hooked = hooked
+	tr.CloseIdleConnections()
+}
+
+// closeWriter is podman's CloseWriter (bindings/containers/attach.go): the
+// interface it probes the dialed connection for to half-close STDIN on an
+// attached exec. Redeclared rather than imported because it is unexported
+// there.
+type closeWriter interface {
+	CloseWrite() error
+}
+
+// newInvalidatingConn wraps nc so its failures reach onBroken, preserving
+// whether the connection can half-close. Two shapes, not one interface check
+// inside a single type: podman decides with a `conn.(CloseWriter)` assertion,
+// so a wrapper that always declares CloseWrite would claim the ability on
+// transports that lack it, and one that never declares it would hide the
+// ability on transports (the local unix socket, TCP) that have it — silently
+// skipping the STDIN half-close that tells an exec's command its input ended.
+func newInvalidatingConn(nc net.Conn, onBroken func()) net.Conn {
+	c := &invalidatingConn{Conn: nc, onBroken: onBroken}
+	if cw, ok := nc.(closeWriter); ok {
+		return &invalidatingCloseWriteConn{invalidatingConn: c, cw: cw}
+	}
+	return c
+}
+
+// invalidatingCloseWriteConn is invalidatingConn plus the pass-through
+// CloseWrite of an underlying connection that supports one.
+type invalidatingCloseWriteConn struct {
+	*invalidatingConn
+	cw closeWriter
+}
+
+func (c *invalidatingCloseWriteConn) CloseWrite() error {
+	err := c.cw.CloseWrite()
+	c.report(err)
+	return err
+}
+
+// execGateFor returns the one-slot channel serialising exec on a host, creating
+// it on first use. Exec cannot run concurrently on one connection: podman's
+// newUpgradeRequest reads and writes conn.Client.Transport unsynchronised and
+// stashes the dialed socket in a closure variable on the way (podman v5.8.2
+// attach.go:566 — "FIXME: This is one giant race condition"), so two execs in
+// flight at once on the same host can cross-wire, one's closeWrite
+// half-closing the other's socket. Two instances' pre_backup hooks, or a hook
+// alongside a registry blob GC, are exactly that pairing.
+//
+// The cost is a real one, and it crosses instances: the gate is per *host*, so
+// one instance's pre_backup database dump legitimately holding it for the full
+// callTimeout (10 minutes) blocks every other exec on that host — the registry
+// blob GC, every other instance's pre_backup — for that long. The wait carries
+// no deadline of its own (the per-call clock only starts once the turn is won),
+// so with k execs queued the tail waits up to k × callTimeout, and a caller
+// whose context has no deadline of its own — a job-rooted one — waits all of
+// it. Nothing here bounds that; it is bounded only by how long the commands
+// operators put in exec hooks actually run.
+//
+// That ceiling is the price of correctness, not an oversight: the alternative
+// is silently crossed streams. But it is why this is a channel and not a
+// sync.Mutex — a caller that has given up (a cancelled request, a cancelled
+// job, a daemon shutting down) must be able to leave the queue, and
+// sync.Mutex.Lock cannot be abandoned. Lifting the ceiling means dialing a
+// connection per exec instead of caching one per host, which is a bigger change
+// than #273 and is tracked in #278.
+//
+// The host is re-checked here rather than trusted from the caller's earlier
+// validation: that validation released r.mu, and SetHosts only ever iterates
+// r.hosts to clean r.execGate up. Minting a channel for an id it will never
+// iterate over would leak one per add/remove cycle for the process lifetime.
+func (r *Real) execGateFor(id string) (chan struct{}, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.hosts[id]; !ok {
+		return nil, fmt.Errorf("unknown host %q", id)
+	}
+	g, ok := r.execGate[id]
+	if !ok {
+		g = make(chan struct{}, 1)
+		r.execGate[id] = g
+	}
+	return g, nil
+}
+
+// restoreTransport returns a func that puts e's hooked transport back on the
+// connection. podman's newUpgradeRequest does not borrow the
+// transport, it replaces it: it builds its own and assigns
+// conn.Client.Transport = t permanently (attach.go:611). Without this, the
+// first exec strands the transport wireInvalidation installed — idle conns and
+// their goroutines included, with IdleConnTimeout: 0 on the replacement so
+// nothing reaps them — the invalidation hook survives only by accident of the
+// replacement's DialContext closing over ours, and each further exec clones
+// one layer deeper off whatever podman left. This daemon execs on every
+// pre_backup hook and every blob GC, so it accumulates for the process
+// lifetime. The replacement also silently drops what bindings had configured
+// (DisableCompression, among others).
+//
+// What goes back is e.hooked, recorded when it was installed — not the field
+// read back off the connection, for the reason connEntry gives: the field is
+// not reliably ours to read (podman writes it unsynchronised, and mid-exec it
+// holds podman's throwaway), and restoring a value read from it would cement
+// that throwaway — IdleConnTimeout: 0, DisableCompression dropped — as the
+// connection's permanent transport while orphaning the hooked one.
+//
+// Best-effort, like wireInvalidation: an unavailable client, or a nil hooked
+// (wireInvalidation found no *http.Transport to install on), means nothing of
+// ours to restore, not a failed exec. Nil cannot occur where it would matter —
+// a connection whose transport is not an *http.Transport panics in podman's own
+// newUpgradeRequest long before this defer runs (#273).
+func (r *Real) restoreTransport(e *connEntry) func() {
+	if e.hooked == nil {
+		return func() {}
+	}
+	conn, err := bindings.GetClient(e.ctx)
+	if err != nil || conn == nil || conn.Client == nil {
+		return func() {}
+	}
+	return func() {
+		theirs := conn.Client.Transport
+		if theirs == e.hooked {
+			return
+		}
+		if tr, ok := theirs.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
+		conn.Client.Transport = e.hooked
 	}
 }
 
-// invalidatingTransport wraps an http.RoundTripper and reports every
-// transport-level failure to onBroken. See wireInvalidation.
-type invalidatingTransport struct {
-	next     http.RoundTripper
+// invalidatingConn reports read/write failures on an established connection to
+// onBroken. See wireInvalidation.
+type invalidatingConn struct {
+	net.Conn
 	onBroken func()
+	closed   atomic.Bool
 }
 
-// RoundTrip evicts on two distinct signals, not one:
-//
-//   - connBroken(err): a raw transport error (dial refused, reset, an EOF) —
-//     the connection visibly died.
-//   - req.Context() itself having timed out: the ~30 operation methods that
-//     route through opCtxFor bound every call with a fixed callTimeout, and a
-//     wedged connection (the TCP socket accepts writes but the OS never
-//     surfaces a read error — the #252 incident) manifests as that deadline
-//     firing, not as a transport error. connBroken deliberately does not
-//     treat context.DeadlineExceeded as broken (ssh_pool.go's sshSession
-//     needs that: there ctx is the *caller's* short budget, and hitting it
-//     says nothing about the connection's health). Here it is different:
-//     req.Context() is opCtxFor's own callTimeout, already generous (10
-//     minutes) specifically so that reaching it means the call hung, not
-//     that it was merely slow. So the deadline firing here is itself the
-//     wedge signal, the same role sshWedgeGrace's watchdog plays for the SSH
-//     pool — no extra grace window is needed on top of a timeout that is
-//     already the grace window.
-//
-// Distinguishing "this call's own deadline fired" from "the caller gave up
-// early" matters: opCtxFor bridges the caller's cancellation into the derived
-// context via context.AfterFunc(parent, cancel), so a client disconnecting
-// mid-request cancels req.Context() before its deadline — that reports
-// context.Canceled, not context.DeadlineExceeded, and must not evict a
-// perfectly healthy connection just because its caller walked away.
-func (t *invalidatingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.next.RoundTrip(req)
-	if err != nil && (connBroken(err) || errors.Is(req.Context().Err(), context.DeadlineExceeded)) {
-		t.onBroken()
-	}
-	return resp, err
+func (c *invalidatingConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	c.report(err)
+	return n, err
 }
+
+func (c *invalidatingConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	c.report(err)
+	return n, err
+}
+
+// Close marks the connection as deliberately torn down, so the read error that
+// tearing it down provokes is not mistaken for the host breaking. net/http
+// closes the underlying connection to cancel an in-flight request — including
+// when the *caller* walked away mid-request — and the blocked read then returns
+// net.ErrClosed. Evicting on that would punish every abandoned request with a
+// redial for everyone else.
+func (c *invalidatingConn) Close() error {
+	c.closed.Store(true)
+	return c.Conn.Close()
+}
+
+// report evicts only on errors that say the far end is gone. Where exactly
+// that line falls is a judgement, and this is the one place it is drawn:
+//
+// Evicting when the connection was in fact fine costs one redial and one
+// version re-probe — bounded, self-healing, and only that cheap because
+// invalidateConn closes the sockets of what it drops. NOT evicting a
+// connection that is in fact dead is the #252 incident: every call to that
+// host replaying the same failure until someone restarts the daemon. The
+// classification is therefore deliberately broad — an ECONNRESET or EPIPE
+// from an idle keep-alive close net/http itself recovered from does evict,
+// and that is accepted rather than overlooked.
+//
+// The two exclusions are where the cheap mistake stops being cheap:
+//
+//   - net.ErrClosed after our own Close: net/http closes the connection to
+//     cancel an in-flight request, including when the caller walked away.
+//     Evicting there would punish every abandoned request.
+//   - io.EOF: the routine end of a keep-alive connection the server closed
+//     while idle, which http.Transport handles by dialing a fresh one. This
+//     one has a gap, and it is worth naming: a host that keeps dialing fine
+//     but EOFs every response read — a podman service restarting, an SSH
+//     channel that opens on a half-dead client — is never evicted here, and
+//     #252's replay-forever shape comes back for that case. The dial-error
+//     path in wireInvalidation is the backstop, so it only bites while dials
+//     keep succeeding. Closing it properly means distinguishing a
+//     zero-byte read on a conn taken from the idle pool from every other EOF,
+//     which this wrapper cannot see today.
+func (c *invalidatingConn) report(err error) {
+	if err == nil || c.closed.Load() {
+		return
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+		return
+	}
+	if connBroken(err) {
+		c.onBroken()
+	}
+}
+
+// invalidator drops a dead connection from the cache it belongs to.
+type invalidator func(id string, dead *connEntry)
 
 // invalidateConn drops the cached libpod connection for id if it is still the
-// one that just failed. The identity check (dead is the exact context ctxFor
+// one that just failed. The identity check (dead is the exact entry connFor
 // stored) matters the same way sshPoolEntry.invalidate's does: between this
 // failure and the invalidation running, a reload (SetHosts) or a concurrent
 // redial may already have replaced the cached connection with a good one, and
 // dropping that would turn one transport fault into a reconnect for every
 // concurrent caller instead of just the one that actually broke.
-func (r *Real) invalidateConn(id string, dead context.Context) {
+// Dropping the map entry is not enough on its own: nothing else holds the
+// evicted connection, so its pooled sockets — and net/http's read and write
+// goroutine per socket — would stay alive for the process lifetime with no way
+// to reach them. Eviction is deliberately trigger-happy (a transport error can
+// also come from an idle keep-alive close net/http itself recovered from, and
+// dropping a healthy connection is the cheap mistake to make), which only
+// holds while a wrong guess costs exactly one redial.
+func (r *Real) invalidateConn(id string, dead *connEntry) {
 	r.mu.Lock()
-	if r.ctx[id] == dead {
+	evicted := r.ctx[id] == dead
+	if evicted {
 		delete(r.ctx, id)
 		// The version check is a property of the connection that just died,
 		// not of the host — a fresh connection must re-verify rather than
@@ -329,6 +656,33 @@ func (r *Real) invalidateConn(id string, dead context.Context) {
 		delete(r.verified, id)
 	}
 	r.mu.Unlock()
+	if evicted {
+		dead.closeIdleConns()
+	}
+}
+
+// invalidateExecConn is invalidateConn for the exec-only connection. It leaves
+// r.verified alone: that records the host's podman version, which the primary
+// connection established and which this connection dying says nothing about.
+func (r *Real) invalidateExecConn(id string, dead *connEntry) {
+	r.mu.Lock()
+	evicted := r.execCtx[id] == dead
+	if evicted {
+		delete(r.execCtx, id)
+	}
+	r.mu.Unlock()
+	if evicted {
+		dead.closeIdleConns()
+	}
+}
+
+// closeIdleConns releases the pooled sockets of a connection nobody will use
+// again. The SSH client underneath an ssh:// connection is not reachable
+// through the bindings API and is left to the garbage collector.
+func (e *connEntry) closeIdleConns() {
+	if e.hooked != nil {
+		e.hooked.CloseIdleConnections()
+	}
 }
 
 // probeVersion fetches the podman version over an established connection ctx.
@@ -381,24 +735,96 @@ func (r *Real) ensureVerified(c context.Context, id string) error {
 // the WithTimeout timer and the AfterFunc registration when the operation
 // completes, regardless of success or failure.
 func (r *Real) opCtxFor(parent context.Context, id string) (context.Context, context.CancelFunc, error) {
-	return r.opCtxForTimeout(parent, id, callTimeout)
+	return r.opCtx(parent, id, callTimeout, r.invalidateConn)
 }
 
 // opCtxForTimeout is opCtxFor with an explicit deadline instead of the fixed
-// callTimeout, for operations (VolumeExport/VolumeImport) whose data volume,
-// not call count, drives how long they legitimately run. See
-// SetVolumeTransferTimeout.
+// callTimeout, for operations (VolumeExport/VolumeImport, ImagePull) whose data
+// volume, not call count, drives how long they legitimately run. See
+// SetVolumeTransferTimeout and imagePullTimeout.
+//
+// Those deadlines carry no invalidation, for the same reason opCtxForStream's
+// does not: callCtx evicts on a deadline because callTimeout is sized so that
+// reaching it means the call hung. A transfer budget is sized to bytes instead,
+// so a large-but-healthy pull or volume copy overrunning it says nothing about
+// the connection — and evicting would drop the host's cached connection and its
+// verified flag on what is merely a slow link.
 func (r *Real) opCtxForTimeout(parent context.Context, id string, timeout time.Duration) (context.Context, context.CancelFunc, error) {
-	c, err := r.ctxFor(parent, id)
+	return r.opCtx(parent, id, timeout, nil)
+}
+
+// opCtxForStream is opCtxFor for operations that hold the context open for a
+// stream rather than a single request/response: ContainerLogs in follow mode,
+// which the UI opens for every logs tab and which stays open for as long as
+// someone is watching. There, reaching callTimeout is the routine end of the
+// stream, not evidence of a wedge — evicting on it would drop the host's
+// cached connection (and its version verification) every callTimeout for as
+// long as one logs tab stays open. Everything else about the context is
+// identical to opCtxFor's.
+func (r *Real) opCtxForStream(parent context.Context, id string) (context.Context, context.CancelFunc, error) {
+	return r.opCtx(parent, id, callTimeout, nil)
+}
+
+// opCtx is the shared body of the three above: resolve the host's cached
+// connection, verify its version once, and derive the per-call context.
+func (r *Real) opCtx(parent context.Context, id string, timeout time.Duration, invalidate invalidator) (context.Context, context.CancelFunc, error) {
+	c, err := r.entryFor(id)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := r.ensureVerified(c, id); err != nil {
+	if err := r.ensureVerified(c.ctx, id); err != nil {
 		return nil, nil, err
 	}
-	ctx, cancel := context.WithTimeout(c, timeout)
+	ctx, cancel := r.callCtx(parent, c, id, timeout, invalidate)
+	return ctx, cancel, nil
+}
+
+// callCtx derives a per-call context from base (a cached, background-rooted
+// connection context, or a longer-lived budget derived from one), bridging
+// parent's cancellation into it. Callers MUST call the returned CancelFunc —
+// typically via defer — to release the timer and the AfterFunc registration.
+//
+// When invalidate is non-nil, the returned CancelFunc carries the second half
+// of the #252 invalidation, and the half no socket-level hook can see: a
+// wedged connection (the TCP socket accepts writes but the OS never surfaces a
+// read error) produces no error at all — the call just hangs until this
+// deadline fires. connBroken deliberately does not treat
+// context.DeadlineExceeded as broken, because ssh_pool.go's sshSession needs
+// the opposite reading: there the ctx is the *caller's* short budget, and
+// hitting it says nothing about the connection's health. Here it is different.
+// This deadline is a single libpod call's own budget, already generous
+// (callTimeout is 10 minutes) precisely so that reaching it means the call
+// hung rather than that it was merely slow — the same role sshWedgeGrace's
+// watchdog plays for the SSH pool.
+//
+// Only *this* deadline counts, never an outer one:
+//
+//   - The caller giving up early cancels ctx through the AfterFunc bridge,
+//     which records context.Canceled, not DeadlineExceeded. A client
+//     disconnecting mid-request must not evict a healthy connection.
+//   - When the two race — a deadlined parent (WaitForPodCompletion's wait
+//     budget) expiring at the same moment as this call's own deadline — ctx can
+//     record DeadlineExceeded from its own timer before the bridge's cancel
+//     lands. parent is therefore checked as well: a pod outlasting the caller's
+//     patience is not a broken connection. Note ctx derives from base, not from
+//     parent, so a parent deadline never propagates into ctx as anything but
+//     the bridge's Canceled — anyone re-parenting ctx to parent must revisit
+//     this check.
+func (r *Real) callCtx(parent context.Context, base *connEntry, id string, timeout time.Duration, invalidate invalidator) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(base.ctx, timeout)
 	stop := context.AfterFunc(parent, cancel)
-	return ctx, func() { stop(); cancel() }, nil
+	return ctx, func() {
+		stop()
+		// cancel() cannot mask a deadline that already fired — a context keeps
+		// the first error it records — so the check below is safe after it.
+		cancel()
+		if invalidate == nil {
+			return
+		}
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) && parent.Err() == nil {
+			invalidate(id, base)
+		}
+	}
 }
 
 // preflightTimeout bounds each host's boot-time connect+version probe.
@@ -515,7 +941,7 @@ func (r *Real) preflightHost(ctx context.Context, id string) error {
 	// connection for first use — caching grants no unverified access, it only
 	// avoids a second dial (opCtxFor still runs the version gate).
 	go func() {
-		c, err := r.ctxFor(ctx, id)
+		c, err := r.ctxFor(id)
 		if err != nil {
 			ch <- result{err: err}
 			return
@@ -547,7 +973,7 @@ func (r *Real) preflightHost(ctx context.Context, id string) error {
 }
 
 func (r *Real) Ping(ctx context.Context, id string) error {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.ctxFor(id)
 	if err != nil {
 		return err
 	}
@@ -556,7 +982,7 @@ func (r *Real) Ping(ctx context.Context, id string) error {
 }
 
 func (r *Real) Version(ctx context.Context, id string) (string, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.ctxFor(id)
 	if err != nil {
 		return "", err
 	}
@@ -608,20 +1034,55 @@ var waitPollInterval = 2 * time.Second
 // opCtxFor, so a 30-minute caller timeout is honoured rather than silently
 // truncated to 10 minutes.
 func (r *Real) WaitForPodCompletion(ctx context.Context, id, podName string, timeout time.Duration) (int, error) {
-	base, err := r.ctxFor(ctx, id)
+	base, err := r.entryFor(id)
 	if err != nil {
 		return 0, err
 	}
-	if err := r.ensureVerified(base, id); err != nil {
+	if err := r.ensureVerified(base.ctx, id); err != nil {
 		return 0, err
 	}
-	c, cancel := context.WithTimeout(base, timeout)
+	// The wait budget carries no connection of its own — it is rooted at
+	// Background, not at base.ctx, so that resolving the connection is entirely
+	// the polls' business (below) and this context cannot pin the one the wait
+	// happened to start on.
+	c, cancel := context.WithTimeout(context.Background(), timeout)
 	stop := context.AfterFunc(ctx, cancel)
 	defer func() { stop(); cancel() }()
 
+	// Each poll is a single libpod call and gets a single call's budget, with
+	// the wedge eviction that comes with it (#252). The wait budget above
+	// cannot carry that signal: it expiring means the pod is still running,
+	// which says nothing about the connection — a legitimate 30-minute blob-GC
+	// wait would otherwise evict a perfectly healthy host on every timeout.
+	// The poll context is derived from the connection (so eviction identifies
+	// the right connection) and bridged to the wait budget (so a wait that ends
+	// tears the poll down at once).
+	//
+	// The connection is resolved per poll rather than once up front, for the
+	// reason ContainerExec resolves its own only after winning the turnstile: a
+	// wait budget is long by design (30 minutes for a blob GC), and an entry
+	// resolved before it can be retired during it — by SetHosts when the
+	// operator re-addresses the host, or by this wait's own eviction. Holding
+	// the first entry would spend the rest of the budget polling the endpoint
+	// the operator just reconfigured away from.
+	poll := func(fn func(context.Context) error) error {
+		base, err := r.entryFor(id)
+		if err != nil {
+			return err
+		}
+		pctx, done := r.callCtx(c, base, id, callTimeout, r.invalidateConn)
+		defer done()
+		return fn(pctx)
+	}
+
 	return waitForCompletion(c, podName,
-		func(ctx context.Context, name string) ([]string, error) {
-			rep, err := pods.Inspect(ctx, name, &pods.InspectOptions{})
+		func(_ context.Context, name string) ([]string, error) {
+			var rep *entities.PodInspectReport
+			err := poll(func(ctx context.Context) error {
+				var err error
+				rep, err = pods.Inspect(ctx, name, &pods.InspectOptions{})
+				return err
+			})
 			if err != nil {
 				return nil, err
 			}
@@ -631,8 +1092,13 @@ func (r *Real) WaitForPodCompletion(ctx context.Context, id, podName string, tim
 			}
 			return ids, nil
 		},
-		func(ctx context.Context, cid string) (running bool, exitCode int, err error) {
-			full, err := containers.Inspect(ctx, cid, &containers.InspectOptions{})
+		func(_ context.Context, cid string) (running bool, exitCode int, err error) {
+			var full *define.InspectContainerData
+			err = poll(func(ctx context.Context) error {
+				var err error
+				full, err = containers.Inspect(ctx, cid, &containers.InspectOptions{})
+				return err
+			})
 			if err != nil {
 				return false, 0, err
 			}
@@ -1037,12 +1503,77 @@ func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
 	return err
 }
 
+// ContainerExec runs cmd in an existing container and returns its exit code
+// and combined output.
+//
+// Three things guard the one property podman's attaching exec does not give
+// us — that a call cannot disturb anything but itself. It runs on the
+// exec-only connection (execEntryFor), so it cannot disturb other operations;
+// execs are serialised per host (execGateFor), so they cannot disturb each
+// other; and the transport podman leaves behind is closed and replaced
+// afterwards (restoreTransport), so an exec cannot disturb the next one.
 func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []string) (ExecResult, error) {
-	c, cancel, err := r.opCtxFor(ctx, id)
+	// Validation before the turnstile, the clock after it — but the *exec*
+	// connection is not dialed here. Nothing at this point needs it: entryFor
+	// below rejects an unknown host, and execGateFor re-checks r.hosts under
+	// r.mu before minting a channel SetHosts would never iterate over to clean
+	// up. Dialing it here would cost a second SSH handshake plus a ping, under
+	// r.mu, before the call has been admitted — and cache an exec connection
+	// that a host failing ensureVerified below never uses and nothing ever
+	// evicts (eviction rides a transport error on a connection nobody sends on),
+	// leaking one idle connection per too-old host for the process lifetime.
+	//
+	// What must not move is the clock: callTimeout starts only after the turn is
+	// won, since an exec may legitimately use the whole budget (a pre_backup
+	// database dump) and a queued one would otherwise fail without ever running,
+	// evicting the exec connection on the way out for a deadline that says
+	// nothing about its health.
+	//
+	// Verified over the *primary* connection, not the exec one. The exec connection
+	// is the one thing nothing outside the turnstile may touch: an exec holding
+	// it has podman's own transport installed on it (newUpgradeRequest writes
+	// the field unsynchronised, with IdleConnTimeout: 0), so a probe issued here
+	// would both race that write and risk parking its keep-alive socket in a
+	// transport restoreTransport is about to orphan. The version is a host
+	// property the primary connection establishes anyway — the same reason
+	// invalidateExecConn leaves r.verified alone.
+	primary, err := r.entryFor(id)
 	if err != nil {
 		return ExecResult{}, err
 	}
+	if err := r.ensureVerified(primary.ctx, id); err != nil {
+		return ExecResult{}, err
+	}
+
+	gate, err := r.execGateFor(id)
+	if err != nil {
+		return ExecResult{}, err
+	}
+	select {
+	case gate <- struct{}{}:
+	case <-ctx.Done():
+		return ExecResult{}, ctx.Err()
+	}
+	defer func() { <-gate }()
+
+	// The connection is resolved *after* the turn is won, never before. The
+	// wait above is unbounded by design (a pre_backup dump may hold the gate
+	// for the whole callTimeout), and an entry fetched before it can be dropped
+	// during it: by invalidateExecConn when the exec ahead broke its socket, or
+	// by SetHosts when the host was reconfigured. Running on the dropped entry
+	// would redial nothing and fail against a dead connection — its own
+	// invalidateExecConn a no-op, the identity check no longer matching — or,
+	// worse, dial through the old entry's SSH client and exec against the
+	// endpoint the operator just reconfigured away from.
+	conn, err := r.execEntryFor(id)
+	if err != nil {
+		return ExecResult{}, err
+	}
+
+	c, cancel := r.callCtx(ctx, conn, id, callTimeout, r.invalidateExecConn)
 	defer cancel()
+
+	defer r.restoreTransport(conn)()
 	sessionID, err := containers.ExecCreate(c, container, &handlers.ExecCreateConfig{
 		ExecOptions: dockerContainer.ExecOptions{
 			Cmd:          cmd,
@@ -1268,7 +1799,16 @@ func (r *Real) VolumeUsage(ctx context.Context, id string) (map[string]int64, er
 // request; mergedCtx derives from c but can be independently cancelled so
 // the streaming call is torn down without killing the cached connection.
 func (r *Real) ContainerLogs(ctx context.Context, id, container string, opts LogOptions) (<-chan LogLine, error) {
-	c, cleanupOpCtx, err := r.opCtxFor(ctx, id)
+	// Only follow mode opts out of the wedge eviction: it holds the context
+	// open for as long as someone is watching, so reaching callTimeout is the
+	// routine end of the stream. A tail-N fetch is an ordinary bounded call and
+	// keeps the #252 signal — a hang past callTimeout there means the
+	// connection is wedged, exactly what opCtxFor's eviction is for.
+	opCtx := r.opCtxFor
+	if opts.Follow {
+		opCtx = r.opCtxForStream
+	}
+	c, cleanupOpCtx, err := opCtx(ctx, id)
 	if err != nil {
 		return nil, err
 	}
@@ -1399,7 +1939,7 @@ func (r *Real) UsedHostPorts(ctx context.Context, id string) ([]PortMapping, err
 // than failing the whole call; only a failed `info` call (host unreachable)
 // returns an error.
 func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
-	c, err := r.ctxFor(ctx, id)
+	c, err := r.ctxFor(id)
 	if err != nil {
 		return HostInfo{}, err
 	}
