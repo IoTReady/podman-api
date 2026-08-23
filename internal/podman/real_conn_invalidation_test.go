@@ -339,6 +339,10 @@ func TestRealClient_TransportStaysHTTPTransport(t *testing.T) {
 // context, so a client that disconnects mid-request cancels the call before
 // its deadline. That says nothing about the connection's health, and evicting
 // on it would turn every abandoned request into a redial for everyone else.
+//
+// Cancellation, specifically: since #282 a caller whose own DEADLINE expires
+// does evict, because the host failing to answer inside a budget nobody
+// abandoned is evidence. See real_parent_deadline_test.go for that half.
 func TestRealClient_CallerCancellationDoesNotEvict(t *testing.T) {
 	sock, _ := fakeLibpodServer(t)
 	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
@@ -355,7 +359,8 @@ func TestRealClient_CallerCancellationDoesNotEvict(t *testing.T) {
 	// inside the (deliberately untouched, generous) callTimeout.
 	breakConn(t, c, "h1", cached, nil)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(20*time.Millisecond, cancel)
 	defer cancel()
 	_, err = c.PodList(ctx, "h1", nil)
 	require.Error(t, err)
