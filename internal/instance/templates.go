@@ -43,6 +43,7 @@ func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
 	if err := render.NormalizeParams(&t.Meta); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
+	templated := setContainerNames(&t)
 	if err := ValidateTemplate(t); err != nil {
 		return err
 	}
@@ -57,6 +58,9 @@ func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
 	if w := backupMarkerNoneWriteWarning(t); w != "" {
 		log.Printf("WARNING: %s", w)
 	}
+	if w := templatedContainerNameWarning(t, templated); w != "" {
+		log.Printf("WARNING: %s", w)
+	}
 	return s.store.PutTemplate(ctx, t)
 }
 
@@ -69,6 +73,7 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 	if err := render.NormalizeParams(&t.Meta); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
+	templated := setContainerNames(&t)
 	// The stored row is read BEFORE validation because validation depends on it:
 	// a near-miss `none` marker the row already carries must not fail an edit
 	// that does not touch it (review-4 finding 4). The error precedence a caller
@@ -90,7 +95,13 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 	// An alias edit is not just informational: unlike ingress, it can make two
 	// LIVE instances claim one DNS name, wedging both against every later apply.
 	// Refuse rather than warn (#269).
-	if networksChanged(existing.Meta.Networks, t.Meta.Networks) {
+	//
+	// A BODY edit can do exactly the same thing without touching `networks:` at
+	// all — renaming a container to a literal name, or dropping the parameter
+	// that made it per-instance, hands both instances the same podman-registered
+	// alias (#272) — so the derived container names gate the check too.
+	if networksChanged(existing.Meta.Networks, t.Meta.Networks) ||
+		!slices.Equal(metaWithContainerNames(existing).ContainerNames, t.Meta.ContainerNames) {
 		if err := s.checkTemplateNetworkConflicts(ctx, t); err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 		}
@@ -124,8 +135,83 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 	if w := backupMarkerNoneWriteWarning(t); w != "" {
 		log.Printf("WARNING: %s", w)
 	}
+	if w := templatedContainerNameWarning(t, templated); w != "" {
+		log.Printf("WARNING: %s", w)
+	}
 
 	return s.store.PutTemplate(ctx, t)
+}
+
+// metaWithContainerNames returns t.Meta with ContainerNames guaranteed to
+// reflect the body, backfilling it from the body when the stored row predates
+// the field (#272).
+//
+// Migration lives here rather than in a schema step: the field is derivable
+// from data every row already carries, so a stored row needs no rewrite — it is
+// simply re-derived on read until the next write of that template persists it.
+// Nil means "not extracted", never "this template declares no containers": a
+// pod with no containers is not playable, so reading nil as "claims nothing"
+// would quietly exempt exactly the rows registered before the check existed.
+//
+// A body that will not render or parse yields nil and a log line. The check
+// then fails OPEN for that template — the same way an instance whose template
+// is gone is skipped — because refusing every apply on the host over an
+// unparseable body would be a worse failure than the collision it is looking
+// for. Such a body cannot pass ValidateTemplate, so it can only come from a row
+// written before that validator, or hand-edited in the database.
+func metaWithContainerNames(t store.Template) render.Meta {
+	if t.Meta.ContainerNames != nil || t.Body == "" {
+		return t.Meta
+	}
+	literal, _, err := render.ContainerNames(t.Body, t.Meta)
+	if err != nil {
+		log.Printf("template %q: cannot extract container names from body (%v); shared-network DNS collisions involving them cannot be detected", t.Meta.ID, err)
+		return t.Meta
+	}
+	m := t.Meta
+	m.ContainerNames = literal
+	return m
+}
+
+// setContainerNames derives the DERIVED-only Meta.ContainerNames from the body
+// before a template is persisted, so every write path (create, edit, clone)
+// stores the same thing and no caller can supply its own list. A body that will
+// not render leaves it nil: validateTemplate reports that failure with a better
+// message, and this must not pre-empt it.
+//
+// It returns the parameter-dependent names in the same pass — they come out of
+// the same extraction, and the write path needs them for its warning — so a
+// registration renders the body twice rather than four times.
+func setContainerNames(t *store.Template) (templated []string) {
+	literal, templated, err := render.ContainerNames(t.Body, t.Meta)
+	if err != nil {
+		t.Meta.ContainerNames = nil
+		return nil
+	}
+	t.Meta.ContainerNames = literal
+	return templated
+}
+
+// templatedContainerNameWarning returns the line to log when a template that
+// declares shared networks has container names that vary per instance — or ""
+// when it does not. templated comes from setContainerNames, which already did
+// the extraction.
+//
+// Templated names are ACCEPTED, not rejected: `name: db-{{.slug}}` is precisely
+// the fix for a container-name collision, so refusing it would ban the good
+// practice along with the bad. But they are also unenforceable — the daemon
+// cannot know what two instances will render them to — so the operator is told
+// that this template's DNS claims on a shared network are only partly policed.
+func templatedContainerNameWarning(t store.Template, templated []string) string {
+	if len(t.Meta.Networks) == 0 || len(templated) == 0 {
+		return ""
+	}
+	nets := make([]string, 0, len(t.Meta.Networks))
+	for _, n := range t.Meta.Networks {
+		nets = append(nets, n.Name)
+	}
+	return fmt.Sprintf("template %q has parameter-dependent container name(s) %v and joins shared network(s) %v: podman aliases the pod by each rendered container name, and the daemon cannot check a name it only sees per instance — two instances rendering the same name would collide silently",
+		t.Meta.ID, templated, nets)
 }
 
 // BackupMarkerNoneVolumes returns the names of a template's volumes vetoed by
@@ -272,6 +358,7 @@ func (s *Service) CloneTemplate(ctx context.Context, srcID, newID string) (store
 	} else if !errors.Is(err, ErrUnknownTemplate) {
 		return store.Template{}, err
 	}
+	_ = setContainerNames(&cl)
 	if err := s.store.PutTemplate(ctx, cl); err != nil {
 		return store.Template{}, err
 	}
@@ -373,6 +460,17 @@ func validateTemplate(t store.Template, stored *store.Template) error {
 
 	if t.Meta.Ingress != nil {
 		if err := checkIngressContainer(rendered, t.Meta.Ingress.Container); err != nil {
+			return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
+		}
+	}
+
+	// Container names are derived from the BODY here, never read off the
+	// submitted meta: an API caller builds render.Meta directly, so trusting
+	// Meta.ContainerNames would let one hide a claim from the check it feeds.
+	// A body that renders but does not parse yields nothing and is not an error
+	// — only the ingress rule above insists the pod be readable YAML.
+	if literal, _, err := render.ContainerNames(t.Body, t.Meta); err == nil {
+		if err := render.ValidateAliasesAgainstContainerNames(t.Meta, literal); err != nil {
 			return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 		}
 	}

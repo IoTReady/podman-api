@@ -42,6 +42,26 @@ type Meta struct {
 	// bad one fails at template registration rather than at deploy (#243).
 	Networks  []Network  `yaml:"networks,omitempty" json:"networks,omitempty"`
 	PreBackup *PreBackup `yaml:"pre_backup,omitempty" json:"pre_backup,omitempty"`
+
+	// ContainerNames is DERIVED, never authored: the literal container names in
+	// the template body, extracted at registration (ParseMeta, and the API write
+	// path) by ContainerNames. It carries no `yaml` tag precisely so a
+	// template-meta block cannot declare it — the body is the only source.
+	//
+	// It exists because podman aliases a pod by every container name in the
+	// played YAML on every network it joins, which makes a literal container
+	// name a claim on a shared network's DNS namespace exactly like a declared
+	// alias. Storing it lets the apply-time uniqueness check
+	// (Service.validateNetworkAliases) see those names without rendering every
+	// peer's body on a hot path (#272).
+	//
+	// A row stored before the field existed decodes with it nil. Nil therefore
+	// means "not extracted", not "this template has no containers" — a pod with
+	// no containers is not playable — and consumers backfill it from the body
+	// (instance.metaWithContainerNames) rather than reading nil as "claims
+	// nothing". Parameter-dependent names are deliberately absent: they are not
+	// the same name on two instances, so there is nothing to enforce.
+	ContainerNames []string `yaml:"-" json:"container_names,omitempty"`
 }
 
 // Network is one shared-network membership: the network name, plus optional
@@ -58,12 +78,22 @@ type Meta struct {
 // resolution. Uniqueness is enforced instead by the daemon, scoped to
 // (host, network, name) — see Service.validateNetworkAliases.
 //
-// That enforcement covers the names the daemon knows: declared aliases and pod
-// DNS names. It does NOT cover the aliases podman adds on its own — kube play
-// registers every container name in the played YAML as an alias on every joined
-// network, so two instances of a template whose container is named "db" already
-// both answer to "db" on a shared network, with or without this field (#272).
-// Pick container names as carefully as aliases.
+// That enforcement covers declared aliases, pod DNS names, and — on every
+// network but the ingress one — the aliases podman adds on its own: kube
+// play registers every container name in the played YAML as an alias on every
+// joined network, so two instances of a template whose container is named "db"
+// would both answer to "db" (#272). Literal container names are extracted at
+// registration into Meta.ContainerNames and folded into the same check, which
+// means a second instance of such a template on the same declared network is
+// refused. Give the container a per-instance name (include a parameter, e.g.
+// `name: db-{{.slug}}`) when two instances must share a network.
+//
+// The shared ingress network is the one exception: every ingress template joins
+// it, it is not an opt-in namespace claim, and the ingress controller addresses
+// pods by pod DNS name — so enforcing container names there would refuse the
+// second instance of every web template for a collision nobody resolves
+// against. That holds however the pod came to join it, naming it in this block
+// included. Declared aliases and pod names are still enforced there.
 type Network struct {
 	Name    string   `yaml:"name" json:"name"`
 	Aliases []string `yaml:"aliases,omitempty" json:"aliases,omitempty"`
@@ -478,6 +508,20 @@ func ParseMeta(src string) (Meta, string, error) {
 	}
 
 	body := bodyAfterLine(src, bodyStart)
+
+	// Container names are DERIVED from the body, not declared: podman aliases
+	// the pod by each of them on every network it joins, so a literal one is a
+	// claim on a shared network's DNS namespace (#272). A body that will not
+	// render or parse yields nothing here rather than an error — that failure is
+	// the write path's to report (instance.ValidateTemplate renders it too), and
+	// reporting it as a meta-parse failure would blame the wrong half of the file.
+	if literal, _, err := ContainerNames(body, wrapper.Meta); err == nil {
+		wrapper.Meta.ContainerNames = literal
+		if err := ValidateAliasesAgainstContainerNames(wrapper.Meta, literal); err != nil {
+			return Meta{}, "", err
+		}
+	}
+
 	return wrapper.Meta, body, nil
 }
 
