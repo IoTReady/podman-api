@@ -3,6 +3,7 @@ package podman
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -1207,4 +1208,312 @@ func TestRealClient_RestoreTransportPutsBackTheHookedOne(t *testing.T) {
 	assert.Same(t, e.hooked, conn.Client.Transport,
 		"restore must put back the hooked transport, not whatever the connection happened to hold")
 	assert.NotSame(t, notOurs, conn.Client.Transport)
+}
+
+// respondingThenEOFConn answers every complete request written to it with a
+// canned HTTP/1.1 response and then, once it has served one and nothing is
+// outstanding, returns io.EOF from the next read — which is exactly what a
+// keep-alive connection the server closed while idle looks like to net/http's
+// readLoop. It is the counterpart to scriptedConn(io.EOF), which EOFs a
+// request that was never answered at all.
+//
+// Reads BLOCK while nothing is pending and nothing has been served yet,
+// because a real socket does: net/http's readLoop Peeks the connection before
+// writeLoop has written the request, and a fake that EOFs that peek models a
+// server that hung up instantly, not an idle close.
+type respondingThenEOFConn struct {
+	mu      sync.Mutex
+	cond    *sync.Cond
+	pending []byte
+	served  bool
+	closed  bool
+}
+
+func newRespondingThenEOFConn() *respondingThenEOFConn {
+	c := &respondingThenEOFConn{}
+	c.cond = sync.NewCond(&c.mu)
+	return c
+}
+
+func (c *respondingThenEOFConn) Read(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for len(c.pending) == 0 && !c.served && !c.closed {
+		c.cond.Wait()
+	}
+	if c.closed {
+		return 0, net.ErrClosed
+	}
+	if len(c.pending) == 0 {
+		// Served a response and nothing is outstanding: the idle close.
+		return 0, io.EOF
+	}
+	n := copy(b, c.pending)
+	c.pending = c.pending[n:]
+	return n, nil
+}
+
+func (c *respondingThenEOFConn) Write(b []byte) (int, error) {
+	if strings.Contains(string(b), "\r\n\r\n") {
+		c.mu.Lock()
+		c.pending = append(c.pending,
+			[]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")...)
+		c.served = true
+		c.cond.Broadcast()
+		c.mu.Unlock()
+	}
+	return len(b), nil
+}
+
+func (c *respondingThenEOFConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.cond.Broadcast()
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *respondingThenEOFConn) LocalAddr() net.Addr              { return fakeAddr{} }
+func (c *respondingThenEOFConn) RemoteAddr() net.Addr             { return fakeAddr{} }
+func (c *respondingThenEOFConn) SetDeadline(time.Time) error      { return nil }
+func (c *respondingThenEOFConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *respondingThenEOFConn) SetWriteDeadline(time.Time) error { return nil }
+
+// breakConnWith is breakConn with the scripted connection supplied by the
+// caller, for tests that need a shape scriptedConn does not model.
+func breakConnWith(t *testing.T, r *Real, id string, cached *connEntry, dial func() net.Conn) {
+	t.Helper()
+	conn, err := bindings.GetClient(cached.ctx)
+	require.NoError(t, err)
+	conn.Client.Transport = &http.Transport{
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return dial(), nil
+		},
+	}
+	r.wireInvalidation(cached, id, r.invalidateConn)
+}
+
+// TestRealClient_EOFOnOutstandingRequestEvicts covers #276. report suppressed
+// io.EOF unconditionally, so a host that keeps *dialing* fine but EOFs every
+// response read — a podman service restarting in a loop, a socket that
+// accepts then closes, an SSH channel that opens on a half-dead client and
+// immediately EOFs — was never evicted: r.ctx[id] and r.verified[id] stayed
+// cached and #252's replay-forever shape came back for that case. An EOF on a
+// connection with a write outstanding is not an idle close, and must evict.
+func TestRealClient_EOFOnOutstandingRequestEvicts(t *testing.T) {
+	sock, accepts := fakeLibpodServer(t)
+	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	require.NoError(t, c.Ping(ctx, "h1"))
+	warmAccepts := accepts.Load()
+
+	c.mu.Lock()
+	cached := c.ctx["h1"]
+	c.verified["h1"] = true
+	c.mu.Unlock()
+	require.NotNil(t, cached)
+
+	// Dials keep succeeding; every response read EOFs with the request still
+	// outstanding.
+	breakConn(t, c, "h1", cached, io.EOF)
+
+	require.Error(t, c.Ping(ctx, "h1"))
+
+	after := waitEvicted(t, c, "h1", cached)
+	require.False(t, cached == after, "an EOF with a request outstanding must evict, not be mistaken for an idle close")
+
+	c.mu.Lock()
+	stillVerified := c.verified["h1"]
+	c.mu.Unlock()
+	assert.False(t, stillVerified, "eviction must drop the version pass recorded against the dead connection")
+
+	assert.NoError(t, c.Ping(ctx, "h1"), "a call after eviction must redial and succeed")
+	assert.Greater(t, accepts.Load(), warmAccepts, "eviction must cause a real redial, not just a state flip")
+}
+
+// TestRealClient_IdleCloseEOFDoesNotEvict is the other half of #276: the case
+// the io.EOF exclusion was written for must keep working. A keep-alive
+// connection the server closes while idle surfaces as a zero-byte EOF read
+// with nothing outstanding; http.Transport handles that transparently by
+// dialing a fresh one, and evicting there would drop a healthy connection on a
+// routine event.
+func TestRealClient_IdleCloseEOFDoesNotEvict(t *testing.T) {
+	sock, _ := fakeLibpodServer(t)
+	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	require.NoError(t, c.Ping(ctx, "h1"))
+
+	c.mu.Lock()
+	cached := c.ctx["h1"]
+	c.verified["h1"] = true
+	c.mu.Unlock()
+	require.NotNil(t, cached)
+
+	breakConnWith(t, c, "h1", cached, func() net.Conn { return newRespondingThenEOFConn() })
+
+	// The request itself is answered; the EOF arrives afterwards, on the idle
+	// connection, which is precisely the excluded case.
+	require.NoError(t, c.Ping(ctx, "h1"))
+
+	// waitEvicted returns as soon as the cache changes; here nothing should
+	// change for its whole window.
+	after := waitEvicted(t, c, "h1", cached)
+	assert.True(t, cached == after, "an idle-close EOF must not evict the cached connection")
+
+	c.mu.Lock()
+	stillVerified := c.verified["h1"]
+	c.mu.Unlock()
+	assert.True(t, stillVerified, "an idle-close EOF must not drop the host's version pass")
+}
+
+// requestScriptedConn answers the first `answers` complete requests written to
+// it with a canned HTTP/1.1 response (answers < 0 means every request), and
+// EOFs the next one — with that request still outstanding, which is the shape
+// respondingThenEOFConn deliberately cannot produce.
+//
+// The difference is where the EOF lands. respondingThenEOFConn EOFs the idle
+// read that follows a completed response; this EOFs a read whose request has
+// just been written. Both are zero-byte io.EOF reads on a connection that has
+// already served a response, so `served` alone cannot separate them — only
+// writePending can, which is the point of the test below.
+//
+// Reads block while nothing is pending, the way a real pooled socket does, so
+// the connection sits in net/http's idle pool between requests instead of
+// being torn down by an EOF nobody asked for.
+type requestScriptedConn struct {
+	mu       sync.Mutex
+	cond     *sync.Cond
+	pending  []byte
+	answers  int
+	requests int
+	eof      bool
+	closed   bool
+}
+
+func newRequestScriptedConn(answers int) *requestScriptedConn {
+	c := &requestScriptedConn{answers: answers}
+	c.cond = sync.NewCond(&c.mu)
+	return c
+}
+
+func (c *requestScriptedConn) Read(b []byte) (int, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for len(c.pending) == 0 && !c.eof && !c.closed {
+		c.cond.Wait()
+	}
+	if c.closed {
+		return 0, net.ErrClosed
+	}
+	if len(c.pending) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(b, c.pending)
+	c.pending = c.pending[n:]
+	return n, nil
+}
+
+func (c *requestScriptedConn) Write(b []byte) (int, error) {
+	if strings.Contains(string(b), "\r\n\r\n") {
+		c.mu.Lock()
+		c.requests++
+		if c.answers != 0 {
+			if c.answers > 0 {
+				c.answers--
+			}
+			c.pending = append(c.pending,
+				[]byte("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}")...)
+		} else {
+			c.eof = true
+		}
+		c.cond.Broadcast()
+		c.mu.Unlock()
+	}
+	return len(b), nil
+}
+
+func (c *requestScriptedConn) requestCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.requests
+}
+
+func (c *requestScriptedConn) Close() error {
+	c.mu.Lock()
+	c.closed = true
+	c.cond.Broadcast()
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *requestScriptedConn) LocalAddr() net.Addr              { return fakeAddr{} }
+func (c *requestScriptedConn) RemoteAddr() net.Addr             { return fakeAddr{} }
+func (c *requestScriptedConn) SetDeadline(time.Time) error      { return nil }
+func (c *requestScriptedConn) SetReadDeadline(time.Time) error  { return nil }
+func (c *requestScriptedConn) SetWriteDeadline(time.Time) error { return nil }
+
+// TestRealClient_EOFOnPooledConnectionWithWriteOutstandingEvicts pins the
+// writePending half of reportRead's condition — the shape #276 names first: a
+// podman service that restarts between two calls, so the connection sitting in
+// net/http's idle pool has already carried a response, gets the next request
+// written to it, and only then EOFs.
+//
+// The two other EOF tests are both decided by `served` alone (one EOFs a
+// freshly dialed connection, the other EOFs an idle one), so deleting
+// `!c.writePending.Load()` from reportRead leaves them passing. This one
+// fails without it: `served` is true here, and writePending is the only thing
+// separating this EOF from the idle close that must stay suppressed.
+func TestRealClient_EOFOnPooledConnectionWithWriteOutstandingEvicts(t *testing.T) {
+	sock, _ := fakeLibpodServer(t)
+	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	require.NoError(t, c.Ping(ctx, "h1"))
+
+	c.mu.Lock()
+	cached := c.ctx["h1"]
+	c.verified["h1"] = true
+	c.mu.Unlock()
+	require.NotNil(t, cached)
+
+	// The first dial gets the connection that answers one request and then
+	// EOFs the next. Later dials get a healthy one: net/http retries an
+	// idempotent request when a *reused* connection fails before any response
+	// byte, and that retry must not be able to manufacture an eviction of its
+	// own — a fresh connection has served == false, so it would evict even
+	// with writePending deleted, masking exactly what this test pins.
+	pooled := newRequestScriptedConn(1)
+	var dials atomic.Int64
+	breakConnWith(t, c, "h1", cached, func() net.Conn {
+		if dials.Add(1) == 1 {
+			return pooled
+		}
+		return newRequestScriptedConn(-1)
+	})
+
+	// Request one: answered, so the connection is served and goes back to the
+	// idle pool with writePending cleared.
+	require.NoError(t, c.Ping(ctx, "h1"))
+	require.Equal(t, 1, pooled.requestCount(), "the first call must go to the pooled connection")
+
+	// Request two: reuses that pooled connection, writes, and EOFs. Whether
+	// the retry then succeeds is net/http's business and not what is being
+	// asserted — the eviction is.
+	_ = c.Ping(ctx, "h1")
+	require.Equal(t, 2, pooled.requestCount(),
+		"the second call must have been written to the already-served pooled connection, or this test is not exercising the shape it claims")
+
+	after := waitEvicted(t, c, "h1", cached)
+	assert.False(t, cached == after,
+		"an EOF on a pooled connection with the request still outstanding must evict: it is a restarted daemon, not an idle close")
+
+	c.mu.Lock()
+	stillVerified := c.verified["h1"]
+	c.mu.Unlock()
+	assert.False(t, stillVerified, "eviction must drop the version pass recorded against the dead connection")
 }
