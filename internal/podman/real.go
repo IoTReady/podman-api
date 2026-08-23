@@ -110,6 +110,12 @@ type Real struct {
 type connEntry struct {
 	ctx    context.Context
 	hooked *http.Transport
+	// probeTimeouts counts CONSECUTIVE diagnostic timeouts on this connection
+	// (probeCtx/verifyCtx); any diagnostic that answers inside its budget
+	// resets it to zero. It is the escape hatch described at
+	// probeEvictThreshold — the only way a host that receives nothing but
+	// diagnostics ever drops a wedged connection.
+	probeTimeouts atomic.Int64
 }
 
 // connCache is one connection cache and everything that belongs to it: the
@@ -966,13 +972,28 @@ func (r *Real) probeVersion(c context.Context) (string, error) {
 // failure the host stays unverified (and the connection stays cached), so a
 // host whose podman is upgraded in place starts passing without a restart.
 // The probe runs outside the mutex; a concurrent duplicate probe is harmless.
-func (r *Real) ensureVerified(c context.Context, id string) error {
+//
+// The probe gets its own verifyTimeout budget rather than the caller's (#275).
+// It used to run on e.ctx directly — the raw cached connection context, rooted
+// at context.Background() — so against a wedged host a host's *first* use
+// after a (re)connect hung here forever, before the caller's own deadline had
+// been built and regardless of how tight it was. Its own budget, rather than
+// the caller's remaining one, because the caller's
+// budget is sometimes far larger than any answer to it is worth waiting for: a
+// volume transfer's hours (SetVolumeTransferTimeout) or a blob GC's wait
+// (WaitForPodCompletion) would otherwise be spent entirely inside the version
+// check. parent is still bridged in, so a caller that gives up first is not
+// held here either. Its budget is deliberately NOT probeTimeout's, because
+// this failure is hard where a diagnostic's is cheap — see verifyTimeout.
+func (r *Real) ensureVerified(parent context.Context, e *connEntry, id string) error {
 	r.mu.Lock()
 	ok := r.verified[id]
 	r.mu.Unlock()
 	if ok {
 		return nil
 	}
+	c, cancel := r.verifyCtx(parent, e, id)
+	defer cancel()
 	v, err := r.probeVersion(c)
 	if err != nil {
 		return fmt.Errorf("verify host %q podman version: %w", id, err)
@@ -986,9 +1007,11 @@ func (r *Real) ensureVerified(c context.Context, id string) error {
 	return nil
 }
 
-// opCtxFor is ctxFor plus the MinPodmanVersion gate. Operation methods must
-// call this instead of ctxFor; diagnostics (Ping, Version, HostInfo) use raw
-// ctxFor so GET /hosts can still display an unsupported host's version (#85).
+// opCtxFor is entryFor plus the MinPodmanVersion gate. Operation methods must
+// call this instead of resolving the connection themselves; diagnostics (Ping,
+// Version, HostInfo) skip the gate — via probeCtx, which is bounded the same
+// way but ungated — so GET /hosts can still display an unsupported host's
+// version (#85).
 //
 // The returned context is derived from the cached long-lived connection context
 // (rooted at context.Background) with a per-call deadline (callTimeout) so a
@@ -1037,7 +1060,7 @@ func (r *Real) opCtx(parent context.Context, id string, timeout time.Duration, i
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := r.ensureVerified(c.ctx, id); err != nil {
+	if err := r.ensureVerified(parent, c, id); err != nil {
 		return nil, nil, err
 	}
 	ctx, cancel := r.callCtx(parent, c, id, timeout, invalidate)
@@ -1119,9 +1142,168 @@ func (r *Real) callCtx(parent context.Context, base *connEntry, id string, timeo
 // var (not const) so tests can shrink it.
 var connDialTimeout = 30 * time.Second
 
+// probeCtx is callCtx with the diagnostic budget: bounded by probeTimeout,
+// bridged to the caller's cancellation, and evicting only on a sustained
+// streak of timeouts rather than on the first one. It is what the calls that
+// deliberately bypass opCtxFor use instead.
+//
+// Bypassing opCtxFor is about the *version gate*, not about deadlines: GET
+// /hosts must still be able to display an unsupported host's version (#85), so
+// Ping/Version/HostInfo cannot go through ensureVerified. That was never a
+// reason for them to run undeadlined on the raw connection context, which is
+// what they did until #275.
+func (r *Real) probeCtx(parent context.Context, base *connEntry, id string) (context.Context, context.CancelFunc) {
+	return r.diagCtx(parent, base, id, probeTimeout)
+}
+
+// verifyCtx is probeCtx with the version gate's own, much larger budget. See
+// verifyTimeout for why the two are not one constant.
+func (r *Real) verifyCtx(parent context.Context, base *connEntry, id string) (context.Context, context.CancelFunc) {
+	return r.diagCtx(parent, base, id, verifyTimeout)
+}
+
+// diagCtx is the shared body of the two above: a deadlined, caller-cancellable
+// context whose timeout feeds the connection's consecutive-timeout streak
+// instead of evicting outright, and whose completion inside budget clears it.
+func (r *Real) diagCtx(parent context.Context, base *connEntry, id string, timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := r.callCtx(parent, base, id, timeout, r.countDiagTimeout)
+	return ctx, func() {
+		// Checked BEFORE cancel(), which would otherwise be the error we read.
+		// A diagnostic that answered inside its budget is direct evidence the
+		// connection is alive, which is exactly what retires the streak.
+		if ctx.Err() == nil {
+			base.probeTimeouts.Store(0)
+		}
+		cancel()
+	}
+}
+
+// countDiagTimeout is the invalidator diagCtx hands callCtx: it records one
+// more consecutive diagnostic timeout on the connection and evicts only once
+// the streak reaches probeEvictThreshold. callCtx has already established the
+// two things that make the count meaningful — the deadline that fired was this
+// call's own, and the caller had not given up — so a cancelled request never
+// contributes.
+func (r *Real) countDiagTimeout(id string, e *connEntry) {
+	if e.probeTimeouts.Add(1) < probeEvictThreshold {
+		return
+	}
+	r.invalidateConn(id, e)
+}
+
 // preflightTimeout bounds each host's boot-time connect+version probe.
 // var (not const) so tests can shrink it.
 var preflightTimeout = 10 * time.Second
+
+// probeTimeout bounds a *diagnostic* libpod call — Ping, Version and HostInfo
+// — as opposed to an operation, which gets callTimeout, or the version gate,
+// which gets verifyTimeout (#275).
+//
+// Where it actually bites is worth being precise about, because the obvious
+// answer is wrong. GET /hosts does NOT run on this budget: listHosts already
+// wraps each host in its own goroutine under a 5s perHostTimeout
+// (internal/api/hosts.go) covering Ping + Version + HostCounts + HostLoad
+// together, so that cap always fires first. What #275 fixed for that path is
+// not this number at all — it is the context.AfterFunc bridge in callCtx,
+// which is what finally makes the existing 5s cap reach libpod instead of
+// being ignored by a request pinned to the connection context.
+//
+// This budget is the backstop for the diagnostic callers that have no cap of
+// their own: GET /hosts/{id} (a bare r.Context()), instance.Service's Ping and
+// HostInfo callers, and the prune scheduler and handler (internal/prune).
+// 10s is preflightTimeout's number because it is the same `info` call asked
+// the same reachability question, and because failing a diagnostic is cheap —
+// the host reads "unreachable" for one render, or a prune tick skips it, and
+// the next call tries again. That cheapness is what separates it from
+// verifyTimeout below.
+//
+// Reaching it once deliberately does NOT evict the cached connection, unlike
+// callTimeout (#252/#273): 10s is the caller's short budget — the reading
+// ssh_pool.go's sshSession takes of its own ctx — and a merely slow host must
+// not have its connection dropped by the cheapest call in the API. Reaching it
+// probeEvictThreshold times in a row does, which is a different claim; see
+// there.
+//
+// var (not const) so tests can shrink it.
+var probeTimeout = 10 * time.Second
+
+// verifyTimeout bounds ensureVerified's version probe. It is deliberately much
+// larger than probeTimeout even though it is literally the same libpod `info`
+// call, because the two failures are not the same failure (#281 review).
+//
+// preflightHost hitting its 10s is SOFT: it logs, defers verification to first
+// use, and the host keeps working. ensureVerified hitting its budget is HARD —
+// opCtx returns the error, the operation fails, and nothing is cached on
+// failure, so the next operation retries and can fail identically. A host
+// whose `info` genuinely takes longer than the budget therefore has EVERY
+// operation fail until a probe happens to land under it. Before #275 those
+// operations succeeded, slowly; a 10s hard cap would have turned "slow" into
+// "down" on exactly the hosts most likely to be slow — vedanta carries 14
+// Frappe tenants on 12 cores and has been observed at load average 75-116.
+//
+// 60s buys that host real headroom while still bounding a wedge to a minute
+// instead of forever, and it is affordable precisely because it is paid ONCE
+// per connection (r.verified is per host, cleared only when the connection is
+// evicted) rather than once per GET /hosts render. It sits coherently with its
+// neighbours: above connDialTimeout's 30s (#277), since dialing and verifying
+// are the two setup costs of a connection and verification is the heavier of
+// the two, and an order of magnitude below callTimeout's 10 minutes, since an
+// operation may legitimately run for minutes and a version check never may.
+//
+// Keeping the failure hard rather than making it soft like preflight's is
+// deliberate: the gate is a safety check (MinPodmanVersion), and a
+// timed-out probe is not evidence that the host passes it.
+//
+// var (not const) so tests can shrink it.
+var verifyTimeout = 60 * time.Second
+
+// probeEvictThreshold is how many CONSECUTIVE diagnostic timeouts on one
+// connection evict it (#281 review). It exists because "a genuinely wedged
+// connection is still evicted by the first real operation through opCtxFor"
+// silently assumes such an operation arrives, and on some hosts none does.
+//
+// A registered host carrying no instances — drained, newly added, a spare —
+// receives only Ping, Version and HostInfo, all of which are non-evicting by
+// the decision above, and wireInvalidation's socket hook sees nothing because
+// a wedged socket produces no error by definition. Nor does the inventory
+// poller rescue it: it does tick every registered host through opCtxFor
+// (RefreshHost -> PodList), but under its own per-host timeout
+// (-inventory-refresh-timeout, 20s by default) that is far shorter than
+// callTimeout, so callCtx records Canceled rather than DeadlineExceeded and
+// correctly declines to evict — and for the same reason it never contributes
+// to this streak either. Such a host would report unreachable forever, including
+// after podman on it recovered, until a reload or a restart.
+//
+// Three, not one, so the property that motivated the no-evict decision
+// survives intact: one slow answer still costs nothing, and any diagnostic
+// that completes inside its budget resets the streak to zero. That reset is
+// the discriminator between "slow" and "wedged" — a host that sometimes
+// answers is never evicted no matter how long it stays slow.
+//
+// What this does NOT amount to is "wedged for 3 x probeTimeout and it goes".
+// Only a caller whose own budget OUTLASTS probeTimeout can advance the streak
+// at all, because callCtx counts a timeout as evidence only when the deadline
+// that fired was this call's own and the caller had not given up. That is the
+// same test the inventory poller fails above, and — the case worth naming,
+// because it is the diagnostic caller that runs most often — GET /hosts fails
+// it too: listHosts caps each host at perHostTimeout (5s, internal/api/hosts.go),
+// which is below this budget, so the bridge cancels first and the render is a
+// no-op in both directions. It neither advances the streak nor resets it.
+//
+// What is left as a contributor is the diagnostics with a longer budget or
+// none: GET /hosts/{id}, instance.Service's Ping and HostInfo callers, and the
+// prune scheduler and handler — and the scheduler's is gated behind probeDue
+// and a positive DiskThreshold. So a drained spare with no prune policy can
+// still sit wedged indefinitely while the host list refreshes past it, and
+// only an operator opening its single-host page three times moves it.
+//
+// That gap is #282's shape, not a separate one: a per-caller budget
+// structurally below the budget whose expiry carries the meaning, so the
+// evidence is thrown away as Canceled. Whatever lands there — distinguishing a
+// parent's own deadline from a client disconnect, or making these caps
+// order-aware — should widen this hatch too, and the two should not be
+// rediscovered separately.
+const probeEvictThreshold = 3
 
 // callTimeout bounds each individual libpod operation so a hung SSH or
 // libpod call fails rather than blocking a job (e.g. a migrate between
@@ -1151,9 +1333,9 @@ var volumeTransferTimeoutOverride time.Duration
 // transfer — the export itself was healthy, it just outlived the same cap
 // meant for a single short RPC. This deadline covers the streamed transfer
 // itself; it does NOT extend ensureVerified's host-verification probe, which
-// (as before this change) runs on an undeadlined context — a first call to a
-// newly-added, slow-to-answer host can stall there before this timeout ever
-// engages.
+// carries verifyTimeout's own much shorter budget (#275) — a first call to a
+// newly-added, slow-to-answer host fails there rather than spending this
+// transfer-sized budget inside a version check.
 //
 // Call this once at startup from a configured flag; it is not safe to call
 // concurrently with an in-flight transfer.
@@ -1264,20 +1446,29 @@ func (r *Real) preflightHost(ctx context.Context, id string) error {
 	}
 }
 
+// Ping reports whether a host answers libpod at all. It bypasses opCtxFor's
+// version gate (see probeCtx) but is bounded by probeTimeout and unblocked by
+// the caller's cancellation.
 func (r *Real) Ping(ctx context.Context, id string) error {
-	c, err := r.ctxFor(ctx, id)
+	e, err := r.entryFor(ctx, id)
 	if err != nil {
 		return err
 	}
+	c, cancel := r.probeCtx(ctx, e, id)
+	defer cancel()
 	_, err = system.Info(c, &system.InfoOptions{})
 	return err
 }
 
+// Version reports a host's podman version. Deliberately ungated so an
+// unsupported host's version is still displayable (#85); bounded like Ping.
 func (r *Real) Version(ctx context.Context, id string) (string, error) {
-	c, err := r.ctxFor(ctx, id)
+	e, err := r.entryFor(ctx, id)
 	if err != nil {
 		return "", err
 	}
+	c, cancel := r.probeCtx(ctx, e, id)
+	defer cancel()
 	return r.probeVersion(c)
 }
 
@@ -1330,7 +1521,7 @@ func (r *Real) WaitForPodCompletion(ctx context.Context, id, podName string, tim
 	if err != nil {
 		return 0, err
 	}
-	if err := r.ensureVerified(base.ctx, id); err != nil {
+	if err := r.ensureVerified(ctx, base, id); err != nil {
 		return 0, err
 	}
 	// The wait budget carries no connection of its own — it is rooted at
@@ -1833,7 +2024,7 @@ func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []st
 	if err != nil {
 		return ExecResult{}, err
 	}
-	if err := r.ensureVerified(primary.ctx, id); err != nil {
+	if err := r.ensureVerified(ctx, primary, id); err != nil {
 		return ExecResult{}, err
 	}
 
@@ -2231,10 +2422,17 @@ func (r *Real) UsedHostPorts(ctx context.Context, id string) ([]PortMapping, err
 // than failing the whole call; only a failed `info` call (host unreachable)
 // returns an error.
 func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
-	c, err := r.ctxFor(ctx, id)
+	e, err := r.entryFor(ctx, id)
 	if err != nil {
 		return HostInfo{}, err
 	}
+	// One probe budget for both libpod calls below, not one each: `info` and
+	// `system df` are the same reachability question asked twice, and a host
+	// that answered the first is not wedged for the second. The loadavg read
+	// is not covered by it — that is the SSH pool's own, separately bounded
+	// path, and it takes the caller's ctx directly.
+	c, cancel := r.probeCtx(ctx, e, id)
+	defer cancel()
 	info, err := system.Info(c, &system.InfoOptions{})
 	if err != nil {
 		return HostInfo{}, err

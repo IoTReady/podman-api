@@ -214,11 +214,10 @@ func TestRealClient_WedgedConnectionIsEvictedOnRepeatedDeadline(t *testing.T) {
 	// Mark the host already verified. In production this happens the first
 	// time any opCtxFor call succeeds (ensureVerified). Ping deliberately
 	// bypasses opCtxFor and never sets it, and ensureVerified's version probe
-	// itself runs on the raw, undeadlined connection context — not the
-	// per-call deadline this test means to exercise — so leaving the host
-	// unverified would have PodList's opCtxFor call hang in that probe
-	// instead of hitting the deadline-bound request against the wedged
-	// transport swapped in below.
+	// carries probeTimeout, not the per-call deadline this test means to
+	// exercise — so leaving the host unverified would have PodList's
+	// opCtxFor call fail in that probe instead of at the deadline-bound
+	// request against the wedged transport swapped in below.
 	c.mu.Lock()
 	c.verified["h1"] = true
 	c.mu.Unlock()
@@ -971,8 +970,23 @@ func TestRealClient_ExecVerifiesOnThePrimaryConnection(t *testing.T) {
 
 	require.Len(t, probed, 1, "exec must verify the host exactly once")
 	got := <-probed
-	assert.False(t, got == execConn.ctx, "the version probe ran on the exec connection, which only the exec holding the lock may touch")
-	assert.True(t, got == primary.ctx, "the version probe must run on the primary connection")
+	// Compared by the bindings client the context carries, not by context
+	// identity: since #275 the probe runs on a probeTimeout-bounded context
+	// *derived* from the connection's, so it is no longer the connection
+	// context itself. The client is what "which connection" actually means.
+	gotClient, err := bindings.GetClient(got)
+	require.NoError(t, err)
+	execClient, err := bindings.GetClient(execConn.ctx)
+	require.NoError(t, err)
+	primaryClient, err := bindings.GetClient(primary.ctx)
+	require.NoError(t, err)
+	assert.False(t, gotClient == execClient, "the version probe ran on the exec connection, which only the exec holding the lock may touch")
+	assert.True(t, gotClient == primaryClient, "the version probe must run on the primary connection")
+
+	// And it must be bounded now, not riding the connection's undeadlined
+	// context the way it did before #275.
+	_, hasDeadline := got.Deadline()
+	assert.True(t, hasDeadline, "the version probe must carry its own deadline (#275)")
 }
 
 // TestRealClient_QueuedExecHonoursCallerCancellation pins the cost of
