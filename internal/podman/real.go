@@ -564,18 +564,55 @@ type invalidatingConn struct {
 	net.Conn
 	onBroken func()
 	closed   atomic.Bool
+
+	// served and writePending are what let report tell an idle-pool close
+	// apart from a host that EOFs every response (#276); see reportRead.
+	// Plain atomics, not a mutex: net/http drives one connection from two
+	// goroutines (readLoop and writeLoop), so Write can run concurrently with
+	// a blocked Read, and these are two independent one-way-ish flags rather
+	// than one invariant needing a consistent pair of values. Read sets
+	// served before clearing writePending, so any observer that sees
+	// writePending false has already seen served true.
+	served       atomic.Bool // a read has returned response bytes on this conn
+	writePending atomic.Bool // a write happened since the last such read
 }
 
 func (c *invalidatingConn) Read(b []byte) (int, error) {
 	n, err := c.Conn.Read(b)
-	c.report(err)
+	if n > 0 {
+		c.served.Store(true)
+		c.writePending.Store(false)
+	}
+	c.reportRead(n, err)
 	return n, err
 }
 
 func (c *invalidatingConn) Write(b []byte) (int, error) {
 	n, err := c.Conn.Write(b)
+	c.writePending.Store(true)
 	c.report(err)
 	return n, err
+}
+
+// reportRead is report plus the one thing report cannot see: whether this EOF
+// is the idle-pool close the io.EOF exclusion exists for. A connection taken
+// from the idle pool has, by definition, already carried a response and has
+// nothing outstanding — so a zero-byte EOF on a conn that has served bytes and
+// has no write pending since is that case, and only that case, is suppressed.
+//
+// The two shapes #276 names fail both halves and now evict: a podman service
+// restarting in a loop, or an SSH channel that opens on a half-dead client,
+// EOFs a request that is still outstanding (writePending) on a connection that
+// never carried a response (not served). The second half is load-bearing on
+// its own, because net/http's readLoop Peeks a freshly dialed connection
+// before writeLoop has written anything to it — a server that hangs up
+// instantly can therefore surface its EOF before the write ever sets
+// writePending.
+func (c *invalidatingConn) reportRead(n int, err error) {
+	if n == 0 && errors.Is(err, io.EOF) && c.served.Load() && !c.writePending.Load() {
+		return
+	}
+	c.report(err)
 }
 
 // Close marks the connection as deliberately torn down, so the read error that
@@ -601,26 +638,29 @@ func (c *invalidatingConn) Close() error {
 // from an idle keep-alive close net/http itself recovered from does evict,
 // and that is accepted rather than overlooked.
 //
-// The two exclusions are where the cheap mistake stops being cheap:
+// The exclusions are where the cheap mistake stops being cheap. There are two,
+// and only the first is applied here:
 //
 //   - net.ErrClosed after our own Close: net/http closes the connection to
 //     cancel an in-flight request, including when the caller walked away.
 //     Evicting there would punish every abandoned request.
-//   - io.EOF: the routine end of a keep-alive connection the server closed
-//     while idle, which http.Transport handles by dialing a fresh one. This
-//     one has a gap, and it is worth naming: a host that keeps dialing fine
-//     but EOFs every response read — a podman service restarting, an SSH
-//     channel that opens on a half-dead client — is never evicted here, and
-//     #252's replay-forever shape comes back for that case. The dial-error
-//     path in wireInvalidation is the backstop, so it only bites while dials
-//     keep succeeding. Closing it properly means distinguishing a
-//     zero-byte read on a conn taken from the idle pool from every other EOF,
-//     which this wrapper cannot see today.
+//   - io.EOF, but only the idle-pool kind: the routine end of a keep-alive
+//     connection the server closed while idle, which http.Transport handles
+//     by dialing a fresh one. Evicting there would drop a healthy connection
+//     on a routine event. report itself cannot tell that apart from an EOF
+//     that means the host is gone — it is handed only the error — so the
+//     distinction is drawn one layer up, in reportRead, and every EOF that
+//     reaches report is already known not to be an idle close. #276 is why:
+//     a host that keeps dialing fine but EOFs every response read used to be
+//     excluded here too, and #252's replay-forever shape came back for it.
+//
+// A write failure has no such exception: it is reported as-is, since there is
+// no idle-pool equivalent of a write that fails.
 func (c *invalidatingConn) report(err error) {
 	if err == nil || c.closed.Load() {
 		return
 	}
-	if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+	if errors.Is(err, net.ErrClosed) {
 		return
 	}
 	if connBroken(err) {
