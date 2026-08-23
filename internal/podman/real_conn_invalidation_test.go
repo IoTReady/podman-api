@@ -325,7 +325,7 @@ func TestRealClient_TransportStaysHTTPTransport(t *testing.T) {
 	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
 	require.NoError(t, err)
 
-	cctx, err := c.ctxFor("h1")
+	cctx, err := c.ctxFor(context.Background(), "h1")
 	require.NoError(t, err)
 	conn, err := bindings.GetClient(cctx)
 	require.NoError(t, err)
@@ -379,7 +379,7 @@ func TestRealClient_DialedConnPreservesCloseWrite(t *testing.T) {
 	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
 	require.NoError(t, err)
 
-	cctx, err := c.ctxFor("h1")
+	cctx, err := c.ctxFor(context.Background(), "h1")
 	require.NoError(t, err)
 	conn, err := bindings.GetClient(cctx)
 	require.NoError(t, err)
@@ -405,7 +405,7 @@ func TestRealClient_DialedConnDoesNotFakeCloseWrite(t *testing.T) {
 	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
 	require.NoError(t, err)
 
-	cctx, err := c.entryFor("h1")
+	cctx, err := c.entryFor(context.Background(), "h1")
 	require.NoError(t, err)
 	// scriptedConn has no CloseWrite, standing in for any transport whose
 	// conns cannot half-close.
@@ -897,11 +897,11 @@ func TestRealClient_EvictionClosesTheHookedTransport(t *testing.T) {
 
 // TestRealClient_InvalidationDoesNotBlockOnTheHostLock pins where invalidation
 // runs. report is called from net/http's per-connection readLoop/writeLoop
-// goroutines, and eviction needs r.mu — which connFor holds across a full
-// bindings.NewConnection, an SSH handshake plus a ping that can take tens of
-// seconds. Evicting inline would park that readLoop behind an unrelated host's
-// dial, so every in-flight request on a healthy connection would hang to its
-// own callTimeout.
+// goroutines, and eviction needs r.mu. Since #277 no dial is held under that
+// lock, so the wait is short in production — but a read loop parked on any
+// lock still stalls every request multiplexed onto that connection, and the
+// test holds r.mu directly to prove the eviction is not on the read loop's
+// path at all.
 func TestRealClient_InvalidationDoesNotBlockOnTheHostLock(t *testing.T) {
 	sock, _ := fakeLibpodServer(t)
 	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
@@ -1189,7 +1189,7 @@ func TestRealClient_RestoreTransportPutsBackTheHookedOne(t *testing.T) {
 	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
 	require.NoError(t, err)
 
-	e, err := c.entryFor("h1")
+	e, err := c.entryFor(context.Background(), "h1")
 	require.NoError(t, err)
 	require.NotNil(t, e.hooked)
 

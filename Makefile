@@ -23,6 +23,10 @@ fmt:
 
 vet:
 	go vet -tags "$(TAGS)" ./...
+	# Second pass so integration-tagged files are compiled too. Without it a
+	# clash with them — a helper redeclared, a signature drifted — is invisible
+	# locally and only fails in CI, which runs this same pair.
+	go vet -tags "$(TAGS) integration" ./...
 
 tidy:
 	go mod tidy

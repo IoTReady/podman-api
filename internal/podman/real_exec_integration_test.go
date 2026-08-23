@@ -93,7 +93,7 @@ func TestReal_ContainerExec_KeepsInvalidationHook(t *testing.T) {
 	_ = c.PodRemove(ctx, "local", pod, true)
 	require.NoError(t, c.PlayKube(ctx, "local", strings.Replace(execPodYAML, "podman-api-exec-itest", pod, 1), true))
 
-	cctx, err := c.ctxFor("local")
+	cctx, err := c.ctxFor(context.Background(), "local")
 	require.NoError(t, err)
 	primary, err := bindings.GetClient(cctx)
 	require.NoError(t, err)

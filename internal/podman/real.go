@@ -73,6 +73,15 @@ type Real struct {
 	// itself ("FIXME: This is one giant race condition"). A one-slot channel
 	// rather than a sync.Mutex because the wait for it must be cancellable.
 	execGate map[string]chan struct{}
+	// dialing and execDialing single-flight the dial for r.ctx and r.execCtx
+	// respectively: one in-flight dial per host per cache, which every other
+	// caller for that host waits on instead of starting its own. They exist
+	// because the dial no longer runs under r.mu (#277) — see connFor — so
+	// nothing else serialises a burst of first-use callers against a cold
+	// host. An entry lives only for the duration of one dial: the dial's own
+	// goroutine removes it, whether it committed a connection or failed.
+	dialing     map[string]*dialCall
+	execDialing map[string]*dialCall
 
 	// hooks is nil in production. It exists because the reload races this file
 	// guards against cannot be interleaved from outside — they live between a
@@ -103,6 +112,32 @@ type connEntry struct {
 	hooked *http.Transport
 }
 
+// connCache is one connection cache and everything that belongs to it: the
+// entries themselves, the single-flight map for dials into it, and the
+// invalidator that drops a dead entry from it. Bundled so connFor takes one
+// argument that cannot be assembled wrongly, rather than three that can.
+type connCache struct {
+	entries    map[string]*connEntry
+	inflight   map[string]*dialCall
+	invalidate invalidator
+}
+
+// dialCall is one in-flight dial: the placeholder connFor reserves under r.mu
+// before dialing off it. done is closed exactly once, by the dialing
+// goroutine, after entry/err are set and the reservation has been removed —
+// so a waiter that has seen done closed may read both without holding r.mu.
+//
+// h is the host config this dial was started against, and it is what makes a
+// joiner's decision possible: a caller must not queue behind a dial to an
+// endpoint the operator has since reconfigured away from. It is written once,
+// before the reservation is published, and never again.
+type dialCall struct {
+	h     config.Host
+	done  chan struct{}
+	entry *connEntry
+	err   error
+}
+
 // testHooks is the test-only seam described on Real.hooks.
 type testHooks struct {
 	// now overrides the clock; nil means time.Now.
@@ -128,14 +163,16 @@ type testHooks struct {
 // opened here; first use opens them.
 func NewReal(hosts []config.Host) (*Real, error) {
 	r := &Real{
-		hosts:    map[string]config.Host{},
-		ctx:      map[string]*connEntry{},
-		verified: map[string]bool{},
-		sshPool:  map[string]*sshPoolEntry{},
-		loadavg:  map[string]loadSample{},
-		loadGate: map[string]chan struct{}{},
-		execCtx:  map[string]*connEntry{},
-		execGate: map[string]chan struct{}{},
+		hosts:       map[string]config.Host{},
+		ctx:         map[string]*connEntry{},
+		verified:    map[string]bool{},
+		sshPool:     map[string]*sshPoolEntry{},
+		loadavg:     map[string]loadSample{},
+		loadGate:    map[string]chan struct{}{},
+		execCtx:     map[string]*connEntry{},
+		execGate:    map[string]chan struct{}{},
+		dialing:     map[string]*dialCall{},
+		execDialing: map[string]*dialCall{},
 	}
 	for _, h := range hosts {
 		if h.ID == "" {
@@ -262,11 +299,14 @@ func (r *Real) uriForLocked(id string) (string, error) {
 // it outlives any individual request context — per-request cancellation must
 // not kill the cached long-lived connection.
 //
-// It deliberately takes no caller context. It used to take one and ignore it,
-// which read as if the caller's deadline bounded the dial; it does not, and
-// cannot — see connFor.
-func (r *Real) ctxFor(id string) (context.Context, error) {
-	e, err := r.entryFor(id)
+// The caller's context is honoured for the *wait*, and only for the wait: it
+// bounds how long this call sits behind an in-flight dial, not the dial
+// itself, which bindings gives no way to cancel. See connFor. It used to take
+// one and ignore it, which read as if the caller's deadline bounded the dial;
+// #274 removed the parameter to make that visible, and #277 made it true
+// enough to reintroduce.
+func (r *Real) ctxFor(parent context.Context, id string) (context.Context, error) {
+	e, err := r.entryFor(parent, id)
 	if err != nil {
 		return nil, err
 	}
@@ -276,8 +316,12 @@ func (r *Real) ctxFor(id string) (context.Context, error) {
 // entryFor is ctxFor for callers that also need the connection itself — the
 // ones that can evict it (callCtx) and so must be able to close exactly what
 // they dropped.
-func (r *Real) entryFor(id string) (*connEntry, error) {
-	return r.connFor(id, r.ctx, r.invalidateConn)
+func (r *Real) entryFor(parent context.Context, id string) (*connEntry, error) {
+	return r.connFor(parent, id, connCache{
+		entries:    r.ctx,
+		inflight:   r.dialing,
+		invalidate: r.invalidateConn,
+	})
 }
 
 // execEntryFor is entryFor for the exec-only connection: a second cached
@@ -297,58 +341,210 @@ func (r *Real) entryFor(id string) (*connEntry, error) {
 // The cost is one extra connection per host that has ever run an exec —
 // pre_backup hooks and registry blob GC — kept for the same lifetime as the
 // primary one.
-func (r *Real) execEntryFor(id string) (*connEntry, error) {
-	return r.connFor(id, r.execCtx, r.invalidateExecConn)
+func (r *Real) execEntryFor(parent context.Context, id string) (*connEntry, error) {
+	return r.connFor(parent, id, connCache{
+		entries:    r.execCtx,
+		inflight:   r.execDialing,
+		invalidate: r.invalidateExecConn,
+	})
 }
 
 // connFor is the shared body of entryFor and execEntryFor: return the cached
-// connection from cache, or dial, wire invalidation, and cache one. invalidate
-// is how a transport failure on this connection drops it from that same cache.
+// connection from c.entries, or dial, wire invalidation, and cache one.
 //
-// It takes no caller context, because there is none it could honour: the dial
-// is bindings.NewConnection, whose SSH path (bindings/connection.go sshClient)
-// calls ssh.Dial with no context and no deadline of its own, and the context it
-// does take becomes the *connection's* lifetime — which must outlive any one
-// request. So the dial is unbounded, and it runs under r.mu: a blackholed host
-// (SYN dropped rather than refused) parks every operation on every host behind
-// it until the kernel's TCP timeout. Callers cannot shorten that, and the
-// signature no longer suggests they can. Bounding it properly means dialing off
-// the lock — a larger change than #273, tracked in #277.
-func (r *Real) connFor(id string, cache map[string]*connEntry, invalidate invalidator) (*connEntry, error) {
+// The dial does not run under r.mu (#277). It used to, and the dial has no
+// deadline it can be given: bindings.NewConnection's SSH path
+// (bindings/connection.go sshClient) calls ssh.Dial with no context, and the
+// context NewConnection does take becomes the *connection's* lifetime, which
+// must outlive any one request. So a blackholed host — SYN dropped rather than
+// refused — parked every operation on *every* host behind r.mu until the
+// kernel's TCP timeout. WaitForPodCompletion resolving its connection per poll
+// made that a routine exposure rather than a first-use-only one.
+//
+// The shape is reserve / dial / commit-or-roll-back:
+//
+//   - Under r.mu: return a cached entry if there is one; join the in-flight
+//     dial if there is one; otherwise reserve a placeholder in c.inflight and
+//     release the lock. r.mu is held for map operations only, so a caller for
+//     a *different* host never waits on this host's dial at all — the point of
+//     the whole exercise.
+//   - Off the lock, on its own goroutine: the dial. It runs on a goroutine
+//     rather than inline precisely because it cannot be cancelled — putting it
+//     on the caller's own stack would make the caller uncancellable too.
+//   - Back under r.mu: remove the reservation and either publish the entry or
+//     record the error, then close done. A failure leaves nothing behind, so
+//     the next caller dials again rather than inheriting a poisoned entry.
+//
+// Every caller — the one that reserved the dial included — then waits in
+// awaitDial, bounded by connDialTimeout and by its own context.
+//
+// A caller only ever joins a dial that matches the host config as it stands
+// *now*. The host is therefore resolved before the in-flight check, not after:
+// resolving it after meant an unknown host waited out a full connDialTimeout
+// on a dial nobody would publish instead of failing immediately, and — the
+// case that matters — a host repointed at a working address by a config reload
+// stayed unreachable for as long as the dial to the old address lived, which
+// on a genuinely blackholed host is the kernel's TCP timeout. That reload is
+// the operator's way out of exactly the failure this function exists to bound,
+// so it cannot be gated on the failure clearing itself first. A caller finding
+// a mismatched dial reserves a fresh one over the top of it; see runDial for
+// what happens to the one it displaced.
+func (r *Real) connFor(parent context.Context, id string, c connCache) (*connEntry, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if c, ok := cache[id]; ok {
-		return c, nil
+	if e, ok := c.entries[id]; ok {
+		r.mu.Unlock()
+		return e, nil
 	}
 	h, ok := r.hosts[id]
 	if !ok {
+		r.mu.Unlock()
 		return nil, fmt.Errorf("unknown host %q", id)
+	}
+	if d, ok := c.inflight[id]; ok && hostConnEq(d.h, h) {
+		r.mu.Unlock()
+		return awaitDial(parent, id, d)
 	}
 	uri, err := r.uriForLocked(id)
 	if err != nil {
+		r.mu.Unlock()
 		return nil, err
 	}
-	// Use context.Background() — not the caller's per-request context — so
+	d := &dialCall{h: h, done: make(chan struct{})}
+	// Replaces any reservation for a since-reconfigured endpoint. The dial it
+	// displaces keeps running (it cannot be cancelled) and still resolves its
+	// own waiters; it simply no longer speaks for this host. runDial's
+	// compare-and-delete is what keeps it from clearing this reservation on
+	// its way out.
+	c.inflight[id] = d
+	r.mu.Unlock()
+
+	go r.runDial(id, h, uri, d, c)
+
+	return awaitDial(parent, id, d)
+}
+
+// awaitDial waits for an in-flight dial to resolve, bounded by
+// connDialTimeout and by the caller's own context, whichever comes first.
+//
+// The budget is per waiter, armed here, not shared and anchored at the dial's
+// start: a caller joining a 29-second-old dial waits a fresh 30 seconds, so
+// two callers can span nearly twice the budget between them. That is the
+// intended reading — connDialTimeout is how long *this* caller is willing to
+// wait for a connection, and a deadline anchored at dial start would instead
+// give the last joiner an arbitrarily short one (a few milliseconds, if it
+// arrived late enough) and fail it for someone else's slowness.
+//
+// Giving up here abandons the wait, never the dial: the dial cannot be
+// cancelled (see connFor), so it keeps running and will still publish a usable
+// connection for whoever asks next if it eventually succeeds. That is also why
+// a timed-out waiter does not tear the reservation down — doing so would let
+// the next caller start a *second* dial against a host that is already not
+// answering, which is how a blackholed host turns one stuck handshake into a
+// pile of them.
+func awaitDial(parent context.Context, id string, d *dialCall) (*connEntry, error) {
+	timer := time.NewTimer(connDialTimeout)
+	defer timer.Stop()
+	select {
+	case <-d.done:
+		if d.err != nil {
+			return nil, d.err
+		}
+		return d.entry, nil
+	case <-timer.C:
+		return nil, fmt.Errorf("connect to host %q: dial did not complete within %s: %w", id, connDialTimeout, context.DeadlineExceeded)
+	case <-parent.Done():
+		return nil, fmt.Errorf("connect to host %q: %w", id, parent.Err())
+	}
+}
+
+// runDial performs one reserved dial and resolves its dialCall. Always called
+// on its own goroutine, and always the only thing that removes the
+// reservation it resolves.
+func (r *Real) runDial(id string, h config.Host, uri string, d *dialCall, c connCache) {
+	// Use context.Background() — not any caller's per-request context — so
 	// the cached connection context is never cancelled by a request ending.
 	// Individual operations still honour per-call cancellation because
 	// DoRequest creates http.NewRequestWithContext(ctx, ...) from the
 	// per-call context passed into each method (PodInspect, PodList, etc.).
 	connBase := context.Background()
-	var c context.Context
+	var (
+		cc  context.Context
+		err error
+	)
 	if h.Addr != "unix" && h.SSHKey != "" {
 		// SSH host with explicit key file. The fourth arg (`machine`) is false
 		// for non-machine connections per the bindings API.
-		c, err = bindings.NewConnectionWithIdentity(connBase, uri, h.SSHKey, false)
+		cc, err = bindings.NewConnectionWithIdentity(connBase, uri, h.SSHKey, false)
 	} else {
-		c, err = bindings.NewConnection(connBase, uri)
+		cc, err = bindings.NewConnection(connBase, uri)
 	}
-	if err != nil {
-		return nil, fmt.Errorf("connect to host %q: %w", id, err)
+
+	var e *connEntry
+	if err == nil {
+		e = &connEntry{ctx: cc}
+		// Wired before publishing, and off the lock: wireInvalidation touches
+		// only this connection and this entry, and it closes the transport
+		// bindings built, which is I/O.
+		r.wireInvalidation(e, id, c.invalidate)
 	}
-	e := &connEntry{ctx: c}
-	r.wireInvalidation(e, id, invalidate)
-	cache[id] = e
-	return e, nil
+
+	// surplus is a connection this dial opened but is not going to publish.
+	// Nothing else holds it, so any pooled socket of its own — and net/http's
+	// read and write goroutine per socket — would live for the process
+	// lifetime. In practice its pool is empty by now: bindings pings over the
+	// transport it built, and wireInvalidation hooks a clone and closes that
+	// original, so this entry's hooked transport has never served a request.
+	// Closed anyway, on the same belt-and-braces reasoning as every other
+	// close site for an entry nobody will use again. Closing is I/O, so it
+	// happens after the unlock — the same rule SetHosts follows.
+	var surplus *connEntry
+
+	r.mu.Lock()
+	// Compare-and-delete, the same identity check the invalidators make: a
+	// dial displaced by connFor (the host was reconfigured mid-dial) must not
+	// clear the reservation that replaced it, or the next caller starts a
+	// second dial against a host that already has one in flight — precisely
+	// the pile-up single-flight exists to prevent.
+	if c.inflight[id] == d {
+		delete(c.inflight, id)
+	}
+	switch {
+	case err != nil:
+		d.err = fmt.Errorf("connect to host %q: %w", id, err)
+	case !hostStillMatches(r.hosts, id, h):
+		// SetHosts landed while this dial was in flight — the host was removed
+		// or re-addressed. Under the old lock-held dial this was impossible;
+		// off the lock it is a real interleaving, and publishing here would
+		// cache a connection to the endpoint the operator just reconfigured
+		// away from and serve every later call over it. Fail this call instead;
+		// the next one dials the new endpoint.
+		surplus = e
+		d.err = fmt.Errorf("connect to host %q: host reconfigured while connecting", id)
+	case c.entries[id] != nil:
+		// Reachable: a host repointed away and then back again can have two
+		// dials outstanding whose configs both match the current one, and
+		// either may finish first. The published entry is the one every other
+		// caller already has, so it wins and ours is the surplus. Waiters on
+		// this call get the live cached connection rather than an error.
+		surplus = e
+		d.entry = c.entries[id]
+	default:
+		c.entries[id] = e
+		d.entry = e
+	}
+	r.mu.Unlock()
+	close(d.done)
+
+	if surplus != nil {
+		surplus.closeIdleConns()
+	}
+}
+
+// hostStillMatches reports whether id is still registered with the same
+// connection parameters it had when a dial for it started.
+func hostStillMatches(hosts map[string]config.Host, id string, dialed config.Host) bool {
+	cur, ok := hosts[id]
+	return ok && hostConnEq(cur, dialed)
 }
 
 // wireInvalidation hooks c's underlying HTTP transport so a transport-level
@@ -404,12 +600,14 @@ func (r *Real) wireInvalidation(e *connEntry, id string, invalidate invalidator)
 	}
 	hooked := tr.Clone()
 	// Invalidation runs on its own goroutine, never inline. report is called
-	// from net/http's per-connection readLoop/writeLoop, and eviction needs
-	// r.mu — which connFor holds across a whole bindings.NewConnection, an SSH
-	// handshake plus a ping. Evicting inline would park that readLoop behind an
-	// unrelated host's dial, hanging every in-flight request on a healthy
-	// connection until its own callTimeout. The identity check inside the
-	// invalidators already makes a late eviction safe.
+	// from net/http's per-connection readLoop/writeLoop, and eviction both
+	// takes r.mu and closes the dead connection's idle sockets — I/O on the
+	// path of the read loop that is reporting the failure. Since #277 r.mu is
+	// no longer held across a dial, so the wait for it is short; the eviction
+	// itself is still not the read loop's work to do, and blocking that loop
+	// stalls every other request multiplexed onto the same connection. The
+	// identity check inside the invalidators already makes a late eviction
+	// safe.
 	onBroken := func() { go invalidate(id, e) }
 	hooked.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		nc, err := dial(ctx, network, addr)
@@ -835,7 +1033,7 @@ func (r *Real) opCtxForStream(parent context.Context, id string) (context.Contex
 // opCtx is the shared body of the three above: resolve the host's cached
 // connection, verify its version once, and derive the per-call context.
 func (r *Real) opCtx(parent context.Context, id string, timeout time.Duration, invalidate invalidator) (context.Context, context.CancelFunc, error) {
-	c, err := r.entryFor(id)
+	c, err := r.entryFor(parent, id)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -893,6 +1091,33 @@ func (r *Real) callCtx(parent context.Context, base *connEntry, id string, timeo
 		}
 	}
 }
+
+// connDialTimeout bounds one attempt to open a libpod connection: TCP connect,
+// the SSH handshake for an ssh:// host, and the /_ping bindings.NewConnection
+// issues as part of connecting.
+//
+// It has to be a budget of its own because none of the existing ones can serve:
+// the context NewConnection takes becomes the *connection's* lifetime (it must
+// outlive any one request, so it cannot carry a deadline), and its SSH path
+// calls ssh.Dial with no context at all. Left unbounded, a blackholed host
+// (SYN dropped rather than refused) rides the kernel's TCP timeout — over two
+// minutes on Linux's default retry schedule.
+//
+// 30s is chosen against the two neighbours it sits between. It is deliberately
+// well above ssh_pool.go's sshDialTimeout (5s), which bounds a bare TCP+SSH
+// handshake for a `cat` of a /proc file: this dial does that handshake plus an
+// HTTP round trip, on a path taken once per host rather than per read, and
+// failing it evicts nothing but costs a real operation. It is equally
+// deliberately nowhere near callTimeout (10 minutes), which is a whole libpod
+// operation's budget — getting a socket is not an operation, and a host that
+// has not answered a ping in 30s is not slow, it is gone. It is also longer
+// than preflightTimeout (10s) so that boot-time preflight keeps giving up
+// first and deferring the version check to first use, exactly as it did
+// before, rather than having this fail the dial underneath it.
+//
+// A caller's own deadline still applies on top: whichever expires first wins.
+// var (not const) so tests can shrink it.
+var connDialTimeout = 30 * time.Second
 
 // preflightTimeout bounds each host's boot-time connect+version probe.
 // var (not const) so tests can shrink it.
@@ -1008,7 +1233,7 @@ func (r *Real) preflightHost(ctx context.Context, id string) error {
 	// connection for first use — caching grants no unverified access, it only
 	// avoids a second dial (opCtxFor still runs the version gate).
 	go func() {
-		c, err := r.ctxFor(id)
+		c, err := r.ctxFor(ctx, id)
 		if err != nil {
 			ch <- result{err: err}
 			return
@@ -1040,7 +1265,7 @@ func (r *Real) preflightHost(ctx context.Context, id string) error {
 }
 
 func (r *Real) Ping(ctx context.Context, id string) error {
-	c, err := r.ctxFor(id)
+	c, err := r.ctxFor(ctx, id)
 	if err != nil {
 		return err
 	}
@@ -1049,7 +1274,7 @@ func (r *Real) Ping(ctx context.Context, id string) error {
 }
 
 func (r *Real) Version(ctx context.Context, id string) (string, error) {
-	c, err := r.ctxFor(id)
+	c, err := r.ctxFor(ctx, id)
 	if err != nil {
 		return "", err
 	}
@@ -1101,7 +1326,7 @@ var waitPollInterval = 2 * time.Second
 // opCtxFor, so a 30-minute caller timeout is honoured rather than silently
 // truncated to 10 minutes.
 func (r *Real) WaitForPodCompletion(ctx context.Context, id, podName string, timeout time.Duration) (int, error) {
-	base, err := r.entryFor(id)
+	base, err := r.entryFor(ctx, id)
 	if err != nil {
 		return 0, err
 	}
@@ -1133,7 +1358,7 @@ func (r *Real) WaitForPodCompletion(ctx context.Context, id, podName string, tim
 	// the first entry would spend the rest of the budget polling the endpoint
 	// the operator just reconfigured away from.
 	poll := func(fn func(context.Context) error) error {
-		base, err := r.entryFor(id)
+		base, err := r.entryFor(c, id)
 		if err != nil {
 			return err
 		}
@@ -1604,7 +1829,7 @@ func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []st
 	// transport restoreTransport is about to orphan. The version is a host
 	// property the primary connection establishes anyway — the same reason
 	// invalidateExecConn leaves r.verified alone.
-	primary, err := r.entryFor(id)
+	primary, err := r.entryFor(ctx, id)
 	if err != nil {
 		return ExecResult{}, err
 	}
@@ -1632,7 +1857,7 @@ func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []st
 	// invalidateExecConn a no-op, the identity check no longer matching — or,
 	// worse, dial through the old entry's SSH client and exec against the
 	// endpoint the operator just reconfigured away from.
-	conn, err := r.execEntryFor(id)
+	conn, err := r.execEntryFor(ctx, id)
 	if err != nil {
 		return ExecResult{}, err
 	}
@@ -2006,7 +2231,7 @@ func (r *Real) UsedHostPorts(ctx context.Context, id string) ([]PortMapping, err
 // than failing the whole call; only a failed `info` call (host unreachable)
 // returns an error.
 func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
-	c, err := r.ctxFor(id)
+	c, err := r.ctxFor(ctx, id)
 	if err != nil {
 		return HostInfo{}, err
 	}
