@@ -569,10 +569,15 @@ type invalidatingConn struct {
 	// apart from a host that EOFs every response (#276); see reportRead.
 	// Plain atomics, not a mutex: net/http drives one connection from two
 	// goroutines (readLoop and writeLoop), so Write can run concurrently with
-	// a blocked Read, and these are two independent one-way-ish flags rather
-	// than one invariant needing a consistent pair of values. Read sets
-	// served before clearing writePending, so any observer that sees
-	// writePending false has already seen served true.
+	// a blocked Read, and these are two independent flags rather than one
+	// invariant needing a consistent pair of values.
+	//
+	// The one pairing that has to hold is the suppressing one, and reportRead
+	// establishes it by load order rather than by locking: Read stores served
+	// before it clears writePending, and reportRead loads writePending before
+	// served, so seeing writePending false guarantees the served store is
+	// already visible. Every other interleaving falls out on the evicting
+	// side, which is the cheap mistake by design (see report).
 	served       atomic.Bool // a read has returned response bytes on this conn
 	writePending atomic.Bool // a write happened since the last such read
 }
@@ -588,8 +593,16 @@ func (c *invalidatingConn) Read(b []byte) (int, error) {
 }
 
 func (c *invalidatingConn) Write(b []byte) (int, error) {
-	n, err := c.Conn.Write(b)
+	// Before the write, not after: writeLoop and readLoop are different
+	// goroutines, so a server that answers between Conn.Write returning and
+	// the store landing would have readLoop clear writePending first and this
+	// store then set it back — leaving a stale "pending" write on a
+	// connection that is now idle, whose next idle-pool close would evict
+	// spuriously. Setting it first also matches the name: a write is pending
+	// from the moment it is attempted. A write that fails leaves it set,
+	// which is what we want — that connection carried an unanswered request.
 	c.writePending.Store(true)
+	n, err := c.Conn.Write(b)
 	c.report(err)
 	return n, err
 }
@@ -609,7 +622,7 @@ func (c *invalidatingConn) Write(b []byte) (int, error) {
 // instantly can therefore surface its EOF before the write ever sets
 // writePending.
 func (c *invalidatingConn) reportRead(n int, err error) {
-	if n == 0 && errors.Is(err, io.EOF) && c.served.Load() && !c.writePending.Load() {
+	if n == 0 && errors.Is(err, io.EOF) && !c.writePending.Load() && c.served.Load() {
 		return
 	}
 	c.report(err)
@@ -656,6 +669,20 @@ func (c *invalidatingConn) Close() error {
 //
 // A write failure has no such exception: it is reported as-is, since there is
 // no idle-pool equivalent of a write that fails.
+//
+// The accepted cost of drawing the line at "nothing outstanding" is that a
+// response already in progress looks identical to a finished one, because
+// every chunk of it is an n > 0 read that clears writePending. That is not
+// limited to a rare truncated body: it covers every LONG-LIVED STREAM for its
+// whole duration — ContainerLogs in follow mode (opCtxForStream; the UI opens
+// one per logs tab) and the hijacked exec connection. A host that dies
+// mid-stream therefore suppresses, for as long as that stream was open. For
+// exec that is the wanted behaviour, since a normal command ending looks
+// exactly the same from here. For follow-logs against a dying podman it is
+// #252's shape again, on the call most likely to be open when a host goes
+// down — accepted rather than overlooked, because separating the two needs
+// response framing this wrapper cannot see. The dial-error path in
+// wireInvalidation remains the backstop for the next call.
 func (c *invalidatingConn) report(err error) {
 	if err == nil || c.closed.Load() {
 		return
