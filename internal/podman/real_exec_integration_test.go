@@ -72,21 +72,30 @@ func TestReal_ContainerExec_LocalOnly(t *testing.T) {
 	assert.True(t, strings.Contains(res.Output, "to-stderr"), "stderr must be captured too, got %q", res.Output)
 }
 
-// TestReal_ContainerExec_KeepsInvalidationHook pins what podman does to the
-// connection on the way out: newUpgradeRequest builds its own *http.Transport
-// and assigns it to conn.Client.Transport permanently (podman v5.8.2
-// attach.go:611), never restoring the original. Left alone, every exec strands
-// the transport wireInvalidation installed — with its idle conns and their
-// goroutines, and IdleConnTimeout: 0 on the replacement so nothing reaps them —
-// and clones one layer deeper the next time round. This daemon execs on every
-// pre_backup hook and every registry blob GC, so it accumulates for the
-// process lifetime.
-func TestReal_ContainerExec_KeepsInvalidationHook(t *testing.T) {
+// TestReal_ContainerExec_LeavesNothingOnTheHost pins what podman does to the
+// connection on the way out and what must be true of it afterwards.
+// newUpgradeRequest builds its own *http.Transport and assigns it to
+// conn.Client.Transport permanently (podman v5.8.2 attach.go:611), never
+// restoring the original. Since #278 that connection is dialed per exec and
+// closed by the exec, so two things have to hold: the transport
+// wireInvalidation installed is back in place by the time the connection is
+// released (otherwise the close reaches podman's throwaway and strands ours,
+// keep-alive sockets and their goroutines included), and no exec ever touches
+// the shared connection every other operation uses.
+func TestReal_ContainerExec_LeavesNothingOnTheHost(t *testing.T) {
 	sock := localSocket(t)
 	c, err := NewReal([]config.Host{{ID: "local", Addr: "unix", Socket: sock}})
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
+
+	var mu sync.Mutex
+	var execConns []*connEntry
+	c.hooks = &testHooks{execDialed: func(e *connEntry) {
+		mu.Lock()
+		defer mu.Unlock()
+		execConns = append(execConns, e)
+	}}
 
 	const pod = "podman-api-exec-hook-itest"
 	t.Cleanup(func() { _ = c.PodRemove(context.Background(), "local", pod, true) })
@@ -99,22 +108,23 @@ func TestReal_ContainerExec_KeepsInvalidationHook(t *testing.T) {
 	require.NoError(t, err)
 	primaryTransport := primary.Client.Transport
 
-	// First exec dials the exec-only connection; take its client afterwards.
-	require.NoError(t, execOK(c, ctx, pod))
-	c.mu.Lock()
-	ectx := c.execCtx["local"]
-	c.mu.Unlock()
-	require.NotNil(t, ectx, "exec must run on its own connection")
-	execConn, err := bindings.GetClient(ectx.ctx)
-	require.NoError(t, err)
-	execTransport := execConn.Client.Transport
-
-	for i := range 2 {
+	for i := range 3 {
 		require.NoError(t, execOK(c, ctx, pod), "exec %d", i)
-		assert.Same(t, execTransport, execConn.Client.Transport,
-			"exec %d left podman's transport in place, dropping the invalidation hook", i)
 		assert.Same(t, primaryTransport, primary.Client.Transport,
 			"exec %d touched the connection every other operation uses", i)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, execConns, 3, "each exec must dial a connection of its own")
+	seen := map[*connEntry]bool{}
+	for i, e := range execConns {
+		assert.False(t, seen[e], "exec %d reused an earlier exec's connection", i)
+		seen[e] = true
+		conn, err := bindings.GetClient(e.ctx)
+		require.NoError(t, err)
+		assert.Same(t, e.hooked, conn.Client.Transport,
+			"exec %d left podman's transport in place, so its close reached the wrong one", i)
 	}
 }
 
