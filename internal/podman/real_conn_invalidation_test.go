@@ -699,18 +699,32 @@ func TestRealClient_EvictionClosesTheDeadConnection(t *testing.T) {
 		"evicting a connection must close its pooled sockets, not just forget the context")
 }
 
+// execConnsOf records every per-exec connection ContainerExec dials, which is
+// the only place a test can see one: it is deliberately published nowhere.
+func execConnsOf(c *Real) *[]*connEntry {
+	seen := &[]*connEntry{}
+	var mu sync.Mutex
+	c.hooks = &testHooks{execDialed: func(e *connEntry) {
+		mu.Lock()
+		defer mu.Unlock()
+		*seen = append(*seen, e)
+	}}
+	return seen
+}
+
 // TestRealClient_ExecUsesItsOwnConnection pins the isolation the exec path
 // needs. podman's newUpgradeRequest replaces conn.Client.Transport for the
 // whole duration of an exec, so on a shared connection every concurrent
 // PodList/Ping/health poll on that host both races that write and can park its
 // keep-alive socket in podman's temporary transport — which has
 // IdleConnTimeout: 0 and becomes unreachable the moment the transport is put
-// back. Serialising exec against exec cannot fix either; exec needs a
-// connection nothing else uses.
+// back. Since #278 the connection is dialed per exec rather than cached per
+// host, so this holds against other execs too, without a turnstile.
 func TestRealClient_ExecUsesItsOwnConnection(t *testing.T) {
 	sock, _ := fakeLibpodServer(t)
 	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
 	require.NoError(t, err)
+	seen := execConnsOf(c)
 
 	ctx := context.Background()
 	require.NoError(t, c.Ping(ctx, "h1"))
@@ -724,37 +738,170 @@ func TestRealClient_ExecUsesItsOwnConnection(t *testing.T) {
 	require.NoError(t, err)
 	hooked := conn.Client.Transport
 
-	// The fake server cannot complete an attach, so the exec itself fails —
-	// what matters is which connection it ran on.
+	// The fake server cannot complete an attach, so the execs themselves fail
+	// — what matters is which connection each ran on.
+	_, _ = c.ContainerExec(ctx, "h1", "some-container", []string{"/bin/true"})
 	_, _ = c.ContainerExec(ctx, "h1", "some-container", []string{"/bin/true"})
 
-	c.mu.Lock()
-	execConn := c.execCtx["h1"]
-	stillPrimary := c.ctx["h1"]
-	c.mu.Unlock()
+	require.Len(t, *seen, 2, "each exec must dial a connection of its own")
+	first, second := (*seen)[0], (*seen)[1]
+	assert.False(t, primary == first, "exec must not share the connection every other call uses")
+	assert.False(t, first == second, "the second exec reused the first one's connection")
 
-	require.NotNil(t, execConn, "exec must dial its own connection")
-	assert.False(t, primary == execConn, "exec must not share the connection every other call uses")
+	c.mu.Lock()
+	stillPrimary := c.ctx["h1"]
+	cached := len(c.ctx)
+	c.mu.Unlock()
 	assert.True(t, primary == stillPrimary, "a failed exec must not evict the primary connection")
+	assert.Equal(t, 1, cached, "an exec connection was left in a cache; nothing would ever evict it")
 	assert.Same(t, hooked, conn.Client.Transport, "exec must not touch the primary connection's transport")
 }
 
-// TestRealClient_UnknownHostExecCreatesNoLock guards a small unbounded-growth
-// hole: the per-host exec turnstile must not be created for an id that was
-// never a host, because SetHosts only ever cleans up entries it finds in
-// r.hosts.
-func TestRealClient_UnknownHostExecCreatesNoLock(t *testing.T) {
-	sock, _ := fakeLibpodServer(t)
+// TestRealClient_ExecsOnOneHostDoNotSerialise is the point of #278. Before it,
+// exec on a host ran behind a per-host turnstile, so one instance's pre_backup
+// database dump legitimately holding it for the whole callTimeout (10 minutes)
+// blocked the registry blob GC and every other instance's pre_backup on that
+// host, with the wait itself carrying no deadline — k queued execs, a tail of
+// up to k × callTimeout. Two execs must be able to be in flight at once.
+func TestRealClient_ExecsOnOneHostDoNotSerialise(t *testing.T) {
+	const n = 2
+	arrived := make(chan struct{}, n)
+	release := make(chan struct{})
+	sock, _ := fakeLibpodServerWith(t, func(w http.ResponseWriter, r *http.Request) bool {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/exec") {
+			return false
+		}
+		// Hold every exec-create open until they have all arrived. If exec
+		// still serialised, the second one never reaches here at all.
+		arrived <- struct{}{}
+		select {
+		case <-release:
+		case <-time.After(10 * time.Second):
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"Id":"sess"}`))
+		return true
+	})
+	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
+	require.NoError(t, err)
+	c.mu.Lock()
+	c.verified["h1"] = true
+	c.mu.Unlock()
+
+	done := make(chan struct{}, n)
+	for range n {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			// Fails at the attach the fake server cannot complete; reaching
+			// exec-create at all is what is under test.
+			_, _ = c.ContainerExec(context.Background(), "h1", "some-container", []string{"/bin/true"})
+		}()
+	}
+
+	for i := range n {
+		select {
+		case <-arrived:
+		case <-time.After(10 * time.Second):
+			close(release)
+			t.Fatalf("only %d of %d execs reached the host: execs on one host still serialise", i, n)
+		}
+	}
+	close(release)
+	for range n {
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("exec never returned")
+		}
+	}
+}
+
+// TestRealClient_ExecClosesItsConnection is the other half of dialing one per
+// exec: nothing else can close it. It is in no cache, so no eviction and no
+// SetHosts reload will ever reach it — an exec that does not release its own
+// connection leaks one per pre_backup hook and per blob GC for the process
+// lifetime.
+//
+// Measured as sockets opened against sockets closed rather than as a raw close
+// count, because a close happens on the exec's way in as well: wireInvalidation
+// closes the transport bindings built once it has hooked a clone of it, which
+// takes the connect-time ping's socket with it. Only the balance distinguishes
+// "the exec cleaned up after itself" from "something closed at some point".
+func TestRealClient_ExecClosesItsConnection(t *testing.T) {
+	sock, ln := fakeLibpodServerListener(t, nil)
 	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
 	require.NoError(t, err)
 
-	_, err = c.ContainerExec(context.Background(), "nope", "some-container", []string{"/bin/true"})
+	ctx := context.Background()
+	require.NoError(t, c.Ping(ctx, "h1"))
+	c.mu.Lock()
+	c.verified["h1"] = true
+	c.mu.Unlock()
+
+	// The primary's own dial leaves one close in flight: wireInvalidation
+	// closes the transport bindings built once it has hooked a clone of it,
+	// taking the connect-time ping's socket with it. Wait for that to land
+	// server-side so the window measured below holds only the exec's sockets.
+	waitFor(t, "the primary's connect-time socket to be closed", func() bool { return ln.closes.Load() >= 1 })
+
+	acceptsBefore, closesBefore := ln.accepts.Load(), ln.closes.Load()
+	// Fails at the attach the fake server cannot complete; the connection must
+	// be released all the same, which is the path — an error — that a deferred
+	// close exists for.
+	_, err = c.ContainerExec(ctx, "h1", "some-container", []string{"/bin/true"})
 	require.Error(t, err)
 
-	c.mu.Lock()
-	_, created := c.execGate["nope"]
-	c.mu.Unlock()
-	assert.False(t, created, "an unknown host must not leave a turnstile behind")
+	opened := ln.accepts.Load() - acceptsBefore
+	require.Positive(t, opened, "exec must dial a connection of its own")
+
+	waitFor(t, "the exec's sockets to be closed", func() bool { return ln.closes.Load()-closesBefore >= opened })
+	closed := ln.closes.Load() - closesBefore
+	assert.Equal(t, opened, closed,
+		"the exec opened %d sockets and closed %d: its connection outlived it, and nothing else will ever close it", opened, closed)
+
+	// The primary is still there and still usable: releasing the exec
+	// connection must not have taken the shared one with it.
+	require.NoError(t, c.Ping(ctx, "h1"))
+}
+
+// TestExecDial_HandoffGivesTheConnectionExactlyOneOwner pins the race the
+// per-exec dial has to survive. The dial cannot be cancelled, so a waiter that
+// times out or is cancelled returns before the connection exists — and a
+// connection neither side owns is an SSH client and its sockets left alive
+// with nothing holding a reference to them.
+func TestExecDial_HandoffGivesTheConnectionExactlyOneOwner(t *testing.T) {
+	t.Run("waiter takes it", func(t *testing.T) {
+		d := &execDial{done: make(chan struct{})}
+		e := &connEntry{}
+		assert.Nil(t, d.settle(e, nil), "the waiter is still there; the dial must not close its connection")
+		got, err := awaitExecDial(context.Background(), "h1", d)
+		require.NoError(t, err)
+		assert.Same(t, e, got)
+	})
+
+	t.Run("dial finishes after the waiter gave up", func(t *testing.T) {
+		d := &execDial{done: make(chan struct{})}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := awaitExecDial(ctx, "h1", d)
+		require.ErrorIs(t, err, context.Canceled)
+
+		e := &connEntry{}
+		assert.Same(t, e, d.settle(e, nil),
+			"a connection dialed for a caller that gave up must be handed back to be closed")
+	})
+
+	t.Run("waiter gives up after the dial finished", func(t *testing.T) {
+		// select may pick a caller's timer even though done is already
+		// closed, so abandon() has to take the published entry over rather
+		// than orphan it.
+		d := &execDial{done: make(chan struct{})}
+		e := &connEntry{}
+		require.Nil(t, d.settle(e, nil))
+		assert.Same(t, e, d.abandon(),
+			"the entry the dial published had no owner left, and nothing closed it")
+		assert.Nil(t, d.abandon(), "the connection must not be handed out twice")
+	})
 }
 
 // TestRealClient_SetHostsClosesDroppedConnections extends the invariant
@@ -791,62 +938,25 @@ func TestRealClient_SetHostsClosesDroppedConnections(t *testing.T) {
 	}
 }
 
-// TestRealClient_ExecDeadlineStartsAfterTheLock pins the ordering ContainerExec
-// needs: the host is resolved before the exec lock (an unknown id must not mint
-// a mutex), but the per-call clock only starts once the lock is held. Execs are
-// serialised per host and one may legitimately run the full callTimeout — a
-// pre_backup database dump — so a queued exec that started its budget at the
-// back of the queue would fail without ever running, and take the exec
-// connection down with it on the way out.
-func TestRealClient_ExecDeadlineStartsAfterTheLock(t *testing.T) {
-	sock, _ := fakeLibpodServer(t)
+// TestRealClient_ExecOnUnknownHostDialsNothing pins that a bad id fails before
+// anything is opened. entryFor rejects it first, and execConnFor re-checks
+// r.hosts under r.mu anyway, because its caller's validation released the lock
+// and a SetHosts landing in that window must not leave an exec dialing an
+// endpoint that is no longer configured.
+func TestRealClient_ExecOnUnknownHostDialsNothing(t *testing.T) {
+	sock, ln := fakeLibpodServerListener(t, nil)
 	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
 	require.NoError(t, err)
+	seen := execConnsOf(c)
 
-	ctx := context.Background()
-	c.mu.Lock()
-	c.verified["h1"] = true
-	c.mu.Unlock()
+	_, err = c.ContainerExec(context.Background(), "nope", "some-container", []string{"/bin/true"})
+	require.Error(t, err)
 
-	// Warm the exec connection so the goroutine below only has the lock to
-	// wait on.
-	_, _ = c.ContainerExec(ctx, "h1", "some-container", []string{"/bin/true"})
-	c.mu.Lock()
-	execConn := c.execCtx["h1"]
-	c.mu.Unlock()
-	require.NotNil(t, execConn)
+	assert.Empty(t, *seen, "an unknown host must not get an exec connection")
+	assert.Zero(t, ln.accepts.Load(), "an unknown host must not be dialed at all")
 
-	origTimeout := callTimeout
-	callTimeout = 100 * time.Millisecond
-	t.Cleanup(func() { callTimeout = origTimeout })
-
-	// Stand in for an exec already running on this host.
-	gate, err := c.execGateFor("h1")
-	require.NoError(t, err)
-	gate <- struct{}{}
-
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := c.ContainerExec(ctx, "h1", "some-container", []string{"/bin/true"})
-		errCh <- err
-	}()
-
-	// Hold the turnstile well past callTimeout, then let the queued exec run.
-	time.Sleep(300 * time.Millisecond)
-	<-gate
-
-	select {
-	case err := <-errCh:
-		assert.NotErrorIs(t, err, context.DeadlineExceeded,
-			"a queued exec spent its budget waiting its turn instead of running")
-	case <-time.After(5 * time.Second):
-		t.Fatal("queued exec never returned")
-	}
-
-	c.mu.Lock()
-	after := c.execCtx["h1"]
-	c.mu.Unlock()
-	assert.True(t, execConn == after, "waiting its turn must not evict the exec connection")
+	_, err = c.execConnFor(context.Background(), "nope")
+	assert.Error(t, err, "execConnFor must re-check the host under r.mu")
 }
 
 // TestRealClient_EvictionClosesTheHookedTransport covers the window in which
@@ -945,8 +1055,10 @@ func TestRealClient_InvalidationDoesNotBlockOnTheHostLock(t *testing.T) {
 // connection both races that write and can park its keep-alive socket in
 // podman's temporary transport, which restoreTransport then orphans. The
 // version is a host property the primary connection already establishes — which
-// is exactly why invalidateExecConn leaves r.verified alone — so it is the
-// connection to probe over.
+// is exactly why the exec connection is dialed only after the gate has passed
+// — so it is the connection to probe over. Since #278 that connection is a
+// fresh one per exec, which the probe would have to pay a whole extra dial to
+// reach.
 func TestRealClient_ExecVerifiesOnThePrimaryConnection(t *testing.T) {
 	sock, _ := fakeLibpodServer(t)
 	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
@@ -958,15 +1070,17 @@ func TestRealClient_ExecVerifiesOnThePrimaryConnection(t *testing.T) {
 		return "5.8.2", nil
 	}
 
+	seen := execConnsOf(c)
+
 	// The fake server cannot complete an attach, so the exec fails — what
 	// matters is which connection the verification probe ran on.
 	_, _ = c.ContainerExec(context.Background(), "h1", "some-container", []string{"/bin/true"})
 
 	c.mu.Lock()
 	primary := c.ctx["h1"]
-	execConn := c.execCtx["h1"]
 	c.mu.Unlock()
-	require.NotNil(t, execConn, "exec must dial its own connection")
+	require.Len(t, *seen, 1, "exec must dial its own connection")
+	execConn := (*seen)[0]
 
 	require.Len(t, probed, 1, "exec must verify the host exactly once")
 	got := <-probed
@@ -980,7 +1094,7 @@ func TestRealClient_ExecVerifiesOnThePrimaryConnection(t *testing.T) {
 	require.NoError(t, err)
 	primaryClient, err := bindings.GetClient(primary.ctx)
 	require.NoError(t, err)
-	assert.False(t, gotClient == execClient, "the version probe ran on the exec connection, which only the exec holding the lock may touch")
+	assert.False(t, gotClient == execClient, "the version probe ran on the exec's own connection instead of the shared one")
 	assert.True(t, gotClient == primaryClient, "the version probe must run on the primary connection")
 
 	// And it must be bounded now, not riding the connection's undeadlined
@@ -989,15 +1103,13 @@ func TestRealClient_ExecVerifiesOnThePrimaryConnection(t *testing.T) {
 	assert.True(t, hasDeadline, "the version probe must carry its own deadline (#275)")
 }
 
-// TestRealClient_QueuedExecHonoursCallerCancellation pins the cost of
-// serialising exec per host. sync.Mutex.Lock is not context-aware, and by the
-// "clock after the lock" ordering the wait for the lock carries no deadline of
-// its own — so with k execs queued behind a pre_backup database dump legitimately
-// running the full callTimeout, a caller waits up to k*callTimeout with no way
-// out: neither its own cancelled request context nor daemon shutdown unblocks
-// it, and the goroutine stays parked. ContainerExec took no lock at all before
-// #273, so this wait is new and must be cancellable.
-func TestRealClient_QueuedExecHonoursCallerCancellation(t *testing.T) {
+// TestRealClient_ExecHonoursCallerCancellation pins that a caller giving up
+// gets its own cancellation back rather than being parked. Before #278 the
+// wait that had to be cancellable was the per-host turnstile; now it is the
+// per-exec dial, which for an ssh:// host is a handshake that cannot itself be
+// cancelled — awaitExecDial abandons the wait, and the dial hands the
+// connection back to be closed rather than stranding it.
+func TestRealClient_ExecHonoursCallerCancellation(t *testing.T) {
 	sock, _ := fakeLibpodServer(t)
 	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
 	require.NoError(t, err)
@@ -1006,28 +1118,21 @@ func TestRealClient_QueuedExecHonoursCallerCancellation(t *testing.T) {
 	c.verified["h1"] = true
 	c.mu.Unlock()
 
-	// Stand in for an exec already running on this host, holding the turnstile
-	// for longer than this test is willing to wait.
-	held, err := c.execGateFor("h1")
-	require.NoError(t, err)
-	held <- struct{}{}
-	defer func() { <-held }()
-
 	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
 	errCh := make(chan error, 1)
 	go func() {
 		_, err := c.ContainerExec(ctx, "h1", "some-container", []string{"/bin/true"})
 		errCh <- err
 	}()
-	time.Sleep(50 * time.Millisecond)
-	cancel()
 
 	select {
 	case err := <-errCh:
 		assert.ErrorIs(t, err, context.Canceled,
-			"a queued exec must return its caller's cancellation, not swallow it")
+			"a cancelled exec must return its caller's cancellation, not swallow it")
 	case <-time.After(5 * time.Second):
-		t.Fatal("a cancelled caller stayed parked waiting its turn")
+		t.Fatal("a cancelled caller stayed parked")
 	}
 }
 
@@ -1063,74 +1168,6 @@ func TestRealClient_SetHostsClosesTheHookedTransport(t *testing.T) {
 	}
 	assert.Greater(t, ln.closes.Load(), closedBefore,
 		"a reload closed the transport the connection happens to hold, not the one it hooked")
-}
-
-// TestRealClient_QueuedExecResolvesConnectionAfterTheGate pins that the exec
-// connection is resolved after the turnstile is won, not before it. The wait is
-// unbounded by design, and an entry captured ahead of it can be dropped during
-// it — by invalidateExecConn, or by a SetHosts that repointed the host. A
-// queued exec running on the dropped entry would talk to the old endpoint.
-func TestRealClient_QueuedExecResolvesConnectionAfterTheGate(t *testing.T) {
-	sock, _ := fakeLibpodServer(t)
-	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
-	require.NoError(t, err)
-
-	ctx := context.Background()
-	c.mu.Lock()
-	c.verified["h1"] = true
-	c.mu.Unlock()
-
-	// Warm the exec connection, then stand in for an exec already holding the
-	// turnstile so the one below queues behind it.
-	_, _ = c.ContainerExec(ctx, "h1", "some-container", []string{"/bin/true"})
-	c.mu.Lock()
-	stale := c.execCtx["h1"]
-	c.mu.Unlock()
-	require.NotNil(t, stale)
-
-	gate, err := c.execGateFor("h1")
-	require.NoError(t, err)
-	gate <- struct{}{}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		_, _ = c.ContainerExec(ctx, "h1", "some-container", []string{"/bin/true"})
-	}()
-
-	// Drop the entry while the exec is queued, exactly as invalidateExecConn or
-	// SetHosts would, then let it run.
-	time.Sleep(50 * time.Millisecond)
-	c.mu.Lock()
-	delete(c.execCtx, "h1")
-	c.mu.Unlock()
-	<-gate
-	<-done
-
-	c.mu.Lock()
-	fresh := c.execCtx["h1"]
-	c.mu.Unlock()
-	require.NotNil(t, fresh, "the queued exec must redial, not run on the entry it saw before queueing")
-	assert.NotSame(t, stale, fresh,
-		"the queued exec ran on the entry captured before the turnstile, which may point at the old endpoint")
-}
-
-// TestRealClient_ExecGateNotMintedForUnknownHost pins that execGateFor re-checks
-// the host under r.mu. Its caller validated the host and released the lock; if
-// SetHosts removed it in that window, minting a gate here would leak a map
-// entry SetHosts never iterates over again.
-func TestRealClient_ExecGateNotMintedForUnknownHost(t *testing.T) {
-	sock, _ := fakeLibpodServer(t)
-	c, err := NewReal([]config.Host{{ID: "h1", Addr: "unix", Socket: sock}})
-	require.NoError(t, err)
-
-	_, err = c.execGateFor("gone")
-	require.Error(t, err)
-
-	c.mu.Lock()
-	_, minted := c.execGate["gone"]
-	c.mu.Unlock()
-	assert.False(t, minted, "execGateFor minted a gate for an id SetHosts will never clean up")
 }
 
 // TestRealClient_TransferDeadlineDoesNotEvict pins that the data-volume budgets
@@ -1169,9 +1206,9 @@ func TestRealClient_TransferDeadlineDoesNotEvict(t *testing.T) {
 // to resolve it up front as its unknown-host check, which cost a second SSH
 // handshake plus a ping under r.mu before anything had been decided — and, when
 // the host then failed the MinPodmanVersion gate, left that connection cached
-// in r.execCtx forever: nothing ever sends on it, and eviction rides a
-// transport error, so one idle connection leaked per too-old host for the
-// process lifetime. entryFor and execGateFor both reject an unknown host on
+// behind forever: since #278 nothing but the exec itself ever closes a
+// per-exec connection, so one dialed before the gate and then abandoned is
+// leaked outright. entryFor and execConnFor both reject an unknown host on
 // their own, so the early dial bought nothing.
 func TestRealClient_ExecOnUnverifiedHostDialsNoExecConnection(t *testing.T) {
 	sock, _ := fakeLibpodServer(t)
@@ -1179,14 +1216,12 @@ func TestRealClient_ExecOnUnverifiedHostDialsNoExecConnection(t *testing.T) {
 	require.NoError(t, err)
 
 	c.versionProbe = func(context.Context) (string, error) { return "5.0.0", nil }
+	seen := execConnsOf(c)
 
 	_, err = c.ContainerExec(context.Background(), "h1", "some-container", []string{"/bin/true"})
 	require.ErrorIs(t, err, ErrHostVersionUnsupported)
 
-	c.mu.Lock()
-	_, dialed := c.execCtx["h1"]
-	c.mu.Unlock()
-	assert.False(t, dialed, "a host that never got past the version gate must not leave an exec connection behind")
+	assert.Empty(t, *seen, "a host that never got past the version gate must not leave an exec connection behind")
 }
 
 // TestRealClient_RestoreTransportPutsBackTheHookedOne pins which transport

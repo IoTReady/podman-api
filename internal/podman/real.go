@@ -64,24 +64,18 @@ type Real struct {
 	// so a burst arriving after the TTL lapses costs one round trip and not one
 	// each.
 	loadGate map[string]chan struct{}
-	// execCtx is the exec-only connection per host. See execEntryFor: podman's
-	// attaching exec takes over the connection it runs on, so it gets one that
-	// nothing else uses.
-	execCtx map[string]*connEntry
-	// execGate serialises exec per host. See ContainerExec: podman's
-	// newUpgradeRequest mutates shared state on the connection, and says so
-	// itself ("FIXME: This is one giant race condition"). A one-slot channel
-	// rather than a sync.Mutex because the wait for it must be cancellable.
-	execGate map[string]chan struct{}
-	// dialing and execDialing single-flight the dial for r.ctx and r.execCtx
-	// respectively: one in-flight dial per host per cache, which every other
-	// caller for that host waits on instead of starting its own. They exist
-	// because the dial no longer runs under r.mu (#277) — see connFor — so
-	// nothing else serialises a burst of first-use callers against a cold
-	// host. An entry lives only for the duration of one dial: the dial's own
-	// goroutine removes it, whether it committed a connection or failed.
-	dialing     map[string]*dialCall
-	execDialing map[string]*dialCall
+	// dialing single-flights the dial for r.ctx: one in-flight dial per host,
+	// which every other caller for that host waits on instead of starting its
+	// own. It exists because the dial no longer runs under r.mu (#277) — see
+	// connFor — so nothing else serialises a burst of first-use callers
+	// against a cold host. An entry lives only for the duration of one dial:
+	// the dial's own goroutine removes it, whether it committed a connection
+	// or failed.
+	//
+	// Exec has no equivalent, deliberately: it dials a connection of its own
+	// per call and closes it on the way out (execConnFor, #278), so there is
+	// no cache for a second caller to join a dial into.
+	dialing map[string]*dialCall
 
 	// hooks is nil in production. It exists because the reload races this file
 	// guards against cannot be interleaved from outside — they live between a
@@ -163,22 +157,24 @@ type testHooks struct {
 	// beforeConnect runs after a read has resolved its host and pool entry but
 	// before it connects — the window a reload has to retire that entry.
 	beforeConnect func()
+	// execDialed runs with each per-exec connection, just after it is dialed
+	// and before the exec runs on it. It exists because that connection is by
+	// design published nowhere a test could read it from — no cache, no map —
+	// and "each exec gets its own" is otherwise unobservable.
+	execDialed func(*connEntry)
 }
 
 // NewReal validates host configs and registers them. Connections are not
 // opened here; first use opens them.
 func NewReal(hosts []config.Host) (*Real, error) {
 	r := &Real{
-		hosts:       map[string]config.Host{},
-		ctx:         map[string]*connEntry{},
-		verified:    map[string]bool{},
-		sshPool:     map[string]*sshPoolEntry{},
-		loadavg:     map[string]loadSample{},
-		loadGate:    map[string]chan struct{}{},
-		execCtx:     map[string]*connEntry{},
-		execGate:    map[string]chan struct{}{},
-		dialing:     map[string]*dialCall{},
-		execDialing: map[string]*dialCall{},
+		hosts:    map[string]config.Host{},
+		ctx:      map[string]*connEntry{},
+		verified: map[string]bool{},
+		sshPool:  map[string]*sshPoolEntry{},
+		loadavg:  map[string]loadSample{},
+		loadGate: map[string]chan struct{}{},
+		dialing:  map[string]*dialCall{},
 	}
 	for _, h := range hosts {
 		if h.ID == "" {
@@ -230,10 +226,6 @@ func (r *Real) SetHosts(hosts []config.Host) {
 				dropped = append(dropped, e)
 				delete(r.ctx, id)
 			}
-			if e, ok := r.execCtx[id]; ok {
-				dropped = append(dropped, e)
-				delete(r.execCtx, id)
-			}
 		}
 
 		r.mu.Lock()
@@ -247,7 +239,6 @@ func (r *Real) SetHosts(hosts []config.Host) {
 				delete(r.verified, id)
 				delete(r.loadavg, id)
 				delete(r.loadGate, id)
-				delete(r.execGate, id)
 				r.dropSSHLocked(id)
 			}
 		}
@@ -330,33 +321,170 @@ func (r *Real) entryFor(parent context.Context, id string) (*connEntry, error) {
 	})
 }
 
-// execEntryFor is entryFor for the exec-only connection: a second cached
-// connection per host, used by nothing but ContainerExec.
+// execConnFor dials a connection for the exclusive use of one exec, and hands
+// it to a caller that must close it (ContainerExec does, unconditionally).
+// Nothing caches it: no map, no single-flight, no invalidator.
 //
-// It exists because podman's attaching exec is not a guest on the connection
-// it runs over, it takes it over: newUpgradeRequest replaces
-// conn.Client.Transport with one of its own for the whole duration of the exec
-// (attach.go:611) and never puts it back. On a shared connection that is both
-// an unsynchronised write against every concurrent PodList/Ping/health poll on
-// that host, and a leak — a request that lands on podman's temporary transport
-// parks its keep-alive socket in a pool with IdleConnTimeout: 0 that becomes
-// unreachable as soon as the transport is swapped back. Serialising exec
-// against exec (execLock) cannot close either; only a connection nothing else
-// touches can.
+// A connection per exec, rather than one cached per host, because podman's
+// attaching exec is not a guest on the connection it runs over, it takes it
+// over. newUpgradeRequest reads and writes conn.Client.Transport
+// unsynchronised, replaces it with one of its own for the whole duration of
+// the exec (attach.go:611) and never puts it back, stashing the dialed socket
+// in a closure variable on the way — podman's own comment there reads "FIXME:
+// This is one giant race condition". Two execs sharing a connection can
+// therefore cross-wire, one's closeWrite half-closing the other's socket.
 //
-// The cost is one extra connection per host that has ever run an exec —
-// pre_backup hooks and registry blob GC — kept for the same lifetime as the
-// primary one.
-func (r *Real) execEntryFor(parent context.Context, id string) (*connEntry, error) {
-	return r.connFor(parent, id, connCache{
-		entries:    r.execCtx,
-		inflight:   r.execDialing,
-		invalidate: r.invalidateExecConn,
-	})
+// #273 answered that with one cached exec connection per host plus a
+// turnstile serialising exec against exec on it. That was correct but it
+// coupled unrelated instances (#278): the turnstile was per *host*, so one
+// instance's pre_backup database dump legitimately holding it for the whole
+// callTimeout (10 minutes) blocked the registry blob GC and every other
+// instance's pre_backup on that host, and the wait for it carried no deadline
+// of its own — with k execs queued the tail waited up to k × callTimeout. An
+// exec that owns the transport podman scribbles on needs no turnstile at all,
+// so there is no queue and no ceiling to bound.
+//
+// The cost is one connection setup — for an ssh:// host, a full SSH handshake
+// — per exec. That is hook and GC frequency (a pre_backup, a blob GC), not
+// request frequency, and it is paid by the exec that incurs it rather than by
+// every other exec on the host. Its other half is what closeIdleConns already
+// documents: the SSH client underneath an ssh:// connection is not reachable
+// through the bindings API, so releasing the connection closes its HTTP
+// sockets and leaves the client itself to the garbage collector. Per exec
+// rather than per host, that is now a repeated cost — bounded, since Go's
+// net.netFD carries a finalizer that closes the socket, but not a deterministic
+// one.
+//
+// The dial runs on its own goroutine for the reason connFor gives: it cannot
+// be cancelled, so running it on the caller's stack would make the caller
+// uncancellable too. A caller that gives up leaves the dial running, and the
+// connection it eventually produces is closed by the dial itself rather than
+// stranded — see execDial.
+func (r *Real) execConnFor(parent context.Context, id string) (*connEntry, error) {
+	r.mu.Lock()
+	h, ok := r.hosts[id]
+	if !ok {
+		r.mu.Unlock()
+		return nil, fmt.Errorf("unknown host %q", id)
+	}
+	uri, err := r.uriForLocked(id)
+	r.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	d := &execDial{done: make(chan struct{})}
+	go r.runExecDial(id, h, uri, d)
+	return awaitExecDial(parent, id, d)
 }
 
-// connFor is the shared body of entryFor and execEntryFor: return the cached
-// connection from c.entries, or dial, wire invalidation, and cache one.
+// execDial is one in-flight per-exec dial, and the handoff of the connection
+// it produces. Exactly one of the two sides ends up owning that connection:
+// the waiter, which then closes it when its exec finishes, or the dial itself,
+// when the waiter gave up first. Neither can be the answer alone — the dial
+// cannot be cancelled, so a waiter that times out or is cancelled returns
+// before the connection exists, and a connection nobody owns is an SSH client
+// and its sockets left alive with nothing holding a reference to them.
+//
+// settled/abandoned are read and written under mu rather than inferred from
+// done, because the two can race: select may pick this caller's timer even
+// though done is already closed, so a waiter can reach abandon() after the
+// dial has settled and must take the connection over rather than orphan it.
+type execDial struct {
+	done chan struct{}
+
+	mu        sync.Mutex
+	settled   bool
+	abandoned bool
+	entry     *connEntry
+	err       error
+}
+
+// settle records the dial's outcome and wakes the waiter. It returns a
+// connection the caller must close: non-nil exactly when the waiter has
+// already given up, in which case nobody else will ever hold it.
+func (d *execDial) settle(e *connEntry, err error) (surplus *connEntry) {
+	d.mu.Lock()
+	if d.abandoned {
+		surplus = e
+	} else {
+		d.entry, d.err, d.settled = e, err, true
+	}
+	d.mu.Unlock()
+	close(d.done)
+	return surplus
+}
+
+// abandon marks the waiter as gone. It returns a connection the caller must
+// close: non-nil exactly when the dial settled before this ran, so the entry
+// it published has no other owner.
+func (d *execDial) abandon() (surplus *connEntry) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.settled {
+		surplus, d.entry = d.entry, nil
+		return surplus
+	}
+	d.abandoned = true
+	return nil
+}
+
+// runExecDial performs one per-exec dial and resolves its execDial. Always
+// called on its own goroutine.
+func (r *Real) runExecDial(id string, h config.Host, uri string, d *execDial) {
+	cc, err := dialConn(h, uri)
+	var e *connEntry
+	if err != nil {
+		err = fmt.Errorf("connect to host %q: %w", id, err)
+	} else {
+		e = &connEntry{ctx: cc}
+		// Wired for what it leaves on the entry, not for eviction: there is no
+		// cache to evict from, and noExecInvalidation says so. wireInvalidation
+		// is still what records e.hooked (which restoreTransport puts back and
+		// closeIdleConns closes) and what keeps the dialed socket wrapped so
+		// podman's CloseWriter probe still finds a half-closable connection.
+		r.wireInvalidation(e, id, noExecInvalidation)
+	}
+	if surplus := d.settle(e, err); surplus != nil {
+		surplus.closeIdleConns()
+	}
+}
+
+// awaitExecDial waits for a per-exec dial, bounded by connDialTimeout and by
+// the caller's own context, whichever comes first — the same budget and the
+// same reasoning as awaitDial. Giving up abandons the wait, never the dial;
+// what it does do, which awaitDial cannot, is make sure the connection that
+// dial produces is closed rather than stranded, since no cache will hold it.
+func awaitExecDial(parent context.Context, id string, d *execDial) (*connEntry, error) {
+	timer := time.NewTimer(connDialTimeout)
+	defer timer.Stop()
+	var gaveUp error
+	select {
+	case <-d.done:
+		// Written before done was closed, so both are safe to read here.
+		if d.err != nil {
+			return nil, d.err
+		}
+		return d.entry, nil
+	case <-timer.C:
+		gaveUp = fmt.Errorf("connect to host %q: dial did not complete within %s: %w", id, connDialTimeout, context.DeadlineExceeded)
+	case <-parent.Done():
+		gaveUp = fmt.Errorf("connect to host %q: %w", id, parent.Err())
+	}
+	if surplus := d.abandon(); surplus != nil {
+		surplus.closeIdleConns()
+	}
+	return nil, gaveUp
+}
+
+// noExecInvalidation is the invalidator a per-exec connection gets: nothing to
+// do. Invalidation exists to drop a *cached* connection so later calls stop
+// being served over a dead one; a per-exec connection is in no cache and gets
+// no later calls, and ContainerExec closes it on every path regardless of how
+// it ended.
+func noExecInvalidation(string, *connEntry) {}
+
+// connFor is the body of entryFor: return the cached connection from
+// c.entries, or dial, wire invalidation, and cache one.
 //
 // The dial does not run under r.mu (#277). It used to, and the dial has no
 // deadline it can be given: bindings.NewConnection's SSH path
@@ -463,27 +591,30 @@ func awaitDial(parent context.Context, id string, d *dialCall) (*connEntry, erro
 	}
 }
 
+// dialConn opens one libpod connection to h. Shared by the cached dial
+// (runDial) and the per-exec one (runExecDial), which differ in what they do
+// with the result, not in how they get it.
+//
+// The connection is rooted at context.Background() — not any caller's
+// per-request context — so it is never cancelled by a request ending.
+// Individual operations still honour per-call cancellation because DoRequest
+// creates http.NewRequestWithContext(ctx, ...) from the per-call context
+// passed into each method (PodInspect, PodList, etc.).
+func dialConn(h config.Host, uri string) (context.Context, error) {
+	base := context.Background()
+	if h.Addr != "unix" && h.SSHKey != "" {
+		// SSH host with explicit key file. The fourth arg (`machine`) is false
+		// for non-machine connections per the bindings API.
+		return bindings.NewConnectionWithIdentity(base, uri, h.SSHKey, false)
+	}
+	return bindings.NewConnection(base, uri)
+}
+
 // runDial performs one reserved dial and resolves its dialCall. Always called
 // on its own goroutine, and always the only thing that removes the
 // reservation it resolves.
 func (r *Real) runDial(id string, h config.Host, uri string, d *dialCall, c connCache) {
-	// Use context.Background() — not any caller's per-request context — so
-	// the cached connection context is never cancelled by a request ending.
-	// Individual operations still honour per-call cancellation because
-	// DoRequest creates http.NewRequestWithContext(ctx, ...) from the
-	// per-call context passed into each method (PodInspect, PodList, etc.).
-	connBase := context.Background()
-	var (
-		cc  context.Context
-		err error
-	)
-	if h.Addr != "unix" && h.SSHKey != "" {
-		// SSH host with explicit key file. The fourth arg (`machine`) is false
-		// for non-machine connections per the bindings API.
-		cc, err = bindings.NewConnectionWithIdentity(connBase, uri, h.SSHKey, false)
-	} else {
-		cc, err = bindings.NewConnection(connBase, uri)
-	}
+	cc, err := dialConn(h, uri)
 
 	var e *connEntry
 	if err == nil {
@@ -672,63 +803,18 @@ func (c *invalidatingCloseWriteConn) CloseWrite() error {
 	return err
 }
 
-// execGateFor returns the one-slot channel serialising exec on a host, creating
-// it on first use. Exec cannot run concurrently on one connection: podman's
-// newUpgradeRequest reads and writes conn.Client.Transport unsynchronised and
-// stashes the dialed socket in a closure variable on the way (podman v5.8.2
-// attach.go:566 — "FIXME: This is one giant race condition"), so two execs in
-// flight at once on the same host can cross-wire, one's closeWrite
-// half-closing the other's socket. Two instances' pre_backup hooks, or a hook
-// alongside a registry blob GC, are exactly that pairing.
-//
-// The cost is a real one, and it crosses instances: the gate is per *host*, so
-// one instance's pre_backup database dump legitimately holding it for the full
-// callTimeout (10 minutes) blocks every other exec on that host — the registry
-// blob GC, every other instance's pre_backup — for that long. The wait carries
-// no deadline of its own (the per-call clock only starts once the turn is won),
-// so with k execs queued the tail waits up to k × callTimeout, and a caller
-// whose context has no deadline of its own — a job-rooted one — waits all of
-// it. Nothing here bounds that; it is bounded only by how long the commands
-// operators put in exec hooks actually run.
-//
-// That ceiling is the price of correctness, not an oversight: the alternative
-// is silently crossed streams. But it is why this is a channel and not a
-// sync.Mutex — a caller that has given up (a cancelled request, a cancelled
-// job, a daemon shutting down) must be able to leave the queue, and
-// sync.Mutex.Lock cannot be abandoned. Lifting the ceiling means dialing a
-// connection per exec instead of caching one per host, which is a bigger change
-// than #273 and is tracked in #278.
-//
-// The host is re-checked here rather than trusted from the caller's earlier
-// validation: that validation released r.mu, and SetHosts only ever iterates
-// r.hosts to clean r.execGate up. Minting a channel for an id it will never
-// iterate over would leak one per add/remove cycle for the process lifetime.
-func (r *Real) execGateFor(id string) (chan struct{}, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, ok := r.hosts[id]; !ok {
-		return nil, fmt.Errorf("unknown host %q", id)
-	}
-	g, ok := r.execGate[id]
-	if !ok {
-		g = make(chan struct{}, 1)
-		r.execGate[id] = g
-	}
-	return g, nil
-}
-
 // restoreTransport returns a func that puts e's hooked transport back on the
 // connection. podman's newUpgradeRequest does not borrow the
 // transport, it replaces it: it builds its own and assigns
 // conn.Client.Transport = t permanently (attach.go:611). Without this, the
-// first exec strands the transport wireInvalidation installed — idle conns and
-// their goroutines included, with IdleConnTimeout: 0 on the replacement so
-// nothing reaps them — the invalidation hook survives only by accident of the
-// replacement's DialContext closing over ours, and each further exec clones
-// one layer deeper off whatever podman left. This daemon execs on every
-// pre_backup hook and every blob GC, so it accumulates for the process
-// lifetime. The replacement also silently drops what bindings had configured
-// (DisableCompression, among others).
+// exec ends with podman's replacement installed and the transport
+// wireInvalidation put there stranded — and it is the hooked one that the
+// connection's close (closeIdleConns) knows how to close, so podman's
+// replacement keeps whatever keep-alive socket the post-attach ExecInspect
+// parked in it, with IdleConnTimeout: 0 so nothing reaps it. This daemon
+// execs on every pre_backup hook and every blob GC, so it accumulates for the
+// process lifetime. The replacement also silently drops what bindings had
+// configured (DisableCompression, among others).
 //
 // What goes back is e.hooked, recorded when it was installed — not the field
 // read back off the connection, for the reason connEntry gives: the field is
@@ -925,21 +1011,6 @@ func (r *Real) invalidateConn(id string, dead *connEntry) {
 		// not of the host — a fresh connection must re-verify rather than
 		// inherit a pass recorded against the socket we just evicted.
 		delete(r.verified, id)
-	}
-	r.mu.Unlock()
-	if evicted {
-		dead.closeIdleConns()
-	}
-}
-
-// invalidateExecConn is invalidateConn for the exec-only connection. It leaves
-// r.verified alone: that records the host's podman version, which the primary
-// connection established and which this connection dying says nothing about.
-func (r *Real) invalidateExecConn(id string, dead *connEntry) {
-	r.mu.Lock()
-	evicted := r.execCtx[id] == dead
-	if evicted {
-		delete(r.execCtx, id)
 	}
 	r.mu.Unlock()
 	if evicted {
@@ -1989,37 +2060,25 @@ func (r *Real) NetworkEnsure(ctx context.Context, id, name string) error {
 // ContainerExec runs cmd in an existing container and returns its exit code
 // and combined output.
 //
-// Three things guard the one property podman's attaching exec does not give
-// us — that a call cannot disturb anything but itself. It runs on the
-// exec-only connection (execEntryFor), so it cannot disturb other operations;
-// execs are serialised per host (execGateFor), so they cannot disturb each
-// other; and the transport podman leaves behind is closed and replaced
-// afterwards (restoreTransport), so an exec cannot disturb the next one.
+// Two things guard the one property podman's attaching exec does not give us —
+// that a call cannot disturb anything but itself. The exec runs on a
+// connection dialed for it alone (execConnFor), so it cannot disturb any other
+// operation or any other exec; and the transport podman leaves behind is
+// closed and replaced afterwards (restoreTransport) before that connection is
+// released, so nothing of podman's outlives the call that created it.
+//
+// There used to be a third: a per-host turnstile serialising exec against exec
+// on a single cached exec connection. A connection per exec removes the need
+// for it along with the cross-instance coupling it caused — one instance's
+// pre_backup dump holding the turnstile for the whole callTimeout blocked
+// every other exec on the host (#278).
 func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []string) (ExecResult, error) {
-	// Validation before the turnstile, the clock after it — but the *exec*
-	// connection is not dialed here. Nothing at this point needs it: entryFor
-	// below rejects an unknown host, and execGateFor re-checks r.hosts under
-	// r.mu before minting a channel SetHosts would never iterate over to clean
-	// up. Dialing it here would cost a second SSH handshake plus a ping, under
-	// r.mu, before the call has been admitted — and cache an exec connection
-	// that a host failing ensureVerified below never uses and nothing ever
-	// evicts (eviction rides a transport error on a connection nobody sends on),
-	// leaking one idle connection per too-old host for the process lifetime.
-	//
-	// What must not move is the clock: callTimeout starts only after the turn is
-	// won, since an exec may legitimately use the whole budget (a pre_backup
-	// database dump) and a queued one would otherwise fail without ever running,
-	// evicting the exec connection on the way out for a deadline that says
-	// nothing about its health.
-	//
-	// Verified over the *primary* connection, not the exec one. The exec connection
-	// is the one thing nothing outside the turnstile may touch: an exec holding
-	// it has podman's own transport installed on it (newUpgradeRequest writes
-	// the field unsynchronised, with IdleConnTimeout: 0), so a probe issued here
-	// would both race that write and risk parking its keep-alive socket in a
-	// transport restoreTransport is about to orphan. The version is a host
-	// property the primary connection establishes anyway — the same reason
-	// invalidateExecConn leaves r.verified alone.
+	// Verified over the *primary* connection, not the exec one, and before the
+	// exec connection is dialed. The version is a host property that the
+	// primary connection establishes anyway, and it is the connection that
+	// caches the answer — probing over the exec connection would pay for a
+	// second dial before the call has been admitted, on a host that may be too
+	// old to run anything at all.
 	primary, err := r.entryFor(ctx, id)
 	if err != nil {
 		return ExecResult{}, err
@@ -2028,34 +2087,30 @@ func (r *Real) ContainerExec(ctx context.Context, id, container string, cmd []st
 		return ExecResult{}, err
 	}
 
-	gate, err := r.execGateFor(id)
+	// One connection, this exec's own, closed on the way out whatever happens:
+	// success, a failure at any step, a caller that cancelled. Nothing else
+	// will ever close it — it is in no cache, so no eviction and no SetHosts
+	// reload can reach it — which is why the close is a defer registered
+	// immediately after the dial and ahead of everything else.
+	conn, err := r.execConnFor(ctx, id)
 	if err != nil {
 		return ExecResult{}, err
 	}
-	select {
-	case gate <- struct{}{}:
-	case <-ctx.Done():
-		return ExecResult{}, ctx.Err()
-	}
-	defer func() { <-gate }()
-
-	// The connection is resolved *after* the turn is won, never before. The
-	// wait above is unbounded by design (a pre_backup dump may hold the gate
-	// for the whole callTimeout), and an entry fetched before it can be dropped
-	// during it: by invalidateExecConn when the exec ahead broke its socket, or
-	// by SetHosts when the host was reconfigured. Running on the dropped entry
-	// would redial nothing and fail against a dead connection — its own
-	// invalidateExecConn a no-op, the identity check no longer matching — or,
-	// worse, dial through the old entry's SSH client and exec against the
-	// endpoint the operator just reconfigured away from.
-	conn, err := r.execEntryFor(ctx, id)
-	if err != nil {
-		return ExecResult{}, err
+	defer conn.closeIdleConns()
+	if r.hooks != nil && r.hooks.execDialed != nil {
+		r.hooks.execDialed(conn)
 	}
 
-	c, cancel := r.callCtx(ctx, conn, id, callTimeout, r.invalidateExecConn)
+	// No invalidator: there is no cached entry for a deadline to evict, and
+	// the connection is released below regardless.
+	c, cancel := r.callCtx(ctx, conn, id, callTimeout, nil)
 	defer cancel()
 
+	// Registered last, so it runs first: podman's throwaway transport is closed
+	// and ours put back before the deferred closeIdleConns above releases the
+	// connection, which closes e.hooked and would otherwise leave podman's
+	// replacement — and the keep-alive socket ExecInspect parked in it — with
+	// nothing holding a reference to them.
 	defer r.restoreTransport(conn)()
 	sessionID, err := containers.ExecCreate(c, container, &handlers.ExecCreateConfig{
 		ExecOptions: dockerContainer.ExecOptions{
