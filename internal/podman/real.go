@@ -1085,20 +1085,59 @@ func (r *Real) opCtx(parent context.Context, id string, timeout time.Duration, i
 // hung rather than that it was merely slow — the same role sshWedgeGrace's
 // watchdog plays for the SSH pool.
 //
-// Only *this* deadline counts, never an outer one:
+// A DEADLINE counts as that evidence, whether it was this call's own or the
+// parent's; genuine CANCELLATION never does (#282):
 //
-//   - The caller giving up early cancels ctx through the AfterFunc bridge,
-//     which records context.Canceled, not DeadlineExceeded. A client
-//     disconnecting mid-request must not evict a healthy connection.
-//   - When the two race — a deadlined parent (WaitForPodCompletion's wait
-//     budget) expiring at the same moment as this call's own deadline — ctx can
-//     record DeadlineExceeded from its own timer before the bridge's cancel
-//     lands. parent is therefore checked as well: a pod outlasting the caller's
-//     patience is not a broken connection. Note ctx derives from base, not from
-//     parent, so a parent deadline never propagates into ctx as anything but
-//     the bridge's Canceled — anyone re-parenting ctx to parent must revisit
-//     this check.
+//   - The caller giving up early — a client disconnecting mid-request, a
+//     shutdown — cancels ctx through the AfterFunc bridge, which records
+//     context.Canceled. Nothing about the connection follows from someone
+//     walking away, so that evicts nothing. A cancelled ancestor reaches this
+//     check as Canceled through any number of intervening deadlines, because
+//     Go propagates the ancestor's error, not the wrapper's kind.
+//   - A parent whose own deadline expired is a different statement: nobody
+//     walked away, the host did not answer inside the time the caller had
+//     budgeted. That reading is what #282 fixes. The exclusion used to be
+//     `parent.Err() == nil`, which collapsed both cases into "caller walked
+//     away" — and so made the one caller that structurally touches every
+//     registered host, the inventory poller, permanently unable to evict
+//     anything: its per-host budget (-inventory-refresh-timeout, 20s) is
+//     necessarily far below callTimeout, so against a wedged host the parent
+//     always expired first. Every tick, forever. The same was true of every
+//     other short-deadlined caller (GET /hosts' 5s perHostTimeout, the UI's
+//     host fetch), which is to say of nearly every caller that runs without an
+//     operator waiting on it.
+//
+// Note ctx derives from base, not from parent, so a parent deadline never
+// propagates into ctx as anything but the bridge's Canceled — parent is
+// therefore examined directly, and anyone re-parenting ctx to parent must
+// revisit this.
+//
+// callCtxOwnDeadlineOnly is the exception, for a parent that is not a caller's
+// budget at all; see there.
 func (r *Real) callCtx(parent context.Context, base *connEntry, id string, timeout time.Duration, invalidate invalidator) (context.Context, context.CancelFunc) {
+	return r.callCtxWith(parent, true, base, id, timeout, invalidate)
+}
+
+// callCtxOwnDeadlineOnly is callCtx for a parent whose deadline says nothing
+// about the connection, so that only the call's OWN deadline is evidence —
+// the pre-#282 reading, kept where it is the correct one.
+//
+// The single such parent is WaitForPodCompletion's wait budget, which is not a
+// caller's patience but a budget sized to how long the POD may legitimately
+// run (30 minutes for a blob GC). It expiring means the pod is still running,
+// which is compatible with every poll along the way having answered promptly:
+// evicting on it would drop a healthy host's connection at the end of any
+// wait that timed out. It is the same reasoning that has opCtxForTimeout and
+// opCtxForStream pass no invalidator at all — a budget sized to something
+// other than the connection's responsiveness cannot testify about it.
+func (r *Real) callCtxOwnDeadlineOnly(parent context.Context, base *connEntry, id string, timeout time.Duration, invalidate invalidator) (context.Context, context.CancelFunc) {
+	return r.callCtxWith(parent, false, base, id, timeout, invalidate)
+}
+
+// callCtxWith is the shared body of the two above. parentDeadlineIsEvidence
+// says whether parent's own deadline expiring counts as evidence about the
+// connection, alongside this call's deadline, which always does.
+func (r *Real) callCtxWith(parent context.Context, parentDeadlineIsEvidence bool, base *connEntry, id string, timeout time.Duration, invalidate invalidator) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(base.ctx, timeout)
 	stop := context.AfterFunc(parent, cancel)
 	return ctx, func() {
@@ -1109,10 +1148,27 @@ func (r *Real) callCtx(parent context.Context, base *connEntry, id string, timeo
 		if invalidate == nil {
 			return
 		}
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) && parent.Err() == nil {
+		if timedOut(ctx, parent, parentDeadlineIsEvidence) {
 			invalidate(id, base)
 		}
 	}
+}
+
+// timedOut reports whether the call ended on a deadline rather than on
+// cancellation — i.e. whether its ending is evidence that the host did not
+// answer. See callCtx for what each case means.
+func timedOut(ctx, parent context.Context, parentDeadlineIsEvidence bool) bool {
+	// Checked first, and against parent rather than ctx: when a cancelled
+	// caller and this call's own deadline race, ctx can record
+	// DeadlineExceeded from its own timer before the bridge's cancel lands,
+	// and a cancelled caller must not evict either way.
+	if errors.Is(parent.Err(), context.Canceled) {
+		return false
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return true
+	}
+	return parentDeadlineIsEvidence && errors.Is(parent.Err(), context.DeadlineExceeded)
 }
 
 // connDialTimeout bounds one attempt to open a libpod connection: TCP connect,
@@ -1265,14 +1321,9 @@ var verifyTimeout = 60 * time.Second
 // A registered host carrying no instances — drained, newly added, a spare —
 // receives only Ping, Version and HostInfo, all of which are non-evicting by
 // the decision above, and wireInvalidation's socket hook sees nothing because
-// a wedged socket produces no error by definition. Nor does the inventory
-// poller rescue it: it does tick every registered host through opCtxFor
-// (RefreshHost -> PodList), but under its own per-host timeout
-// (-inventory-refresh-timeout, 20s by default) that is far shorter than
-// callTimeout, so callCtx records Canceled rather than DeadlineExceeded and
-// correctly declines to evict — and for the same reason it never contributes
-// to this streak either. Such a host would report unreachable forever, including
-// after podman on it recovered, until a reload or a restart.
+// a wedged socket produces no error by definition. Such a host would report
+// unreachable forever, including after podman on it recovered, until a reload
+// or a restart.
 //
 // Three, not one, so the property that motivated the no-evict decision
 // survives intact: one slow answer still costs nothing, and any diagnostic
@@ -1280,29 +1331,14 @@ var verifyTimeout = 60 * time.Second
 // the discriminator between "slow" and "wedged" — a host that sometimes
 // answers is never evicted no matter how long it stays slow.
 //
-// What this does NOT amount to is "wedged for 3 x probeTimeout and it goes".
-// Only a caller whose own budget OUTLASTS probeTimeout can advance the streak
-// at all, because callCtx counts a timeout as evidence only when the deadline
-// that fired was this call's own and the caller had not given up. That is the
-// same test the inventory poller fails above, and — the case worth naming,
-// because it is the diagnostic caller that runs most often — GET /hosts fails
-// it too: listHosts caps each host at perHostTimeout (5s, internal/api/hosts.go),
-// which is below this budget, so the bridge cancels first and the render is a
-// no-op in both directions. It neither advances the streak nor resets it.
-//
-// What is left as a contributor is the diagnostics with a longer budget or
-// none: GET /hosts/{id}, instance.Service's Ping and HostInfo callers, and the
-// prune scheduler and handler — and the scheduler's is gated behind probeDue
-// and a positive DiskThreshold. So a drained spare with no prune policy can
-// still sit wedged indefinitely while the host list refreshes past it, and
-// only an operator opening its single-host page three times moves it.
-//
-// That gap is #282's shape, not a separate one: a per-caller budget
-// structurally below the budget whose expiry carries the meaning, so the
-// evidence is thrown away as Canceled. Whatever lands there — distinguishing a
-// parent's own deadline from a client disconnect, or making these caps
-// order-aware — should widen this hatch too, and the two should not be
-// rediscovered separately.
+// What this does NOT amount to is "wedged for 3 x probeTimeout and it goes":
+// what fires is whichever budget is shorter, this one or the caller's own.
+// Since #282 a caller's deadline expiring counts the same as this one's, so
+// the short-budgeted diagnostics do contribute — GET /hosts, whose listHosts
+// caps each host at perHostTimeout (5s, internal/api/hosts.go), advances the
+// streak once per render and evicts on the third, and its successes still
+// reset it. Only a caller that was CANCELLED (a client disconnecting) is a
+// no-op in both directions: it neither advances the streak nor resets it.
 const probeEvictThreshold = 3
 
 // callTimeout bounds each individual libpod operation so a hung SSH or
@@ -1539,7 +1575,9 @@ func (r *Real) WaitForPodCompletion(ctx context.Context, id, podName string, tim
 	// wait would otherwise evict a perfectly healthy host on every timeout.
 	// The poll context is derived from the connection (so eviction identifies
 	// the right connection) and bridged to the wait budget (so a wait that ends
-	// tears the poll down at once).
+	// tears the poll down at once) — via callCtxOwnDeadlineOnly, so that the
+	// wait budget expiring does not read as the host failing to answer the way
+	// a caller's deadline does since #282. See callCtxOwnDeadlineOnly.
 	//
 	// The connection is resolved per poll rather than once up front, for the
 	// reason ContainerExec resolves its own only after winning the turnstile: a
@@ -1553,7 +1591,7 @@ func (r *Real) WaitForPodCompletion(ctx context.Context, id, podName string, tim
 		if err != nil {
 			return err
 		}
-		pctx, done := r.callCtx(c, base, id, callTimeout, r.invalidateConn)
+		pctx, done := r.callCtxOwnDeadlineOnly(c, base, id, callTimeout, r.invalidateConn)
 		defer done()
 		return fn(pctx)
 	}
