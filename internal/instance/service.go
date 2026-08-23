@@ -330,26 +330,79 @@ type netClaim struct {
 	template string
 	slug     string
 	joins    []render.Network
+	// containers are the template's LITERAL container names. podman aliases the
+	// pod by each of them on every network it joins, so they are claims the
+	// template never wrote down — see claimedNames (#272).
+	containers []string
+	// declared is the set of networks the template names in its own `networks:`
+	// block, as opposed to the implicit ingress network joinNetworks prepends.
+	// Container names are enforced only on the former; see claimedNames.
+	declared map[string]bool
 }
 
-// names returns every DNS name the claim registers on network net: the pod's own
-// podman DNS name plus the template's declared aliases. It reports false when
-// the claim does not join that network at all.
+// claimName is one DNS name a pod answers to on a network, with where it came
+// from — the kind is only ever used to explain a collision, since an operator
+// looking at `aliases:` cannot otherwise tell why "db" was already taken.
+type claimName struct {
+	name string
+	kind string
+}
+
+const (
+	kindPodName   = "pod DNS name"
+	kindAlias     = "declared alias"
+	kindContainer = "container name"
+)
+
+// newClaim builds the claim an instance of tmpl/slug makes under meta.
+func (s *Service) newClaim(tmpl, slug string, m render.Meta) netClaim {
+	declared := make(map[string]bool, len(m.Networks))
+	for _, n := range m.Networks {
+		declared[n.Name] = true
+	}
+	return netClaim{
+		template:   tmpl,
+		slug:       slug,
+		joins:      s.joinNetworks(m),
+		containers: m.ContainerNames,
+		declared:   declared,
+	}
+}
+
+// claimedNames returns every DNS name the claim registers on network net: the
+// pod's own podman DNS name, the template's declared aliases, and — on a
+// network the template DECLARES — its literal container names. It reports false
+// when the claim does not join that network at all.
 //
-// NOTE this is the set the daemon KNOWS about, not everything podman registers.
-// kube play additionally aliases each pod by the container names in its YAML
+// The container names are there because podman puts them there: kube play adds
+// every container name in the played YAML as an alias on every joined network
 // (podman 5.8.2, pkg/domain/infra/abi/play.go: "Add the original container names
-// from the kube yaml as aliases"), which the daemon cannot see without rendering
-// every peer's body. Container-name collisions are therefore NOT caught here —
-// see the wiki's shared-networks section and #272.
-func (c netClaim) names(net string) ([]string, bool) {
+// from the kube yaml as aliases"). Two instances of a template whose container
+// is named "db" therefore both answer to "db", which is the same silent
+// arbitrary resolution the declared-alias rule exists to prevent (#272). Only
+// LITERAL names count: a name carrying a parameter ("db-{{.slug}}") is a
+// different name on every instance and claims nothing shared.
+//
+// The implicit ingress network is deliberately EXEMPT. Every ingress template
+// joins it — it is not an opt-in namespace claim the way `networks:` is — the
+// ingress controller addresses pods by pod DNS name, and enforcing container
+// names there would refuse the second instance of every web template on the
+// host. Declared aliases and pod names are still enforced there, as before.
+func (c netClaim) claimedNames(net string) ([]claimName, bool) {
 	for _, j := range c.joins {
 		if j.Name != net {
 			continue
 		}
-		out := make([]string, 0, len(j.Aliases)+1)
-		out = append(out, podName(c.template, c.slug))
-		out = append(out, j.Aliases...)
+		out := make([]claimName, 0, len(j.Aliases)+len(c.containers)+1)
+		out = append(out, claimName{podName(c.template, c.slug), kindPodName})
+		for _, a := range j.Aliases {
+			out = append(out, claimName{a, kindAlias})
+		}
+		if c.declared[net] {
+			for _, n := range c.containers {
+				out = append(out, claimName{n, kindContainer})
+			}
+		}
 		return out, true
 	}
 	return nil, false
@@ -388,21 +441,34 @@ func (c netClaim) names(net string) ([]string, bool) {
 // conflict.
 func firstNameConflictFor(subject netClaim, peers []netClaim) error {
 	for _, j := range subject.joins {
-		mine, _ := subject.names(j.Name)
-		claimed := make(map[string]struct{}, len(mine))
+		mine, _ := subject.claimedNames(j.Name)
+		claimed := make(map[string]string, len(mine))
 		for _, n := range mine {
-			claimed[n] = struct{}{}
+			// A name claimed two ways by the SAME pod (an alias that repeats a
+			// container name) is not a conflict; keep the first kind seen.
+			if _, dup := claimed[n.name]; !dup {
+				claimed[n.name] = n.kind
+			}
 		}
 		for _, p := range peers {
-			theirs, joined := p.names(j.Name)
+			theirs, joined := p.claimedNames(j.Name)
 			if !joined {
 				continue
 			}
 			for _, n := range theirs {
-				if _, clash := claimed[n]; clash {
-					return fmt.Errorf("networks: DNS name %q on network %q is claimed by both %s/%s and %s/%s",
-						n, j.Name, subject.template, subject.slug, p.template, p.slug)
+				mineKind, clash := claimed[n.name]
+				if !clash {
+					continue
 				}
+				err := fmt.Errorf("networks: DNS name %q on network %q is claimed by both %s/%s (%s) and %s/%s (%s)",
+					n.name, j.Name, subject.template, subject.slug, mineKind, p.template, p.slug, n.kind)
+				if mineKind == kindContainer || n.kind == kindContainer {
+					// The container-name half of a collision is invisible in the
+					// template meta — podman registers it — so the message has to
+					// say where it came from and how to get out of it.
+					err = fmt.Errorf("%w; podman registers every container name in a pod as an alias on each network it joins, so give the container a per-instance name (e.g. `name: %s-{{.slug}}`) or keep the two instances off this network", err, n.name)
+				}
+				return err
 			}
 		}
 	}
@@ -437,10 +503,10 @@ func (s *Service) hostClaims(ctx context.Context, host string, metaFor map[strin
 			if err != nil {
 				return nil, err
 			}
-			meta = t.Meta
+			meta = metaWithContainerNames(t)
 			cache[k.Template] = meta
 		}
-		out = append(out, netClaim{template: k.Template, slug: k.Slug, joins: s.joinNetworks(meta)})
+		out = append(out, s.newClaim(k.Template, k.Slug, meta))
 	}
 	return out, nil
 }
@@ -457,11 +523,12 @@ func (s *Service) hostClaims(ctx context.Context, host string, metaFor map[strin
 // opts.SupersededSlug names an instance being replaced by this apply (rename),
 // whose claims are therefore about to be released; see ApplyOptions.
 func (s *Service) validateNetworkAliases(ctx context.Context, host string, req ApplyRequest, tmpl store.Template, opts ApplyOptions) error {
-	mine := netClaim{template: req.Template, slug: req.Slug, joins: s.joinNetworks(tmpl.Meta)}
+	meta := metaWithContainerNames(tmpl)
+	mine := s.newClaim(req.Template, req.Slug, meta)
 	if len(mine.joins) == 0 {
 		return nil
 	}
-	peers, err := s.hostClaims(ctx, host, map[string]render.Meta{req.Template: tmpl.Meta})
+	peers, err := s.hostClaims(ctx, host, map[string]render.Meta{req.Template: meta})
 	if err != nil {
 		return fmt.Errorf("networks: check alias uniqueness on %s: %w", host, err)
 	}
@@ -503,7 +570,7 @@ func (s *Service) warnOnNetworkNameConflict(ctx context.Context, host, tmpl, slu
 	if err != nil {
 		return
 	}
-	subject := netClaim{template: tmpl, slug: slug, joins: s.joinNetworks(meta)}
+	subject := s.newClaim(tmpl, slug, meta)
 	if err := firstNameConflictFor(subject, excluding(claims, tmpl, slug)); err != nil {
 		log.Printf("WARNING: converge %s/%s on %s: %v; podman will resolve it arbitrarily", tmpl, slug, host, err)
 	}
@@ -527,7 +594,7 @@ func (s *Service) checkTemplateNetworkConflicts(ctx context.Context, t store.Tem
 		return nil
 	}
 	for _, h := range s.hostsSnap() {
-		claims, err := s.hostClaims(ctx, h.ID, map[string]render.Meta{t.Meta.ID: t.Meta})
+		claims, err := s.hostClaims(ctx, h.ID, map[string]render.Meta{t.Meta.ID: metaWithContainerNames(t)})
 		if err != nil {
 			// A host that cannot be read cannot be cleared either. Fail the edit
 			// rather than let a conflict through on a store blip.

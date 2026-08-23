@@ -342,14 +342,19 @@ func TestSupersededSlugDoesNotExcuseAnotherTemplate(t *testing.T) {
 // path, so accepting it would wedge both instances against all three with no
 // in-product way out (#269 review finding 2).
 func TestUpdateTemplateRejectsAliasThatWedgesLiveInstances(t *testing.T) {
-	svc, _, _ := sharedNetSvc(t, sharedNetTemplate("frappe-shared"))
+	// The container name is made per-instance so two instances can coexist on
+	// the network at all: a LITERAL container name is itself a claim podman
+	// registers (#272), and the wedge under test here is the alias edit.
+	base := sharedNetTemplate("frappe-shared")
+	base.Body = strings.ReplaceAll(base.Body, "name: db\n", "name: db-{{.slug}}\n")
+	svc, _, _ := sharedNetSvc(t, base)
 	ctx := context.Background()
 	require.NoError(t, svc.Apply(ctx, "h1", sharedNetApply("a"), ApplyOptions{Replace: true}))
 	require.NoError(t, svc.Apply(ctx, "h1", sharedNetApply("b"), ApplyOptions{Replace: true}))
 
-	err := svc.UpdateTemplate(ctx, sharedNetTemplateWith(
-		render.Network{Name: "frappe-shared", Aliases: []string{"mariadb"}},
-	))
+	edited := base
+	edited.Meta.Networks = []render.Network{{Name: "frappe-shared", Aliases: []string{"mariadb"}}}
+	err := svc.UpdateTemplate(ctx, edited)
 
 	require.ErrorIs(t, err, ErrInvalidTemplate)
 	assert.Contains(t, err.Error(), "mariadb")
@@ -404,6 +409,9 @@ func TestApplyIgnoresConflictBetweenOtherInstances(t *testing.T) {
 	other := sharedNetTemplateWith(render.Network{Name: "frappe-shared"})
 	other.Meta.ID = "app"
 	other.Body = strings.ReplaceAll(aliased.Body, "db-{{.slug}}", "app-{{.slug}}")
+	// ...and its own container name, so the subject shares nothing with the
+	// clashing pair beyond the network itself (#272).
+	other.Body = strings.ReplaceAll(other.Body, "name: db\n", "name: web\n")
 	svc, st := newSvcWith(t, fc, hosts, aliased, other)
 	ctx := context.Background()
 
@@ -429,6 +437,7 @@ func TestUpdateTemplateIgnoresConflictInAnotherTemplate(t *testing.T) {
 	other := sharedNetTemplateWith(render.Network{Name: "frappe-shared"})
 	other.Meta.ID = "app"
 	other.Body = strings.ReplaceAll(aliased.Body, "db-{{.slug}}", "app-{{.slug}}")
+	other.Body = strings.ReplaceAll(other.Body, "name: db\n", "name: web\n")
 	svc, st := newSvcWith(t, fc, hosts, aliased, other)
 	ctx := context.Background()
 	seedBootSpec(t, st, "h1", "db", "a", nil)
