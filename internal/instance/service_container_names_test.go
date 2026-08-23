@@ -11,7 +11,6 @@ import (
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/render"
-	"github.com/iotready/podman-api/internal/store"
 )
 
 // #272: kube play registers every container name in the played YAML as an alias
@@ -210,4 +209,40 @@ func TestUpdateTemplateRejectsBodyEditThatWedgesOnContainerName(t *testing.T) {
 	require.NoError(t, svc.Apply(ctx, "h1", sharedNetApply("a"), ApplyOptions{Replace: true}))
 }
 
-var _ = store.Template{}
+// ...and the exemption survives a template that names the ingress network in
+// its own `networks:` block, which is the supported way to declare an alias on
+// it (joinNetworks merges rather than drops). Keying the exemption on how the
+// membership was declared instead of on the network's identity would refuse the
+// second instance of exactly this legal web template, on its container name —
+// the failure the exemption exists to prevent (#285 review item 1).
+func TestApplyAllowsSharedContainerNameOnExplicitlyDeclaredIngressNetwork(t *testing.T) {
+	tmpl := sharedNetTemplateWith(render.Network{Name: "podman-api-ingress", Aliases: []string{"front"}})
+	tmpl.Meta.Ingress = &render.Ingress{Container: "db", Port: 3306}
+	svc, fc, _ := sharedNetSvc(t, tmpl)
+	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
+	ctx := context.Background()
+
+	require.NoError(t, svc.Apply(ctx, "h1", sharedNetApply("first"), ApplyOptions{Replace: true}))
+	err := svc.Apply(ctx, "h1", sharedNetApply("second"), ApplyOptions{Replace: true})
+
+	// The declared ALIAS still collides — that rule is unchanged — so assert on
+	// the container name specifically: it must not be what refuses this apply.
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "front")
+	assert.NotContains(t, err.Error(), "container name")
+	assert.Len(t, fc.PlayCalls, 1)
+}
+
+// The same template without the alias: two instances of an ingress web template
+// that names the ingress network explicitly must both deploy.
+func TestApplyAllowsTwoInstancesOnExplicitlyDeclaredIngressNetwork(t *testing.T) {
+	tmpl := sharedNetTemplate("podman-api-ingress")
+	tmpl.Meta.Ingress = &render.Ingress{Container: "db", Port: 3306}
+	svc, fc, _ := sharedNetSvc(t, tmpl)
+	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
+	ctx := context.Background()
+
+	require.NoError(t, svc.Apply(ctx, "h1", sharedNetApply("first"), ApplyOptions{Replace: true}))
+	require.NoError(t, svc.Apply(ctx, "h1", sharedNetApply("second"), ApplyOptions{Replace: true}))
+	assert.Len(t, fc.PlayCalls, 2)
+}

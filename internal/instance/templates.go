@@ -43,7 +43,7 @@ func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
 	if err := render.NormalizeParams(&t.Meta); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
-	setContainerNames(&t)
+	templated := setContainerNames(&t)
 	if err := ValidateTemplate(t); err != nil {
 		return err
 	}
@@ -58,7 +58,7 @@ func (s *Service) CreateTemplate(ctx context.Context, t store.Template) error {
 	if w := backupMarkerNoneWriteWarning(t); w != "" {
 		log.Printf("WARNING: %s", w)
 	}
-	if w := templatedContainerNameWarning(t); w != "" {
+	if w := templatedContainerNameWarning(t, templated); w != "" {
 		log.Printf("WARNING: %s", w)
 	}
 	return s.store.PutTemplate(ctx, t)
@@ -73,7 +73,7 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 	if err := render.NormalizeParams(&t.Meta); err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidTemplate, err)
 	}
-	setContainerNames(&t)
+	templated := setContainerNames(&t)
 	// The stored row is read BEFORE validation because validation depends on it:
 	// a near-miss `none` marker the row already carries must not fail an edit
 	// that does not touch it (review-4 finding 4). The error precedence a caller
@@ -135,7 +135,7 @@ func (s *Service) UpdateTemplate(ctx context.Context, t store.Template) error {
 	if w := backupMarkerNoneWriteWarning(t); w != "" {
 		log.Printf("WARNING: %s", w)
 	}
-	if w := templatedContainerNameWarning(t); w != "" {
+	if w := templatedContainerNameWarning(t, templated); w != "" {
 		log.Printf("WARNING: %s", w)
 	}
 
@@ -178,30 +178,32 @@ func metaWithContainerNames(t store.Template) render.Meta {
 // stores the same thing and no caller can supply its own list. A body that will
 // not render leaves it nil: validateTemplate reports that failure with a better
 // message, and this must not pre-empt it.
-func setContainerNames(t *store.Template) {
-	literal, _, err := render.ContainerNames(t.Body, t.Meta)
+//
+// It returns the parameter-dependent names in the same pass — they come out of
+// the same extraction, and the write path needs them for its warning — so a
+// registration renders the body twice rather than four times.
+func setContainerNames(t *store.Template) (templated []string) {
+	literal, templated, err := render.ContainerNames(t.Body, t.Meta)
 	if err != nil {
 		t.Meta.ContainerNames = nil
-		return
+		return nil
 	}
 	t.Meta.ContainerNames = literal
+	return templated
 }
 
 // templatedContainerNameWarning returns the line to log when a template that
 // declares shared networks has container names that vary per instance — or ""
-// when it does not.
+// when it does not. templated comes from setContainerNames, which already did
+// the extraction.
 //
 // Templated names are ACCEPTED, not rejected: `name: db-{{.slug}}` is precisely
 // the fix for a container-name collision, so refusing it would ban the good
 // practice along with the bad. But they are also unenforceable — the daemon
 // cannot know what two instances will render them to — so the operator is told
 // that this template's DNS claims on a shared network are only partly policed.
-func templatedContainerNameWarning(t store.Template) string {
-	if len(t.Meta.Networks) == 0 {
-		return ""
-	}
-	_, templated, err := render.ContainerNames(t.Body, t.Meta)
-	if err != nil || len(templated) == 0 {
+func templatedContainerNameWarning(t store.Template, templated []string) string {
+	if len(t.Meta.Networks) == 0 || len(templated) == 0 {
 		return ""
 	}
 	nets := make([]string, 0, len(t.Meta.Networks))
@@ -356,7 +358,7 @@ func (s *Service) CloneTemplate(ctx context.Context, srcID, newID string) (store
 	} else if !errors.Is(err, ErrUnknownTemplate) {
 		return store.Template{}, err
 	}
-	setContainerNames(&cl)
+	_ = setContainerNames(&cl)
 	if err := s.store.PutTemplate(ctx, cl); err != nil {
 		return store.Template{}, err
 	}

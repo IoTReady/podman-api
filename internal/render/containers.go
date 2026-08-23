@@ -34,11 +34,11 @@ import (
 // path already report a body that will not render, so they generally treat a
 // failure here as "nothing extractable" rather than a second error.
 func ContainerNames(body string, m Meta) (literal, templated []string, err error) {
-	a, err := containerNamesRendered(body, probeParams(m, "aaa", 1, false))
+	a, err := containerNamesRendered(body, probeParams(m, 0))
 	if err != nil {
 		return nil, nil, err
 	}
-	b, err := containerNamesRendered(body, probeParams(m, "bbb", 2, true))
+	b, err := containerNamesRendered(body, probeParams(m, 1))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -47,6 +47,14 @@ func ContainerNames(body string, m Meta) (literal, templated []string, err error
 		// cannot be paired up positionally. Nothing here is provably literal.
 		return nil, a, nil
 	}
+	// CAVEAT: pairing is positional, so it is only sound while both renders emit
+	// the containers in the same ORDER. The length guard above catches a shape
+	// change; a parameter that REORDERS the list without changing its length
+	// would pair name i against a different container's name, mislabelling both
+	// as templated. That direction is fail-open — a name that is really literal
+	// is simply not enforced — so it is left as a caveat rather than paid for
+	// with a matching pass that would have its own ambiguities (two containers
+	// can legitimately render the same name in one probe).
 	seenLit := map[string]bool{}
 	seenTmpl := map[string]bool{}
 	for i := range a {
@@ -65,18 +73,42 @@ func ContainerNames(body string, m Meta) (literal, templated []string, err error
 	return literal, templated, nil
 }
 
-// probeParams gives every declared parameter a value of the right type,
-// IGNORING any declared default so two probes really do differ everywhere.
-func probeParams(m Meta, s string, i int, b bool) map[string]any {
+// probeParams gives every declared parameter a value of the right type for
+// probe number variant (0 or 1), IGNORING any declared default so two probes
+// really do differ everywhere.
+//
+// A `select` parameter is probed with two of its OWN declared options rather
+// than with arbitrary strings. A body may gate a container name on a
+// comparison — `{{if eq .mode "postgres"}}db{{else}}web{{end}}` — and a value
+// outside the option set takes the same branch in both probes, which banks
+// "web" as a literal claim the template may never render and misses the real
+// "db" one. The first half of that is merely fail-open; the second REFUSES a
+// legal deployment over a name no instance uses, so the option set is used
+// wherever it can distinguish the branches. A select declaring a single option
+// gets that option in both probes, which is correct: every instance renders it.
+// This is the same reasoning the false/true pair already applies to `bool`.
+func probeParams(m Meta, variant int) map[string]any {
+	str := [2]string{"aaa", "bbb"}[variant]
+	num := [2]int{1, 2}[variant]
+	bl := [2]bool{false, true}[variant]
 	out := make(map[string]any, len(m.Parameters))
 	for _, p := range m.Parameters {
 		switch p.Type {
 		case "int":
-			out[p.Name] = i
+			out[p.Name] = num
 		case "bool":
-			out[p.Name] = b
-		default: // string, select, or unspecified
-			out[p.Name] = s
+			out[p.Name] = bl
+		case "select":
+			switch {
+			case len(p.Options) >= 2:
+				out[p.Name] = p.Options[variant]
+			case len(p.Options) == 1:
+				out[p.Name] = p.Options[0]
+			default:
+				out[p.Name] = str
+			}
+		default: // string, or unspecified
+			out[p.Name] = str
 		}
 	}
 	return out

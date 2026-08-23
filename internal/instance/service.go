@@ -334,10 +334,11 @@ type netClaim struct {
 	// pod by each of them on every network it joins, so they are claims the
 	// template never wrote down — see claimedNames (#272).
 	containers []string
-	// declared is the set of networks the template names in its own `networks:`
-	// block, as opposed to the implicit ingress network joinNetworks prepends.
-	// Container names are enforced only on the former; see claimedNames.
-	declared map[string]bool
+	// ingressNet is the shared ingress network's name, or "" when ingress is
+	// disabled. It is the ONE network container names are not enforced on, and
+	// it is matched by IDENTITY rather than by how the membership was declared —
+	// see claimedNames.
+	ingressNet string
 }
 
 // claimName is one DNS name a pod answers to on a network, with where it came
@@ -356,22 +357,18 @@ const (
 
 // newClaim builds the claim an instance of tmpl/slug makes under meta.
 func (s *Service) newClaim(tmpl, slug string, m render.Meta) netClaim {
-	declared := make(map[string]bool, len(m.Networks))
-	for _, n := range m.Networks {
-		declared[n.Name] = true
-	}
 	return netClaim{
 		template:   tmpl,
 		slug:       slug,
 		joins:      s.joinNetworks(m),
 		containers: m.ContainerNames,
-		declared:   declared,
+		ingressNet: s.ingressNet,
 	}
 }
 
 // claimedNames returns every DNS name the claim registers on network net: the
-// pod's own podman DNS name, the template's declared aliases, and — on a
-// network the template DECLARES — its literal container names. It reports false
+// pod's own podman DNS name, the template's declared aliases, and — on every
+// network but the ingress one — its literal container names. It reports false
 // when the claim does not join that network at all.
 //
 // The container names are there because podman puts them there: kube play adds
@@ -383,11 +380,18 @@ func (s *Service) newClaim(tmpl, slug string, m render.Meta) netClaim {
 // LITERAL names count: a name carrying a parameter ("db-{{.slug}}") is a
 // different name on every instance and claims nothing shared.
 //
-// The implicit ingress network is deliberately EXEMPT. Every ingress template
+// The shared ingress network is deliberately EXEMPT. Every ingress template
 // joins it — it is not an opt-in namespace claim the way `networks:` is — the
 // ingress controller addresses pods by pod DNS name, and enforcing container
 // names there would refuse the second instance of every web template on the
 // host. Declared aliases and pod names are still enforced there, as before.
+//
+// The exemption is keyed on the network's IDENTITY, not on how the pod came to
+// join it. A template may name the ingress network in its own `networks:` block
+// — that is the supported way to declare an alias on it, and joinNetworks
+// merges rather than drops — so an exemption keyed on "the template did not
+// declare this network" would drop away for exactly that legal configuration
+// and refuse the second instance of such a web template on its container name.
 func (c netClaim) claimedNames(net string) ([]claimName, bool) {
 	for _, j := range c.joins {
 		if j.Name != net {
@@ -398,7 +402,7 @@ func (c netClaim) claimedNames(net string) ([]claimName, bool) {
 		for _, a := range j.Aliases {
 			out = append(out, claimName{a, kindAlias})
 		}
-		if c.declared[net] {
+		if net != c.ingressNet {
 			for _, n := range c.containers {
 				out = append(out, claimName{n, kindContainer})
 			}
@@ -564,8 +568,14 @@ func (s *Service) warnOnNetworkNameConflict(ctx context.Context, host, tmpl, slu
 	}
 	// NOTE this costs a ListSpecKeys plus a GetTemplate per distinct template,
 	// per converged instance — O(N) host scans over a boot of N instances, and
-	// one log line per instance for a conflict that involves two. Cheap enough at
-	// current fleet sizes; hoist the claim set to the caller if that changes.
+	// one log line per instance for a conflict that involves two. It also costs
+	// O(N) TEMPLATE RENDERS: every template row whose stored ContainerNames is
+	// nil is re-derived from its body by metaWithContainerNames on each of those
+	// scans (two renders plus a YAML decode each), and a nil is not only a legacy
+	// row — a template whose container names are all parameter-dependent, which
+	// is the shape this check recommends, stores nil for as long as it exists.
+	// Cheap enough at current fleet sizes; hoist the claim set to the caller if
+	// that changes.
 	claims, err := s.hostClaims(ctx, host, map[string]render.Meta{tmpl: meta})
 	if err != nil {
 		return

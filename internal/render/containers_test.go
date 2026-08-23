@@ -151,3 +151,37 @@ spec:
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "container name")
 }
+
+// A `select` parameter probed with a value outside its own option set takes the
+// same branch in both probes: the real claim ("db") is missed, and "web" — a
+// name no instance renders — is banked as a literal claim that would REFUSE a
+// legal second instance. Probing with the declared options closes that
+// (#285 review item 2).
+func TestContainerNamesUsesSelectOptions(t *testing.T) {
+	m := Meta{ID: "x", Parameters: []ParamDef{
+		{Name: "mode", Type: "select", Options: []string{"postgres", "mysql"}},
+	}}
+	body := `spec:
+  containers:
+    - name: {{if eq .mode "postgres"}}db{{else}}web{{end}}
+`
+	lit, tmplted, err := ContainerNames(body, m)
+	require.NoError(t, err)
+	assert.Empty(t, lit, "the name depends on the mode, so nothing is literal")
+	assert.Equal(t, []string{"db"}, tmplted)
+}
+
+// A select with a single option renders the same name for every instance, so
+// that name IS a literal claim.
+func TestContainerNamesSelectWithOneOption(t *testing.T) {
+	m := Meta{ID: "x", Parameters: []ParamDef{
+		{Name: "mode", Type: "select", Options: []string{"postgres"}},
+	}}
+	body := `spec:
+  containers:
+    - name: {{if eq .mode "postgres"}}db{{else}}web{{end}}
+`
+	lit, _, err := ContainerNames(body, m)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"db"}, lit)
+}

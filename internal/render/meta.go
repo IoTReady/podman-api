@@ -78,8 +78,8 @@ type Meta struct {
 // resolution. Uniqueness is enforced instead by the daemon, scoped to
 // (host, network, name) — see Service.validateNetworkAliases.
 //
-// That enforcement covers declared aliases, pod DNS names, and — on the
-// networks a template DECLARES here — the aliases podman adds on its own: kube
+// That enforcement covers declared aliases, pod DNS names, and — on every
+// network but the ingress one — the aliases podman adds on its own: kube
 // play registers every container name in the played YAML as an alias on every
 // joined network, so two instances of a template whose container is named "db"
 // would both answer to "db" (#272). Literal container names are extracted at
@@ -88,11 +88,12 @@ type Meta struct {
 // refused. Give the container a per-instance name (include a parameter, e.g.
 // `name: db-{{.slug}}`) when two instances must share a network.
 //
-// The implicit ingress network is the one exception: every ingress template
-// joins it, it is not an opt-in namespace claim, and the ingress controller
-// addresses pods by pod DNS name — so enforcing container names there would
-// refuse the second instance of every web template for a collision nobody
-// resolves against. Declared aliases and pod names are still enforced there.
+// The shared ingress network is the one exception: every ingress template joins
+// it, it is not an opt-in namespace claim, and the ingress controller addresses
+// pods by pod DNS name — so enforcing container names there would refuse the
+// second instance of every web template for a collision nobody resolves
+// against. That holds however the pod came to join it, naming it in this block
+// included. Declared aliases and pod names are still enforced there.
 type Network struct {
 	Name    string   `yaml:"name" json:"name"`
 	Aliases []string `yaml:"aliases,omitempty" json:"aliases,omitempty"`
