@@ -602,8 +602,16 @@ func excluding(claims []netClaim, tmpl string, slugs ...string) []netClaim {
 // that two pods are answering to one name.
 //
 // Never fails the converge: a store hiccup here must not keep an instance down.
-func (s *Service) warnOnNetworkNameConflict(ctx context.Context, host, tmpl, slug string, meta render.Meta) {
-	if len(meta.Networks) == 0 {
+//
+// subject is the converging instance's own effective meta (template + ITS
+// per-instance networks); tmplMeta is the template's meta WITHOUT them, used to
+// stand in for other instances of the same template. Keeping the two apart is
+// load-bearing, exactly as it is in validateNetworkAliases: hostClaims seeds its
+// template cache from tmplMeta, so folding the subject's per-instance networks
+// into it would attribute this instance's memberships to every peer sharing its
+// template and report a conflict on a network no peer has joined (#270 review).
+func (s *Service) warnOnNetworkNameConflict(ctx context.Context, host, tmpl, slug string, subject, tmplMeta render.Meta) {
+	if len(subject.Networks) == 0 {
 		return
 	}
 	// NOTE this costs a ListSpecKeys plus a GetTemplate per distinct template,
@@ -616,12 +624,11 @@ func (s *Service) warnOnNetworkNameConflict(ctx context.Context, host, tmpl, slu
 	// is the shape this check recommends, stores nil for as long as it exists.
 	// Cheap enough at current fleet sizes; hoist the claim set to the caller if
 	// that changes.
-	claims, err := s.hostClaims(ctx, host, map[string]render.Meta{tmpl: meta})
+	claims, err := s.hostClaims(ctx, host, map[string]render.Meta{tmpl: tmplMeta})
 	if err != nil {
 		return
 	}
-	subject := s.newClaim(tmpl, slug, meta)
-	if err := firstNameConflictFor(subject, excluding(claims, tmpl, slug)); err != nil {
+	if err := firstNameConflictFor(s.newClaim(tmpl, slug, subject), excluding(claims, tmpl, slug)); err != nil {
 		log.Printf("WARNING: converge %s/%s on %s: %v; podman will resolve it arbitrarily", tmpl, slug, host, err)
 	}
 }
@@ -640,9 +647,17 @@ func (s *Service) warnOnNetworkNameConflict(ctx context.Context, host, tmpl, slu
 // It only inspects hosts, never podman, and only for templates that declare
 // networks — a template with none cannot introduce a conflict.
 func (s *Service) checkTemplateNetworkConflicts(ctx context.Context, t store.Template) error {
-	if len(t.Meta.Networks) == 0 {
-		return nil
-	}
+	// No `if len(t.Meta.Networks) == 0 { return nil }` shortcut: it was sound
+	// only while every membership came from the template. An instance can now
+	// join a network its template never names (#270), so a template declaring
+	// none can still introduce a cross-instance collision — a container-name
+	// edit claims a name on every non-ingress network the pod joins (#272), and
+	// those networks may all be per-instance. Skipping the scan would let such
+	// an edit through and leave both instances permanently un-appliable (this is
+	// also the upgrade/rotate/parameter-update path), which is precisely the
+	// unreachable state this function exists to preserve. The scan is one
+	// ListSpecNetworks plus a GetTemplate per distinct template per host, on the
+	// rare template-write path (#270 review).
 	for _, h := range s.hostsSnap() {
 		claims, err := s.hostClaims(ctx, h.ID, map[string]render.Meta{t.Meta.ID: metaWithContainerNames(t)})
 		if err != nil {
@@ -812,9 +827,18 @@ func (s *Service) Apply(ctx context.Context, host string, req ApplyRequest, opts
 	// not just over the store access. That's acceptable for a single-operator
 	// system — non-ingress and different-host deploys take no host lock and stay
 	// fully concurrent. Taken before the instanceLock (consistent order → no
-	// deadlock) and only when domains are present; a request with no domains can
-	// never create a claim, so it needs no host-wide serialization. (#82)
-	if len(req.Domains) > 0 {
+	// deadlock) and only when the request can create a host-wide claim.
+	//
+	// Per-instance networks (#270) are the second such claim: validateNetworkAliases
+	// is the same check→persist pair, and the claim only becomes durable at
+	// PutSpec far below, so two concurrent domain-less applies each requesting
+	// the same network + alias would both read an unclaimed host and both
+	// succeed — the duplicate DNS name #269 exists to prevent, now reachable
+	// from a scripted rollout because the aliases are request data rather than a
+	// property of the template. (A collision between two TEMPLATE-declared alias
+	// sets can still race the same way; that predates this change and needs the
+	// template lookup Apply does not do before locking.)
+	if len(req.Domains) > 0 || len(req.Networks) > 0 {
 		hl := s.hostLock(host)
 		hl.Lock()
 		defer hl.Unlock()
@@ -1559,6 +1583,21 @@ func (s *Service) lifecycle(ctx context.Context, host, tmpl, slug string,
 func (s *Service) Upgrade(ctx context.Context, host string, req ApplyRequest, image string) error {
 	if image == "" {
 		return errors.New("upgrade requires an image")
+	}
+	// This request is rebuilt from the caller's body, which carries no networks.
+	// Applying it as-is would detach the pod from every network it joined
+	// per-instance and persist that loss (#270 review) — silently, with the
+	// instance still Running. Carry the stored set forward unless the caller
+	// stated one. Read outside the instance lock Apply takes below: a concurrent
+	// apply could make it stale, which is the same staleness every other field
+	// of a caller-supplied request already has, and far better than a certain
+	// detach.
+	if req.Networks == nil {
+		if spec, err := s.store.GetSpec(ctx, host, req.Template, req.Slug); err == nil {
+			req.Networks = slices.Clone(spec.AppliedNetworks)
+		} else if !errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("load spec: %w", err)
+		}
 	}
 	// Shallow-copy parameters to avoid mutating the caller's map.
 	params := make(map[string]any, len(req.Parameters)+1)

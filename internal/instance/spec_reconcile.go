@@ -481,7 +481,8 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 	// contended, and by this point the conflicting state already exists on disk.
 	// It must not be silent either: this is exactly the arbitrary-resolution
 	// failure aliases exist to prevent, so name both instances in the log (#269).
-	s.warnOnNetworkNameConflict(ctx, hostID, tmpl, slug, metaWithNetworks(metaWithContainerNames(tmplObj), spec.AppliedNetworks))
+	tmplMeta := metaWithContainerNames(tmplObj)
+	s.warnOnNetworkNameConflict(ctx, hostID, tmpl, slug, metaWithNetworks(tmplMeta, spec.AppliedNetworks), tmplMeta)
 
 	// Step 8: play kube. replace=true when the pod exists (non-Running) so
 	// podman replaces the stale pod; replace=false when the pod is absent.

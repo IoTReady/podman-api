@@ -1,9 +1,13 @@
 package instance
 
 import (
+	"bytes"
 	"context"
+	"log"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -247,4 +251,141 @@ func TestMigrateCarriesPerInstanceNetworksToDestination(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []render.Network{{Name: "customer-a"}}, sp.AppliedNetworks)
 	assert.Equal(t, []string{"customer-a"}, fc.NetworkEnsureCalls["h2"])
+}
+
+// #270 review: converge must measure PEERS by their template's meta, not by the
+// converging instance's. Folding the subject's per-instance networks into the
+// substituted template meta attributes them to every other instance of that
+// template, and the headline use case — two isolated groups off one template —
+// then logs a false conflict on a network the peer never joined, on every boot.
+func TestReconcileSpecsOnHost_DoesNotAttributePerInstanceNetworksToPeers(t *testing.T) {
+	svc, _, st := sharedNetSvc(t, sharedNetTemplate())
+	ctx := context.Background()
+	require.NoError(t, st.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "db", Slug: "vedanta",
+		Parameters:      map[string]any{"slug": "vedanta"},
+		AppliedNetworks: []render.Network{{Name: "customer-a", Aliases: []string{"db"}}},
+	}))
+	require.NoError(t, st.PutSpec(ctx, store.Spec{
+		Host: "h1", Template: "db", Slug: "swelect",
+		Parameters: map[string]any{"slug": "swelect"},
+	}))
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	svc.ReconcileSpecsOnHost(ctx, "h1")
+
+	assert.NotContains(t, logs.String(), "WARNING", "swelect joins no per-instance network and claims no alias")
+}
+
+// A REAL conflict on a per-instance network both instances joined must still be
+// reported — the fix above must not silence the warning it exists for.
+func TestReconcileSpecsOnHost_WarnsOnRealPerInstanceNetworkConflict(t *testing.T) {
+	svc, _, st := sharedNetSvc(t, sharedNetTemplate())
+	ctx := context.Background()
+	for _, slug := range []string{"vedanta", "swelect"} {
+		require.NoError(t, st.PutSpec(ctx, store.Spec{
+			Host: "h1", Template: "db", Slug: slug,
+			Parameters:      map[string]any{"slug": slug},
+			AppliedNetworks: []render.Network{{Name: "customer-a", Aliases: []string{"db"}}},
+		}))
+	}
+
+	var logs bytes.Buffer
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+
+	svc.ReconcileSpecsOnHost(ctx, "h1")
+
+	assert.Contains(t, logs.String(), `DNS name "db" on network "customer-a"`)
+}
+
+// #270 review: the template-edit conflict check used to skip any template
+// declaring no networks. With per-instance memberships that shortcut is a hole —
+// a container-name edit claims a name on every non-ingress network the pod joins
+// (#272), and those networks can all come from the instances. Accepting the edit
+// would wedge both instances against every later apply (upgrade, rotate and
+// parameter update all go through applyLocked).
+func TestUpdateTemplateRejectsContainerNameEditColidingOnPerInstanceNetwork(t *testing.T) {
+	tmpl := sharedNetTemplate() // declares no networks at all
+	tmpl.Body = strings.Replace(tmpl.Body, "- name: db\n", "- name: db-{{.slug}}\n", 1)
+	svc, _, st := sharedNetSvc(t, tmpl)
+	ctx := context.Background()
+
+	for _, slug := range []string{"a", "b"} {
+		req := sharedNetApply(slug)
+		req.Networks = []render.Network{{Name: "shared"}}
+		require.NoError(t, svc.Apply(ctx, "h1", req, ApplyOptions{Replace: true}))
+	}
+
+	// Collapse the per-instance container name to a literal one: both pods would
+	// then answer to "db" on "shared".
+	edited, err := st.GetTemplate(ctx, "db")
+	require.NoError(t, err)
+	edited.Body = strings.Replace(edited.Body, "- name: db-{{.slug}}\n", "- name: db\n", 1)
+
+	err = svc.UpdateTemplate(ctx, edited)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrInvalidTemplate)
+	assert.Contains(t, err.Error(), `DNS name "db" on network "shared"`)
+}
+
+// #270 review: the body-rebuilt upgrade route carries no networks, so applying
+// it as-is would detach the pod from every per-instance network and persist the
+// loss — silently, with the instance still Running.
+func TestUpgradeCarriesPerInstanceNetworksForward(t *testing.T) {
+	tmpl := sharedNetTemplate()
+	tmpl.Meta.Parameters = requiredParams("slug", "image")
+	tmpl.Body = strings.Replace(tmpl.Body, "mariadb:latest", "{{.image}}", 1)
+	svc, fc, st := sharedNetSvc(t, tmpl)
+	ctx := context.Background()
+
+	req := sharedNetApply("vedanta")
+	req.Parameters["image"] = "mariadb:10"
+	req.Networks = []render.Network{{Name: "customer-a"}}
+	require.NoError(t, svc.Apply(ctx, "h1", req, ApplyOptions{Replace: true}))
+
+	// The upgrade request is rebuilt from a request body: parameters and secrets
+	// only, no networks — exactly what POST /upgrade hands the service.
+	require.NoError(t, svc.Upgrade(ctx, "h1", ApplyRequest{
+		Template:   "db",
+		Slug:       "vedanta",
+		Parameters: map[string]any{"slug": "vedanta"},
+	}, "mariadb:11"))
+
+	sp, err := st.GetSpec(ctx, "h1", "db", "vedanta")
+	require.NoError(t, err)
+	assert.Equal(t, []render.Network{{Name: "customer-a"}}, sp.AppliedNetworks)
+	assert.Equal(t, []string{"customer-a"}, fc.PlayCalls[len(fc.PlayCalls)-1].Networks)
+}
+
+// #270 review: a request carrying per-instance networks makes a host-wide claim
+// exactly as a domain-carrying one does, so it must take the per-host lock —
+// otherwise two concurrent applies both read an unclaimed host and both persist
+// the same alias. Asserting the lock is held is not observable from outside, so
+// this pins the condition that decides it.
+func TestApplyTakesHostLockForNetworkCarryingRequest(t *testing.T) {
+	svc, _, _ := sharedNetSvc(t, sharedNetTemplate())
+	ctx := context.Background()
+
+	// Hold the host lock, then run an apply that carries networks (and no
+	// domains) in the background: it must block until the lock is released.
+	hl := svc.hostLock("h1")
+	hl.Lock()
+	done := make(chan error, 1)
+	go func() {
+		req := sharedNetApply("vedanta")
+		req.Networks = []render.Network{{Name: "customer-a"}}
+		done <- svc.Apply(ctx, "h1", req, ApplyOptions{Replace: true})
+	}()
+	select {
+	case err := <-done:
+		hl.Unlock()
+		t.Fatalf("apply completed while the host lock was held: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	hl.Unlock()
+	require.NoError(t, <-done)
 }
