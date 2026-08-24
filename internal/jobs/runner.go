@@ -5,6 +5,7 @@ package jobs
 import (
 	"context"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -120,6 +121,53 @@ type Runner struct {
 	// pre-#238 behaviour.
 	volumeKinds   []string
 	volumeWorkers int
+	// volumeRotation gives the reserved pool per-kind fairness (#242);
+	// non-nil only once SetVolumeTransferPool has taken effect.
+	volumeRotation *kindRotation
+}
+
+// kindRotation tracks, per job kind, how recently the reserved pool last
+// claimed a job of that kind, so claims can be ordered least-recently-served
+// first (#242).
+//
+// The reserved volume-transfer pool is small (2 workers by default) and its
+// kinds can each hold a worker for up to -volume-transfer-timeout, so a
+// strictly oldest-first claim across all of VolumeTransferKinds lets one kind
+// own the whole reserved pool: a fleet-wide backup wave queues an
+// operator-triggered migrate/evacuate behind every backup in it. Rotation
+// bounds that wait to one job per other kind rather than the length of the
+// wave — the same starvation #238 fixed at the whole-pool level, one layer
+// down.
+//
+// Fairness is best-effort, not a guarantee: two reserved workers can compute
+// their order concurrently and land on the same kind before either records
+// it as served. The next round corrects that, which is all the bound needs.
+type kindRotation struct {
+	mu   sync.Mutex
+	seq  uint64
+	last map[string]uint64 // kind -> sequence number of its last claim; absent == never
+}
+
+func newKindRotation() *kindRotation { return &kindRotation{last: map[string]uint64{}} }
+
+// order returns kinds least-recently-claimed first. A kind never claimed
+// sorts ahead of every claimed one (zero value), and ties keep the caller's
+// declaration order, so an idle rotation preserves the configured order.
+func (kr *kindRotation) order(kinds []string) []string {
+	out := append([]string(nil), kinds...)
+	kr.mu.Lock()
+	defer kr.mu.Unlock()
+	sort.SliceStable(out, func(i, j int) bool { return kr.last[out[i]] < kr.last[out[j]] })
+	return out
+}
+
+// served records that a job of kind was just claimed, moving it to the back of
+// the rotation.
+func (kr *kindRotation) served(kind string) {
+	kr.mu.Lock()
+	defer kr.mu.Unlock()
+	kr.seq++
+	kr.last[kind] = kr.seq
 }
 
 // inflightJob tracks a currently-running job so an operator request can cancel
@@ -182,12 +230,18 @@ func (r *Runner) SetReconcilers(rec Reconcilers) { r.reconcilers = rec }
 // -volume-transfer-timeout (2h default, was 10min pre-#237), starving every
 // other job kind behind it. Reserving a small sub-pool for those kinds
 // guarantees the general pool always has free workers regardless.
+//
+// #242: within the reserved pool, claims rotate over kinds
+// least-recently-served first (see kindRotation) rather than running
+// strictly oldest-first, so one kind's wave cannot own the whole (small)
+// reservation and starve the others inside it.
 func (r *Runner) SetVolumeTransferPool(kinds []string, workers int) {
 	if len(kinds) == 0 || workers <= 0 {
 		return
 	}
 	r.volumeKinds = kinds
 	r.volumeWorkers = workers
+	r.volumeRotation = newKindRotation()
 }
 
 // reconcilableKinds returns the kinds that have a registered reconciler.
@@ -442,7 +496,7 @@ func (r *Runner) worker(ctx context.Context, claimKinds []string, exclude bool, 
 }
 
 // claim dispatches to store.ClaimNext (kinds == nil, exclude == false),
-// store.ClaimNextMatching (kinds set, exclude == false), or
+// the reserved pool's fair per-kind claim (kinds set, exclude == false), or
 // store.ClaimNextExcluding (exclude == true).
 func (r *Runner) claim(ctx context.Context, kinds []string, exclude bool) (store.Job, bool, error) {
 	switch {
@@ -451,8 +505,34 @@ func (r *Runner) claim(ctx context.Context, kinds []string, exclude bool) (store
 	case kinds == nil:
 		return r.store.ClaimNext(ctx)
 	default:
+		return r.claimRotating(ctx, kinds)
+	}
+}
+
+// claimRotating claims the oldest queued job of the least-recently-claimed
+// kind that has any, instead of the oldest job across all kinds (#242). It
+// asks the store for one kind at a time — a single ClaimNextMatching(kinds)
+// is atomic but strictly oldest-first, which is exactly the ordering that
+// starves the other kinds inside the reserved pool.
+//
+// Cost is at most one claim query per kind (5 for VolumeTransferKinds), paid
+// only by the small reserved pool, and only on a pass that finds little or no
+// work; the loop stops at the first kind that yields a job.
+func (r *Runner) claimRotating(ctx context.Context, kinds []string) (store.Job, bool, error) {
+	if r.volumeRotation == nil { // unset only if a caller bypassed SetVolumeTransferPool
 		return r.store.ClaimNextMatching(ctx, kinds)
 	}
+	for _, kind := range r.volumeRotation.order(kinds) {
+		job, ok, err := r.store.ClaimNextMatching(ctx, []string{kind})
+		if err != nil {
+			return store.Job{}, false, err
+		}
+		if ok {
+			r.volumeRotation.served(kind)
+			return job, true, nil
+		}
+	}
+	return store.Job{}, false, nil
 }
 
 // finishTimeout bounds the terminal-state write so a slow/contended store can't

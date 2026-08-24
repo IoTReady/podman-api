@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -435,4 +437,94 @@ func TestRunner_VolumeTransferPool_NoOpBelowThreshold(t *testing.T) {
 		got, _ := m.GetJob(context.Background(), j.ID)
 		return got.State == store.JobSucceeded
 	})
+}
+
+func TestRunner_VolumeTransferPool_RotatesBetweenReservedKinds(t *testing.T) {
+	// #242: within the reserved volume-transfer pool, a wave of one kind must
+	// not starve the others. The pool claims oldest-first across all of
+	// VolumeTransferKinds, so a queue of [backup, backup, migrate] served
+	// strictly FIFO puts an operator-triggered migrate behind every backup —
+	// each of which may hold its worker for up to -volume-transfer-timeout.
+	//
+	// Here the single reserved worker runs backup #1; backup #2 and migrate
+	// are then enqueued and backup #1 is released. Pre-fix the freed worker
+	// claims backup #2 (the older job) and stays on it, so migrate never
+	// runs. Post-fix the pool rotates to the least-recently-served kind with
+	// queued work, so migrate is claimed next and completes.
+	m := store.NewMemory()
+	var backups int32
+	firstRunning := make(chan struct{})
+	release := make(chan struct{})
+	reg := Registry{
+		"backup": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+			if atomic.AddInt32(&backups, 1) == 1 {
+				close(firstRunning)
+				select {
+				case <-release:
+					return nil
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			// A later backup stands in for a long-running transfer: it holds
+			// its worker for the rest of the test.
+			<-ctx.Done()
+			return ctx.Err()
+		}),
+		"migrate": handlerFunc(func(ctx context.Context, job store.Job, jc *JobContext) error {
+			return nil
+		}),
+	}
+	// 2 total workers, exactly 1 reserved — so the reserved pool's own claim
+	// order is what decides whether migrate ever runs.
+	r := NewRunner(m, reg, 2)
+	r.SetVolumeTransferPool([]string{"backup", "migrate"}, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r.Start(ctx)
+
+	if _, err := m.Enqueue(context.Background(), "backup", json.RawMessage(`{}`), ""); err != nil {
+		t.Fatalf("enqueue backup #1: %v", err)
+	}
+	r.Notify()
+	select {
+	case <-firstRunning:
+	case <-time.After(2 * time.Second):
+		t.Fatal("backup #1 never started")
+	}
+
+	if _, err := m.Enqueue(context.Background(), "backup", json.RawMessage(`{}`), ""); err != nil {
+		t.Fatalf("enqueue backup #2: %v", err)
+	}
+	mig, _ := m.Enqueue(context.Background(), "migrate", json.RawMessage(`{}`), "")
+	r.Notify()
+
+	close(release) // frees the reserved worker to claim its next job
+	waitFor(t, func() bool {
+		got, _ := m.GetJob(context.Background(), mig.ID)
+		return got.State == store.JobSucceeded
+	})
+}
+
+func TestKindRotation_OrdersLeastRecentlyServedFirst(t *testing.T) {
+	kinds := []string{"backup", "restore", "migrate"}
+	kr := newKindRotation()
+
+	// Nothing served yet: the configured order is preserved.
+	if got := kr.order(kinds); !reflect.DeepEqual(got, kinds) {
+		t.Fatalf("initial order = %v, want %v", got, kinds)
+	}
+
+	kr.served("backup")
+	// backup moves to the back; the never-served kinds keep their relative order.
+	if got, want := kr.order(kinds), []string{"restore", "migrate", "backup"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("order after serving backup = %v, want %v", got, want)
+	}
+
+	kr.served("restore")
+	kr.served("backup")
+	// migrate is still never-served, then restore, then backup (most recent).
+	if got, want := kr.order(kinds), []string{"migrate", "restore", "backup"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("order after backup,restore,backup = %v, want %v", got, want)
+	}
 }
