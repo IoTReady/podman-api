@@ -7,6 +7,7 @@ import (
 
 	"github.com/iotready/podman-api/extension"
 	"github.com/iotready/podman-api/internal/store"
+	"slices"
 )
 
 // CheckInstanceExists validates the precondition for operating on a live instance
@@ -74,6 +75,10 @@ func (s *Service) PITRRestore(ctx context.Context, req PITRRestoreRequest, step 
 		Parameters: spec.Parameters,
 		Secrets:    spec.Secrets,
 		Domains:    spec.Domains,
+		// Carry the instance's own extra networks (#270) forward: they live
+		// on the spec, not the template, so a re-apply that omitted them would
+		// detach the pod from every network it joined per-instance.
+		Networks: slices.Clone(spec.AppliedNetworks),
 	}, ApplyOptions{Replace: true, RestoreIntent: intent}); err != nil {
 		return fmt.Errorf("apply: %w", err)
 	}

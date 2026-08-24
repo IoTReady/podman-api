@@ -102,6 +102,8 @@ func classify(err error) (code string, status int, msg string) {
 		return "spec_corrupt", http.StatusUnprocessableEntity, err.Error()
 	case errors.Is(err, instance.ErrPortConflict):
 		return "port_conflict", http.StatusConflict, err.Error()
+	case errors.Is(err, instance.ErrNetworkNameConflict):
+		return "network_name_conflict", http.StatusConflict, err.Error()
 	case errors.Is(err, instance.ErrSameHost):
 		return "invalid_request", http.StatusBadRequest, err.Error()
 	case errors.Is(err, instance.ErrNewSlugSameAsOld):

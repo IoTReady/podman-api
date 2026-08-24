@@ -465,10 +465,14 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 		}
 	}
 
-	// Step 7: ensure the ingress network (when declared) and the template's own
-	// shared networks, so a pod re-converged after a reboot comes back with the
-	// same connectivity the apply path gave it.
-	networks, err := s.ensureNetworks(ctx, hostID, tmplObj.Meta)
+	// Step 7: ensure the ingress network (when declared), the template's own
+	// shared networks, and the extra ones THIS instance was applied with
+	// (#270), so a pod re-converged after a reboot comes back with the same
+	// connectivity the apply path gave it. The per-instance set is replayed
+	// from the spec, not re-derived: it exists in no template, so ensuring the
+	// template's list alone would quietly detach the pod from it.
+	netMeta := metaWithNetworks(tmplObj.Meta, spec.AppliedNetworks)
+	networks, err := s.ensureNetworks(ctx, hostID, netMeta)
 	if err != nil {
 		return false, err
 	}
@@ -477,7 +481,8 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 	// contended, and by this point the conflicting state already exists on disk.
 	// It must not be silent either: this is exactly the arbitrary-resolution
 	// failure aliases exist to prevent, so name both instances in the log (#269).
-	s.warnOnNetworkNameConflict(ctx, hostID, tmpl, slug, metaWithContainerNames(tmplObj))
+	tmplMeta := metaWithContainerNames(tmplObj)
+	s.warnOnNetworkNameConflict(ctx, hostID, tmpl, slug, metaWithNetworks(tmplMeta, spec.AppliedNetworks), tmplMeta)
 
 	// Step 8: play kube. replace=true when the pod exists (non-Running) so
 	// podman replaces the stale pod; replace=false when the pod is absent.
@@ -512,6 +517,11 @@ func (s *Service) reconcileOneSpec(ctx context.Context, hostID, tmpl, slug strin
 		// naming what THIS spec was last actually applied with, not whatever
 		// the current template now declares.
 		AppliedVolumeMeta: maps.Clone(spec.AppliedVolumeMeta),
+		// AppliedNetworks is preserved for the same reason the AppliedVolume*
+		// fields are: converge replays what this instance was applied with, and
+		// dropping it here would detach the pod from its extra networks on the
+		// NEXT converge (this one having already played it onto them).
+		AppliedNetworks: slices.Clone(spec.AppliedNetworks),
 	}
 	if err := s.store.PutSpec(ctx, sp); err != nil {
 		// Spec persist failed but the pod is already running. Log the error

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -271,7 +272,7 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 	}
 	step("stop-source", req.FromHost)
 
-	stoppedPaired, err := s.migratePostStop(ctx, req, eff, tmpl, spec.Secrets, spec.Domains, step)
+	stoppedPaired, err := s.migratePostStop(ctx, req, eff, tmpl, spec.Secrets, spec.Domains, spec.AppliedNetworks, step)
 	if err != nil {
 		step("rollback", err.Error())
 		// Compensate on a detached context: migratePostStop may have failed
@@ -323,8 +324,10 @@ func (s *Service) Migrate(ctx context.Context, req MigrateRequest, step func(ste
 // on rollback or after commit. domains are the source spec's public hostnames,
 // threaded through so an ingress instance keeps its route on the destination
 // (Apply re-validates host-wide uniqueness and serializes the claim per host —
-// #82 — so passing them here is sufficient).
-func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, tmpl store.Template, secrets map[string]string, domains []string, step func(step, detail string)) (stoppedPaired []PairedInstanceRef, err error) {
+// #82 — so passing them here is sufficient). networks are the source spec's own
+// extra shared networks (#270), threaded the same way so the instance is
+// attached to the same set on the destination.
+func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff map[string]any, tmpl store.Template, secrets map[string]string, domains []string, networks []render.Network, step func(step, detail string)) (stoppedPaired []PairedInstanceRef, err error) {
 	// Provision any persisted per-host secrets the destination is missing, from
 	// the source host's stored value. Idempotent: only creates what is absent.
 	// Provisioned secrets are intentionally left in place on rollback — they are
@@ -423,6 +426,9 @@ func (s *Service) migratePostStop(ctx context.Context, req MigrateRequest, eff m
 	// needed a secret the template later grew.
 	if err := s.Apply(ctx, req.ToHost, ApplyRequest{
 		Template: req.Template, Slug: req.Slug, Parameters: eff, Secrets: secrets, Domains: domains,
+		// The instance keeps its own extra networks on the destination host
+		// (#270); ensureNetworks creates them there if they do not exist yet.
+		Networks: slices.Clone(networks),
 	}, ApplyOptions{Replace: false, AllowMissingSecrets: true}); err != nil {
 		return stoppedPaired, fmt.Errorf("apply on dest: %w", err)
 	}

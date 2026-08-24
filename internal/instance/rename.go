@@ -11,6 +11,7 @@ import (
 	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/render"
 	"github.com/iotready/podman-api/internal/store"
+	"slices"
 )
 
 var (
@@ -151,6 +152,10 @@ func (s *Service) Rename(ctx context.Context, host, tmpl, slug string, req Renam
 		Parameters: params,
 		Secrets:    spec.Secrets,
 		Domains:    domains,
+		// The renamed instance keeps the extra networks the old slug was
+		// applied with (#270) — a rename must not silently change what the
+		// instance is attached to.
+		Networks: slices.Clone(spec.AppliedNetworks),
 		// The old spec is still in the store — it is deleted only after the new
 		// pod verifies, so a failed apply can roll back to a registered
 		// instance. Name it as superseded so its domains and shared-network DNS

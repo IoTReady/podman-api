@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS specs (
   domains             TEXT NOT NULL DEFAULT '[]',
   applied_volumes     TEXT,
   applied_volume_meta TEXT,
+  applied_networks    TEXT,
   created             INTEGER NOT NULL,
   updated             INTEGER NOT NULL,
   PRIMARY KEY (host, template, slug)
@@ -215,6 +216,8 @@ func OpenSQLite(path string, keys *KeyStore) (*SQLite, error) {
 // distinct from a JSON '[]' meaning "known: applied with no volumes").
 // v10 added specs.applied_volume_meta (nullable, same unknown-vs-known-empty
 // convention as applied_volumes; #256 review round-4).
+// v11 added specs.applied_networks (nullable, same convention: NULL = a row
+// written before per-instance networks existed; #270).
 // Each step is guarded by user_version so OpenSQLite is idempotent.
 func migrateSchema(db *sql.DB) error {
 	var v int
@@ -380,6 +383,27 @@ func migrateSchema(db *sql.DB) error {
 		}
 		v = 10
 	}
+	if v < 11 {
+		// applied_networks column — added by schemaSQL on a fresh DB but absent
+		// on a pre-v11 DB. Nullable with no default, same convention as the two
+		// applied_volume* columns: a pre-existing row reads back
+		// AppliedNetworks == nil, meaning "this instance was applied before the
+		// per-instance override existed", which is indistinguishable from — and
+		// treated identically to — "applied with no extra networks" (#270).
+		has, err := columnExists(db, "specs", "applied_networks")
+		if err != nil {
+			return fmt.Errorf("migrateSchema: check applied_networks column: %w", err)
+		}
+		if !has {
+			if _, err := db.Exec(`ALTER TABLE specs ADD COLUMN applied_networks TEXT`); err != nil {
+				return fmt.Errorf("migrateSchema: add applied_networks column: %w", err)
+			}
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 11`); err != nil {
+			return fmt.Errorf("migrateSchema v11: set user_version: %w", err)
+		}
+		v = 11
+	}
 	return nil
 }
 
@@ -448,11 +472,18 @@ func (s *SQLite) PutSpec(ctx context.Context, sp Spec) error {
 	if err != nil {
 		return err
 	}
+	// AppliedNetworks has no unknown-vs-known-empty distinction to preserve
+	// (see the Spec field doc), but it goes through jsonOrNull anyway so an
+	// instance with no override stores NULL rather than a pointless "[]".
+	appliedNetworks, err := jsonOrNull(sp.AppliedNetworks)
+	if err != nil {
+		return err
+	}
 	now := time.Now().Unix()
 	return s.write(ctx, func() error {
 		_, err := s.db.ExecContext(ctx, `
-INSERT INTO specs (host, template, slug, parameters, secrets, injector_secrets, domains, applied_volumes, applied_volume_meta, created, updated)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO specs (host, template, slug, parameters, secrets, injector_secrets, domains, applied_volumes, applied_volume_meta, applied_networks, created, updated)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(host, template, slug) DO UPDATE SET
   parameters          = excluded.parameters,
   secrets             = excluded.secrets,
@@ -460,15 +491,16 @@ ON CONFLICT(host, template, slug) DO UPDATE SET
   domains             = excluded.domains,
   applied_volumes     = excluded.applied_volumes,
   applied_volume_meta = excluded.applied_volume_meta,
+  applied_networks    = excluded.applied_networks,
   updated             = excluded.updated`,
-			sp.Host, sp.Template, sp.Slug, string(params), blob, injBlob, string(domJSON), appliedVolumes, appliedVolumeMeta, now, now)
+			sp.Host, sp.Template, sp.Slug, string(params), blob, injBlob, string(domJSON), appliedVolumes, appliedVolumeMeta, appliedNetworks, now, now)
 		return err
 	})
 }
 
 func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT parameters, secrets, injector_secrets, domains, applied_volumes, applied_volume_meta, created, updated FROM specs WHERE host=? AND template=? AND slug=?`,
+		`SELECT parameters, secrets, injector_secrets, domains, applied_volumes, applied_volume_meta, applied_networks, created, updated FROM specs WHERE host=? AND template=? AND slug=?`,
 		host, template, slug)
 	var (
 		paramsJSON           string
@@ -477,9 +509,10 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 		domainsJSON          string
 		appliedVolumesRaw    sql.NullString
 		appliedVolumeMetaRaw sql.NullString
+		appliedNetworksRaw   sql.NullString
 		created, updated     int64
 	)
-	if err := row.Scan(&paramsJSON, &blob, &injBlob, &domainsJSON, &appliedVolumesRaw, &appliedVolumeMetaRaw, &created, &updated); err != nil {
+	if err := row.Scan(&paramsJSON, &blob, &injBlob, &domainsJSON, &appliedVolumesRaw, &appliedVolumeMetaRaw, &appliedNetworksRaw, &created, &updated); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Spec{}, ErrNotFound
 		}
@@ -534,11 +567,16 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 	if err := unmarshalNullable(appliedVolumeMetaRaw, &appliedVolumeMeta, "applied_volume_meta"); err != nil {
 		return Spec{}, err
 	}
+	var appliedNetworks []render.Network
+	if err := unmarshalNullable(appliedNetworksRaw, &appliedNetworks, "applied_networks"); err != nil {
+		return Spec{}, err
+	}
 	return Spec{
 		Host: host, Template: template, Slug: slug,
 		Parameters: params, Secrets: secrets, InjectorSecrets: injectorSecrets, Domains: domains,
 		AppliedVolumes:    appliedVolumes,
 		AppliedVolumeMeta: appliedVolumeMeta,
+		AppliedNetworks:   appliedNetworks,
 		Created:           time.Unix(created, 0), Updated: time.Unix(updated, 0),
 	}, nil
 }
@@ -550,7 +588,7 @@ func (s *SQLite) GetSpec(ctx context.Context, host, template, slug string) (Spec
 // load-bearing for every AppliedVolumes consumer, so both writer and reader
 // (unmarshalNullable) go through one implementation rather than repeating the
 // convention per field (#265 review, minor cleanup).
-func jsonOrNull[T []string | map[string]AppliedVolumeMarker](v T) (sql.NullString, error) {
+func jsonOrNull[T []string | map[string]AppliedVolumeMarker | []render.Network](v T) (sql.NullString, error) {
 	if v == nil {
 		return sql.NullString{}, nil
 	}
@@ -603,6 +641,32 @@ func (s *SQLite) ListSpecKeys(ctx context.Context, host string) ([]SpecKey, erro
 	for rows.Next() {
 		var k SpecKey
 		if err := rows.Scan(&k.Template, &k.Slug); err != nil {
+			return nil, err
+		}
+		out = append(out, k)
+	}
+	return out, rows.Err()
+}
+
+func (s *SQLite) ListSpecNetworks(ctx context.Context, host string) ([]SpecNetworks, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT template, slug, applied_networks FROM specs WHERE host=? ORDER BY template, slug`, host)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SpecNetworks{}
+	for rows.Next() {
+		var (
+			k   SpecNetworks
+			raw sql.NullString
+		)
+		if err := rows.Scan(&k.Template, &k.Slug, &raw); err != nil {
+			return nil, err
+		}
+		// applied_networks is plaintext, so this projection stays readable on a
+		// key-less open — same as ListSpecKeys.
+		if err := unmarshalNullable(raw, &k.Networks, "applied_networks"); err != nil {
 			return nil, err
 		}
 		out = append(out, k)

@@ -12,6 +12,8 @@ import (
 
 	"github.com/stretchr/testify/require"
 	_ "modernc.org/sqlite"
+
+	"github.com/iotready/podman-api/internal/render"
 )
 
 func openTestStore(t *testing.T, ks *KeyStore) *SQLite {
@@ -561,4 +563,80 @@ func TestSQLiteCheckHostRename(t *testing.T) {
 
 	require.NoError(t, s.PutHostSecret(ctx, "h3", "tok", []byte("v")))
 	require.ErrorIs(t, s.CheckHostRename(ctx, "h1", "h3"), ErrHostRenameConflict)
+}
+
+// TestMigrateAddsAppliedNetworksColumn (#270): a pre-v11 DB has no
+// applied_networks column; migrating it in must leave existing rows with no
+// per-instance networks, and the column must then work for new writes.
+func TestMigrateAddsAppliedNetworksColumn(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/old.db"
+	raw, err := sql.Open("sqlite", "file:"+path)
+	require.NoError(t, err)
+	_, err = raw.Exec(`CREATE TABLE specs (
+  host TEXT NOT NULL, template TEXT NOT NULL, slug TEXT NOT NULL,
+  parameters TEXT NOT NULL, secrets BLOB, injector_secrets BLOB,
+  domains TEXT NOT NULL DEFAULT '[]', applied_volumes TEXT,
+  applied_volume_meta TEXT,
+  created INTEGER NOT NULL, updated INTEGER NOT NULL,
+  PRIMARY KEY (host, template, slug));`)
+	require.NoError(t, err)
+	_, err = raw.Exec(`INSERT INTO specs (host, template, slug, parameters, domains, created, updated)
+VALUES ('h', 'pre-existing', 'x', '{}', '[]', 0, 0)`)
+	require.NoError(t, err)
+	_, err = raw.Exec(`PRAGMA user_version = 10`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	keys := NewKeyStore(testKey(0x11))
+	s, err := OpenSQLite(path, keys)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+
+	got, err := s.GetSpec(ctx, "h", "pre-existing", "x")
+	require.NoError(t, err)
+	require.Nil(t, got.AppliedNetworks)
+
+	nets := []render.Network{{Name: "customer-a", Aliases: []string{"db"}}}
+	require.NoError(t, s.PutSpec(ctx, Spec{
+		Host: "h", Template: "web", Slug: "x",
+		Parameters: map[string]any{}, Secrets: map[string]string{},
+		AppliedNetworks: nets,
+	}))
+	got, err = s.GetSpec(ctx, "h", "web", "x")
+	require.NoError(t, err)
+	require.Equal(t, nets, got.AppliedNetworks)
+}
+
+// ListSpecNetworks is the projection the apply-time DNS uniqueness check reads
+// (#270): it must carry each instance's own networks, and — unlike GetSpec —
+// must work on a key-less open, since applied_networks is plaintext.
+func TestSQLite_ListSpecNetworks(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := dir + "/s.db"
+	s, err := OpenSQLite(path, NewKeyStore(testKey(0x11)))
+	require.NoError(t, err)
+	nets := []render.Network{{Name: "customer-a", Aliases: []string{"db"}}}
+	require.NoError(t, s.PutSpec(ctx, Spec{
+		Host: "h1", Template: "web", Slug: "a",
+		Parameters: map[string]any{}, Secrets: map[string]string{"p": "v"},
+		AppliedNetworks: nets,
+	}))
+	require.NoError(t, s.PutSpec(ctx, Spec{
+		Host: "h1", Template: "web", Slug: "b", Parameters: map[string]any{},
+	}))
+	require.NoError(t, s.Close())
+
+	keyless, err := OpenSQLite(path, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = keyless.Close() })
+	got, err := keyless.ListSpecNetworks(ctx, "h1")
+	require.NoError(t, err)
+	require.Equal(t, []SpecNetworks{
+		{SpecKey: SpecKey{Template: "web", Slug: "a"}, Networks: nets},
+		{SpecKey: SpecKey{Template: "web", Slug: "b"}},
+	}, got)
 }

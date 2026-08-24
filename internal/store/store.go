@@ -7,6 +7,8 @@ import (
 	"context"
 	"errors"
 	"time"
+
+	"github.com/iotready/podman-api/internal/render"
 )
 
 // ErrNotFound is returned when no row matches a lookup (specs, jobs, or host secrets).
@@ -110,8 +112,28 @@ type Spec struct {
 	//
 	// Non-secret; stored in plaintext, same as Domains and AppliedVolumes.
 	AppliedVolumeMeta map[string]AppliedVolumeMarker
-	Created           time.Time
-	Updated           time.Time
+	// AppliedNetworks is the set of EXTRA shared-network memberships this
+	// instance's own apply requested (#270), over and above the ones its
+	// template declares. Same "what THIS apply declared" semantics as
+	// AppliedVolumes: it is the instance's property, not the template's, so
+	// boot converge replays it rather than re-deriving the join list from the
+	// template alone — without it an instance's extra networks would silently
+	// vanish on the next reboot.
+	//
+	// The effective join set is the UNION of the template's networks and these
+	// (see Service.joinNetworks): an instance can be added to a network, never
+	// dropped from one its template guarantees. Opting out is a template split.
+	//
+	// nil means "none" — either applied with no override, or a row written
+	// before this field existed. The two are deliberately not distinguished:
+	// unlike AppliedVolumes, nothing here needs to tell "unknown" from "empty",
+	// because an absent override and an empty override produce the same join
+	// set.
+	//
+	// Non-secret; stored in plaintext, same as Domains and AppliedVolumes.
+	AppliedNetworks []render.Network
+	Created         time.Time
+	Updated         time.Time
 }
 
 // AppliedVolumeMarker is one volume's backup marker and exclude patterns as
@@ -129,6 +151,23 @@ type SpecKey struct {
 	Slug     string
 }
 
+// SpecNetworks is one instance's key plus the extra shared networks its own
+// apply declared (Spec.AppliedNetworks). It exists as its own projection rather
+// than as fields on SpecKey because SpecKey is used as a map key by host-wide
+// planning, and a slice field would make it uncomparable.
+//
+// The apply-time DNS uniqueness check builds every peer's claim from key +
+// template meta, and a peer's per-instance networks live in no template (#270);
+// without them that check would be blind to exactly the memberships this
+// feature adds, and two instances could silently claim one DNS name on a
+// network they both joined per-instance — the failure #269 exists to prevent.
+// It stays cheap: a non-secret column in the same single query, no GetSpec and
+// no decryption, so it works on a key-less open.
+type SpecNetworks struct {
+	SpecKey
+	Networks []render.Network
+}
+
 // Store persists instance specs. Implementations encrypt Secrets at rest and
 // stamp Created (first write) and Updated (every write); the in-memory test
 // double does neither.
@@ -137,6 +176,10 @@ type Store interface {
 	PutSpec(ctx context.Context, s Spec) error
 	GetSpec(ctx context.Context, host, template, slug string) (Spec, error)
 	DeleteSpec(ctx context.Context, host, template, slug string) error
+	// ListSpecNetworks returns every instance on host with the extra networks
+	// its own apply declared. Same scan as ListSpecKeys, one column wider; see
+	// SpecNetworks.
+	ListSpecNetworks(ctx context.Context, host string) ([]SpecNetworks, error)
 	// ListSpecKeys returns the (template, slug) of every spec on host, without
 	// decrypting secrets. Empty slice (no error) when the host has none.
 	ListSpecKeys(ctx context.Context, host string) ([]SpecKey, error)

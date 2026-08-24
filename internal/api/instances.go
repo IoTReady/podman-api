@@ -7,6 +7,7 @@ import (
 
 	"github.com/iotready/podman-api/internal/ingress"
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/render"
 )
 
 func (h *handlers) listInstances(w http.ResponseWriter, r *http.Request) {
@@ -67,6 +68,10 @@ func (h *handlers) createInstance(w http.ResponseWriter, r *http.Request) {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_domains", Message: err.Error()})
 		return
 	}
+	if err := render.ValidateNetworkList(req.Networks, "networks"); err != nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_networks", Message: err.Error()})
+		return
+	}
 	opts := instance.ApplyOptions{Replace: false, SkipPull: queryBool(r, "skip_pull")}
 	obs, err := h.svc.ApplyAndObserve(r.Context(), host, req, opts)
 	if err != nil {
@@ -98,7 +103,7 @@ func (h *handlers) applyInstance(w http.ResponseWriter, r *http.Request) {
 	req.Template = pathTmpl
 	req.Slug = pathSlug
 	// An absent/empty PUT body decodes to a zero-value ApplyRequest
-	// (Parameters, Secrets, and Domains all nil). applyInstance always runs
+	// (Parameters, Secrets, Domains and Networks all nil). applyInstance always runs
 	// with Replace:true, so — unlike createInstance, where a genuinely empty
 	// Template/Slug is already rejected by validInstancePath above —
 	// forwarding that zero value here would silently discard every
@@ -111,8 +116,13 @@ func (h *handlers) applyInstance(w http.ResponseWriter, r *http.Request) {
 	// PUT against an existing instance, so reject it explicitly here rather
 	// than relying on validation happening to catch it downstream (#254
 	// review).
-	if len(req.Parameters) == 0 && len(req.Secrets) == 0 && len(req.Domains) == 0 {
-		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "body is required: at least one of parameters, secrets, or domains must be set"})
+	//
+	// networks (#270) counts as a body the same way domains does — and, like
+	// domains, a PUT that omits it clears the instance's per-instance
+	// memberships: this endpoint states the instance's whole declared state,
+	// it does not patch it.
+	if len(req.Parameters) == 0 && len(req.Secrets) == 0 && len(req.Domains) == 0 && len(req.Networks) == 0 {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: "body is required: at least one of parameters, secrets, domains, or networks must be set"})
 		return
 	}
 	if !validSlugParameter(w, req.Parameters, req.Slug) {
@@ -121,6 +131,10 @@ func (h *handlers) applyInstance(w http.ResponseWriter, r *http.Request) {
 
 	if err := ingress.ValidateDomains(req.Domains); err != nil {
 		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_domains", Message: err.Error()})
+		return
+	}
+	if err := render.ValidateNetworkList(req.Networks, "networks"); err != nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_networks", Message: err.Error()})
 		return
 	}
 	opts := instance.ApplyOptions{Replace: true, SkipPull: queryBool(r, "skip_pull")}
