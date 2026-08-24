@@ -99,20 +99,21 @@ func TestLayoutCacheBustsAssets(t *testing.T) {
 
 func TestErrorStatus(t *testing.T) {
 	cases := map[error]int{
-		instance.ErrUnknownHost:        http.StatusNotFound,
-		instance.ErrUnknownTemplate:    http.StatusNotFound,
-		instance.ErrInstanceNotFound:   http.StatusNotFound,
-		instance.ErrInstanceExists:     http.StatusConflict,
-		instance.ErrPortConflict:       http.StatusConflict,
-		instance.ErrHostDraining:       http.StatusLocked,
-		instance.ErrHostSecretMissing:  http.StatusUnprocessableEntity,
-		instance.ErrImagePull:          http.StatusBadGateway,
-		instance.ErrStoreDisabled:      http.StatusNotImplemented,
-		instance.ErrSameHost:           http.StatusBadRequest,
-		store.ErrSecretsNeedKey:        http.StatusBadRequest,
-		store.ErrSecretsUndecryptable:  http.StatusUnprocessableEntity,
-		instance.ErrInvalidBackupScope: http.StatusBadRequest,
-		errors.New("boom"):             http.StatusInternalServerError,
+		instance.ErrUnknownHost:         http.StatusNotFound,
+		instance.ErrUnknownTemplate:     http.StatusNotFound,
+		instance.ErrInstanceNotFound:    http.StatusNotFound,
+		instance.ErrInstanceExists:      http.StatusConflict,
+		instance.ErrPortConflict:        http.StatusConflict,
+		instance.ErrNetworkNameConflict: http.StatusConflict,
+		instance.ErrHostDraining:        http.StatusLocked,
+		instance.ErrHostSecretMissing:   http.StatusUnprocessableEntity,
+		instance.ErrImagePull:           http.StatusBadGateway,
+		instance.ErrStoreDisabled:       http.StatusNotImplemented,
+		instance.ErrSameHost:            http.StatusBadRequest,
+		store.ErrSecretsNeedKey:         http.StatusBadRequest,
+		store.ErrSecretsUndecryptable:   http.StatusUnprocessableEntity,
+		instance.ErrInvalidBackupScope:  http.StatusBadRequest,
+		errors.New("boom"):              http.StatusInternalServerError,
 	}
 	for err, want := range cases {
 		if got := errorStatus(err); got != want {
@@ -137,6 +138,7 @@ func TestErrorStatus_AgreesWithAPIClassify(t *testing.T) {
 		instance.ErrInstanceNotFound,
 		instance.ErrInstanceExists,
 		instance.ErrPortConflict,
+		instance.ErrNetworkNameConflict,
 		instance.ErrHostDraining,
 		instance.ErrHostSecretMissing,
 		instance.ErrImagePull,

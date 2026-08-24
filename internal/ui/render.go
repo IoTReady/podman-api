@@ -119,7 +119,8 @@ func errorStatus(err error) int {
 	case errors.Is(err, instance.ErrInvalidBackupScope):
 		return http.StatusBadRequest
 	case errors.Is(err, instance.ErrInstanceExists),
-		errors.Is(err, instance.ErrPortConflict):
+		errors.Is(err, instance.ErrPortConflict),
+		errors.Is(err, instance.ErrNetworkNameConflict):
 		return http.StatusConflict
 	case errors.Is(err, instance.ErrHostDraining):
 		return http.StatusLocked

@@ -389,3 +389,59 @@ func TestApplyTakesHostLockForNetworkCarryingRequest(t *testing.T) {
 	hl.Unlock()
 	require.NoError(t, <-done)
 }
+
+// undecryptableSpecStore answers GetSpec the way a store with a missing or
+// rotated key does, while every other read still works. It stands in for the
+// state POST /upgrade exists to recover from: the caller re-supplies parameters
+// and secrets in the body precisely because the stored copy cannot be read.
+type undecryptableSpecStore struct {
+	Store
+}
+
+func (u undecryptableSpecStore) GetSpec(context.Context, string, string, string) (store.Spec, error) {
+	return store.Spec{}, store.ErrSecretsUndecryptable
+}
+
+// #288 re-review: the networks carry-forward must not make the recovery path
+// depend on a decryptable spec. Reading the non-decrypting ListSpecNetworks
+// projection keeps the upgrade working AND keeps the networks.
+func TestUpgradeCarriesNetworksForwardWhenSpecIsUndecryptable(t *testing.T) {
+	tmpl := sharedNetTemplate()
+	tmpl.Meta.Parameters = requiredParams("slug", "image")
+	tmpl.Body = strings.Replace(tmpl.Body, "mariadb:latest", "{{.image}}", 1)
+	svc, fc, st := sharedNetSvc(t, tmpl)
+	ctx := context.Background()
+
+	req := sharedNetApply("vedanta")
+	req.Parameters["image"] = "mariadb:10"
+	req.Networks = []render.Network{{Name: "customer-a"}}
+	require.NoError(t, svc.Apply(ctx, "h1", req, ApplyOptions{Replace: true}))
+
+	// From here on the spec cannot be decrypted; the projection still can.
+	svc.SetStore(undecryptableSpecStore{st})
+
+	require.NoError(t, svc.Upgrade(ctx, "h1", ApplyRequest{
+		Template:   "db",
+		Slug:       "vedanta",
+		Parameters: map[string]any{"slug": "vedanta"},
+	}, "mariadb:11"))
+
+	assert.Equal(t, []string{"customer-a"}, fc.PlayCalls[len(fc.PlayCalls)-1].Networks)
+}
+
+// #288 re-review: the OpenAPI spec promises a conflict, not a 500, so the DNS
+// collision has to carry a sentinel the API layer can classify. Both the apply
+// path and the template-edit path must report it.
+func TestNetworkNameConflictIsSentinel(t *testing.T) {
+	svc, _, _ := sharedNetSvc(t, sharedNetTemplate())
+	ctx := context.Background()
+
+	first := sharedNetApply("vedanta")
+	first.Networks = []render.Network{{Name: "customer-a", Aliases: []string{"primary"}}}
+	require.NoError(t, svc.Apply(ctx, "h1", first, ApplyOptions{Replace: true}))
+
+	second := sharedNetApply("swelect")
+	second.Networks = []render.Network{{Name: "customer-a", Aliases: []string{"primary"}}}
+	err := svc.Apply(ctx, "h1", second, ApplyOptions{Replace: true})
+	require.ErrorIs(t, err, ErrNetworkNameConflict)
+}

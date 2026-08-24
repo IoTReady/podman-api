@@ -88,7 +88,8 @@ components:
             instance_already_exists, host_secret_missing, host_draining,
             template_already_exists, template_in_use, invalid_template,
             upstream_error, too_many_ops, internal,
-            invalid_request, port_conflict, not_found, not_implemented,
+            invalid_request, port_conflict, network_name_conflict,
+            not_found, not_implemented,
             conflict, registry_unreachable,
           ]
         message: {type: string}
@@ -394,9 +395,11 @@ components:
             replacing) the ones its template declares. Persisted on the spec, so
             boot converge re-attaches the pod to them. PUT states the whole set:
             omitting the field clears it. A name or alias already claimed by
-            another instance on the same host and network is rejected
-            (invalid_networks / 409-style conflict), because podman would
-            resolve the duplicate arbitrarily.
+            another instance on the same host and network is rejected with
+            409 network_name_conflict, because podman would resolve the
+            duplicate arbitrarily. Note the pod's container names count as
+            claims too — podman registers each as an alias on every non-ingress
+            network the pod joins.
           items: {$ref: '#/components/schemas/NetworkMembership'}
 
     NetworkMembership:

@@ -34,9 +34,15 @@ var (
 	ErrImagePull         = errors.New("image pull failed")
 	ErrHostDraining      = errors.New("host is draining")
 	ErrPortConflict      = errors.New("required host port already in use")
-	ErrSameHost          = errors.New("source and destination host are the same")
-	ErrStoreDisabled     = errors.New("migrate requires the state store")
-	ErrVolumeIntegrity   = errors.New("volume copy failed integrity check")
+	// ErrNetworkNameConflict marks the DNS-name collision firstNameConflictFor
+	// reports, so the API layer can answer 409 network_name_conflict instead of
+	// 500 internal. It is a conflict with another instance's claim, not a
+	// malformed request: the caller fixes it by renaming or by keeping the two
+	// instances off the network, never by re-sending the same body (#288 review).
+	ErrNetworkNameConflict = errors.New("shared-network DNS name already claimed")
+	ErrSameHost            = errors.New("source and destination host are the same")
+	ErrStoreDisabled       = errors.New("migrate requires the state store")
+	ErrVolumeIntegrity     = errors.New("volume copy failed integrity check")
 
 	ErrBackupNotFound      = errors.New("backup not found")
 	ErrBackupNotRestorable = errors.New("backup is not restorable")
@@ -496,8 +502,8 @@ func firstNameConflictFor(subject netClaim, peers []netClaim) error {
 				if !clash {
 					continue
 				}
-				err := fmt.Errorf("networks: DNS name %q on network %q is claimed by both %s/%s (%s) and %s/%s (%s)",
-					n.name, j.Name, subject.template, subject.slug, mineKind, p.template, p.slug, n.kind)
+				err := fmt.Errorf("%w: networks: DNS name %q on network %q is claimed by both %s/%s (%s) and %s/%s (%s)",
+					ErrNetworkNameConflict, n.name, j.Name, subject.template, subject.slug, mineKind, p.template, p.slug, n.kind)
 				if mineKind == kindContainer || n.kind == kindContainer {
 					// The container-name half of a collision is invisible in the
 					// template meta — podman registers it — so the message has to
@@ -509,6 +515,28 @@ func firstNameConflictFor(subject netClaim, peers []netClaim) error {
 		}
 	}
 	return nil
+}
+
+// appliedNetworks returns the per-instance networks stored for one instance, or
+// nil when the instance has no spec. It reads the ListSpecNetworks projection
+// rather than GetSpec so it never decrypts: callers on the recovery paths (see
+// Upgrade) must not be broken by an unreadable secrets blob.
+//
+// The projection is host-wide, which is one extra row scan per call — acceptable
+// on the low-frequency upgrade path, and the whole point is that no key is
+// needed. A store error is returned: silently dropping the networks here would
+// reintroduce the very detach the carry-forward exists to prevent.
+func (s *Service) appliedNetworks(ctx context.Context, host, tmpl, slug string) ([]render.Network, error) {
+	rows, err := s.store.ListSpecNetworks(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("load instance networks: %w", err)
+	}
+	for _, r := range rows {
+		if r.Template == tmpl && r.Slug == slug {
+			return slices.Clone(r.Networks), nil
+		}
+	}
+	return nil, nil
 }
 
 // hostClaims builds the DNS-name claims of every instance on host. metaFor lets
@@ -644,8 +672,10 @@ func (s *Service) warnOnNetworkNameConflict(ctx context.Context, host, tmpl, slu
 // with no in-product way out but reverting the template. Refusing the edit keeps
 // that state unreachable.
 //
-// It only inspects hosts, never podman, and only for templates that declare
-// networks — a template with none cannot introduce a conflict.
+// It only inspects hosts, never podman. It runs for EVERY template, including
+// one that declares no networks of its own: an instance can join a network its
+// template never names (#270), so a container-name edit on a network-less
+// template can still collide — see the note in the body.
 func (s *Service) checkTemplateNetworkConflicts(ctx context.Context, t store.Template) error {
 	// No `if len(t.Meta.Networks) == 0 { return nil }` shortcut: it was sound
 	// only while every membership came from the template. An instance can now
@@ -1592,12 +1622,19 @@ func (s *Service) Upgrade(ctx context.Context, host string, req ApplyRequest, im
 	// apply could make it stale, which is the same staleness every other field
 	// of a caller-supplied request already has, and far better than a certain
 	// detach.
+	//
+	// Read through the non-decrypting projection, NOT GetSpec: this route exists
+	// to re-apply an instance from a caller-supplied parameters+secrets body, and
+	// is the way out when the stored spec cannot be decrypted (no key, rotated
+	// key, corrupt row). Making it depend on a decryptable spec would turn an
+	// optional carry-forward field into a hard failure on exactly the recovery
+	// path (#288 re-review).
 	if req.Networks == nil {
-		if spec, err := s.store.GetSpec(ctx, host, req.Template, req.Slug); err == nil {
-			req.Networks = slices.Clone(spec.AppliedNetworks)
-		} else if !errors.Is(err, store.ErrNotFound) {
-			return fmt.Errorf("load spec: %w", err)
+		nets, err := s.appliedNetworks(ctx, host, req.Template, req.Slug)
+		if err != nil {
+			return err
 		}
+		req.Networks = nets
 	}
 	// Shallow-copy parameters to avoid mutating the caller's map.
 	params := make(map[string]any, len(req.Parameters)+1)
