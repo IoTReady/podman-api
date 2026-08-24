@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -83,6 +84,24 @@ func (m *Memory) GetSpec(_ context.Context, host, template, slug string) (Spec, 
 		return Spec{}, ErrNotFound
 	}
 	return s, nil
+}
+
+func (m *Memory) ListSpecNetworks(_ context.Context, host string) ([]SpecNetworks, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ListSpecKeysErr != nil {
+		return nil, m.ListSpecKeysErr
+	}
+	out := []SpecNetworks{}
+	for _, s := range m.specs {
+		if s.Host == host {
+			out = append(out, SpecNetworks{
+				SpecKey:  SpecKey{Template: s.Template, Slug: s.Slug},
+				Networks: slices.Clone(s.AppliedNetworks),
+			})
+		}
+	}
+	return out, nil
 }
 
 // FailGetSpec makes every subsequent GetSpec return err. Test-only.

@@ -510,3 +510,59 @@ func TestRenameInstanceRejectsInvalidNewSlug(t *testing.T) {
 		}
 	}
 }
+
+// #270: the deploy endpoints accept a per-instance `networks` field, and the
+// pod is attached to it. Without the field on ApplyRequest, DisallowUnknownFields
+// would 400 this body outright.
+func TestCreateInstance_PerInstanceNetworks(t *testing.T) {
+	srv, tok, f := newSrvFull(t)
+
+	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},` +
+		`"secrets":{"auth_secret":"s"},"networks":[{"name":"customer-a","aliases":["db"]}]}`
+	resp := postJSON(t, srv, tok, "POST", "/hosts/h1/instances", body)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+
+	require.Len(t, f.PlayCalls, 1)
+	assert.Contains(t, f.PlayCalls[0].Networks, "customer-a:alias=db")
+	assert.Contains(t, f.NetworkEnsureCalls["h1"], "customer-a")
+}
+
+// An invalid network name is a 400 from the same validator that polices a
+// template's own declarations — and nothing reaches the host.
+func TestCreateInstance_RejectsInvalidNetwork(t *testing.T) {
+	srv, tok, f := newSrvFull(t)
+
+	body := `{"template":"app","slug":"hello","parameters":{"slug":"hello","image":"i:1"},` +
+		`"secrets":{"auth_secret":"s"},"networks":[{"name":"not a network"}]}`
+	resp := postJSON(t, srv, tok, "POST", "/hosts/h1/instances", body)
+	defer resp.Body.Close()
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Empty(t, f.PlayCalls)
+}
+
+// A PUT carrying only `networks` is a real body: it states the instance's
+// declared networks, so it must not be rejected by the empty-body guard.
+func TestApplyInstance_NetworksOnlyBodyIsAccepted(t *testing.T) {
+	srv, tok, f := newSrvFull(t)
+
+	body := `{"parameters":{"slug":"hello","image":"i:1"},"secrets":{"auth_secret":"s"}}`
+	resp := postJSON(t, srv, tok, "PUT", "/hosts/h1/instances/app/hello", body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	resp = postJSON(t, srv, tok, "PUT", "/hosts/h1/instances/app/hello",
+		`{"networks":[{"name":"customer-a"}]}`)
+	defer resp.Body.Close()
+	// The template declares required parameters, so this particular re-apply is
+	// still rejected by render.Validate — but by validation, not by the
+	// handler's "body is required" guard, and the message must say so.
+	if resp.StatusCode == http.StatusBadRequest {
+		var out map[string]any
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&out))
+		assert.NotContains(t, out["message"], "body is required")
+		return
+	}
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Contains(t, f.PlayCalls[len(f.PlayCalls)-1].Networks, "customer-a")
+}

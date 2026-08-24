@@ -531,6 +531,10 @@ func (u *UI) editApply(w http.ResponseWriter, r *http.Request) {
 		Parameters: params,
 		Secrets:    secrets,
 		Domains:    spec.Domains,
+		// The edit form does not surface networks, so the stored set is carried
+		// through unchanged — otherwise saving an unrelated parameter edit would
+		// detach the instance from every network it joined per-instance (#270).
+		Networks: slices.Clone(spec.AppliedNetworks),
 	}
 	obs, applyErr := u.cfg.Svc.ApplyAndObserve(r.Context(), host, req, instance.ApplyOptions{Replace: true})
 	if applyErr != nil {

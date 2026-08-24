@@ -99,6 +99,20 @@ type ApplyRequest struct {
 	Parameters map[string]any    `json:"parameters"`
 	Secrets    map[string]string `json:"secrets"`
 	Domains    []string          `json:"domains,omitempty"`
+	// Networks are EXTRA shared-network memberships for this instance alone,
+	// unioned with (never replacing) the ones its template declares (#270). It
+	// is how one template serves two groups that must not share a network, and
+	// how an existing instance joins a new network without a template edit that
+	// would move every other instance of it too.
+	//
+	// Union, not override: an instance cannot drop the connectivity its
+	// template guarantees. Opting out of a template network is a template-split
+	// problem, deliberately not solved here.
+	//
+	// Validated exactly as a template's own `networks:` are
+	// (render.ValidateNetworkList) and persisted on the spec, so boot converge
+	// replays this instance's own set rather than re-deriving it.
+	Networks []render.Network `json:"networks,omitempty"`
 }
 
 // DeleteOptions controls cleanup beyond the pod itself.
@@ -266,6 +280,24 @@ func (s *Service) joinNetworks(m render.Meta) []render.Network {
 			}
 		}
 	}
+	return out
+}
+
+// metaWithNetworks returns m with extra unioned into its declared networks, so
+// every consumer downstream — ensureNetworks, joinNetworks, the claim machinery
+// — keeps taking a single render.Meta and cannot drift on what an instance is
+// attached to (#270). It mirrors metaWithContainerNames: a derived view of a
+// template's meta for one instance, never a stored template edit.
+//
+// Appending duplicates is safe and load-bearing: joinNetworks de-duplicates by
+// name and MERGES aliases, so an override naming a network the template already
+// declares adds its aliases to that join instead of producing a second one.
+func metaWithNetworks(m render.Meta, extra []render.Network) render.Meta {
+	if len(extra) == 0 {
+		return m
+	}
+	out := m
+	out.Networks = append(slices.Clone(m.Networks), extra...)
 	return out
 }
 
@@ -483,14 +515,16 @@ func firstNameConflictFor(subject netClaim, peers []netClaim) error {
 // a caller substitute a template's meta — the template-edit check asks "what
 // would the claims be if this edit landed" without persisting it first.
 //
-// It reads no specs: SpecKey carries template+slug, which is all a pod name and
-// (via the template) an alias set needs. Templates are cached, so a host of N
-// instances costs one ListSpecKeys plus one GetTemplate per DISTINCT template.
+// It decrypts no specs: SpecNetworks carries template+slug — all a pod name and
+// (via the template) an alias set needs — plus each instance's own extra
+// networks, which live in no template (#270). Templates are cached, so a host of
+// N instances costs one ListSpecNetworks plus one GetTemplate per DISTINCT
+// template.
 //
 // An instance whose template is gone is skipped: its pod's membership is
 // unknowable from here, and a lingering orphan must not block every apply.
 func (s *Service) hostClaims(ctx context.Context, host string, metaFor map[string]render.Meta) ([]netClaim, error) {
-	keys, err := s.store.ListSpecKeys(ctx, host)
+	keys, err := s.store.ListSpecNetworks(ctx, host)
 	if err != nil {
 		return nil, err
 	}
@@ -510,7 +544,10 @@ func (s *Service) hostClaims(ctx context.Context, host string, metaFor map[strin
 			meta = metaWithContainerNames(t)
 			cache[k.Template] = meta
 		}
-		out = append(out, s.newClaim(k.Template, k.Slug, meta))
+		// Per-INSTANCE networks are unioned after the per-template lookup, never
+		// into the cache: two instances of one template can carry different
+		// overrides, and caching one instance's would attribute it to the rest.
+		out = append(out, s.newClaim(k.Template, k.Slug, metaWithNetworks(meta, k.Networks)))
 	}
 	return out, nil
 }
@@ -527,12 +564,15 @@ func (s *Service) hostClaims(ctx context.Context, host string, metaFor map[strin
 // opts.SupersededSlug names an instance being replaced by this apply (rename),
 // whose claims are therefore about to be released; see ApplyOptions.
 func (s *Service) validateNetworkAliases(ctx context.Context, host string, req ApplyRequest, tmpl store.Template, opts ApplyOptions) error {
-	meta := metaWithContainerNames(tmpl)
+	meta := metaWithNetworks(metaWithContainerNames(tmpl), req.Networks)
 	mine := s.newClaim(req.Template, req.Slug, meta)
 	if len(mine.joins) == 0 {
 		return nil
 	}
-	peers, err := s.hostClaims(ctx, host, map[string]render.Meta{req.Template: meta})
+	// The substituted meta deliberately carries the container names but NOT this
+	// request's per-instance networks: it stands in for OTHER instances of the
+	// same template, whose own memberships come from their own SpecKey.
+	peers, err := s.hostClaims(ctx, host, map[string]render.Meta{req.Template: metaWithContainerNames(tmpl)})
 	if err != nil {
 		return fmt.Errorf("networks: check alias uniqueness on %s: %w", host, err)
 	}
@@ -866,6 +906,13 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 	if len(req.Secrets) > 0 && !s.store.SecretsEnabled() {
 		return store.ErrSecretsNeedKey
 	}
+	// Per-instance networks are policed by the same validator as a template's
+	// own declarations, before anything is mutated: a malformed name would
+	// otherwise reach NetworkEnsure with the pod half-deployed, and a bad one
+	// persisted on the spec would fail every later boot converge.
+	if err := render.ValidateNetworkList(req.Networks, "networks"); err != nil {
+		return fmt.Errorf("validate: %w", err)
+	}
 	// Validate ingress rules BEFORE playing the pod or persisting the spec, so a
 	// rejected request never leaves a poison spec in the store — a persisted spec
 	// that violates these rules would fail every later reconcile on the host.
@@ -1043,11 +1090,14 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 		}
 	}
 
-	networks, err := s.ensureNetworks(ctx, host, tmpl.Meta)
+	// The join set is the template's declarations unioned with this instance's
+	// own (#270) — assembled once, here, and reused for the log line below.
+	netMeta := metaWithNetworks(tmpl.Meta, req.Networks)
+	networks, err := s.ensureNetworks(ctx, host, netMeta)
 	if err != nil {
 		return err
 	}
-	if joins := s.joinNetworks(tmpl.Meta); len(joins) > 0 {
+	if joins := s.joinNetworks(netMeta); len(joins) > 0 {
 		// Log the network NAMES, not the join arguments: what was ensured is
 		// "frappe-shared", not "frappe-shared:alias=mariadb".
 		names := make([]string, 0, len(joins))
@@ -1082,6 +1132,11 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 		// that has not been re-applied since (#256 review round-4, blocking
 		// finding).
 		AppliedVolumeMeta: appliedVolumeMeta(tmpl.Meta.Volumes),
+		// AppliedNetworks records this instance's own extra memberships so boot
+		// converge can replay them: they exist in no template, so a converge
+		// that re-derived the join list from tmpl.Meta alone would silently
+		// detach the pod from them on the next reboot (#270).
+		AppliedNetworks: slices.Clone(req.Networks),
 	}
 	// Recheck the template still exists, then persist the spec — both under the
 	// template read lock so a concurrent DeleteTemplate (write lock) cannot slip
@@ -1561,6 +1616,10 @@ func (s *Service) UpgradeImage(ctx context.Context, host, tmpl, slug, image stri
 		Parameters: params,
 		Secrets:    spec.Secrets,
 		Domains:    spec.Domains,
+		// Carry the instance's own extra networks (#270) forward: they live
+		// on the spec, not the template, so a re-apply that omitted them would
+		// detach the pod from every network it joined per-instance.
+		Networks: slices.Clone(spec.AppliedNetworks),
 	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
 }
 
@@ -1609,6 +1668,10 @@ func (s *Service) RotateInstanceSecrets(ctx context.Context, host, tmpl, slug st
 		Parameters: spec.Parameters,
 		Secrets:    merged,
 		Domains:    spec.Domains,
+		// Carry the instance's own extra networks (#270) forward: they live
+		// on the spec, not the template, so a re-apply that omitted them would
+		// detach the pod from every network it joined per-instance.
+		Networks: slices.Clone(spec.AppliedNetworks),
 	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
 }
 
@@ -1702,6 +1765,10 @@ func (s *Service) UpdateInstanceParameters(ctx context.Context, host, tmpl, slug
 		Parameters: merged,
 		Secrets:    maps.Clone(spec.Secrets),
 		Domains:    spec.Domains,
+		// Carry the instance's own extra networks (#270) forward: they live
+		// on the spec, not the template, so a re-apply that omitted them would
+		// detach the pod from every network it joined per-instance.
+		Networks: slices.Clone(spec.AppliedNetworks),
 	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
 }
 

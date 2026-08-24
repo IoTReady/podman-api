@@ -387,6 +387,27 @@ components:
           type: object
           additionalProperties: {type: string}
           description: per-instance secret values (zeroed after use)
+        networks:
+          type: array
+          description: >-
+            extra shared podman networks for THIS instance, unioned with (never
+            replacing) the ones its template declares. Persisted on the spec, so
+            boot converge re-attaches the pod to them. PUT states the whole set:
+            omitting the field clears it. A name or alias already claimed by
+            another instance on the same host and network is rejected
+            (invalid_networks / 409-style conflict), because podman would
+            resolve the duplicate arbitrarily.
+          items: {$ref: '#/components/schemas/NetworkMembership'}
+
+    NetworkMembership:
+      type: object
+      required: [name]
+      properties:
+        name: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
+        aliases:
+          type: array
+          description: extra DNS names the pod answers to on this network
+          items: {type: string, pattern: '^[a-z0-9][a-z0-9-]{0,38}[a-z0-9]$'}
 
     UpgradeRequest:
       type: object

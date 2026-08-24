@@ -231,31 +231,39 @@ func ValidateIngress(ing *Ingress) error {
 // — podman resolves per-network, so "db" on frappe-shared and "db" on metrics are
 // distinct names, not a collision.
 func ValidateNetworks(m Meta) error {
-	seen := make(map[string]struct{}, len(m.Networks))
-	for _, n := range m.Networks {
+	return ValidateNetworkList(m.Networks, "template-meta: networks")
+}
+
+// ValidateNetworkList applies those same rules to any list of memberships, so a
+// per-instance `networks` override on an apply request (#270) is policed exactly
+// as a template's own declarations are — one validator, no chance of the two
+// surfaces drifting on what a legal network name or alias is.
+func ValidateNetworkList(nets []Network, subject string) error {
+	seen := make(map[string]struct{}, len(nets))
+	for _, n := range nets {
 		if strings.TrimSpace(n.Name) == "" {
-			return errors.New("template-meta: networks entries must not be empty")
+			return fmt.Errorf("%s: entries must not be empty", subject)
 		}
 		if !ValidName(n.Name) {
-			return fmt.Errorf("template-meta: networks: %q is not a valid network name", n.Name)
+			return fmt.Errorf("%s: %q is not a valid network name", subject, n.Name)
 		}
 		if _, dup := seen[n.Name]; dup {
-			return fmt.Errorf("template-meta: networks: %q declared twice", n.Name)
+			return fmt.Errorf("%s: %q declared twice", subject, n.Name)
 		}
 		seen[n.Name] = struct{}{}
 
 		aliases := make(map[string]struct{}, len(n.Aliases))
 		for _, a := range n.Aliases {
 			if strings.TrimSpace(a) == "" {
-				return fmt.Errorf("template-meta: networks: %q: aliases entries must not be empty", n.Name)
+				return fmt.Errorf("%s: %q: aliases entries must not be empty", subject, n.Name)
 			}
 			// An alias becomes a DNS name podman registers for the pod, so it
 			// carries the same charset constraint as the network name itself.
 			if !ValidName(a) {
-				return fmt.Errorf("template-meta: networks: %q: %q is not a valid alias", n.Name, a)
+				return fmt.Errorf("%s: %q: %q is not a valid alias", subject, n.Name, a)
 			}
 			if _, dup := aliases[a]; dup {
-				return fmt.Errorf("template-meta: networks: %q: alias %q declared twice", n.Name, a)
+				return fmt.Errorf("%s: %q: alias %q declared twice", subject, n.Name, a)
 			}
 			aliases[a] = struct{}{}
 		}

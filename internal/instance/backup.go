@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"slices"
 	"sort"
 	"strings"
 
@@ -1076,6 +1077,8 @@ func (s *Service) restorePostTeardown(ctx context.Context, b store.Backup, spec 
 	if err := s.Apply(ctx, b.Host, ApplyRequest{
 		Template: b.Template, Slug: b.Slug,
 		Parameters: spec.Parameters, Secrets: spec.Secrets, Domains: spec.Domains,
+		// A restore re-applies the instance as it was, extra networks included (#270).
+		Networks: slices.Clone(spec.AppliedNetworks),
 	}, ApplyOptions{Replace: false}); err != nil {
 		return fmt.Errorf("apply: %w", err)
 	}
