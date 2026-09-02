@@ -2,6 +2,7 @@ package api
 
 import (
 	"net/http"
+	"sync"
 
 	apispec "github.com/iotready/podman-api/api"
 	"github.com/iotready/podman-api/internal/auth"
@@ -164,6 +165,12 @@ type handlers struct {
 	pruner        RegistryPruner
 	hostRenamer   HostFileRenamer
 	hostsReloader func() error
+
+	// hostViewMu guards hostViewIssues, which records the last incompleteness
+	// category rendered for each host by GET /hosts so the handler logs a
+	// transition rather than one line per request. See logHostViewTransition.
+	hostViewMu     sync.Mutex
+	hostViewIssues map[string]string
 }
 
 // RouterOption supplies an optional dependency to NewRouter. Options exist

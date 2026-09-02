@@ -2530,7 +2530,7 @@ func (r *Real) HostInfo(ctx context.Context, id string) (HostInfo, error) {
 	if err != nil {
 		return HostInfo{}, err
 	}
-	out := HostInfo{}
+	out := HostInfo{PodmanVersion: info.Version.Version}
 	if info.Host != nil {
 		out.CPUs = info.Host.CPUs
 		out.MemTotal = info.Host.MemTotal
@@ -2808,6 +2808,15 @@ func (r *Real) hostLoadAvg(ctx context.Context, id string) *[3]float64 {
 	// ctx-aware, for the same reason the pool's dial gate is: a caller that
 	// waited out someone else's read and only then started its own would have
 	// spent its budget to arrive exactly where it began.
+	// Three give-up paths below return a bare nil without logging — this one,
+	// acquireGate's, and sampleLoadAvg's reload-race branch — deliberately:
+	// each is either a benign race or a contended moment, and logging them on
+	// a scrape target would be the noise this gating exists to avoid. What
+	// they cannot do is add up to a host reporting nothing FOREVER with no
+	// signal at all, which is how #258's residue survived; the render layer
+	// now reports an absent load.loadavg on the transition instead
+	// (api.handlers.logHostViewTransition), so the silence here is bounded by
+	// an observation nobody has to remember to add a case to.
 	gate, known := r.loadGateFor(id)
 	if !known {
 		return nil

@@ -68,7 +68,14 @@ type Fake struct {
 	// SetHostsCalls records every host list passed to SetHosts, in order.
 	SetHostsCalls [][]config.Host
 	// VersionStr overrides the version Version reports; empty means "fake-1.0".
+	// HostInfo reports the same string (see versionLocked).
 	VersionStr string
+	// PingCalls and VersionCalls count the standalone reachability/version
+	// probes. They are counters rather than nothing because "how many times
+	// does rendering one host probe libpod" is the property #289 is about:
+	// on a real host Ping, Version and HostInfo are all `system.Info`.
+	PingCalls    int
+	VersionCalls int
 
 	// PullErr, if non-nil, makes ImagePull return this error for matching refs.
 	// Key is image ref; the empty key matches any ref.
@@ -642,12 +649,29 @@ func (f *Fake) ImagePull(ctx context.Context, host, ref string) error {
 	return nil
 }
 
-func (f *Fake) Ping(_ context.Context, _ string) error { return nil }
+func (f *Fake) Ping(_ context.Context, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.PingCalls++
+	return nil
+}
+
 func (f *Fake) Version(_ context.Context, _ string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.VersionCalls++
+	return f.versionLocked(), nil
+}
+
+// versionLocked is the version string Version reports; callers hold f.mu.
+// HostInfo uses it too, because on a real host both come from one libpod
+// `info` call and a fake that let them disagree would hide exactly the kind of
+// double-probe the API layer must not make (#289).
+func (f *Fake) versionLocked() string {
 	if f.VersionStr != "" {
-		return f.VersionStr, nil
+		return f.VersionStr
 	}
-	return "fake-1.0", nil
+	return "fake-1.0"
 }
 
 // Knows reports a host as registered unless it's listed in Unknown.
@@ -675,7 +699,11 @@ func (f *Fake) HostInfo(_ context.Context, _ string) (podman.HostInfo, error) {
 	if f.HostInfoErr != nil {
 		return podman.HostInfo{}, f.HostInfoErr
 	}
-	return f.HostInfoVal, nil
+	out := f.HostInfoVal
+	if out.PodmanVersion == "" {
+		out.PodmanVersion = f.versionLocked()
+	}
+	return out, nil
 }
 
 func (f *Fake) HostUptime(_ context.Context, _ string) (time.Duration, bool, error) {

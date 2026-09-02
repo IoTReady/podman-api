@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -13,21 +14,37 @@ import (
 	"github.com/iotready/podman-api/internal/podman"
 )
 
+// listHostsPerHostTimeout bounds one host's whole render inside GET /hosts, so
+// one slow host cannot stretch the list response for every other. It is a var
+// only so tests can shrink it.
+//
+// It is the binding budget on this path — tighter than probeTimeout, which
+// each libpod diagnostic carries on its own — and that is precisely why
+// hostView below must make exactly ONE libpod call. See its doc comment.
+var listHostsPerHostTimeout = 5 * time.Second
+
 func (h *handlers) listHosts(w http.ResponseWriter, r *http.Request) {
 	hosts := h.svc.Hosts()
 	out := make([]map[string]any, len(hosts))
-	const perHostTimeout = 5 * time.Second
+	issues := make([]hostViewIssue, len(hosts))
 	var wg sync.WaitGroup
 	for i, host := range hosts {
 		wg.Add(1)
 		go func(i int, host config.Host) {
 			defer wg.Done()
-			ctx, cancel := context.WithTimeout(r.Context(), perHostTimeout)
+			ctx, cancel := context.WithTimeout(r.Context(), listHostsPerHostTimeout)
 			defer cancel()
-			out[i] = h.hostViewCtx(ctx, host)
+			out[i], issues[i] = h.hostView(ctx, host)
 		}(i, host)
 	}
 	wg.Wait()
+	// Logged from the list path only, and only on a change. GET /hosts/{id}
+	// runs the same render on a much larger budget, so letting it report too
+	// would have the two paths' different verdicts flap against each other in
+	// the log for a host that is merely slow.
+	for i, host := range hosts {
+		h.logHostViewTransition(host.ID, issues[i])
+	}
 	WriteJSON(w, http.StatusOK, out)
 }
 
@@ -35,17 +52,46 @@ func (h *handlers) getHost(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("host")
 	for _, host := range h.svc.Hosts() {
 		if host.ID == id {
-			WriteJSON(w, http.StatusOK, h.hostViewCtx(r.Context(), host))
+			view, _ := h.hostView(r.Context(), host)
+			WriteJSON(w, http.StatusOK, view)
 			return
 		}
 	}
 	WriteError(w, instance.ErrUnknownHost)
 }
 
-// hostViewCtx is the canonical JSON shape for a host: identity + reachability +
-// drain state + a live count of managed instances. Reachability calls run
-// per-request (not cached) so operators get a true picture.
-func (h *handlers) hostViewCtx(ctx context.Context, host config.Host) map[string]any {
+// hostViewIssue records why a rendered host view came back incomplete. kind is
+// a stable category ("" when the view is complete) so the transition log keys
+// on WHAT went missing rather than on the error text, which can vary between
+// otherwise identical failures; detail carries the underlying errors for the
+// human reading the line.
+type hostViewIssue struct {
+	kind   string
+	detail string
+}
+
+// hostView is the canonical JSON shape for a host: identity + reachability +
+// drain state + version + load + a live count of managed instances. Reachability
+// is resolved per-request (not cached) so operators get a true picture.
+//
+// It makes exactly ONE libpod call — HostLoad, i.e. `system.Info` — and derives
+// reachability and the podman version from it (#289). It used to call Ping,
+// then Version, then HostLoad, which is that same `system.Info` three times
+// over, sequentially, inside listHostsPerHostTimeout. On a host whose `info` is
+// slow that overran the budget with the calls that carry the interesting
+// payload last, so GET /hosts reported the host "ok" and then omitted both its
+// version and its whole load object — the "loadavg silently missing for one
+// host" symptom of #258/#289, whose cause was never in the loadavg path at all:
+// HostInfo returns before it ever reads loadavg when `system.Info` fails.
+//
+// Measured on the fleet that found it: local `podman info` is ~90ms on
+// engine-infra and podman-1, ~430ms on vedanta, and ~1.7s on dev (a large
+// graphroot on spinning disks) — so dev alone paid 3x1.7s > 5s and dev alone
+// lost its load object, every single call.
+//
+// Ordering is deliberate: the counts sweep, which scales with the number of
+// containers on the host, runs after the fields that are cheap and interesting.
+func (h *handlers) hostView(ctx context.Context, host config.Host) (map[string]any, hostViewIssue) {
 	entry := map[string]any{
 		"id":       host.ID,
 		"addr":     host.Addr,
@@ -53,26 +99,71 @@ func (h *handlers) hostViewCtx(ctx context.Context, host config.Host) map[string
 		"status":   "unknown",
 		"draining": host.Drain,
 	}
-	reachable := false
-	if err := h.svc.Ping(ctx, host.ID); err == nil {
-		reachable = true
-		entry["status"] = "ok"
-		if v, err := h.svc.Version(ctx, host.ID); err == nil {
-			entry["podman_version"] = v
-		}
-	} else {
+	info, err := h.svc.HostLoad(ctx, host.ID)
+	if err != nil {
 		entry["status"] = "unreachable"
+		return entry, hostViewIssue{kind: "unreachable", detail: fmt.Sprintf("libpod info: %v", err)}
 	}
-	if reachable {
-		if ic, cc, err := h.svc.HostCounts(ctx, host.ID); err == nil {
-			entry["instance_count"] = ic
-			entry["container_count"] = cc
-		}
-		if info, err := h.svc.HostLoad(ctx, host.ID); err == nil {
-			entry["load"] = loadView(info)
-		}
+	entry["status"] = "ok"
+	if info.PodmanVersion != "" {
+		entry["podman_version"] = info.PodmanVersion
 	}
-	return entry
+	entry["load"] = loadView(info)
+
+	var kinds, details []string
+	if info.LoadAvg == nil {
+		// The one thing HostInfo reports best-effort rather than failing on.
+		// Every path in podman.Real.hostLoadAvg that gives up returns a bare
+		// nil, and three of them do so without logging — so without this a
+		// host could report no loadavg forever and produce no signal at all,
+		// which is exactly how #258's residue survived a fix that was meant to
+		// make it impossible.
+		kinds = append(kinds, "loadavg")
+		details = append(details, "load.loadavg absent (no cached sample and the read-through produced nothing)")
+	}
+	if ic, cc, cerr := h.svc.HostCounts(ctx, host.ID); cerr == nil {
+		entry["instance_count"] = ic
+		entry["container_count"] = cc
+	} else {
+		kinds = append(kinds, "counts")
+		details = append(details, fmt.Sprintf("instance/container counts: %v", cerr))
+	}
+	if len(kinds) == 0 {
+		return entry, hostViewIssue{}
+	}
+	return entry, hostViewIssue{kind: strings.Join(kinds, "+"), detail: strings.Join(details, "; ")}
+}
+
+// logHostViewTransition reports an incomplete host view, but only when the
+// category differs from the last one recorded for that host.
+//
+// Gated on the transition for the same reason podman.Real.hostLoadAvg and the
+// inventory poller gate theirs: GET /hosts is a scrape target, and a host that
+// is permanently degraded would otherwise emit a line per request. Unlike
+// those two, though, this observes the RENDER — so a metric that goes missing
+// between the sampler and the response, for any reason including ones nobody
+// has thought of yet, still produces a signal.
+func (h *handlers) logHostViewTransition(id string, issue hostViewIssue) {
+	h.hostViewMu.Lock()
+	if h.hostViewIssues == nil {
+		h.hostViewIssues = map[string]string{}
+	}
+	prev, seen := h.hostViewIssues[id]
+	if prev == issue.kind && seen {
+		h.hostViewMu.Unlock()
+		return
+	}
+	h.hostViewIssues[id] = issue.kind
+	h.hostViewMu.Unlock()
+
+	if issue.kind == "" {
+		if seen {
+			log.Printf("api: GET /hosts: host %q renders completely again", id)
+		}
+		return
+	}
+	log.Printf("api: GET /hosts: host %q rendered incomplete [%s] within its %s per-host budget: %s",
+		id, issue.kind, listHostsPerHostTimeout, issue.detail)
 }
 
 // loadView renders a HostInfo as the canonical JSON load object. Pointer
