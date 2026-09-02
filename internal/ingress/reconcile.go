@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"time"
 )
@@ -26,9 +25,7 @@ func (c *CaddyController) Reconcile(ctx context.Context, host string) error {
 	// Caddy is unreachable (not yet started, restarting) that is not an error
 	// when there is nothing to serve.
 	if len(routes) == 0 {
-		if err := c.deleteServer(ctx, adminAddr); err != nil {
-			log.Printf("ingress: best-effort cleanup on %s (admin %s): %v", host, adminAddr, err)
-		}
+		c.logCleanupTransition(host, adminAddr, c.deleteServer(ctx, adminAddr))
 		return nil
 	}
 

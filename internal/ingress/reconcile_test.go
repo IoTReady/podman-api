@@ -1,9 +1,13 @@
 package ingress
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"log"
 	"net/http"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -181,4 +185,128 @@ func TestReconcileFailsWhenAdminNotReady(t *testing.T) {
 	defer cancel()
 	err := c.Reconcile(ctx, "h1")
 	require.Error(t, err)
+}
+
+// --- best-effort cleanup logging (#290) --------------------------------------
+
+// captureLog redirects the standard logger for the duration of the test and
+// returns a func yielding everything written so far.
+func captureLog(t *testing.T) func() string {
+	t.Helper()
+	var buf bytes.Buffer
+	var mu sync.Mutex
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.Write(p)
+	}))
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+	return func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.String()
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+// countLines returns how many lines of s contain sub.
+func countLines(s, sub string) int {
+	n := 0
+	for _, line := range strings.Split(s, "\n") {
+		if line != "" && strings.Contains(line, sub) {
+			n++
+		}
+	}
+	return n
+}
+
+// A host that runs no Caddy derives zero routes and its best-effort cleanup
+// DELETE is refused every single time. Before #290 that logged an
+// ERROR-shaped line on every -ingress-interval tick, forever.
+func TestReconcileCleanupFailureLogsOnceNotEveryTick(t *testing.T) {
+	logs := captureLog(t)
+	refused := fmt.Errorf("dial tcp 100.64.0.23:2019: connect: connection refused")
+	c := NewCaddyController(newMemStore(t, nil), Config{})
+	c.adminDo = func(context.Context, string, string, string, []byte) (int, []byte, error) {
+		return 0, nil, refused
+	}
+
+	for i := 0; i < 5; i++ {
+		require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	}
+
+	require.Equal(t, 1, countLines(logs(), "best-effort cleanup on h1"),
+		"a permanently absent admin endpoint must log once, not once per tick:\n%s", logs())
+	require.Contains(t, logs(), "connection refused", "the first line still names the real cause")
+}
+
+// The gate is on the transition, not on "log at most once ever": a cleanup
+// that starts succeeding says so, and a later failure is reported again.
+func TestReconcileCleanupLogsBothTransitions(t *testing.T) {
+	logs := captureLog(t)
+	fail := true
+	c := NewCaddyController(newMemStore(t, nil), Config{})
+	c.adminDo = func(context.Context, string, string, string, []byte) (int, []byte, error) {
+		if fail {
+			return 0, nil, fmt.Errorf("connection refused")
+		}
+		return http.StatusOK, nil, nil
+	}
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.Equal(t, 1, countLines(logs(), "failed"))
+
+	fail = false
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.Equal(t, 1, countLines(logs(), "succeeded again"), logs())
+
+	fail = true
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.Equal(t, 2, countLines(logs(), "failed"), logs())
+}
+
+// A cleanup that has only ever succeeded is not worth a line.
+func TestReconcileCleanupSuccessIsSilent(t *testing.T) {
+	logs := captureLog(t)
+	c := NewCaddyController(newMemStore(t, nil), Config{})
+	stub, _ := adminRecorder(http.StatusOK)
+	c.adminDo = stub
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+
+	require.Empty(t, logs(), "a working cleanup says nothing")
+}
+
+// State is per host: one host's permanent failure must not suppress another's
+// first report.
+func TestReconcileCleanupStateIsPerHost(t *testing.T) {
+	logs := captureLog(t)
+	c := NewCaddyController(newMemStore(t, nil), Config{})
+	c.adminDo = func(context.Context, string, string, string, []byte) (int, []byte, error) {
+		return 0, nil, fmt.Errorf("connection refused")
+	}
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.NoError(t, c.Reconcile(context.Background(), "h2"))
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.NoError(t, c.Reconcile(context.Background(), "h2"))
+
+	require.Equal(t, 1, countLines(logs(), "cleanup on h1"), logs())
+	require.Equal(t, 1, countLines(logs(), "cleanup on h2"), logs())
+
+	c.forgetCleanupState("h1")
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.Equal(t, 2, countLines(logs(), "cleanup on h1"), logs())
 }
