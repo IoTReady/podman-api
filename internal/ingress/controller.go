@@ -2,6 +2,7 @@ package ingress
 
 import (
 	"context"
+	"log"
 	"sync"
 
 	"github.com/iotready/podman-api/internal/store"
@@ -49,6 +50,12 @@ type CaddyController struct {
 
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex // per-host serialization
+
+	// cleanupMu guards cleanupFailed, which records the last best-effort
+	// cleanup outcome per host so the periodic reconcile loop logs a
+	// transition rather than every tick. See logCleanupTransition.
+	cleanupMu     sync.Mutex
+	cleanupFailed map[string]bool
 }
 
 // NewCaddyController builds a controller. st serves both spec storage and
@@ -60,10 +67,11 @@ func NewCaddyController(st Store, cfg Config) *CaddyController {
 		cfg.AdminAddr = "localhost:2019"
 	}
 	return &CaddyController{
-		store:   st,
-		cfg:     cfg,
-		adminDo: caddyAdminDo,
-		locks:   map[string]*sync.Mutex{},
+		store:         st,
+		cfg:           cfg,
+		adminDo:       caddyAdminDo,
+		locks:         map[string]*sync.Mutex{},
+		cleanupFailed: map[string]bool{},
 	}
 }
 
@@ -88,6 +96,49 @@ func (c *CaddyController) resolveAdminAddr(hostID string) string {
 		}
 	}
 	return c.cfg.AdminAddr
+}
+
+// logCleanupTransition reports the outcome of a best-effort cleanup, but only
+// when it differs from the last outcome recorded for this host.
+//
+// The unconditional log this replaces was an ERROR-shaped line every
+// -ingress-interval, forever, for a host that runs no Caddy at all: the
+// cleanup DELETEs our server namespace whenever a host derives zero routes,
+// and a host with no admin endpoint refuses that connection every single time.
+// It can never succeed and nothing is broken by its failing, so repeating it
+// is pure alert fatigue — but silencing it outright would hide a real ingress
+// failure on a host that does run Caddy, which is why this is gated on the
+// transition rather than removed.
+//
+// Both directions are reported: the first failure after a success (or after
+// nothing at all), and the first success after a failure. A host that has only
+// ever succeeded logs nothing, which is the common case.
+func (c *CaddyController) logCleanupTransition(host, adminAddr string, err error) {
+	c.cleanupMu.Lock()
+	if c.cleanupFailed == nil {
+		c.cleanupFailed = map[string]bool{}
+	}
+	wasFailing, seen := c.cleanupFailed[host]
+	c.cleanupFailed[host] = err != nil
+	c.cleanupMu.Unlock()
+
+	switch {
+	case err != nil && (!seen || !wasFailing):
+		log.Printf("ingress: best-effort cleanup on %s (admin %s) failed; not logging again until it changes: %v",
+			host, adminAddr, err)
+	case err == nil && seen && wasFailing:
+		log.Printf("ingress: best-effort cleanup on %s (admin %s) succeeded again", host, adminAddr)
+	}
+}
+
+// forgetCleanupState drops a host's recorded cleanup outcome. Only tests need
+// it today; it exists so the map cannot be mistaken for something that must be
+// pruned on a host-list reload — it is keyed by host id and bounded by the
+// number of hosts that have ever been reconciled.
+func (c *CaddyController) forgetCleanupState(host string) {
+	c.cleanupMu.Lock()
+	delete(c.cleanupFailed, host)
+	c.cleanupMu.Unlock()
 }
 
 // Compile-time guarantees.

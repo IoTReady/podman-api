@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +20,7 @@ import (
 	"github.com/iotready/podman-api/internal/auth"
 	"github.com/iotready/podman-api/internal/config"
 	"github.com/iotready/podman-api/internal/instance"
+	"github.com/iotready/podman-api/internal/podman"
 	"github.com/iotready/podman-api/internal/podman/fake"
 	"github.com/iotready/podman-api/internal/store"
 )
@@ -521,4 +523,152 @@ func TestRenameHostNoRenamerConfiguredOutranksValidation(t *testing.T) {
 			require.Equal(t, http.StatusNotImplemented, resp.StatusCode)
 		})
 	}
+}
+
+// --- GET /hosts: one libpod probe per host (#289) ----------------------------
+
+// captureLog redirects the standard logger for the test's duration.
+func captureLog(t *testing.T) func() string {
+	t.Helper()
+	var mu sync.Mutex
+	var buf strings.Builder
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(writerFunc(func(p []byte) (int, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.Write(p)
+	}))
+	log.SetFlags(0)
+	t.Cleanup(func() {
+		log.SetOutput(prevOut)
+		log.SetFlags(prevFlags)
+	})
+	return func() string {
+		mu.Lock()
+		defer mu.Unlock()
+		return buf.String()
+	}
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
+
+func countLogLines(s, sub string) int {
+	n := 0
+	for _, line := range strings.Split(s, "\n") {
+		if line != "" && strings.Contains(line, sub) {
+			n++
+		}
+	}
+	return n
+}
+
+// Ping, Version and HostInfo are all `system.Info` against a real host, so
+// rendering one host must issue exactly one of them. Three sequential copies
+// inside listHostsPerHostTimeout is what dropped dev's version and its whole
+// load object from GET /hosts (#289).
+func TestHostView_MakesOneLibpodProbePerHost(t *testing.T) {
+	srv, tok, f := newSrvFull(t)
+
+	resp := authedReq(t, srv, tok, "GET", "/hosts")
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	assert.Equal(t, 1, f.HostInfoCalls, "exactly one libpod info per rendered host")
+	assert.Zero(t, f.PingCalls, "reachability comes from the same info call, not a second probe")
+	assert.Zero(t, f.VersionCalls, "the version comes from the same info call, not a third probe")
+}
+
+// The version must still be reported, and must come from HostInfo now.
+func TestHostView_VersionComesFromHostInfo(t *testing.T) {
+	srv, tok, f := newSrvFull(t)
+	f.VersionStr = "5.8.4"
+	f.HostInfoVal = podman.HostInfo{CPUs: 4}
+
+	resp := authedReq(t, srv, tok, "GET", "/hosts/h1")
+	defer resp.Body.Close()
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, "ok", got["status"])
+	assert.Equal(t, "5.8.4", got["podman_version"])
+	assert.Zero(t, f.VersionCalls)
+}
+
+// A host whose libpod info fails is unreachable and carries neither a version
+// nor a load object — and says so in the log, once.
+func TestHostView_InfoFailureIsUnreachableAndLoggedOnce(t *testing.T) {
+	logs := captureLog(t)
+	srv, tok, f := newSrvFull(t)
+	f.HostInfoErr = errors.New("context deadline exceeded")
+
+	for i := 0; i < 3; i++ {
+		resp := authedReq(t, srv, tok, "GET", "/hosts")
+		var body []map[string]any
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+		resp.Body.Close()
+		require.Len(t, body, 1)
+		assert.Equal(t, "unreachable", body[0]["status"])
+		assert.NotContains(t, body[0], "load")
+		assert.NotContains(t, body[0], "podman_version")
+	}
+
+	assert.Equal(t, 1, countLogLines(logs(), "rendered incomplete"), logs())
+	assert.Contains(t, logs(), "[unreachable]")
+	assert.Contains(t, logs(), "context deadline exceeded")
+}
+
+// The observability hole this closes: a host that reports every other metric
+// but never a loadavg used to produce NO log line anywhere, because every
+// give-up path in podman.Real.hostLoadAvg returns a bare nil and three of them
+// do not log at all (#258 residue).
+func TestHostView_MissingLoadAvgIsLoggedOnceThenOnRecovery(t *testing.T) {
+	logs := captureLog(t)
+	srv, tok, f := newSrvFull(t)
+	f.HostInfoVal = podman.HostInfo{CPUs: 8, MemTotal: 100, MemFree: 50} // LoadAvg nil
+
+	for i := 0; i < 3; i++ {
+		resp := authedReq(t, srv, tok, "GET", "/hosts")
+		resp.Body.Close()
+	}
+	assert.Equal(t, 1, countLogLines(logs(), "rendered incomplete"), logs())
+	assert.Contains(t, logs(), "[loadavg]")
+	assert.Contains(t, logs(), "load.loadavg absent")
+
+	la := [3]float64{1, 2, 3}
+	f.HostInfoVal = podman.HostInfo{CPUs: 8, MemTotal: 100, MemFree: 50, LoadAvg: &la}
+	for i := 0; i < 3; i++ {
+		resp := authedReq(t, srv, tok, "GET", "/hosts")
+		resp.Body.Close()
+	}
+	assert.Equal(t, 1, countLogLines(logs(), "renders completely again"), logs())
+	assert.Equal(t, 1, countLogLines(logs(), "rendered incomplete"), logs())
+}
+
+// A host that has always rendered completely says nothing.
+func TestHostView_CompleteRenderIsSilent(t *testing.T) {
+	logs := captureLog(t)
+	srv, tok, f := newSrvFull(t)
+	la := [3]float64{1, 2, 3}
+	f.HostInfoVal = podman.HostInfo{CPUs: 8, LoadAvg: &la}
+
+	for i := 0; i < 3; i++ {
+		resp := authedReq(t, srv, tok, "GET", "/hosts")
+		resp.Body.Close()
+	}
+	assert.Empty(t, logs())
+}
+
+// GET /hosts/{id} runs the same render on a much larger budget, so it must not
+// contribute to the transition log — otherwise the two paths' differing
+// verdicts flap against each other for a host that is merely slow.
+func TestHostView_SingleHostRouteDoesNotLog(t *testing.T) {
+	logs := captureLog(t)
+	srv, tok, f := newSrvFull(t)
+	f.HostInfoErr = errors.New("boom")
+
+	resp := authedReq(t, srv, tok, "GET", "/hosts/h1")
+	resp.Body.Close()
+
+	assert.Empty(t, logs())
 }

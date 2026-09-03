@@ -105,13 +105,21 @@ type Secret struct {
 // Pointer fields are nil when the underlying source does not report them, so
 // an absent metric serializes as null rather than a misleading zero.
 type HostInfo struct {
-	CPUs       int         // logical CPUs
-	MemTotal   int64       // bytes
-	MemFree    int64       // bytes
-	MemUsedPct float64     // derived: (MemTotal-MemFree)/MemTotal*100, 0 if MemTotal==0
-	CPUPct     *float64    // average CPU utilization since boot (user+system %); nil when libpod omits CPUUtilization
-	LoadAvg    *[3]float64 // 1/5/15-min; nil when unavailable
-	Disk       DiskUsage
+	// PodmanVersion is the host's podman version, as reported by the same
+	// libpod `info` call every other field here comes from. It is carried on
+	// this struct rather than fetched separately because Ping, Version and
+	// HostInfo were three invocations of ONE call: rendering a host used to
+	// pay for `info` three times inside a single per-host budget, which is
+	// what silently dropped both the version and the whole load object for a
+	// host whose `info` is slow (#289). Empty when libpod reported none.
+	PodmanVersion string
+	CPUs          int         // logical CPUs
+	MemTotal      int64       // bytes
+	MemFree       int64       // bytes
+	MemUsedPct    float64     // derived: (MemTotal-MemFree)/MemTotal*100, 0 if MemTotal==0
+	CPUPct        *float64    // average CPU utilization since boot (user+system %); nil when libpod omits CPUUtilization
+	LoadAvg       *[3]float64 // 1/5/15-min; nil when unavailable
+	Disk          DiskUsage
 }
 
 // DiskUsage describes the host's container-storage partition (graphroot).
