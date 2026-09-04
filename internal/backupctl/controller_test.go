@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -33,6 +34,13 @@ type fakeSvc struct {
 	hostErr         error
 	declaredCalls   int
 	backupableCalls int
+
+	// existingBackupIDs, when non-nil, gates DeleteBackup: an id not in the
+	// set is reported ErrBackupNotFound, mirroring the real Service. A nil map
+	// means "anything is deletable" for tests that don't care.
+	existingBackupIDs map[string]bool
+	deleteErr         error
+	deletedIDs        []string
 }
 
 func key(host, tmpl, slug string) string { return host + "/" + tmpl + "/" + slug }
@@ -69,6 +77,17 @@ func (f *fakeSvc) CheckBackupable(_ context.Context, _, _, _ string, _ []string)
 func (f *fakeSvc) CheckBackupScopeDeclared(_ context.Context, _, _, _ string, _ []string) error {
 	f.declaredCalls++
 	return f.backupableErr
+}
+
+func (f *fakeSvc) DeleteBackup(_ context.Context, id string) error {
+	if f.deleteErr != nil {
+		return f.deleteErr
+	}
+	if f.existingBackupIDs != nil && !f.existingBackupIDs[id] {
+		return fmt.Errorf("%w: %s", instance.ErrBackupNotFound, id)
+	}
+	f.deletedIDs = append(f.deletedIDs, id)
+	return nil
 }
 
 func tmpl(id string, vols ...render.Volume) store.Template {
@@ -519,4 +538,133 @@ func TestEnqueueBackup_ReconcilingJobDefersTheTick(t *testing.T) {
 		require.NoError(t, err)
 		assert.NotEmpty(t, id, "the deferral is per instance, not global")
 	})
+}
+
+// TestListBackups_projectsWithoutManifests (#292): a retention policy needs
+// state/timing/size, never the per-file sha256 manifest — the field that makes
+// a bulk listing expensive. The projection sums each row's per-volume sizes
+// into one SizeBytes total and carries the state through as a plain string.
+func TestListBackups_projectsWithoutManifests(t *testing.T) {
+	created := time.Date(2026, 8, 24, 3, 0, 0, 0, time.UTC)
+	finished := time.Date(2026, 8, 24, 3, 5, 0, 0, time.UTC)
+	svc := &fakeSvc{
+		backups: map[string][]store.Backup{
+			key("h1", "glitchtip", "main"): {
+				{
+					ID: "bk_1", Host: "h1", Template: "glitchtip", Slug: "main",
+					State: store.BackupComplete, Created: created, Finished: finished,
+					Volumes: []store.BackupVolume{
+						{Name: "pgdata", SizeBytes: 1000, Manifest: []byte(`{"a":1}`)},
+						{Name: "uploads", SizeBytes: 234, Manifest: []byte(`{"b":2}`)},
+					},
+				},
+				{
+					ID: "bk_2", Host: "h1", Template: "glitchtip", Slug: "main",
+					State: store.BackupFailed, Created: created,
+				},
+			},
+		},
+	}
+	c := &Controller{Svc: svc, Jobs: store.NewMemory()}
+
+	got, err := c.ListBackups(context.Background(), "h1", "glitchtip", "main", 0)
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+
+	assert.Equal(t, extension.Backup{
+		ID: "bk_1", Host: "h1", Template: "glitchtip", Slug: "main",
+		State: "complete", Created: created, Finished: finished, SizeBytes: 1234,
+	}, got[0])
+	assert.Equal(t, extension.Backup{
+		ID: "bk_2", Host: "h1", Template: "glitchtip", Slug: "main",
+		State: "failed", Created: created, SizeBytes: 0,
+	}, got[1])
+}
+
+func TestListBackups_propagatesStoreError(t *testing.T) {
+	wantErr := errors.New("store unreachable")
+	c := &Controller{Svc: &erroringListBackupsSvc{err: wantErr}, Jobs: store.NewMemory()}
+	_, err := c.ListBackups(context.Background(), "h1", "web", "a", 0)
+	require.ErrorIs(t, err, wantErr)
+}
+
+// erroringListBackupsSvc wraps fakeSvc but forces ListBackups to fail,
+// isolating that error path without overloading fakeSvc's existing listErr
+// (which already means something else: ListAllInstances failing).
+type erroringListBackupsSvc struct {
+	fakeSvc
+	err error
+}
+
+func (e *erroringListBackupsSvc) ListBackups(context.Context, string, string, string, int) ([]store.Backup, error) {
+	return nil, e.err
+}
+
+// TestDeleteBackup_removesBlobsAndRow (#292): the controller's DeleteBackup
+// delegates straight to the same Service.DeleteBackup the HTTP handler calls
+// (blobs then row), once BackupDeletable has cleared it.
+func TestDeleteBackup_removesBlobsAndRow(t *testing.T) {
+	svc := &fakeSvc{existingBackupIDs: map[string]bool{"bk_1": true}}
+	c := &Controller{Svc: svc, Jobs: store.NewMemory()}
+
+	err := c.DeleteBackup(context.Background(), "bk_1")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"bk_1"}, svc.deletedIDs)
+}
+
+// TestDeleteBackup_NoopWhenAbsent: a retention pass retried, or racing another
+// deleter, must not treat "already gone" as a failure.
+func TestDeleteBackup_NoopWhenAbsent(t *testing.T) {
+	svc := &fakeSvc{existingBackupIDs: map[string]bool{}}
+	c := &Controller{Svc: svc, Jobs: store.NewMemory()}
+
+	err := c.DeleteBackup(context.Background(), "bk_gone")
+	require.NoError(t, err)
+	assert.Empty(t, svc.deletedIDs)
+}
+
+// TestDeleteBackup_RefusesBackupInFlight: a backup job still queued/running
+// for this id must block the delete — retention must never delete a run that
+// is still being written. Service.DeleteBackup is never reached.
+func TestDeleteBackup_RefusesBackupInFlight(t *testing.T) {
+	mem := store.NewMemory()
+	req := instance.BackupRequest{BackupID: "bk_1", Host: "h1", Template: "web", Slug: "a"}
+	args, err := json.Marshal(req)
+	require.NoError(t, err)
+	_, err = mem.Enqueue(context.Background(), "backup", args, "")
+	require.NoError(t, err)
+
+	svc := &fakeSvc{existingBackupIDs: map[string]bool{"bk_1": true}}
+	c := &Controller{Svc: svc, Jobs: mem}
+
+	err = c.DeleteBackup(context.Background(), "bk_1")
+	require.ErrorIs(t, err, instance.ErrBackupBusy)
+	assert.Empty(t, svc.deletedIDs, "an in-flight backup must never reach Service.DeleteBackup")
+}
+
+// TestDeleteBackup_RefusesRestoreInFlight mirrors the backup case for a
+// restore job — the two jobs BackupDeletable checks.
+func TestDeleteBackup_RefusesRestoreInFlight(t *testing.T) {
+	mem := store.NewMemory()
+	req := instance.RestoreRequest{BackupID: "bk_1"}
+	args, err := json.Marshal(req)
+	require.NoError(t, err)
+	_, err = mem.Enqueue(context.Background(), "restore", args, "")
+	require.NoError(t, err)
+
+	svc := &fakeSvc{existingBackupIDs: map[string]bool{"bk_1": true}}
+	c := &Controller{Svc: svc, Jobs: mem}
+
+	err = c.DeleteBackup(context.Background(), "bk_1")
+	require.ErrorIs(t, err, instance.ErrBackupBusy)
+	assert.Empty(t, svc.deletedIDs)
+}
+
+func TestDeleteBackup_propagatesOtherErrors(t *testing.T) {
+	wantErr := errors.New("blob store: connection refused")
+	svc := &fakeSvc{deleteErr: wantErr}
+	c := &Controller{Svc: svc, Jobs: store.NewMemory()}
+
+	err := c.DeleteBackup(context.Background(), "bk_1")
+	require.ErrorIs(t, err, wantErr)
 }
