@@ -24,13 +24,14 @@ type recordingInjector struct {
 	gotYAML    string
 	gotMeta    extension.TemplateMeta
 	gotParams  map[string]any
+	gotHost    string
 	gotSlug    string
 	gotRestore *extension.RestoreIntent // restore arg from the most recent call
 }
 
-func (r *recordingInjector) InjectSidecars(_ context.Context, yaml string, meta extension.TemplateMeta, params map[string]any, slug string, restore *extension.RestoreIntent) (extension.SidecarInjection, error) {
+func (r *recordingInjector) InjectSidecars(_ context.Context, yaml string, meta extension.TemplateMeta, params map[string]any, host, slug string, restore *extension.RestoreIntent) (extension.SidecarInjection, error) {
 	r.calls++
-	r.gotYAML, r.gotMeta, r.gotParams, r.gotSlug = yaml, meta, params, slug
+	r.gotYAML, r.gotMeta, r.gotParams, r.gotHost, r.gotSlug = yaml, meta, params, host, slug
 	r.gotRestore = restore
 	if r.err != nil {
 		return extension.SidecarInjection{}, r.err

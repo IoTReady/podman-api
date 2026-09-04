@@ -105,13 +105,22 @@ type RestoreIntent struct {
 // rendered but before it is applied.
 //
 // The implementation receives the rendered pod YAML, the projected template
-// metadata, the resolved template parameters, the instance slug, and an optional
-// one-shot RestoreIntent (nil on a normal apply and on every reconcile; non-nil
-// only on an explicit point-in-time restore). It returns the (possibly modified)
-// YAML plus any secrets the core must create before PlayKube and prune on delete.
-// Return SidecarInjection{YAML: renderedYAML} to pass through without injection.
+// metadata, the resolved template parameters, the target host id, the instance
+// slug, and an optional one-shot RestoreIntent (nil on a normal apply and on
+// every reconcile; non-nil only on an explicit point-in-time restore). It
+// returns the (possibly modified) YAML plus any secrets the core must create
+// before PlayKube and prune on delete. Return SidecarInjection{YAML:
+// renderedYAML} to pass through without injection.
 type SidecarInjector interface {
-	InjectSidecars(ctx context.Context, renderedYAML string, meta TemplateMeta, params map[string]any, slug string, restore *RestoreIntent) (SidecarInjection, error)
+	// host is the control plane's own identifier for the target host — the id
+	// of its hosts/*.yaml entry (e.g. "vedanta"), NOT the OS hostname of any
+	// machine involved. The core runs as a single process managing many remote
+	// hosts, so there is no other way for an injector to learn which host an
+	// instance is being applied to; before this parameter existed, injectors
+	// that needed a host segment (e.g. in an S3 key path) fell back to
+	// os.Hostname(), which resolves to the control plane's own hostname on
+	// every call, for every instance on every host.
+	InjectSidecars(ctx context.Context, renderedYAML string, meta TemplateMeta, params map[string]any, host, slug string, restore *RestoreIntent) (SidecarInjection, error)
 }
 
 // PortSpec names a single host-level port a sidecar needs to bind exclusively,
