@@ -1016,7 +1016,7 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 
 	var injectorSecrets []store.InjectorSecret
 	if s.sidecar != nil {
-		inj, err := s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmpl.Meta), req.Parameters, req.Slug, opts.RestoreIntent)
+		inj, err := s.sidecar.InjectSidecars(ctx, yaml, toExtMeta(tmpl.Meta), req.Parameters, host, req.Slug, opts.RestoreIntent)
 		if err != nil {
 			return fmt.Errorf("sidecar inject: %w", err)
 		}

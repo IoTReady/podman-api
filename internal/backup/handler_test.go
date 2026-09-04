@@ -170,7 +170,7 @@ func TestRestoreHandler_BadArgsFails(t *testing.T) {
 // test can assert the timestamp threaded all the way through.
 type recordingSidecar struct{ gotRestore *extension.RestoreIntent }
 
-func (r *recordingSidecar) InjectSidecars(_ context.Context, yaml string, _ extension.TemplateMeta, _ map[string]any, _ string, restore *extension.RestoreIntent) (extension.SidecarInjection, error) {
+func (r *recordingSidecar) InjectSidecars(_ context.Context, yaml string, _ extension.TemplateMeta, _ map[string]any, _, _ string, restore *extension.RestoreIntent) (extension.SidecarInjection, error) {
 	r.gotRestore = restore
 	return extension.SidecarInjection{YAML: yaml}, nil
 }
