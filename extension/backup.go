@@ -102,10 +102,37 @@ type BackupOptions struct {
 	Volumes *[]string
 }
 
+// Backup is one backup row, projected for a retention policy. It carries
+// state, timing, and total size only — deliberately WITHOUT the per-file
+// sha256 manifest that store.Backup.Volumes carries, which is what makes a
+// bulk listing expensive: a single Frappe sites-tree manifest alone is
+// ~92MB, and a fleet-wide retention pass listing hundreds of backups must not
+// deserialize that into memory just to decide what to prune.
+type Backup struct {
+	ID       string
+	Host     string
+	Template string
+	Slug     string
+	// State is the backup's lifecycle state — "creating", "complete", or
+	// "failed" (the string form of the core's store.BackupState; kept as a
+	// plain string here since this package does not import internal/store).
+	// Only "complete" and "failed" are terminal; DeleteBackup refuses any
+	// other state.
+	State    string
+	Created  time.Time
+	Finished time.Time // zero until complete/failed
+	// SizeBytes is the sum of every exported volume's tar size, zero for a
+	// backup that never completed.
+	SizeBytes int64
+}
+
 // BackupController is handed to a registered BackupScheduler so it can drive
-// scheduled backups without reaching into internal/ packages. It exposes only
-// the three capabilities a scheduler needs: discover backup-eligible instances,
-// learn when each last succeeded, and enqueue a backup job.
+// scheduled backups without reaching into internal/ packages. It exposes
+// discovery of backup-eligible instances, learning when each last succeeded,
+// enqueuing a backup job, listing an instance's backups, and deleting one
+// completely — so a downstream retention policy can prune from the SAME
+// inventory the API lists, rather than re-deriving one from the blob store's
+// key space (see IoTReadyNext/podman-api#292).
 type BackupController interface {
 	// ListBackupInstances returns every live instance (across all known hosts)
 	// that has at least one volume whose marker is not `none`, with those
@@ -154,6 +181,24 @@ type BackupController interface {
 	// that wants one outage per window should coalesce its volumes into a single
 	// scoped call rather than issuing one call per volume.
 	EnqueueBackup(ctx context.Context, host, template, slug string, opts BackupOptions) (jobID string, err error)
+
+	// ListBackups returns the instance's backups newest-first, so a retention
+	// policy can select what to prune from the same inventory
+	// GET .../backups exposes. limit <= 0 uses the core's default page size.
+	ListBackups(ctx context.Context, host, template, slug string, limit int) ([]Backup, error)
+
+	// DeleteBackup removes one backup completely: its blobs AND its row, over
+	// the same path DELETE /backups/{id} uses — so a retention policy's
+	// listing and the blob store can never diverge the way they do when a
+	// pruner deletes objects without deleting the row.
+	//
+	// Deleting an absent backup is a no-op (nil error): a retention pass that
+	// is retried, or that races another deleter, must not treat "already
+	// gone" as a failure. It refuses (returns an error and deletes nothing) a
+	// backup that has a backup or restore job actively in flight for it —
+	// i.e. one that is not yet in a terminal state — so retention can never
+	// delete a run that is still being written or restored from.
+	DeleteBackup(ctx context.Context, id string) error
 }
 
 // BackupScheduler is the commercial hook for scheduled volume backups. When one

@@ -3,6 +3,7 @@ package backupctl
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"time"
@@ -22,6 +23,11 @@ type Service interface {
 	ListBackups(ctx context.Context, host, template, slug string, limit int) ([]store.Backup, error)
 	CheckBackupable(ctx context.Context, host, template, slug string, volumes []string) error
 	CheckBackupScopeDeclared(ctx context.Context, host, template, slug string, volumes []string) error
+	// DeleteBackup removes a backup's blobs then its row, in that order — the
+	// same method DELETE /backups/{id} calls. Absence is reported as
+	// instance.ErrBackupNotFound (via errors.Is); the controller turns that
+	// into a no-op for a retention caller.
+	DeleteBackup(ctx context.Context, id string) error
 }
 
 // Controller is the core-side implementation of extension.BackupController. It
@@ -302,4 +308,59 @@ func (c *Controller) backupReconciling(ctx context.Context, host, template, slug
 		}
 	}
 	return false, nil
+}
+
+// ListBackups returns the instance's backups newest-first, projected without
+// the per-file manifest each store.Backup.Volumes entry carries — a retention
+// policy needs state, timing and total size, never the manifest that makes a
+// bulk listing expensive (#292).
+func (c *Controller) ListBackups(ctx context.Context, host, template, slug string, limit int) ([]extension.Backup, error) {
+	backups, err := c.Svc.ListBackups(ctx, host, template, slug, limit)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]extension.Backup, 0, len(backups))
+	for _, b := range backups {
+		var size int64
+		for _, v := range b.Volumes {
+			size += v.SizeBytes
+		}
+		out = append(out, extension.Backup{
+			ID:        b.ID,
+			Host:      b.Host,
+			Template:  b.Template,
+			Slug:      b.Slug,
+			State:     string(b.State),
+			Created:   b.Created,
+			Finished:  b.Finished,
+			SizeBytes: size,
+		})
+	}
+	return out, nil
+}
+
+// DeleteBackup removes one backup completely — its blobs and its row — over
+// the same path DELETE /backups/{id} uses: instance.BackupDeletable's
+// job-based busy check, then Service.DeleteBackup (blobs then row).
+//
+// A backup with no active backup/restore job is deletable regardless of its
+// stored row state, matching BackupDeletable's own documented behavior (a
+// daemon crash can leave a `creating` row with no live job, and that row must
+// stay deletable) — so no separate state check is layered on top here.
+//
+// An absent backup — Service.DeleteBackup wraps store.ErrNotFound as
+// instance.ErrBackupNotFound via GetBackup — is reported back to the caller
+// as a no-op (nil error), not a failure: a retention pass that is retried, or
+// that races another deleter, must not treat "already gone" as an error.
+func (c *Controller) DeleteBackup(ctx context.Context, id string) error {
+	if err := instance.BackupDeletable(ctx, c.Jobs, id); err != nil {
+		return err
+	}
+	if err := c.Svc.DeleteBackup(ctx, id); err != nil {
+		if errors.Is(err, instance.ErrBackupNotFound) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
