@@ -27,16 +27,36 @@ type ExcludedPaths struct {
 }
 
 // BackupVolume records one exported volume: its full name
-// (<template>-<slug>-<vol>), the tar's byte size, and the sha256 per-file
-// manifest (the instance package's Manifest, serialized). Manifests live in
-// the row — not the blob store — so restore verifies the artifact against
-// metadata it does not have to trust. Excluded is set only when the template
-// declared exclude patterns for this volume (#248).
+// (<template>-<slug>-<vol>) and the tar's byte size. Excluded is set only
+// when the template declared exclude patterns for this volume (#248).
+//
+// Manifest storage (#293): the sha256 per-file manifest (the instance
+// package's Manifest, serialized) used to be stored inline here, in full, on
+// every row — a single large Frappe volume cost ~88MB of database row, paid
+// on every read (scanBackup unmarshals it unconditionally, including for
+// ListBackups, which does not even expose it). As of the #293 fix, a NEW
+// backup instead writes the manifest as its own gzip-compressed JSON blob
+// beside the volume's tar in the blob store, and the row keeps only
+// ManifestSHA256 — the sha256 hex digest of the *uncompressed* manifest JSON
+// — so restore can fetch the blob and prove it hasn't been swapped or
+// corrupted without trusting the row for content.
+//
+// Two shapes therefore coexist in production, and both must keep working
+// indefinitely — there is no migration that rewrites existing rows:
+//
+//   - OLD (pre-#293) row: Manifest is the full inline JSON; ManifestSHA256 is
+//     empty. No manifest blob exists for these backups.
+//   - NEW (#293+) row: Manifest is empty/nil; ManifestSHA256 names the
+//     manifest to fetch from the blob store at manifestBlobKey(...).
+//
+// A reader distinguishes the two by checking len(Manifest) > 0 first (old
+// format takes precedence — a row can never legitimately carry both).
 type BackupVolume struct {
-	Name      string          `json:"name"`
-	SizeBytes int64           `json:"size_bytes"`
-	Manifest  json.RawMessage `json:"manifest"`
-	Excluded  *ExcludedPaths  `json:"excluded,omitempty"`
+	Name           string          `json:"name"`
+	SizeBytes      int64           `json:"size_bytes"`
+	Manifest       json.RawMessage `json:"manifest,omitempty"`
+	ManifestSHA256 string          `json:"manifest_sha256,omitempty"`
+	Excluded       *ExcludedPaths  `json:"excluded,omitempty"`
 }
 
 // Backup is one row of the backups table.

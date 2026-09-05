@@ -2,6 +2,7 @@ package instance
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -158,12 +159,20 @@ func TestBackup_HappyPath(t *testing.T) {
 	require.Len(t, b.Volumes, 1)
 	assert.Equal(t, "pg-a-data", b.Volumes[0].Name)
 	assert.Greater(t, b.Volumes[0].SizeBytes, int64(0))
-	assert.NotEmpty(t, b.Volumes[0].Manifest)
+	// New backups (#293) record only a manifest digest in the row; the
+	// manifest content itself lives in its own blob, not inline.
+	assert.Empty(t, b.Volumes[0].Manifest)
+	assert.NotEmpty(t, b.Volumes[0].ManifestSHA256)
 
 	key := "h1/pg/a/" + req.BackupID + "/pg-a-data.tar"
 	rc, err := blob.Get(ctx, key)
 	require.NoError(t, err)
 	_ = rc.Close()
+
+	mkey := "h1/pg/a/" + req.BackupID + "/pg-a-data.manifest.json.gz"
+	mrc, err := blob.Get(ctx, mkey)
+	require.NoError(t, err)
+	_ = mrc.Close()
 
 	// Pod is running again.
 	p, err := f.PodInspect(ctx, "h1", "pg-a")
@@ -389,20 +398,24 @@ func TestRestore_HappyPath(t *testing.T) {
 	assert.Contains(t, steps, "verify")
 }
 
+// TestRestore_VerifyMismatchFails exercises the OLD (pre-#293) inline-manifest
+// shape: a row whose stored manifest disagrees with the blob's actual content
+// must still fail verification, since old rows have no sidecar blob to check
+// against and are read via their own inline bv.Manifest.
 func TestRestore_VerifyMismatchFails(t *testing.T) {
 	svc, f, mem, blob, id := newRestoreSvc(t)
 	ctx := context.Background()
 
 	// Replace the complete row with one whose stored manifest disagrees with the
 	// blob's actual content. Rows are immutable through the public API, so delete
-	// and re-create: same id, same blob, but a manifest claiming a different
-	// sha256 for file "f" — verification must reject it.
+	// and re-create: same id, same tar blob, but an INLINE manifest (old format)
+	// claiming a different sha256 for file "f" — verification must reject it.
 	orig, err := mem.GetBackup(ctx, id)
 	require.NoError(t, err)
 	require.NoError(t, mem.DeleteBackup(ctx, id))
 
-	var m Manifest
-	require.NoError(t, json.Unmarshal(orig.Volumes[0].Manifest, &m))
+	m, err := svc.loadManifest(ctx, orig, orig.Volumes[0])
+	require.NoError(t, err)
 	fi := m["f"]
 	fi.sha256 = "deadbeef" // corrupt the recorded digest
 	m["f"] = fi
@@ -421,6 +434,35 @@ func TestRestore_VerifyMismatchFails(t *testing.T) {
 
 	err = svc.Restore(ctx, RestoreRequest{BackupID: id}, nil)
 	require.ErrorIs(t, err, ErrVolumeIntegrity)
+
+	// Verification failed before Apply: the pod was torn down and never recreated.
+	_, perr := f.PodInspect(ctx, "h1", "postgres-a")
+	require.ErrorIs(t, perr, podman.ErrNotFound)
+}
+
+// TestRestore_NewFormatManifestVerifyMismatchFails is the #293 counterpart of
+// TestRestore_VerifyMismatchFails: a NEW-format row (ManifestSHA256 set, no
+// inline Manifest) whose recorded digest no longer matches the manifest blob's
+// actual content must fail restore rather than silently trusting the blob.
+func TestRestore_NewFormatManifestVerifyMismatchFails(t *testing.T) {
+	svc, f, mem, _, id := newRestoreSvc(t)
+	ctx := context.Background()
+
+	orig, err := mem.GetBackup(ctx, id)
+	require.NoError(t, err)
+	require.NoError(t, mem.DeleteBackup(ctx, id))
+
+	require.NoError(t, mem.CreateBackup(ctx, store.Backup{
+		ID: id, Host: orig.Host, Template: orig.Template, Slug: orig.Slug,
+	}))
+	ok, err := mem.CompleteBackup(ctx, id, []store.BackupVolume{
+		{Name: orig.Volumes[0].Name, SizeBytes: orig.Volumes[0].SizeBytes, ManifestSHA256: "deadbeef"},
+	})
+	require.NoError(t, err)
+	require.True(t, ok)
+
+	err = svc.Restore(ctx, RestoreRequest{BackupID: id}, nil)
+	require.Error(t, err)
 
 	// Verification failed before Apply: the pod was torn down and never recreated.
 	_, perr := f.PodInspect(ctx, "h1", "postgres-a")
@@ -994,8 +1036,8 @@ func TestRestore_VerifyMismatchKeepsSpec(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, mem.DeleteBackup(ctx, id))
 
-	var m Manifest
-	require.NoError(t, json.Unmarshal(orig.Volumes[0].Manifest, &m))
+	m, err := svc.loadManifest(ctx, orig, orig.Volumes[0])
+	require.NoError(t, err)
 	fi := m["f"]
 	fi.sha256 = "deadbeef"
 	m["f"] = fi
@@ -2390,4 +2432,76 @@ func TestCheckBackupable_AllDeclaredVetoedStillRecoversARenamedVolume(t *testing
 	assert.Equal(t, "pg-a-data", b.Volumes[0].Name)
 	_, err = blob.Get(ctx, "h1/pg/a/"+req.BackupID+"/pg-a-data.tar")
 	assert.NoError(t, err)
+}
+
+// --- #293: manifest storage shape (loadManifest) ---
+
+// TestLoadManifest_NewFormatRoundTrips is a direct unit test of the write path
+// (backupVolume, via a real Backup run) and the read path (loadManifest): a
+// freshly created backup writes ManifestSHA256 (no inline Manifest) and a
+// gzip-compressed manifest blob, and loadManifest reconstructs the exact
+// Manifest that was fingerprinted.
+func TestLoadManifest_NewFormatRoundTrips(t *testing.T) {
+	svc, _, mem, blob := newBackupSvc(t)
+	ctx := context.Background()
+	req := newBackupReq()
+	require.NoError(t, svc.Backup(ctx, req, nil))
+
+	b, err := mem.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	require.Len(t, b.Volumes, 1)
+	bv := b.Volumes[0]
+	require.Empty(t, bv.Manifest, "new backups must not store the manifest inline")
+	require.NotEmpty(t, bv.ManifestSHA256)
+
+	// The blob is really gzip-compressed JSON at the documented key.
+	rc, err := blob.Get(ctx, "h1/pg/a/"+req.BackupID+"/pg-a-data.manifest.json.gz")
+	require.NoError(t, err)
+	gz, err := gzip.NewReader(rc)
+	require.NoError(t, err)
+	raw, err := io.ReadAll(gz)
+	require.NoError(t, err)
+	require.NoError(t, rc.Close())
+	var direct Manifest
+	require.NoError(t, json.Unmarshal(raw, &direct))
+	require.NotEmpty(t, direct)
+
+	got, err := svc.loadManifest(ctx, b, bv)
+	require.NoError(t, err)
+	assert.Equal(t, direct, got)
+}
+
+// TestLoadManifest_OldFormatInline verifies backward compatibility: a row
+// carrying the pre-#293 inline Manifest (and no ManifestSHA256) is read
+// directly, with no blob store access at all — proven by pointing the row at
+// a backup id whose blob store has no manifest blob (only ever wrote the
+// inline JSON), which would fail loadManifest if it ever fell through to the
+// blob-fetch path.
+func TestLoadManifest_OldFormatInline(t *testing.T) {
+	svc, _, _, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	raw, err := json.Marshal(Manifest{"f": {typ: '0', size: 3, sha256: "abc"}})
+	require.NoError(t, err)
+	b := store.Backup{ID: "bk_old", Host: "h1", Template: "pg", Slug: "a"}
+	bv := store.BackupVolume{Name: "pg-a-data", SizeBytes: 3, Manifest: raw}
+
+	got, err := svc.loadManifest(ctx, b, bv)
+	require.NoError(t, err)
+	require.Contains(t, got, "f")
+	assert.Equal(t, "abc", got["f"].sha256)
+}
+
+// TestLoadManifest_NoManifestRecordedIsAnError guards against a future bug
+// silently treating "neither Manifest nor ManifestSHA256 set" as an empty,
+// vacuously-passing manifest.
+func TestLoadManifest_NoManifestRecordedIsAnError(t *testing.T) {
+	svc, _, _, _ := newBackupSvc(t)
+	ctx := context.Background()
+
+	b := store.Backup{ID: "bk_x", Host: "h1", Template: "pg", Slug: "a"}
+	bv := store.BackupVolume{Name: "pg-a-data", SizeBytes: 3}
+
+	_, err := svc.loadManifest(ctx, b, bv)
+	require.Error(t, err)
 }

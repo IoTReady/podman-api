@@ -1,7 +1,10 @@
 package instance
 
 import (
+	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,6 +48,13 @@ type volMeta struct {
 // backupBlobKey is the blob layout: <host>/<template>/<slug>/<backup-id>/<volume>.tar
 func backupBlobKey(host, tmpl, slug, id, volume string) string {
 	return host + "/" + tmpl + "/" + slug + "/" + id + "/" + volume + ".tar"
+}
+
+// manifestBlobKey is the sidecar manifest's blob layout, alongside the tar
+// under the same backup prefix so DeleteAll(backupBlobPrefix(...)) sweeps
+// both together (#293).
+func manifestBlobKey(host, tmpl, slug, id, volume string) string {
+	return host + "/" + tmpl + "/" + slug + "/" + id + "/" + volume + ".manifest.json.gz"
 }
 
 // backupBlobPrefix addresses every blob of one backup (for DeleteAll).
@@ -921,13 +931,92 @@ func (s *Service) backupVolume(ctx context.Context, req BackupRequest, name stri
 	if err != nil {
 		return store.BackupVolume{}, fmt.Errorf("marshal manifest: %w", err)
 	}
-	bv := store.BackupVolume{Name: name, SizeBytes: cw.n, Manifest: raw}
+	// #293: the manifest is written as its own gzip-compressed blob, not
+	// inline in the row — see the BackupVolume doc comment for the two-shape
+	// read contract this establishes.
+	sum := sha256.Sum256(raw)
+	if err := s.writeManifestBlob(ctx, req.Host, req.Template, req.Slug, req.BackupID, name, raw); err != nil {
+		return store.BackupVolume{}, fmt.Errorf("write manifest blob: %w", err)
+	}
+	bv := store.BackupVolume{Name: name, SizeBytes: cw.n, ManifestSHA256: hex.EncodeToString(sum[:])}
 	if len(patterns) > 0 {
 		bv.Excluded = &store.ExcludedPaths{
 			Patterns: stats.Patterns, Entries: stats.Entries, Bytes: stats.Bytes,
 		}
 	}
 	return bv, nil
+}
+
+// writeManifestBlob gzip-compresses raw (the manifest's uncompressed JSON)
+// and commits it to the blob store at manifestBlobKey(...). Mirrors the
+// Put/Commit/Abort contract backupVolume uses for the tar itself.
+func (s *Service) writeManifestBlob(ctx context.Context, host, tmpl, slug, id, volume string, raw []byte) error {
+	w, err := s.blobs.Put(ctx, manifestBlobKey(host, tmpl, slug, id, volume))
+	if err != nil {
+		return fmt.Errorf("open blob: %w", err)
+	}
+	gz := gzip.NewWriter(w)
+	if _, err := gz.Write(raw); err != nil {
+		_ = w.Abort()
+		return fmt.Errorf("gzip: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		_ = w.Abort()
+		return fmt.Errorf("gzip close: %w", err)
+	}
+	if err := w.Commit(); err != nil {
+		return fmt.Errorf("commit: %w", err)
+	}
+	return nil
+}
+
+// loadManifest returns the manifest for one backed-up volume, transparently
+// handling both storage shapes (#293): an OLD row with the manifest inline
+// (bv.Manifest non-empty) is unmarshaled directly; a NEW row (ManifestSHA256
+// set, bv.Manifest empty) fetches and gunzips the sidecar blob, then verifies
+// its sha256 against the row before trusting its content — the row is the
+// thing restore does NOT have to trust the blob store alone for.
+//
+// A row with neither (should not happen — backupVolume always sets one or the
+// other) is reported as a corrupt/missing manifest rather than silently
+// treated as an empty one, since an empty manifest would make restore
+// verification pass vacuously.
+func (s *Service) loadManifest(ctx context.Context, b store.Backup, bv store.BackupVolume) (Manifest, error) {
+	if len(bv.Manifest) > 0 {
+		var m Manifest
+		if err := json.Unmarshal(bv.Manifest, &m); err != nil {
+			return nil, fmt.Errorf("stored manifest corrupt: %w", err)
+		}
+		return m, nil
+	}
+	if bv.ManifestSHA256 == "" {
+		return nil, fmt.Errorf("no manifest recorded for volume %q (neither inline nor blob reference)", bv.Name)
+	}
+	rc, err := s.blobs.Get(ctx, manifestBlobKey(b.Host, b.Template, b.Slug, b.ID, bv.Name))
+	if err != nil {
+		return nil, fmt.Errorf("open manifest blob: %w", err)
+	}
+	defer rc.Close()
+	gz, err := gzip.NewReader(rc)
+	if err != nil {
+		return nil, fmt.Errorf("gzip reader: %w", err)
+	}
+	raw, err := io.ReadAll(gz)
+	if err != nil {
+		return nil, fmt.Errorf("read manifest blob: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		return nil, fmt.Errorf("gzip close: %w", err)
+	}
+	sum := sha256.Sum256(raw)
+	if got := hex.EncodeToString(sum[:]); got != bv.ManifestSHA256 {
+		return nil, fmt.Errorf("manifest blob for volume %q does not match recorded sha256 (want %s, got %s)", bv.Name, bv.ManifestSHA256, got)
+	}
+	var m Manifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, fmt.Errorf("manifest blob corrupt: %w", err)
+	}
+	return m, nil
 }
 
 // countingWriter counts bytes through to w.
@@ -1152,9 +1241,9 @@ func (s *Service) restoreVolume(ctx context.Context, b store.Backup, bv store.Ba
 		return fmt.Errorf("import: %w", err)
 	}
 
-	var want Manifest
-	if err := json.Unmarshal(bv.Manifest, &want); err != nil {
-		return fmt.Errorf("stored manifest corrupt: %w", err)
+	want, err := s.loadManifest(ctx, b, bv)
+	if err != nil {
+		return fmt.Errorf("load manifest: %w", err)
 	}
 	// Strip excluded paths from the stored manifest so old backups (captured
 	// before the exclusion filter existed) compare equally with the re-exported
