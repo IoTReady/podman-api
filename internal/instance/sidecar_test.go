@@ -342,6 +342,50 @@ func TestService_Apply_HostPortRequirer_Conflict_AbortsBeforeMutation(t *testing
 	require.Error(t, specErr, "no spec should be persisted on a required-port conflict")
 }
 
+// #295: a re-apply (Replace: true) of a live instance whose OWN pod already
+// publishes the exact hostPort it also declares via RequiredHostPorts must
+// not be rejected as a conflict against itself — the old pod is still up and
+// still publishing at the moment this check runs, moments before Replace
+// tears it down. UsedHostPorts' busy set must exclude ports owned by the pod
+// currently being applied (podName(req.Template, req.Slug)).
+func TestService_Apply_HostPortRequirer_SelfConflict_DoesNotBlock(t *testing.T) {
+	svc, f := newSvc(t)
+	// The instance's own currently-running pod (postgres-demo) already
+	// publishes udp/500 — e.g. a WireGuard sidecar's own hostPort listener.
+	f.AddPod("h1", podman.Pod{Name: "postgres-demo", Status: "Running",
+		Containers: []podman.Container{{Name: "c", Ports: []podman.PortMapping{
+			{HostPort: 500, Protocol: "udp", Pod: "postgres-demo"},
+		}}}})
+	inj := &portRequiringInjector{
+		recordingInjector: recordingInjector{out: injectedPod},
+		ports:             []extension.PortSpec{{Port: 500, Protocol: "udp"}},
+	}
+	svc.SetSidecarInjector(inj)
+
+	require.NoError(t, svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true}))
+	require.Len(t, f.PlayCalls, 1)
+}
+
+// #295 counterpart: a port held by a DIFFERENT pod must still be reported as
+// a conflict — only the instance's own pod is excluded from the busy set.
+func TestService_Apply_HostPortRequirer_OtherPodConflict_StillBlocks(t *testing.T) {
+	svc, f := newSvc(t)
+	f.AddPod("h1", podman.Pod{Name: "other-pod", Status: "Running",
+		Containers: []podman.Container{{Name: "c", Ports: []podman.PortMapping{
+			{HostPort: 500, Protocol: "udp", Pod: "other-pod"},
+		}}}})
+	inj := &portRequiringInjector{
+		recordingInjector: recordingInjector{out: injectedPod},
+		ports:             []extension.PortSpec{{Port: 500, Protocol: "udp"}},
+	}
+	svc.SetSidecarInjector(inj)
+
+	err := svc.Apply(context.Background(), "h1", pgApply("demo"), ApplyOptions{Replace: true})
+	require.ErrorIs(t, err, ErrPortConflict)
+	assert.Contains(t, err.Error(), "udp/500")
+	assert.Empty(t, f.PlayCalls, "PlayKube must not be called on a real cross-pod conflict")
+}
+
 // The actual #130 repro: a host-level, non-podman process (a native
 // strongSwan charon, modeled here via f.AddHostBoundPort rather than
 // f.AddPod) holds the required port. UsedHostPorts alone is blind to this —

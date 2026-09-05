@@ -1043,8 +1043,18 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 			if err != nil {
 				return fmt.Errorf("ports in use: %w", err)
 			}
+			selfPod := podName(req.Template, req.Slug)
 			busy := make(map[string]bool, len(used))
 			for _, p := range used {
+				// Apply uses Replace: true, so on a re-apply the instance's own
+				// pod is still up and still publishing at this point in the
+				// check — exclude it, or an instance that both publishes a
+				// hostPort and declares that same port via RequiredHostPorts
+				// can never be re-applied (#295). Ports held by any OTHER pod
+				// still count as busy.
+				if p.Pod == selfPod {
+					continue
+				}
 				busy[p.Protocol+"/"+strconv.Itoa(p.HostPort)] = true
 			}
 			// UsedHostPorts only sees ports podman itself published for a
