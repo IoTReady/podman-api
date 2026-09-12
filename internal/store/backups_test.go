@@ -48,6 +48,31 @@ func TestBackups_CreateGetRoundTrip(t *testing.T) {
 	}
 }
 
+// TestBackups_ModeRoundTrips guards the #135 SQLite schema addition: CreateBackup
+// writes Mode into the new `mode` column and GetBackup reads it back, on both
+// backends. A row that never set Mode (the pre-existing, snapshot-mode shape)
+// must read back "" rather than erroring or panicking on a NULL/missing
+// column — this is what every backup row before live mode existed as.
+func TestBackups_ModeRoundTrips(t *testing.T) {
+	for name, bs := range backupStores(t) {
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+
+			liveID := NewBackupID()
+			require.NoError(t, bs.CreateBackup(ctx, Backup{ID: liveID, Host: "h1", Template: "sites-tpl", Slug: "s1", Mode: "live"}))
+			live, err := bs.GetBackup(ctx, liveID)
+			require.NoError(t, err)
+			assert.Equal(t, "live", live.Mode)
+
+			snapID := NewBackupID()
+			require.NoError(t, bs.CreateBackup(ctx, Backup{ID: snapID, Host: "h1", Template: "pg", Slug: "a"}))
+			snap, err := bs.GetBackup(ctx, snapID)
+			require.NoError(t, err)
+			assert.Equal(t, "", snap.Mode, "an unset Mode must read back as the snapshot-mode zero value")
+		})
+	}
+}
+
 func TestBackups_CompleteRecordsVolumesAndFinished(t *testing.T) {
 	for name, bs := range backupStores(t) {
 		t.Run(name, func(t *testing.T) {

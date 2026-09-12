@@ -129,10 +129,10 @@ func TestMigrateAddsTemplatesTable(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "web", got.Meta.ID)
 
-	// user_version must be 11 (v11 added the applied_networks column).
+	// user_version must be 12 (v12 added the backups.mode column, #135).
 	var v int
 	require.NoError(t, s.db.QueryRow(`PRAGMA user_version`).Scan(&v))
-	require.Equal(t, 11, v)
+	require.Equal(t, 12, v)
 }
 
 // TestFreshDB_UserVersion asserts that a brand-new DB opened via OpenSQLite
@@ -144,7 +144,7 @@ func TestFreshDB_UserVersion(t *testing.T) {
 
 	var v int
 	require.NoError(t, s.db.QueryRow(`PRAGMA user_version`).Scan(&v))
-	require.Equal(t, 11, v)
+	require.Equal(t, 12, v)
 }
 
 func TestSQLite_KeylessRejectsSecretsButAllowsTemplates(t *testing.T) {
@@ -211,7 +211,7 @@ func TestMigrateV6_PreservesExistingSecretsBlob(t *testing.T) {
 	// Confirm all migrations ran.
 	var v int
 	require.NoError(t, s.db.QueryRow(`PRAGMA user_version`).Scan(&v))
-	require.Equal(t, 11, v)
+	require.Equal(t, 12, v)
 
 	// The sealed blob must survive the recreate: GetSpec must decrypt it correctly.
 	got, err := s.GetSpec(context.Background(), "h1", "pg", "demo")

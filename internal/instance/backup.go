@@ -32,6 +32,13 @@ type BackupRequest struct {
 	// carries the scope it was enqueued with — ReconcileBackup itself never
 	// re-runs the export; it only fails the row and restarts the instance.
 	Volumes []string `json:"volumes,omitempty"`
+	// Mode selects the export mechanism: "" and "snapshot" (the default) stop
+	// the pod, export every scoped volume as a whole-volume tar, and restart —
+	// unchanged, pre-existing behavior. "live" execs a template-declared
+	// LiveBackup.BackupExec inside the running container and copies out only
+	// its declared OutputPath — the pod is never stopped. See
+	// Service.liveBackup.
+	Mode string `json:"mode,omitempty"`
 }
 
 // volMeta bundles a volume's backup marker and exclude patterns — the two
@@ -712,6 +719,9 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 	if step == nil {
 		step = func(string, string) {}
 	}
+	if req.Mode == "live" {
+		return s.liveBackup(ctx, req, step)
+	}
 	// Same lock as migrate: backup/restore/migrate of one instance serialize.
 	lk := s.migrateLock(req.Template, req.Slug)
 	lk.Lock()
@@ -881,6 +891,180 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 	return nil
 }
 
+// liveBackup runs a "live" mode backup (#135): exec a template-declared
+// command inside the ALREADY RUNNING container and copy out its declared
+// output path, instead of stopping the pod and exporting the whole volume.
+// The pod is never stopped, never restarted, and Get/wasRunning bookkeeping
+// the snapshot path needs for its restart decision does not apply here —
+// there is nothing to restart. See render.LiveBackup's doc for the exec
+// contract and CLAUDE.md/the design spec for why this exists.
+//
+// Scope is deliberately restrictive: exactly one volume, and that volume must
+// declare LiveBackup — an empty or multi-volume scope is refused up front
+// rather than guessing which volume's LiveBackup contract applies to a
+// pod-wide exec. This mirrors checkBackupable's synchronous-refusal posture
+// for the snapshot path, but the scope rule itself is stricter: unlike an
+// unscoped snapshot backup ("every declared volume not marked none"), live
+// mode has no notion of exporting more than one volume in a single exec, so
+// there is no unscoped case to define.
+func (s *Service) liveBackup(ctx context.Context, req BackupRequest, step func(step, detail string)) error {
+	if len(req.Volumes) != 1 {
+		return fmt.Errorf("%w: live mode requires exactly one volume in scope, got %d", ErrInvalidBackupScope, len(req.Volumes))
+	}
+	// Same lock as the snapshot path and migrate/restore: backup/restore/
+	// migrate of one instance serialize regardless of mode.
+	lk := s.migrateLock(req.Template, req.Slug)
+	lk.Lock()
+	defer lk.Unlock()
+
+	if s.blobs == nil {
+		return ErrBackupsDisabled
+	}
+	t, err := s.lookup(ctx, req.Host, req.Template)
+	if err != nil {
+		return err
+	}
+	spec, err := s.store.GetSpec(ctx, req.Host, req.Template, req.Slug)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrInstanceNotFound
+		}
+		return err
+	}
+	volShort := req.Volumes[0]
+	var lb *render.LiveBackup
+	for _, v := range t.Meta.Volumes {
+		if v.Name == volShort {
+			lb = v.LiveBackup
+			break
+		}
+	}
+	if lb == nil {
+		return fmt.Errorf("%w: volume %q declares no live_backup", ErrInvalidBackupScope, volShort)
+	}
+	container := podName(req.Template, req.Slug) + "-" + lb.Container
+
+	// Every live_backup argv element is rendered independently against the
+	// instance's own parameters — unlike PreBackup's single shell string,
+	// there is no shell here at all (see LiveBackup's doc: this design
+	// deliberately avoids a second place that needs shell-escaping
+	// discipline), so each element of the argv is its own render.RenderBody
+	// call rather than one call over a joined command line.
+	renderArgv := func(argv []string) ([]string, error) {
+		out := make([]string, len(argv))
+		for i, a := range argv {
+			r, rerr := render.RenderBody(a, spec.Parameters)
+			if rerr != nil {
+				return nil, fmt.Errorf("render live_backup argv: %w", rerr)
+			}
+			out[i] = r
+		}
+		return out, nil
+	}
+
+	step("load", req.Host+"/"+req.Template+"/"+req.Slug)
+	if err := s.store.CreateBackup(ctx, store.Backup{
+		ID: req.BackupID, Host: req.Host, Template: req.Template, Slug: req.Slug,
+		State: store.BackupCreating, Mode: "live",
+	}); err != nil {
+		return fmt.Errorf("record backup: %w", err)
+	}
+
+	// Same detached-context cleanup pattern as the snapshot path's fail(): the
+	// failure may BE a ctx cancellation, and the row must still be marked
+	// failed and any partial blob reaped regardless.
+	fail := func(cause error) error {
+		dctx := context.WithoutCancel(ctx)
+		if _, ferr := s.store.FailBackup(dctx, req.BackupID); ferr != nil {
+			step("mark-failed-failed", ferr.Error())
+		}
+		if derr := s.blobs.DeleteAll(dctx, backupBlobPrefix(req.Host, req.Template, req.Slug, req.BackupID)); derr != nil {
+			step("cleanup-blobs-failed", derr.Error())
+		}
+		return cause
+	}
+
+	runExecStep := func(stepName string, argv []string) error {
+		if len(argv) == 0 {
+			return nil
+		}
+		rendered, rerr := renderArgv(argv)
+		if rerr != nil {
+			return rerr
+		}
+		step(stepName, container)
+		res, eerr := s.client.ContainerExec(ctx, req.Host, container, rendered)
+		if eerr != nil {
+			return fmt.Errorf("%s: exec in %s: %w", stepName, container, eerr)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("%s: command exited %d in %s: %s", stepName, res.ExitCode, container, res.Output)
+		}
+		return nil
+	}
+
+	if err := runExecStep("live-pre-exec", lb.PreExec); err != nil {
+		return fail(err)
+	}
+	backupErr := runExecStep("live-backup-exec", lb.BackupExec)
+	// PostExec runs regardless of BackupExec's outcome — it is the caller's
+	// mechanism for e.g. turning off an app's maintenance mode, and must run
+	// even when BackupExec failed, so a failed dump never leaves the app
+	// stuck in maintenance mode (see LiveBackup's doc). Its own failure is
+	// folded into the reported error alongside backupErr's rather than
+	// silently dropped, since a maintenance-mode-stuck app is itself a real
+	// failure worth surfacing even when the dump otherwise succeeded.
+	postErr := runExecStep("live-post-exec", lb.PostExec)
+	if backupErr != nil {
+		if postErr != nil {
+			return fail(fmt.Errorf("%w (additionally, post_exec failed: %s)", backupErr, postErr))
+		}
+		return fail(backupErr)
+	}
+	if postErr != nil {
+		return fail(postErr)
+	}
+
+	step("copy-out", lb.OutputPath)
+	rc, err := s.client.ContainerCopyOut(ctx, req.Host, container, lb.OutputPath)
+	if err != nil {
+		// ContainerCopyOut against a path that does not exist in the container
+		// returns a generic, non-ErrNotFound error (podman's own archive
+		// endpoint reports "no such file or directory" as an opaque failure,
+		// not a condition this client widens to ErrNotFound — see Task 1/#135:
+		// a missing container path is deliberately treated as a different
+		// condition from a missing container or host). backup_exec exited 0
+		// above without error, so the most likely real cause of a copy-out
+		// failure is that it never actually produced OutputPath — worth
+		// stating explicitly rather than leaving an opaque transport error to
+		// be puzzled over.
+		return fail(fmt.Errorf("copy out %s from %s: %w (backup_exec may have exited 0 without producing this path)", lb.OutputPath, container, err))
+	}
+	// Close error discarded, matching backupVolume's own `defer rc.Close()`
+	// posture on the snapshot path: backupVolumeFromReader has already
+	// consumed rc to a clean EOF (or failed doing so, reported below) by the
+	// time this runs, so a close failure here carries no information the tar
+	// read didn't already surface.
+	defer rc.Close()
+	bv, berr := s.backupVolumeFromReader(ctx, req, volumeName(req.Template, req.Slug, volShort), rc, nil)
+	if berr != nil {
+		return fail(fmt.Errorf("copy-out volume %q: %w", volShort, berr))
+	}
+
+	ok, err := s.store.CompleteBackup(ctx, req.BackupID, []store.BackupVolume{bv})
+	if err != nil {
+		return fail(fmt.Errorf("complete backup: %w", err))
+	}
+	if !ok {
+		// Row left creating-state while we held the lock — only a concurrent
+		// reconciler marking it failed can do that, which cannot happen while
+		// the job itself is live. Defensive, mirrors the snapshot path.
+		return fail(fmt.Errorf("backup %s no longer in creating state", req.BackupID))
+	}
+	step("complete", req.BackupID)
+	return nil
+}
+
 // backupVolume exports one volume, teeing the tar into the blob store and
 // the manifest builder in a single pass. The blob is committed only after a
 // clean EOF + manifest build.
@@ -898,13 +1082,36 @@ func (s *Service) Backup(ctx context.Context, req BackupRequest, step func(step,
 // filtered and re-encoded in the same pass that builds the manifest (#248).
 // With no patterns the original TeeReader copy runs unchanged, so every volume
 // that has not opted in is bit-identical to before.
+//
+// This is now a thin wrapper: everything past opening the reader lives in
+// backupVolumeFromReader, shared with live mode's liveBackup (#135), which
+// produces its tar from ContainerCopyOut rather than VolumeExport but needs
+// the exact same blob-write/manifest/commit treatment once it has one.
 func (s *Service) backupVolume(ctx context.Context, req BackupRequest, name string, patterns []string) (store.BackupVolume, error) {
 	rc, err := s.client.VolumeExport(ctx, req.Host, name)
 	if err != nil {
 		return store.BackupVolume{}, fmt.Errorf("export: %w", err)
 	}
 	defer rc.Close()
+	return s.backupVolumeFromReader(ctx, req, name, rc, patterns)
+}
 
+// backupVolumeFromReader is backupVolume's tar-consuming half, taking an
+// already-open reader instead of opening one itself via VolumeExport — shared
+// by the snapshot path (backupVolume, reading from VolumeExport) and live mode
+// (liveBackup, reading from ContainerCopyOut), since both produce the exact
+// same tar+manifest blob shape regardless of where the tar came from. See
+// backupVolume's doc comment for the integrity assumption and the
+// patterns/filterTar behaviour this inherits unchanged.
+//
+// name is the FULL (namespaced) volume name the backup blob is filed under —
+// backupVolume passes the real podman volume name; liveBackup passes
+// volumeName(req.Template, req.Slug, <the one scoped short name>) even though
+// no podman volume of that name was ever read, so the resulting
+// store.BackupVolume looks identical in shape to a snapshot-mode row and
+// Restore's existing volume-recreation path can treat it the same way once
+// Task 4 wires the live-mode restore branch.
+func (s *Service) backupVolumeFromReader(ctx context.Context, req BackupRequest, name string, rc io.Reader, patterns []string) (store.BackupVolume, error) {
 	w, err := s.blobs.Put(ctx, backupBlobKey(req.Host, req.Template, req.Slug, req.BackupID, name))
 	if err != nil {
 		return store.BackupVolume{}, fmt.Errorf("open blob: %w", err)

@@ -217,6 +217,28 @@ func TestEnqueueBackup_enqueuesBackupJob(t *testing.T) {
 	assert.NotEmpty(t, req.BackupID)
 }
 
+// TestEnqueueBackup_ThreadsModeIntoTheBackupRequest guards against Mode being
+// dropped between extension.BackupOptions and the instance.BackupRequest this
+// enqueues — the two are otherwise easy to let drift since Mode is opaque to
+// this controller (#135): it is set by a commercial scheduler's own marker
+// grammar and interpreted only by instance.Service.
+func TestEnqueueBackup_ThreadsModeIntoTheBackupRequest(t *testing.T) {
+	mem := store.NewMemory()
+	c := &Controller{Svc: &fakeSvc{}, Jobs: mem}
+	volumes := []string{"sites"}
+
+	id, err := c.EnqueueBackup(context.Background(), "h1", "web", "a", extension.BackupOptions{Volumes: &volumes, Mode: "live"})
+	require.NoError(t, err)
+	require.NotEmpty(t, id)
+
+	jobs, err := mem.ListJobs(context.Background(), store.JobFilter{Kind: "backup"})
+	require.NoError(t, err)
+	require.Len(t, jobs, 1)
+	var req instance.BackupRequest
+	require.NoError(t, json.Unmarshal(jobs[0].Args, &req))
+	assert.Equal(t, "live", req.Mode)
+}
+
 func TestEnqueueBackup_dedupesInFlight(t *testing.T) {
 	mem := store.NewMemory()
 	// pre-enqueue a backup job for the same instance → already in flight (queued)

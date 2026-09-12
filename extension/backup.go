@@ -100,6 +100,13 @@ type BackupOptions struct {
 	// Naming a volume the template does not declare, or one marked `none`,
 	// fails the call — it never silently degrades to a smaller backup.
 	Volumes *[]string
+
+	// Mode selects the backup mechanism ("" / "snapshot" = the existing
+	// stop/export/restart flow; "live" = exec-based, never stops the pod —
+	// see the core's Service.liveBackup). A commercial scheduler sets this
+	// from its own opaque `mode=` marker grammar; the core does not interpret
+	// the marker string itself, only this already-decided value.
+	Mode string
 }
 
 // Backup is one backup row, projected for a retention policy. It carries

@@ -134,6 +134,13 @@ type Fake struct {
 	// LifecycleErr, if non-nil, makes PodStart/PodStop/PodRestart fail while
 	// leaving the pod in place, to exercise action-failure paths.
 	LifecycleErr error
+	// PodStopCalls counts PodStop invocations — used by live-mode backup tests
+	// to assert the pod is never stopped on that path.
+	PodStopCalls int
+	// VolumeExportCalls records the volume name of every VolumeExport
+	// invocation — used by live-mode backup tests to assert no whole-volume
+	// export ever happens on that path.
+	VolumeExportCalls []string
 	// HostInfoVal is returned by HostInfo when HostInfoErr is nil.
 	HostInfoVal podman.HostInfo
 	// HostInfoErr, if non-nil, makes HostInfo return this error.
@@ -204,6 +211,17 @@ type Fake struct {
 	// CopyInErr, if non-nil, makes ContainerCopyIn fail immediately (without
 	// reading the supplied reader).
 	CopyInErr error
+
+	// execResults holds per-(container,cmd) results configured via
+	// SetContainerExecResult, consulted by ContainerExec ahead of ExecFunc so a
+	// live-mode-backup test can configure several distinct commands (e.g.
+	// backup_exec and post_exec) without writing its own dispatch closure.
+	execResults map[string]podman.ExecResult
+	// copyOutOverrides holds tar bytes configured via SetCopyOutTar, keyed by
+	// containerFileKey(container, path) — host-independent (a live-mode test
+	// runs against one host), consulted by ContainerCopyOut ahead of the
+	// host-scoped containerFiles map ContainerCopyIn writes.
+	copyOutOverrides map[string][]byte
 }
 
 // PlayCall records one PlayKube invocation for assertions.
@@ -491,6 +509,9 @@ func (f *Fake) PodStart(_ context.Context, h, name string) error {
 	return f.setStatus(h, name, "Running")
 }
 func (f *Fake) PodStop(_ context.Context, h, name string) error {
+	f.mu.Lock()
+	f.PodStopCalls++
+	f.mu.Unlock()
 	return f.setStatus(h, name, "Exited")
 }
 func (f *Fake) PodRestart(_ context.Context, h, name string) error {
@@ -588,6 +609,9 @@ func (f *Fake) VolumeRemove(_ context.Context, h, name string, _ bool) error {
 }
 
 func (f *Fake) VolumeExport(_ context.Context, h, name string) (io.ReadCloser, error) {
+	f.mu.Lock()
+	f.VolumeExportCalls = append(f.VolumeExportCalls, name)
+	f.mu.Unlock()
 	if f.ExportReader != nil {
 		return f.ExportReader(h, name), nil
 	}
@@ -872,11 +896,50 @@ func (f *Fake) ContainerExec(_ context.Context, host, container string, cmd []st
 	f.mu.Lock()
 	f.ExecCalls = append(f.ExecCalls, ExecCall{Host: host, Container: container, Cmd: cmd})
 	fn := f.ExecFunc
+	result, ok := f.execResults[execResultKey(container, cmd)]
 	f.mu.Unlock()
+	if ok {
+		return result, nil
+	}
 	if fn != nil {
 		return fn(host, container, cmd)
 	}
 	return podman.ExecResult{}, nil
+}
+
+// execResultKey identifies a (container, cmd) pair for SetContainerExecResult
+// / WasExecuted. Joined with a NUL byte, which cannot appear in an argv
+// element, so no two distinct (container, cmd) pairs can collide.
+func execResultKey(container string, cmd []string) string {
+	return container + "\x00" + strings.Join(cmd, "\x00")
+}
+
+// SetContainerExecResult configures ContainerExec to return result the next
+// (and every subsequent) time it is called with exactly this container+cmd
+// pair, checked ahead of ExecFunc — so a live-mode-backup test can configure
+// several distinct commands (backup_exec, post_exec, ...) declaratively
+// instead of writing its own dispatch closure. Test-only.
+func (f *Fake) SetContainerExecResult(container string, cmd []string, result podman.ExecResult) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.execResults == nil {
+		f.execResults = map[string]podman.ExecResult{}
+	}
+	f.execResults[execResultKey(container, cmd)] = result
+}
+
+// WasExecuted reports whether ContainerExec was ever called with exactly this
+// container+cmd pair. Test-only.
+func (f *Fake) WasExecuted(container string, cmd []string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	want := execResultKey(container, cmd)
+	for _, c := range f.ExecCalls {
+		if execResultKey(c.Container, c.Cmd) == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *Fake) CopyToContainer(_ context.Context, host, container, destDir, name string, content []byte) error {
@@ -901,6 +964,11 @@ func (f *Fake) ContainerCopyOut(_ context.Context, host, container, path string)
 	if f.CopyOutErr != nil {
 		return nil, f.CopyOutErr
 	}
+	if src, ok := f.copyOutOverrides[containerFileKey(container, path)]; ok {
+		buf := make([]byte, len(src))
+		copy(buf, src)
+		return io.NopCloser(bytes.NewReader(buf)), nil
+	}
 	src, ok := f.hostContainerFiles(host)[containerFileKey(container, path)]
 	if !ok {
 		return nil, podman.ErrNotFound
@@ -908,6 +976,19 @@ func (f *Fake) ContainerCopyOut(_ context.Context, host, container, path string)
 	buf := make([]byte, len(src))
 	copy(buf, src)
 	return io.NopCloser(bytes.NewReader(buf)), nil
+}
+
+// SetCopyOutTar seeds the tar bytes ContainerCopyOut returns for exactly this
+// container+path pair, independent of host — the live-mode-backup equivalent
+// of SetVolumeData, for a test that never calls ContainerCopyIn to produce the
+// bytes it wants to read back. Test-only.
+func (f *Fake) SetCopyOutTar(container, path string, tar []byte) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.copyOutOverrides == nil {
+		f.copyOutOverrides = map[string][]byte{}
+	}
+	f.copyOutOverrides[containerFileKey(container, path)] = tar
 }
 
 func (f *Fake) ContainerCopyIn(_ context.Context, host, container, path string, r io.Reader) error {

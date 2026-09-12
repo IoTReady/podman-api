@@ -68,6 +68,14 @@ type Backup struct {
 	State    BackupState
 	Volumes  []BackupVolume
 	Image    string // image ref at backup time; informational hint only
+	// Mode records which mechanism produced this backup ("" == "snapshot",
+	// pre-existing rows and every non-live backup; "live" == exec-based, never
+	// stopped the pod — see instance.Service.liveBackup). Restore reads this
+	// back to choose its own branch — it is never re-derived from anything
+	// else, since a live-mode backup's tar happens to have the exact same
+	// shape as a snapshot's and the two are NOT otherwise distinguishable
+	// from the row alone (#135).
+	Mode     string
 	Created  time.Time
 	Finished time.Time // zero until complete/failed
 }

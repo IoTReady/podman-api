@@ -212,7 +212,7 @@ func (c *Controller) EnqueueBackup(ctx context.Context, host, template, slug str
 	}
 	req := instance.BackupRequest{
 		BackupID: store.NewBackupID(), Host: host, Template: template, Slug: slug,
-		Volumes: volumes,
+		Volumes: volumes, Mode: opts.Mode,
 	}
 	args, err := json.Marshal(req)
 	if err != nil {

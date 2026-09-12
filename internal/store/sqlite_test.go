@@ -610,6 +610,51 @@ VALUES ('h', 'pre-existing', 'x', '{}', '[]', 0, 0)`)
 	require.Equal(t, nets, got.AppliedNetworks)
 }
 
+// TestMigrateAddsBackupsModeColumn (#135): a pre-v12 DB has a backups table
+// with no mode column; migrating it in must leave an existing row reading
+// back Mode == "" (the snapshot-mode zero value every pre-live-mode backup
+// genuinely was — unlike the applied_* columns above, there is no "unknown"
+// state to preserve here), and the column must then work for new writes.
+func TestMigrateAddsBackupsModeColumn(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/old.db"
+	raw, err := sql.Open("sqlite", "file:"+path)
+	require.NoError(t, err)
+	_, err = raw.Exec(`CREATE TABLE backups (
+  id       TEXT PRIMARY KEY,
+  host     TEXT NOT NULL,
+  template TEXT NOT NULL,
+  slug     TEXT NOT NULL,
+  state    TEXT NOT NULL,
+  volumes  TEXT NOT NULL DEFAULT '[]',
+  image    TEXT NOT NULL DEFAULT '',
+  created  INTEGER NOT NULL,
+  finished INTEGER
+);`)
+	require.NoError(t, err)
+	_, err = raw.Exec(`INSERT INTO backups (id, host, template, slug, state, created)
+VALUES ('bk_old', 'h', 'pg', 'a', 'complete', 0)`)
+	require.NoError(t, err)
+	_, err = raw.Exec(`PRAGMA user_version = 11`)
+	require.NoError(t, err)
+	require.NoError(t, raw.Close())
+
+	s, err := OpenSQLite(path, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+
+	ctx := context.Background()
+
+	got, err := s.GetBackup(ctx, "bk_old")
+	require.NoError(t, err)
+	require.Equal(t, "", got.Mode)
+
+	require.NoError(t, s.CreateBackup(ctx, Backup{ID: "bk_new", Host: "h", Template: "sites-tpl", Slug: "s1", Mode: "live"}))
+	got, err = s.GetBackup(ctx, "bk_new")
+	require.NoError(t, err)
+	require.Equal(t, "live", got.Mode)
+}
+
 // ListSpecNetworks is the projection the apply-time DNS uniqueness check reads
 // (#270): it must carry each instance's own networks, and — unlike GetSpec —
 // must work on a key-less open, since applied_networks is plaintext.
