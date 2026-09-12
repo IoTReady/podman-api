@@ -2618,6 +2618,132 @@ func TestBackup_LiveMode_BackupExecFailure_StillRunsPostExecAndFails(t *testing.
 	assert.Zero(t, blob.len(), "a failed live backup must clean up any partial blob")
 }
 
+// --- Live mode restore (#135, Task 4) ---
+
+// createCompleteLiveBackup runs a real live-mode Backup of volName on
+// host/tmplID/slug (the template must already be registered via
+// templateWithLiveBackupVolume + registerTemplateAndSpec) and returns the
+// resulting complete store.Backup row. It seeds fake exec/copy-out results
+// for the template's OWN declared backup_exec/pre_exec/post_exec/output_path
+// so the backup genuinely succeeds rather than being hand-assembled — which
+// is what proves the blob ends up filed under exactly the key liveRestore
+// must fetch it from.
+func createCompleteLiveBackup(t *testing.T, svc *Service, f *fake.Fake, mem *store.Memory, host, tmplID, slug, volName string) store.Backup {
+	t.Helper()
+	ctx := context.Background()
+	tmpl, err := mem.GetTemplate(ctx, tmplID)
+	require.NoError(t, err)
+	var lb *render.LiveBackup
+	for _, v := range tmpl.Meta.Volumes {
+		if v.Name == volName {
+			lb = v.LiveBackup
+		}
+	}
+	require.NotNil(t, lb, "template %s declares no live_backup for volume %s", tmplID, volName)
+
+	container := podName(tmplID, slug) + "-" + lb.Container
+	for _, argv := range [][]string{lb.PreExec, lb.BackupExec, lb.PostExec} {
+		if len(argv) > 0 {
+			f.SetContainerExecResult(container, argv, podman.ExecResult{ExitCode: 0})
+		}
+	}
+	f.SetCopyOutTar(container, lb.OutputPath, tarBytes(t, map[string]string{"dump.sql": "SELECT 1;"}))
+
+	req := BackupRequest{
+		BackupID: store.NewBackupID(), Host: host, Template: tmplID, Slug: slug,
+		Volumes: []string{volName}, Mode: "live",
+	}
+	require.NoError(t, svc.Backup(ctx, req, nil))
+	b, err := mem.GetBackup(ctx, req.BackupID)
+	require.NoError(t, err)
+	require.Equal(t, store.BackupComplete, b.State)
+	return b
+}
+
+// seedPod adds a minimal pod for host/tmplID/slug at the given status, so
+// Service.Get (which liveRestore calls to check run state) resolves it.
+func seedPod(f *fake.Fake, host, tmplID, slug, status string) {
+	name := podName(tmplID, slug)
+	f.AddPod(host, podman.Pod{
+		Name: name, ID: name, Status: status,
+		Containers: []podman.Container{{Name: name + "-app", Status: status}},
+		Labels:     map[string]string{"podman-api/template": tmplID, "podman-api/slug": slug},
+	})
+}
+
+func TestRestore_LiveMode_RestoresIntoRunningInstance(t *testing.T) {
+	svc, f, mem, _ := newTestService(t)
+	ctx := context.Background()
+	lb := &render.LiveBackup{
+		Container: "app", BackupExec: []string{"true"}, OutputPath: "/data/dump",
+		RestorePreExec: []string{"echo", "pause"}, RestoreExec: []string{"echo", "restore"},
+		RestorePostExec: []string{"echo", "resume"}, RestoreStagePath: "/data/restore",
+	}
+	tmpl := templateWithLiveBackupVolume(t, "sites", lb)
+	registerTemplateAndSpec(t, mem, tmpl, "h", "sites-tpl", "s1")
+	seedPod(f, "h", "sites-tpl", "s1", "Running")
+	b := createCompleteLiveBackup(t, svc, f, mem, "h", "sites-tpl", "s1", "sites")
+
+	container := podName("sites-tpl", "s1") + "-app"
+	for _, argv := range [][]string{{"echo", "pause"}, {"echo", "restore"}, {"echo", "resume"}} {
+		f.SetContainerExecResult(container, argv, podman.ExecResult{ExitCode: 0})
+	}
+
+	var steps []string
+	err := svc.Restore(ctx, RestoreRequest{BackupID: b.ID}, recordSteps(&steps))
+	require.NoError(t, err)
+	assert.True(t, f.WasExecuted(container, []string{"echo", "restore"}))
+	assert.True(t, f.WasExecuted(container, []string{"echo", "resume"}), "post-exec (resume) must run on success")
+	assert.Zero(t, f.PodRemoveCalls, "live-mode restore must never tear the pod down")
+	assert.Zero(t, f.PodStopCalls, "live-mode restore must never stop the pod")
+	assert.Contains(t, steps, "stage")
+	assert.Contains(t, steps, "live-restore-exec")
+	assert.Contains(t, steps, "live-restore-post-exec")
+	assert.Contains(t, steps, "complete")
+}
+
+func TestRestore_LiveMode_RestoreExecFails_DoesNotRunPostExec(t *testing.T) {
+	svc, f, mem, _ := newTestService(t)
+	ctx := context.Background()
+	lb := &render.LiveBackup{
+		Container: "app", BackupExec: []string{"true"}, OutputPath: "/data/dump",
+		RestorePreExec: []string{"echo", "pause"}, RestoreExec: []string{"false"},
+		RestorePostExec: []string{"echo", "resume"}, RestoreStagePath: "/data/restore",
+	}
+	tmpl := templateWithLiveBackupVolume(t, "sites", lb)
+	registerTemplateAndSpec(t, mem, tmpl, "h", "sites-tpl", "s1")
+	seedPod(f, "h", "sites-tpl", "s1", "Running")
+	b := createCompleteLiveBackup(t, svc, f, mem, "h", "sites-tpl", "s1", "sites")
+
+	container := podName("sites-tpl", "s1") + "-app"
+	f.SetContainerExecResult(container, []string{"echo", "pause"}, podman.ExecResult{ExitCode: 0})
+	f.SetContainerExecResult(container, []string{"false"}, podman.ExecResult{ExitCode: 1})
+
+	err := svc.Restore(ctx, RestoreRequest{BackupID: b.ID}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "RECOVERY REQUIRED")
+	assert.False(t, f.WasExecuted(container, []string{"echo", "resume"}), "post-exec (resume) must NOT run when restore_exec failed")
+}
+
+func TestRestore_LiveMode_RefusesIfInstanceNotRunning(t *testing.T) {
+	svc, f, mem, _ := newTestService(t)
+	ctx := context.Background()
+	lb := &render.LiveBackup{
+		Container: "app", BackupExec: []string{"true"}, OutputPath: "/data/dump",
+		RestoreExec: []string{"true"}, RestoreStagePath: "/data/restore",
+	}
+	tmpl := templateWithLiveBackupVolume(t, "sites", lb)
+	registerTemplateAndSpec(t, mem, tmpl, "h", "sites-tpl", "s1")
+	seedPod(f, "h", "sites-tpl", "s1", "Running") // running for the backup...
+	b := createCompleteLiveBackup(t, svc, f, mem, "h", "sites-tpl", "s1", "sites")
+	require.NoError(t, f.PodStop(ctx, "h", podName("sites-tpl", "s1"))) // ...then stopped for the restore
+
+	err := svc.Restore(ctx, RestoreRequest{BackupID: b.ID}, nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "requires", "error should name the running-state requirement")
+	assert.Zero(t, f.PodRemoveCalls, "a refused live-mode restore must never touch the pod")
+}
+
 func TestBackup_LiveMode_RejectsMultiVolumeScope(t *testing.T) {
 	svc, _, mem, _ := newTestService(t)
 	lb := &render.LiveBackup{

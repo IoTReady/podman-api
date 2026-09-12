@@ -137,6 +137,9 @@ type Fake struct {
 	// PodStopCalls counts PodStop invocations — used by live-mode backup tests
 	// to assert the pod is never stopped on that path.
 	PodStopCalls int
+	// PodRemoveCalls counts PodRemove invocations — used by live-mode restore
+	// tests to assert the pod is never torn down on that path.
+	PodRemoveCalls int
 	// VolumeExportCalls records the volume name of every VolumeExport
 	// invocation — used by live-mode backup tests to assert no whole-volume
 	// export ever happens on that path.
@@ -520,6 +523,7 @@ func (f *Fake) PodRestart(_ context.Context, h, name string) error {
 func (f *Fake) PodRemove(_ context.Context, h, name string, _ bool) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.PodRemoveCalls++
 	if _, ok := f.hostPods(h)[name]; !ok {
 		return podman.ErrNotFound
 	}
