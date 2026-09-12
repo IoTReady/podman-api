@@ -11,6 +11,15 @@ import (
 // Reconcile makes host's Caddy proxy match the store-derived routes. It is
 // serialized per host and safe to call repeatedly.
 func (c *CaddyController) Reconcile(ctx context.Context, host string) error {
+	if c.cfg.UnmanagedHosts[host] {
+		// This host opted out (ingress_managed: false) — its :443 belongs to a
+		// foreign/hand-maintained Caddy config. Never call its admin API, not
+		// even the zero-routes cleanup path, which would otherwise DELETE our
+		// server namespace from a Caddy config that was never ours to begin
+		// with (issue #301).
+		return nil
+	}
+
 	lock := c.hostLock(host)
 	lock.Lock()
 	defer lock.Unlock()

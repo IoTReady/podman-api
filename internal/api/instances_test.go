@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -565,4 +566,183 @@ func TestApplyInstance_NetworksOnlyBodyIsAccepted(t *testing.T) {
 	}
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Contains(t, f.PlayCalls[len(f.PlayCalls)-1].Networks, "customer-a")
+}
+
+// recordingIngressCtl is a minimal ingress.Controller test double: it records
+// which hosts were reconciled and always succeeds.
+type recordingIngressCtl struct{ hosts []string }
+
+func (r *recordingIngressCtl) Reconcile(_ context.Context, host string) error {
+	r.hosts = append(r.hosts, host)
+	return nil
+}
+
+// newIngressTestServer is like newTestServer but the "web" template declares
+// ingress and the service has ingress enabled, so PATCH .../domains can be
+// exercised end to end.
+func newIngressTestServer(t *testing.T, keys []config.APIKey) (*httptest.Server, *recordingIngressCtl) {
+	tmpl := store.Template{
+		Meta: render.Meta{
+			ID: "web",
+			Parameters: []render.ParamDef{
+				{Name: "slug", Type: "string", Required: true},
+				{Name: "image", Type: "string", Required: true},
+			},
+			Ingress: &render.Ingress{Container: "web", Port: 8080},
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: web-{{.slug}}
+  labels:
+    podman-api/template: web
+    podman-api/slug: {{.slug}}
+spec:
+  containers:
+    - name: web
+      image: {{.image}}
+`,
+		Origin: "seed",
+	}
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	f := fake.New()
+	mem := store.NewMemory()
+	require.NoError(t, mem.PutTemplate(context.Background(), tmpl))
+	svc := instance.NewService(f, hosts)
+	svc.SetStore(mem)
+	rec := &recordingIngressCtl{}
+	svc.SetIngress(rec, "podman-api-ingress")
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil, "", nil))
+	t.Cleanup(srv.Close)
+	return srv, rec
+}
+
+// PATCH .../domains is issue #301's ask 3: clear a persisted domain without
+// restating the instance's full declared secret set (there are none declared
+// here at all — the "web" template has no per-instance secret — which is
+// exactly the scenario a sealed instance with irreplaceable secrets needs).
+func TestPatchInstanceDomains_ClearsDomains(t *testing.T) {
+	tok := "t"
+	hash, _ := config.HashToken(tok)
+	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*"}}}
+	srv, _ := newIngressTestServer(t, keys)
+
+	body := `{"template":"web","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"domains":["hello.example.com"]}`
+	resp := postJSON(t, srv, tok, "PUT", "/hosts/h1/instances/web/hello", body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	resp = postJSON(t, srv, tok, "PATCH", "/hosts/h1/instances/web/hello/domains", `{"domains":[]}`)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Empty(t, got["domains"])
+}
+
+func TestPatchInstanceDomains_MissingFieldIsRejected(t *testing.T) {
+	tok := "t"
+	hash, _ := config.HashToken(tok)
+	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*"}}}
+	srv, _ := newIngressTestServer(t, keys)
+
+	body := `{"template":"web","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"domains":["hello.example.com"]}`
+	resp := postJSON(t, srv, tok, "PUT", "/hosts/h1/instances/web/hello", body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	resp = postJSON(t, srv, tok, "PATCH", "/hosts/h1/instances/web/hello/domains", `{}`)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, "invalid_body", got["code"])
+}
+
+func TestPatchInstanceDomains_RejectsBadDomain(t *testing.T) {
+	tok := "t"
+	hash, _ := config.HashToken(tok)
+	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*"}}}
+	srv, _ := newIngressTestServer(t, keys)
+
+	body := `{"template":"web","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"domains":["hello.example.com"]}`
+	resp := postJSON(t, srv, tok, "PUT", "/hosts/h1/instances/web/hello", body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	resp = postJSON(t, srv, tok, "PATCH", "/hosts/h1/instances/web/hello/domains", `{"domains":["NOT A DOMAIN"]}`)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, "invalid_domains", got["code"])
+}
+
+// failingIngressCtl always fails Reconcile with a Caddy-shaped error, to
+// prove the HTTP layer surfaces it as a distinct, non-500 response.
+type failingIngressCtl struct{}
+
+func (failingIngressCtl) Reconcile(context.Context, string) error {
+	return errors.New(`ingress: admin PUT server: status 500: {"error":"listener address repeated: tcp/:443"}`)
+}
+
+// An ingress reconcile failure surfaces as a distinct, non-500 error carrying
+// the underlying Caddy error (issue #301, ask 1) — never a bare "internal"
+// 500 against a pod/domains-change that actually succeeded.
+func TestPatchInstanceDomains_IngressFailureIsNotOpaque500(t *testing.T) {
+	tmpl := store.Template{
+		Meta: render.Meta{
+			ID: "web",
+			Parameters: []render.ParamDef{
+				{Name: "slug", Type: "string", Required: true},
+				{Name: "image", Type: "string", Required: true},
+			},
+			Ingress: &render.Ingress{Container: "web", Port: 8080},
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: web-{{.slug}}
+  labels:
+    podman-api/template: web
+    podman-api/slug: {{.slug}}
+spec:
+  containers:
+    - name: web
+      image: {{.image}}
+`,
+		Origin: "seed",
+	}
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	f := fake.New()
+	mem := store.NewMemory()
+	require.NoError(t, mem.PutTemplate(context.Background(), tmpl))
+	svc := instance.NewService(f, hosts)
+	svc.SetStore(mem)
+	svc.SetIngress(&recordingIngressCtl{}, "podman-api-ingress")
+
+	tok := "t"
+	hash, _ := config.HashToken(tok)
+	keys := []config.APIKey{{ID: "k", SecretHash: hash, Scopes: []string{"instances:*"}}}
+	srv := httptest.NewServer(NewRouter(svc, mem, auth.NewKeyStore(keys), nil, nil, nil, "", nil))
+	t.Cleanup(srv.Close)
+
+	body := `{"template":"web","slug":"hello","parameters":{"slug":"hello","image":"i:1"},"domains":["hello.example.com"]}`
+	resp := postJSON(t, srv, tok, "PUT", "/hosts/h1/instances/web/hello", body)
+	resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// Now the host's Caddy admin API starts failing (a foreign config fight,
+	// in the issue's real scenario) — swap the controller for one that fails.
+	svc.SetIngress(failingIngressCtl{}, "podman-api-ingress")
+
+	resp = postJSON(t, srv, tok, "PATCH", "/hosts/h1/instances/web/hello/domains", `{"domains":[]}`)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusBadGateway, resp.StatusCode, "must not be an opaque 500")
+
+	var got map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&got))
+	assert.Equal(t, "ingress_reconcile_failed", got["code"])
+	assert.Contains(t, got["message"], "listener address repeated", "underlying Caddy error must be surfaced")
 }

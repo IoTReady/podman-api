@@ -2,6 +2,7 @@ package api
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -26,6 +27,8 @@ func TestWriteError_KnownSentinels(t *testing.T) {
 		{instance.ErrHostSecretMissing, "host_secret_missing", http.StatusUnprocessableEntity},
 		{render.ErrInvalidParameters, "invalid_parameters", http.StatusBadRequest},
 		{store.ErrSecretsNeedKey, "secrets_need_key", http.StatusBadRequest},
+		{instance.ErrIngressReconcileFailed, "ingress_reconcile_failed", http.StatusBadGateway},
+		{fmt.Errorf("%w: %v", instance.ErrIngressReconcileFailed, errors.New("ingress: admin PUT server: status 500: boom")), "ingress_reconcile_failed", http.StatusBadGateway},
 		{errors.New("anything else"), "internal", http.StatusInternalServerError},
 	}
 	for _, c := range cases {
@@ -35,6 +38,19 @@ func TestWriteError_KnownSentinels(t *testing.T) {
 		assert.Contains(t, rr.Body.String(), `"code":"`+c.code+`"`)
 		assert.Equal(t, "application/json", rr.Header().Get("Content-Type"))
 	}
+}
+
+// The underlying Caddy admin-API error must reach the response body, not just
+// an opaque "internal" message — the whole point of issue #301's ask 1 is
+// that a caller can see the pod is fine and the problem is in Caddy.
+func TestWriteError_IngressReconcileFailedSurfacesUnderlyingError(t *testing.T) {
+	err := fmt.Errorf("%w: %v", instance.ErrIngressReconcileFailed,
+		errors.New("ingress: admin PUT server: status 500: {\"error\":\"loading new config: listener address repeated: tcp/:443\"}"))
+	rr := httptest.NewRecorder()
+	WriteError(rr, err)
+	assert.Equal(t, http.StatusBadGateway, rr.Code)
+	assert.Contains(t, rr.Body.String(), `"code":"ingress_reconcile_failed"`)
+	assert.Contains(t, rr.Body.String(), "listener address repeated")
 }
 
 func TestWriteJSON(t *testing.T) {

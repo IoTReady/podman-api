@@ -49,6 +49,15 @@ var (
 	ErrBackupBusy          = errors.New("backup has a backup or restore in flight")
 	ErrBackupsDisabled     = errors.New("backups require a blob store (-backup-dir)")
 	ErrInvalidBackupScope  = errors.New("backup scope names a volume that cannot be backed up")
+
+	// ErrIngressReconcileFailed marks a failure to push routes to a host's
+	// Caddy admin API after an otherwise-successful apply/delete/rename. The
+	// pod itself is unaffected — it was already played (or already
+	// stopped/removed) by the time this runs — so the API layer maps this to
+	// a distinct, non-500 status rather than reporting the same "internal"
+	// failure a broken apply would (issue #301): the caller needs to know its
+	// pod is running/serving fine and the problem is downstream, in Caddy.
+	ErrIngressReconcileFailed = errors.New("ingress reconcile failed")
 )
 
 // BackupMarkerNone is the one marker literal the core interprets. A volume
@@ -334,6 +343,16 @@ func (s *Service) validateIngress(ctx context.Context, host string, req ApplyReq
 	}
 	if tmpl.Meta.Ingress == nil {
 		return fmt.Errorf("instance %s/%s declares domains but template %q has no ingress", req.Template, req.Slug, req.Template)
+	}
+	// A host with ingress_managed: false is never reconciled at all (#301) --
+	// the reconciler silently no-ops rather than touching a foreign/hand-
+	// maintained Caddy config it doesn't own. Without this check the domain
+	// would still be accepted and persisted here, and GET .../instances/...
+	// would show it as configured, while the instance is never actually
+	// routed and nothing anywhere says so. Reject it up front instead,
+	// consistent with every other ingress precondition this function checks.
+	if hc, ok := s.host(host); ok && hc.IngressManaged != nil && !*hc.IngressManaged {
+		return fmt.Errorf("instance %s/%s declares domains but host %s is not ingress-managed (ingress_managed: false) -- its :443 belongs to a foreign Caddy config that will never route this domain", req.Template, req.Slug, host)
 	}
 	keys, err := s.store.ListSpecKeys(ctx, host)
 	if err != nil {
@@ -1233,7 +1252,7 @@ func (s *Service) applyLocked(ctx context.Context, host string, req ApplyRequest
 	}
 	if s.ingressEnabled() {
 		if err := s.ingress.Reconcile(ctx, host); err != nil {
-			return fmt.Errorf("ingress reconcile: %w", err)
+			return fmt.Errorf("%w: %v", ErrIngressReconcileFailed, err)
 		}
 	}
 	return nil
@@ -1858,6 +1877,72 @@ func (s *Service) UpdateInstanceParameters(ctx context.Context, host, tmpl, slug
 	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
 }
 
+// UpdateInstanceDomains replaces the instance's stored ingress domains list
+// wholesale and re-applies (Replace=true), restarting the pod. Parameters and
+// secrets are carried forward unchanged from the stored spec.
+//
+// Unlike .../parameters and .../secrets this is a REPLACE, not a merge:
+// domains is a single list rather than a set of named keys, so "add a
+// domain", "remove a domain" and "clear every domain" are all just "supply
+// the new full list" — there is no per-key overlay to do. A nil or empty
+// domains clears every domain the instance carries.
+//
+// This is the route issue #301 (ask 3) adds for the symmetric gap #207 left
+// behind: #207 gave PATCH .../secrets a way to ADD a secret without
+// restating the full declared set, but domains had no such route at all —
+// PATCH .../parameters deliberately preserves domains untouched (see its own
+// doc comment), and PUT demands the instance's complete declared secret set.
+// So a persisted domain was unremovable on a sealed instance (one whose
+// per-instance secret plaintext the operator can no longer read back)
+// without minting fresh throwaway secrets for everything else just to push a
+// PUT — the same shape of gap #207 already fixed for adding a secret.
+//
+// Like UpdateInstanceParameters/RotateInstanceSecrets, AllowMissingSecrets is
+// set so a template that gained a required per-instance secret after this
+// instance was deployed does not block a domains-only change; and because
+// this replaces the pod, a manifest podman refuses leaves the instance down
+// until a boot converge or a manual re-apply.
+func (s *Service) UpdateInstanceDomains(ctx context.Context, host, tmpl, slug string, domains []string) error {
+	// Mirrors Apply's own conditional host lock (see its doc comment above):
+	// validateIngress's domain-uniqueness check only becomes durable once
+	// PutSpec runs deep inside applyLocked, so two concurrent claims to the
+	// same new domain (two PATCH .../domains calls, or one racing an
+	// Apply/PUT) could otherwise both pass validation before either
+	// persists. Unlike UpdateInstanceParameters (which always re-applies
+	// the instance's OWN unchanged domains, so no new claim is ever made),
+	// this method's entire purpose is to change domains -- taken only when
+	// domains is non-empty, matching Apply's condition exactly: clearing to
+	// empty removes a claim rather than making one, so it needs no lock.
+	// Taken before the instance lock, same order Apply uses, to avoid a
+	// lock-ordering deadlock against a concurrent Apply.
+	if len(domains) > 0 {
+		hl := s.hostLock(host)
+		hl.Lock()
+		defer hl.Unlock()
+	}
+	lock := s.instanceLock(host, tmpl, slug)
+	lock.Lock()
+	defer lock.Unlock()
+	spec, err := s.store.GetSpec(ctx, host, tmpl, slug)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return ErrInstanceNotFound
+		}
+		return fmt.Errorf("load spec: %w", err)
+	}
+	return s.applyLocked(ctx, host, ApplyRequest{
+		Template:   tmpl,
+		Slug:       slug,
+		Parameters: spec.Parameters,
+		Secrets:    maps.Clone(spec.Secrets),
+		Domains:    slices.Clone(domains),
+		// Carry the instance's own extra networks (#270) forward: they live
+		// on the spec, not the template, so a re-apply that omitted them would
+		// detach the pod from every network it joined per-instance.
+		Networks: slices.Clone(spec.AppliedNetworks),
+	}, ApplyOptions{Replace: true, AllowMissingSecrets: true})
+}
+
 // StoredSpec returns the persisted spec (parameters, secrets, domains) for an
 // existing instance, so the UI edit form can pre-populate parameters and merge
 // secrets before re-applying. The caller must NOT render or log the returned
@@ -2011,7 +2096,7 @@ func (s *Service) Delete(ctx context.Context, host, tmpl, slug string, opts Dele
 	// an already-gone pod still converges the proxy toward "route removed".
 	if s.ingressEnabled() {
 		if err := s.ingress.Reconcile(ctx, host); err != nil {
-			return fmt.Errorf("ingress reconcile: %w", err)
+			return fmt.Errorf("%w: %v", ErrIngressReconcileFailed, err)
 		}
 	}
 	// If the pod was already gone and the caller asked for no pruning, there was

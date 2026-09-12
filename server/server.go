@@ -271,6 +271,7 @@ func RunWithFlags(opts ...Option) error {
 
 	if *ingressEnabled {
 		hostAdmins := make(map[string]string)
+		unmanagedHosts := make(map[string]bool)
 		for _, h := range hosts {
 			switch {
 			case h.CaddyAdminAddr != "":
@@ -289,10 +290,19 @@ func RunWithFlags(opts ...Option) error {
 				}
 				hostAdmins[h.ID] = net.JoinHostPort(hostname, "2019")
 			}
+			// ingress_managed: false opts a host out of reconciliation entirely
+			// (issue #301) — its :443 belongs to a foreign/hand-maintained Caddy
+			// config the reconciler must never touch. Unset (nil) stays managed,
+			// so existing hosts/*.yaml files need no change.
+			if h.IngressManaged != nil && !*h.IngressManaged {
+				unmanagedHosts[h.ID] = true
+				log.Printf("ingress: host %s is unmanaged (ingress_managed: false); it will never be reconciled", h.ID)
+			}
 		}
 		ctl := ingress.NewCaddyController(db, ingress.Config{
-			AdminAddr:  *ingressAdminAddr,
-			HostAdmins: hostAdmins,
+			AdminAddr:      *ingressAdminAddr,
+			HostAdmins:     hostAdmins,
+			UnmanagedHosts: unmanagedHosts,
 		})
 		svc.SetIngress(ctl, *ingressNetwork)
 		ingressCtl = ctl

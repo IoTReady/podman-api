@@ -29,6 +29,18 @@ type Host struct {
 	// address instead of the global -ingress-caddy-admin-addr default. Empty
 	// means use the global default.
 	CaddyAdminAddr string `yaml:"caddy_admin_addr,omitempty"`
+	// IngressManaged opts a host out of ingress reconciliation when set to
+	// false: the ingress controller never calls this host's Caddy admin API,
+	// even when -ingress-enabled is set and an instance on this host carries
+	// domains. A pointer so "unset" (nil) reads as the default, true — every
+	// host stays managed unless explicitly opted out, so existing
+	// hosts/*.yaml files need no change to keep their current behaviour.
+	//
+	// Exists for a host whose :443 is already owned by a foreign/hand-
+	// maintained Caddy config (e.g. a caddy/edge instance with its own
+	// Caddyfile): without this, the reconciler fights that config forever,
+	// each side reading the other as the squatter (issue #301).
+	IngressManaged *bool `yaml:"ingress_managed,omitempty"`
 }
 
 // PruneConfig is the raw per-host prune policy as parsed from hosts/*.yaml.

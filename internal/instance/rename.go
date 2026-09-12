@@ -204,7 +204,7 @@ func (s *Service) Rename(ctx context.Context, host, tmpl, slug string, req Renam
 
 	if s.ingressEnabled() {
 		if err := s.ingress.Reconcile(ctx, host); err != nil {
-			return fmt.Errorf("ingress reconcile: %w", err)
+			return fmt.Errorf("%w: %v", ErrIngressReconcileFailed, err)
 		}
 		step("ingress", host)
 	}

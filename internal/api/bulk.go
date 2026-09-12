@@ -120,6 +120,13 @@ func bulkClassify(err error) (string, int, string) {
 		return "instance_not_found", http.StatusNotFound, err.Error()
 	case errors.Is(err, instance.ErrHostDraining):
 		return "host_draining", http.StatusLocked, err.Error()
+	case errors.Is(err, instance.ErrIngressReconcileFailed):
+		// Mirrors classify()'s treatment (#301): the pod itself already
+		// applied/deleted/renamed successfully by the time this fires, so a
+		// per-op bulk result should say "ingress push failed", not
+		// "internal" -- that would hide that the actual pod operation
+		// succeeded.
+		return "ingress_reconcile_failed", http.StatusBadGateway, err.Error()
 	default:
 		return "internal", http.StatusInternalServerError, err.Error()
 	}
