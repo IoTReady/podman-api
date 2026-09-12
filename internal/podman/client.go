@@ -72,6 +72,18 @@ type Client interface {
 	// `destDir` inside the running container (e.g. destDir="/etc/caddy",
 	// name="Caddyfile"). destDir must already exist in the container.
 	CopyToContainer(ctx context.Context, hostID, container, destDir, name string, content []byte) error
+	// ContainerCopyOut streams a tar of path out of the named running
+	// container — the same underlying podman archive API `podman cp` uses,
+	// wrapped here so a caller never shells out. The caller must Close the
+	// returned reader. Used by live-mode backup to pull a template-declared
+	// output path (e.g. a fresh bench-backup dump directory) without
+	// touching VolumeExport/the whole-volume tar path.
+	ContainerCopyOut(ctx context.Context, hostID, container, path string) (io.ReadCloser, error)
+	// ContainerCopyIn writes the tar stream r into path inside the named
+	// running container, the reverse of ContainerCopyOut. Used by live-mode
+	// restore to stage a downloaded backup artifact before running the
+	// template's restore_exec.
+	ContainerCopyIn(ctx context.Context, hostID, container, path string, r io.Reader) error
 
 	// Logs
 	ContainerLogs(ctx context.Context, hostID, container string, opts LogOptions) (<-chan LogLine, error)
