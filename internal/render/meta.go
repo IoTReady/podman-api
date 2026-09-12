@@ -181,6 +181,11 @@ type Volume struct {
 	// directory but never remove it: "dir/**" drops everything under "dir"
 	// while "dir" itself still ships.
 	Exclude []string `yaml:"exclude,omitempty" json:"exclude,omitempty"`
+
+	// LiveBackup declares this volume's zero-downtime backup/restore commands.
+	// Only meaningful when the commercial `Backup` marker says `mode=live`
+	// (opaque to this package) — nil otherwise. See LiveBackup's doc.
+	LiveBackup *LiveBackup `yaml:"live_backup,omitempty" json:"live_backup,omitempty"`
 }
 
 // Ingress declares which container+port in the rendered pod serves HTTP, so the
@@ -203,6 +208,81 @@ type Ingress struct {
 type PreBackup struct {
 	Container string `yaml:"container" json:"container"`
 	Command   string `yaml:"command" json:"command"`
+}
+
+// LiveBackup declares, for a volume backed up in "live" mode (never a pod
+// stop — see the commercial `mode=live` marker grammar this gates on), the
+// commands that produce and restore an app-consistent export without
+// disturbing the running container. Unlike PreBackup, every command is an
+// argv array run directly (no shell, no string interpolation) — a live
+// backup/restore command line commonly carries a site name or file path from
+// render parameters, and this design does not want a second place that needs
+// shell-escaping discipline.
+//
+// PreExec/PostExec (if set) always run in that fixed order around
+// BackupExec, regardless of BackupExec's own outcome — PostExec is
+// responsible for e.g. turning off an app's maintenance mode, and must run
+// even when BackupExec failed, so a failed backup never leaves the app
+// stuck in maintenance mode.
+//
+// RestorePostExec is the one asymmetric case in this whole design: it must
+// NOT run if RestoreExec failed (see instance.Service's live-mode Restore
+// for why) — that decision lives in the caller, not here; this struct only
+// declares the commands.
+type LiveBackup struct {
+	Container  string   `yaml:"container" json:"container"`
+	PreExec    []string `yaml:"pre_exec,omitempty" json:"pre_exec,omitempty"`
+	BackupExec []string `yaml:"backup_exec" json:"backup_exec"`
+	PostExec   []string `yaml:"post_exec,omitempty" json:"post_exec,omitempty"`
+	// OutputPath is the container-absolute path copied out via
+	// ContainerCopyOut immediately after BackupExec succeeds.
+	OutputPath string `yaml:"output_path" json:"output_path"`
+
+	RestoreExec     []string `yaml:"restore_exec" json:"restore_exec"`
+	RestorePreExec  []string `yaml:"restore_pre_exec,omitempty" json:"restore_pre_exec,omitempty"`
+	RestorePostExec []string `yaml:"restore_post_exec,omitempty" json:"restore_post_exec,omitempty"`
+	// RestoreStagePath is the container-absolute path ContainerCopyIn writes
+	// the downloaded backup artifact to before RestoreExec runs. RestoreExec's
+	// argv may reference it via the {staged_path} placeholder (substituted by
+	// instance.Service, not by this package).
+	RestoreStagePath string `yaml:"restore_stage_path" json:"restore_stage_path"`
+}
+
+// ValidateLiveBackup checks a LiveBackup declaration: nil is valid (no live
+// mode declared). When non-nil, Container/BackupExec/OutputPath/RestoreExec/
+// RestoreStagePath must be non-empty, and no exec argv (Pre/Backup/Post/
+// Restore/RestorePre/RestorePost) may contain an empty element — an empty
+// argv[i] is never a meaningful command fragment and always indicates a
+// template-authoring mistake (a trailing comma in the YAML list, most
+// commonly) that would otherwise surface as a confusing exec failure instead
+// of a registration-time error.
+func ValidateLiveBackup(lb *LiveBackup) error {
+	if lb == nil {
+		return nil
+	}
+	if lb.Container == "" {
+		return fmt.Errorf("live_backup: container is required")
+	}
+	if len(lb.BackupExec) == 0 {
+		return fmt.Errorf("live_backup: backup_exec is required")
+	}
+	if lb.OutputPath == "" {
+		return fmt.Errorf("live_backup: output_path is required")
+	}
+	if len(lb.RestoreExec) == 0 {
+		return fmt.Errorf("live_backup: restore_exec is required")
+	}
+	if lb.RestoreStagePath == "" {
+		return fmt.Errorf("live_backup: restore_stage_path is required")
+	}
+	for _, argv := range [][]string{lb.PreExec, lb.BackupExec, lb.PostExec, lb.RestoreExec, lb.RestorePreExec, lb.RestorePostExec} {
+		for _, arg := range argv {
+			if arg == "" {
+				return fmt.Errorf("live_backup: exec argv contains an empty element")
+			}
+		}
+	}
+	return nil
 }
 
 // ValidateIngress checks an ingress declaration: container non-empty and
@@ -375,6 +455,9 @@ func validateVolumes(m Meta, stored *Meta) error {
 			if !doublestar.ValidatePattern(p) {
 				return fmt.Errorf("template-meta: volume %q: invalid pattern %q", v.Name, p)
 			}
+		}
+		if err := ValidateLiveBackup(v.LiveBackup); err != nil {
+			return fmt.Errorf("template-meta: volume %q: %w", v.Name, err)
 		}
 	}
 	return nil
