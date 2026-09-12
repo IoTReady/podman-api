@@ -20,9 +20,9 @@ func (s *SQLite) CreateBackup(ctx context.Context, b Backup) error {
 	}
 	return s.write(ctx, func() error {
 		_, err := s.db.ExecContext(ctx,
-			`INSERT INTO backups (id, host, template, slug, state, volumes, image, created)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-			b.ID, b.Host, b.Template, b.Slug, string(BackupCreating), string(vols), b.Image, time.Now().UnixNano())
+			`INSERT INTO backups (id, host, template, slug, state, volumes, image, mode, created)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			b.ID, b.Host, b.Template, b.Slug, string(BackupCreating), string(vols), b.Image, b.Mode, time.Now().UnixNano())
 		return err
 	})
 }
@@ -70,13 +70,13 @@ func (s *SQLite) casBackupState(ctx context.Context, id string, state BackupStat
 
 func (s *SQLite) GetBackup(ctx context.Context, id string) (Backup, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, host, template, slug, state, volumes, image, created, COALESCE(finished, 0) FROM backups WHERE id = ?`, id)
+		`SELECT id, host, template, slug, state, volumes, image, mode, created, COALESCE(finished, 0) FROM backups WHERE id = ?`, id)
 	return scanBackup(row)
 }
 
 func (s *SQLite) ListBackups(ctx context.Context, host, template, slug string, limit int) ([]Backup, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, host, template, slug, state, volumes, image, created, COALESCE(finished, 0)
+		`SELECT id, host, template, slug, state, volumes, image, mode, created, COALESCE(finished, 0)
 		 FROM backups WHERE host = ? AND template = ? AND slug = ?
 		 ORDER BY created DESC, id DESC LIMIT ?`,
 		host, template, slug, clampJobLimit(limit))
@@ -118,7 +118,7 @@ func scanBackup(r rowScanner) (Backup, error) {
 	var b Backup
 	var state, vols string
 	var created, finished int64
-	if err := r.Scan(&b.ID, &b.Host, &b.Template, &b.Slug, &state, &vols, &b.Image, &created, &finished); err != nil {
+	if err := r.Scan(&b.ID, &b.Host, &b.Template, &b.Slug, &state, &vols, &b.Image, &b.Mode, &created, &finished); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return Backup{}, ErrNotFound
 		}

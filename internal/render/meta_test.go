@@ -333,6 +333,33 @@ kind: Pod
 	}
 }
 
+func TestValidateLiveBackup(t *testing.T) {
+	cases := []struct {
+		name    string
+		lb      *LiveBackup
+		wantErr bool
+	}{
+		{"nil is valid", nil, false},
+		{"missing container", &LiveBackup{BackupExec: []string{"true"}, OutputPath: "/x", RestoreExec: []string{"true"}, RestoreStagePath: "/x"}, true},
+		{"missing backup_exec", &LiveBackup{Container: "app", OutputPath: "/x", RestoreExec: []string{"true"}, RestoreStagePath: "/x"}, true},
+		{"missing output_path", &LiveBackup{Container: "app", BackupExec: []string{"true"}, RestoreExec: []string{"true"}, RestoreStagePath: "/x"}, true},
+		{"missing restore_exec", &LiveBackup{Container: "app", BackupExec: []string{"true"}, OutputPath: "/x", RestoreStagePath: "/x"}, true},
+		{"missing restore_stage_path", &LiveBackup{Container: "app", BackupExec: []string{"true"}, OutputPath: "/x", RestoreExec: []string{"true"}}, true},
+		{"empty exec element rejected", &LiveBackup{Container: "app", BackupExec: []string{""}, OutputPath: "/x", RestoreExec: []string{"true"}, RestoreStagePath: "/x"}, true},
+		{"valid minimal", &LiveBackup{Container: "app", BackupExec: []string{"true"}, OutputPath: "/x", RestoreExec: []string{"true"}, RestoreStagePath: "/x"}, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := ValidateLiveBackup(c.lb)
+			if c.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 // ValidateVolumes runs on UPDATE as well as create, so the near-miss rule made
 // a row already stored with `None` — exactly the population the rule was
 // written about — permanently uneditable: every PUT failed, including one

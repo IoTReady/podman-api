@@ -11,6 +11,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -2205,6 +2206,64 @@ func (r *Real) CopyToContainer(ctx context.Context, id, container, destDir, name
 		return mapNotFound(err)
 	}
 	return copyFn()
+}
+
+// ContainerCopyOut streams a tar of path out of the named running container
+// via the same GET /containers/{id}/archive endpoint `podman cp` uses. It
+// mirrors VolumeExport's shape rather than ContainerExec's: this is a plain
+// HTTP GET/response-body stream, not an attach/hijack session, so there is no
+// need for ContainerExec's dedicated per-call connection and transport
+// juggling — opCtxForTimeout (the same helper VolumeExport/VolumeImport use)
+// is the right fit. The connection's context deadline is volumeTransferTimeout,
+// not the shorter callTimeout, for the same reason as VolumeExport: this
+// transfers bytes, and the archive under a busy site's dump directory can
+// legitimately take longer than a single libpod call is budgeted for.
+func (r *Real) ContainerCopyOut(ctx context.Context, id, container, path string) (io.ReadCloser, error) {
+	c, cancel, err := r.opCtxForTimeout(ctx, id, volumeTransferTimeout())
+	if err != nil {
+		return nil, err
+	}
+	conn, err := bindings.GetClient(c)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	params := url.Values{}
+	params.Set("path", path)
+	resp, err := conn.DoRequest(c, nil, http.MethodGet, "/containers/%s/archive", params, nil, container)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	if !resp.IsSuccess() {
+		defer resp.Body.Close()
+		cancel()
+		// Process(nil) drains the body and returns podman's error for non-2xx
+		// (e.g. "no such file or directory" for a path that doesn't exist).
+		return nil, mapNotFound(resp.Process(nil))
+	}
+	return &cancelReadCloser{ReadCloser: resp.Body, cancel: cancel}, nil
+}
+
+// ContainerCopyIn writes tar stream r into path inside the named running
+// container via PUT /containers/{id}/archive, the reverse of ContainerCopyOut.
+// Like ContainerCopyOut, this uses opCtxForTimeout/volumeTransferTimeout
+// rather than ContainerExec's exec-connection pattern: CopyFromArchive's
+// returned func is a single synchronous DoRequest with tarStream as the
+// request body, not an attach session, and a restore payload can be large
+// enough to outrun the fixed callTimeout budget CopyToContainer's own small
+// single-file writes stay well under.
+func (r *Real) ContainerCopyIn(ctx context.Context, id, container, path string, tarStream io.Reader) error {
+	c, cancel, err := r.opCtxForTimeout(ctx, id, volumeTransferTimeout())
+	if err != nil {
+		return err
+	}
+	defer cancel()
+	copyFunc, err := containers.CopyFromArchive(c, container, path, tarStream)
+	if err != nil {
+		return mapNotFound(err)
+	}
+	return mapNotFound(copyFunc())
 }
 
 // --- helpers ---

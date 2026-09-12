@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS backups (
   state    TEXT NOT NULL,
   volumes  TEXT NOT NULL DEFAULT '[]',
   image    TEXT NOT NULL DEFAULT '',
+  mode     TEXT NOT NULL DEFAULT '',
   created  INTEGER NOT NULL,
   finished INTEGER
 );
@@ -403,6 +404,27 @@ func migrateSchema(db *sql.DB) error {
 			return fmt.Errorf("migrateSchema v11: set user_version: %w", err)
 		}
 		v = 11
+	}
+	if v < 12 {
+		// mode column — added by schemaSQL on a fresh DB but absent on a pre-v12
+		// DB. NOT NULL DEFAULT '' so a pre-existing row backfills to "" (the
+		// snapshot-mode zero value, exactly what every row before live mode
+		// existed as), rather than nullable-and-unknown like the applied_*
+		// columns above — there is no ambiguity to preserve here, every
+		// pre-v12 backup genuinely WAS a snapshot-mode backup (#135).
+		has, err := columnExists(db, "backups", "mode")
+		if err != nil {
+			return fmt.Errorf("migrateSchema: check backups.mode column: %w", err)
+		}
+		if !has {
+			if _, err := db.Exec(`ALTER TABLE backups ADD COLUMN mode TEXT NOT NULL DEFAULT ''`); err != nil {
+				return fmt.Errorf("migrateSchema: add backups.mode column: %w", err)
+			}
+		}
+		if _, err := db.Exec(`PRAGMA user_version = 12`); err != nil {
+			return fmt.Errorf("migrateSchema v12: set user_version: %w", err)
+		}
+		v = 12
 	}
 	return nil
 }
