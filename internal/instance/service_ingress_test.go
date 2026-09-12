@@ -198,3 +198,121 @@ func TestApplyRejectsDuplicateDomainAcrossInstances(t *testing.T) {
 	assert.Contains(t, err.Error(), "already claimed")
 	assert.Empty(t, f.PlayCalls, "no pod should be played for a rejected request")
 }
+
+// webWithSecretsTemplate declares BOTH ingress and two per-instance secrets, so
+// a domains-only update can be proven not to touch either.
+func webWithSecretsTemplate() store.Template {
+	return store.Template{
+		Meta: render.Meta{
+			ID:         "websec",
+			Parameters: requiredParams("slug", "image"),
+			Ingress:    &render.Ingress{Container: "web", Port: 8080},
+			Secrets:    render.Secrets{PerInstance: []string{"password", "token"}},
+		},
+		Body: `apiVersion: v1
+kind: Pod
+metadata:
+  name: websec-{{.slug}}
+  labels:
+    podman-api/template: websec
+    podman-api/slug: {{.slug}}
+spec:
+  containers:
+    - name: web
+      image: {{.image}}
+`,
+		Origin: "seed",
+	}
+}
+
+// UpdateInstanceDomains is issue #301's ask 3: a route to clear an instance's
+// domains without restating its full declared secret set. It must replace the
+// domains list wholesale while leaving parameters and secrets untouched.
+func TestUpdateInstanceDomains_ClearsWithoutSecrets(t *testing.T) {
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	svc, mem := newSvcWith(t, fake.New(), hosts, webWithSecretsTemplate())
+	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", ApplyRequest{
+		Template:   "websec",
+		Slug:       "demo",
+		Parameters: map[string]any{"slug": "demo", "image": "img:1"},
+		Secrets:    map[string]string{"password": "p", "token": "t"},
+		Domains:    []string{"demo.example.com"},
+	}, ApplyOptions{Replace: true}))
+
+	// Clear domains with an empty (non-nil) slice, WITHOUT resupplying any
+	// secret plaintext — the whole point of the route.
+	require.NoError(t, svc.UpdateInstanceDomains(ctx, "h1", "websec", "demo", []string{}))
+
+	got, err := mem.GetSpec(ctx, "h1", "websec", "demo")
+	require.NoError(t, err)
+	assert.Empty(t, got.Domains)
+	assert.Equal(t, "p", got.Secrets["password"], "secrets must survive untouched")
+	assert.Equal(t, "t", got.Secrets["token"], "secrets must survive untouched")
+	assert.Equal(t, "img:1", got.Parameters["image"], "parameters must survive untouched")
+}
+
+// A nil domains argument must also clear (not merely no-op), since the HTTP
+// handler passes an explicitly-empty slice for "domains": [] and this method
+// must not special-case nil into "leave alone" — that would silently
+// resurrect the merge semantics this route deliberately does not have.
+func TestUpdateInstanceDomains_NilAlsoClears(t *testing.T) {
+	svc, f := newWebSvc(t)
+	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", webApply("demo"), ApplyOptions{Replace: true}))
+
+	require.NoError(t, svc.UpdateInstanceDomains(ctx, "h1", "web", "demo", nil))
+
+	require.Len(t, f.PlayCalls, 2, "domains change replaces the pod")
+	_, err := svc.Get(ctx, "h1", "web", "demo")
+	require.NoError(t, err)
+}
+
+// Replacing to a brand new (non-empty) domain list is also a replace, not a
+// merge — the old domain must be gone, not accumulated alongside the new one.
+func TestUpdateInstanceDomains_ReplacesRatherThanMerges(t *testing.T) {
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	svc, mem := newSvcWith(t, fake.New(), hosts, webTemplate())
+	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", webApply("demo"), ApplyOptions{Replace: true}))
+
+	require.NoError(t, svc.UpdateInstanceDomains(ctx, "h1", "web", "demo", []string{"new.example.com"}))
+
+	got, err := mem.GetSpec(ctx, "h1", "web", "demo")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"new.example.com"}, got.Domains)
+}
+
+func TestUpdateInstanceDomains_NoSpecIsNotFound(t *testing.T) {
+	svc, _, _ := newSvcMem(t)
+	err := svc.UpdateInstanceDomains(context.Background(), "h1", "postgres", "ghost", nil)
+	require.ErrorIs(t, err, ErrInstanceNotFound)
+}
+
+func TestUpdateInstanceDomains_CorruptSpecPropagates(t *testing.T) {
+	svc, _, mem := newSvcMem(t)
+	svc.SetStore(&getSpecErrStore{Memory: mem, err: store.ErrSpecCorrupt})
+	err := svc.UpdateInstanceDomains(context.Background(), "h1", "postgres", "demo", nil)
+	require.ErrorIs(t, err, store.ErrSpecCorrupt)
+}
+
+// An ingress reconcile failure during a domains-only update must be reported
+// through the same ErrIngressReconcileFailed sentinel as apply/delete/rename —
+// the pod is still fine, only the Caddy push failed (issue #301, ask 1).
+func TestUpdateInstanceDomains_IngressFailureIsClassified(t *testing.T) {
+	svc, _ := newWebSvc(t)
+	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
+	ctx := context.Background()
+	require.NoError(t, svc.Apply(ctx, "h1", webApply("demo"), ApplyOptions{Replace: true}))
+
+	// Only now does the host's ingress start failing — the initial deploy above
+	// must succeed for this to be a meaningful "update fails" test.
+	svc.SetIngress(hostErrIngress{failHost: "h1"}, "podman-api-ingress")
+
+	err := svc.UpdateInstanceDomains(ctx, "h1", "web", "demo", nil)
+	require.ErrorIs(t, err, ErrIngressReconcileFailed)
+	assert.Contains(t, err.Error(), "caddy wedged", "underlying error must be surfaced, not swallowed")
+}

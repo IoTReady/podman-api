@@ -412,6 +412,56 @@ func (h *handlers) patchInstanceSecrets(w http.ResponseWriter, r *http.Request) 
 	WriteJSON(w, http.StatusOK, obs)
 }
 
+// patchInstanceDomains replaces the instance's stored ingress domains list
+// wholesale and re-applies. Unlike .../parameters and .../secrets this is a
+// REPLACE of the whole list, not a merge — domains is a single field, so
+// there is no per-key overlay to do, and an empty (but present) "domains"
+// array clears every domain. This is the route issue #301 adds for the
+// symmetric gap #207 fixed for secrets: PATCH .../parameters preserves
+// domains untouched and PUT demands the instance's complete declared secret
+// set, so before this route a persisted domain was unremovable on a sealed
+// instance without minting fresh throwaway secrets for everything else. Like
+// .../parameters and .../secrets this replaces the pod, so a manifest podman
+// refuses can leave the instance down until a boot converge or manual
+// re-apply — see Service.UpdateInstanceDomains.
+//
+// "domains" uses a pointer so the body can distinguish "omitted" (400 — see
+// below) from "present but empty" (a deliberate clear-everything request);
+// json.Unmarshal leaves both a missing key and an explicit `"domains":null`
+// as nil, so both are rejected the same way an omitted key would be.
+func (h *handlers) patchInstanceDomains(w http.ResponseWriter, r *http.Request) {
+	host := r.PathValue("host")
+	tmpl := r.PathValue("template")
+	slug := r.PathValue("slug")
+	if !validInstancePath(w, tmpl, slug) {
+		return
+	}
+	var body struct {
+		Domains *[]string `json:"domains"`
+	}
+	if !decodeBody(w, r, &body) {
+		return
+	}
+	if body.Domains == nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_body", Message: `domains is required (an empty array clears every domain)`})
+		return
+	}
+	if err := ingress.ValidateDomains(*body.Domains); err != nil {
+		WriteJSON(w, http.StatusBadRequest, ErrorBody{Code: "invalid_domains", Message: err.Error()})
+		return
+	}
+	if err := h.svc.UpdateInstanceDomains(r.Context(), host, tmpl, slug, *body.Domains); err != nil {
+		WriteError(w, err)
+		return
+	}
+	obs, err := h.svc.Get(r.Context(), host, tmpl, slug)
+	if err != nil {
+		WriteError(w, err)
+		return
+	}
+	WriteJSON(w, http.StatusOK, obs)
+}
+
 func (h *handlers) renameInstance(w http.ResponseWriter, r *http.Request) {
 	host := r.PathValue("host")
 	tmpl := r.PathValue("template")

@@ -65,6 +65,14 @@ func classify(err error) (code string, status int, msg string) {
 		return "host_secret_missing", http.StatusUnprocessableEntity, err.Error()
 	case errors.Is(err, instance.ErrImagePull):
 		return "upstream_error", http.StatusBadGateway, err.Error()
+	case errors.Is(err, instance.ErrIngressReconcileFailed):
+		// The pod itself was already applied/deleted/renamed successfully by the
+		// time this fires -- the failure is downstream, in Caddy -- so this is
+		// deliberately not "internal"/500 (issue #301). 502 matches ErrImagePull's
+		// convention: something this process depends on, not this process itself,
+		// failed. err.Error() carries the full chain, underlying Caddy admin-API
+		// error included.
+		return "ingress_reconcile_failed", http.StatusBadGateway, err.Error()
 	case errors.Is(err, instance.ErrHostDraining):
 		return "host_draining", http.StatusLocked, err.Error()
 	case errors.Is(err, podman.ErrNotFound):
