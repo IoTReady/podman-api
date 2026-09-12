@@ -27,6 +27,7 @@ func TestBulkClassify_AllBranches(t *testing.T) {
 		{instance.ErrUnknownTemplate, "unknown_template", http.StatusNotFound},
 		{instance.ErrInstanceNotFound, "instance_not_found", http.StatusNotFound},
 		{instance.ErrHostDraining, "host_draining", http.StatusLocked},
+		{instance.ErrIngressReconcileFailed, "ingress_reconcile_failed", http.StatusBadGateway},
 		{errors.New("anything else"), "internal", http.StatusInternalServerError},
 	}
 	for _, c := range cases {
@@ -34,6 +35,35 @@ func TestBulkClassify_AllBranches(t *testing.T) {
 		assert.Equal(t, c.code, code)
 		assert.Equal(t, c.stat, stat)
 		assert.Equal(t, c.err.Error(), msg)
+	}
+}
+
+// TestBulkClassify_AgreesWithClassify locks bulkClassify() and classify()
+// together for every sentinel bulkClassify recognizes. They are hand-written
+// mirrors of the same switch (like errorStatus/classify, see
+// internal/ui/render_test.go's TestErrorStatus_AgreesWithAPIClassify for the
+// prior instance of this exact drift): ErrIngressReconcileFailed was added to
+// classify() (#301) and missed here, so a bulk apply/delete against a host
+// whose Caddy admin API is failing reported "internal"/500 for every affected
+// instance instead of the distinct signal a single-instance call gets --
+// hiding that the pod operations themselves succeeded. Both switches are
+// package-local here, so classify() is called directly rather than through
+// api.WriteError.
+func TestBulkClassify_AgreesWithClassify(t *testing.T) {
+	shared := []error{
+		instance.ErrUnknownHost,
+		instance.ErrUnknownTemplate,
+		instance.ErrInstanceNotFound,
+		instance.ErrHostDraining,
+		instance.ErrIngressReconcileFailed,
+	}
+	for _, err := range shared {
+		bCode, bStat, _ := bulkClassify(err)
+		cCode, cStat, _ := classify(err)
+		if bCode != cCode || bStat != cStat {
+			t.Errorf("bulkClassify(%v) = (%q, %d), but classify() = (%q, %d) — the two switches have drifted",
+				err, bCode, bStat, cCode, cStat)
+		}
 	}
 }
 
