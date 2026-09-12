@@ -1893,6 +1893,23 @@ func (s *Service) UpdateInstanceParameters(ctx context.Context, host, tmpl, slug
 // this replaces the pod, a manifest podman refuses leaves the instance down
 // until a boot converge or a manual re-apply.
 func (s *Service) UpdateInstanceDomains(ctx context.Context, host, tmpl, slug string, domains []string) error {
+	// Mirrors Apply's own conditional host lock (see its doc comment above):
+	// validateIngress's domain-uniqueness check only becomes durable once
+	// PutSpec runs deep inside applyLocked, so two concurrent claims to the
+	// same new domain (two PATCH .../domains calls, or one racing an
+	// Apply/PUT) could otherwise both pass validation before either
+	// persists. Unlike UpdateInstanceParameters (which always re-applies
+	// the instance's OWN unchanged domains, so no new claim is ever made),
+	// this method's entire purpose is to change domains -- taken only when
+	// domains is non-empty, matching Apply's condition exactly: clearing to
+	// empty removes a claim rather than making one, so it needs no lock.
+	// Taken before the instance lock, same order Apply uses, to avoid a
+	// lock-ordering deadlock against a concurrent Apply.
+	if len(domains) > 0 {
+		hl := s.hostLock(host)
+		hl.Lock()
+		defer hl.Unlock()
+	}
 	lock := s.instanceLock(host, tmpl, slug)
 	lock.Lock()
 	defer lock.Unlock()

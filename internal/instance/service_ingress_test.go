@@ -225,6 +225,54 @@ spec:
 	}
 }
 
+// Mirrors TestApplyDomainUniquenessIsHostSerialized, but through
+// UpdateInstanceDomains rather than Apply: two different EXISTING instances
+// racing to claim the SAME host-wide-unique domain via PATCH .../domains must
+// not both succeed, for exactly the reason Apply itself takes a conditional
+// host lock. UpdateInstanceDomains's whole purpose is to CHANGE domains
+// (unlike UpdateInstanceParameters, which always re-applies the instance's
+// own unchanged domains and therefore correctly takes no host lock) -- found
+// missing the lock entirely in review of #301's PR.
+func TestUpdateInstanceDomainsUniquenessIsHostSerialized(t *testing.T) {
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x"}}
+	mem := seedStore(t, webTemplate())
+	svc, _ := newSvcWith(t, fake.New(), hosts, webTemplate())
+	svc.SetStore(slowReadStore{Memory: mem, delay: 50 * time.Millisecond})
+	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
+	ctx := context.Background()
+
+	const n = 8
+	for i := 0; i < n; i++ {
+		require.NoError(t, mem.PutSpec(ctx, store.Spec{
+			Host: "h1", Template: "web", Slug: fmt.Sprintf("inst%d", i),
+			Parameters: map[string]any{"slug": fmt.Sprintf("inst%d", i), "image": "img:1"},
+		}))
+	}
+
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			// Distinct slugs -> distinct instance locks (all run concurrently),
+			// but every request claims the same domain app.example.com.
+			errs[i] = svc.UpdateInstanceDomains(ctx, "h1", "web", fmt.Sprintf("inst%d", i), []string{"app.example.com"})
+		}(i)
+	}
+	wg.Wait()
+
+	success := 0
+	for _, e := range errs {
+		if e == nil {
+			success++
+			continue
+		}
+		assert.Contains(t, e.Error(), "already claimed")
+	}
+	assert.Equal(t, 1, success, "exactly one instance may claim a host-wide-unique domain")
+}
+
 // UpdateInstanceDomains is issue #301's ask 3: a route to clear an instance's
 // domains without restating its full declared secret set. It must replace the
 // domains list wholesale while leaving parameters and secrets untouched.
