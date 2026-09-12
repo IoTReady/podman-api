@@ -270,35 +270,7 @@ func RunWithFlags(opts ...Option) error {
 	var ingressCtl *ingress.CaddyController
 
 	if *ingressEnabled {
-		hostAdmins := make(map[string]string)
-		unmanagedHosts := make(map[string]bool)
-		for _, h := range hosts {
-			switch {
-			case h.CaddyAdminAddr != "":
-				hostAdmins[h.ID] = h.CaddyAdminAddr
-			case h.Addr != "unix" && h.Addr != "":
-				// Derive from SSH addr "user@host" → "host:2019" so operators
-				// don't need to set caddy_admin_addr for standard deployments.
-				// Strip "user@" prefix, then strip any SSH port, then append :2019.
-				raw := h.Addr
-				if at := strings.IndexByte(raw, '@'); at >= 0 {
-					raw = raw[at+1:]
-				}
-				hostname := raw
-				if parsed, _, err := net.SplitHostPort(raw); err == nil {
-					hostname = parsed // e.g. "host:2222" → "host"; "[::1]:22" → "::1"
-				}
-				hostAdmins[h.ID] = net.JoinHostPort(hostname, "2019")
-			}
-			// ingress_managed: false opts a host out of reconciliation entirely
-			// (issue #301) — its :443 belongs to a foreign/hand-maintained Caddy
-			// config the reconciler must never touch. Unset (nil) stays managed,
-			// so existing hosts/*.yaml files need no change.
-			if h.IngressManaged != nil && !*h.IngressManaged {
-				unmanagedHosts[h.ID] = true
-				log.Printf("ingress: host %s is unmanaged (ingress_managed: false); it will never be reconciled", h.ID)
-			}
-		}
+		hostAdmins, unmanagedHosts := deriveIngressHostConfig(hosts)
 		ctl := ingress.NewCaddyController(db, ingress.Config{
 			AdminAddr:      *ingressAdminAddr,
 			HostAdmins:     hostAdmins,
@@ -601,6 +573,17 @@ func RunWithFlags(opts ...Option) error {
 		client.SetHosts(newHosts)
 		svc.SetHosts(newHosts)
 		hostsHolder.Store(&newHosts)
+		if ingressCtl != nil {
+			// Without this, an operator flipping ingress_managed on a live
+			// host keeps being fought/reconciled (or, in the other
+			// direction, stops being reconciled) by the already-running
+			// periodic loop until the whole process restarts — validateIngress
+			// alone picks up the live hosts snapshot for *new* domain
+			// applies, but the reconcile loop was still working off the
+			// controller's boot-time Config (issue #301 follow-up).
+			hostAdmins, unmanagedHosts := deriveIngressHostConfig(newHosts)
+			ingressCtl.SetHostConfig(hostAdmins, unmanagedHosts)
+		}
 		draining := 0
 		for _, hh := range newHosts {
 			if hh.Drain {
@@ -891,6 +874,44 @@ func pollerDisabledMetricsWarning(setFlags map[string]bool, containerStats bool,
 	return fmt.Sprintf("%s set but the inventory poller is disabled (-inventory-refresh-interval=0): "+
 		"container resource and volume usage metrics require the poller and will NOT be exported",
 		strings.Join(asked, " and "))
+}
+
+// deriveIngressHostConfig computes the ingress controller's per-host admin
+// addresses and unmanaged set from a freshly-loaded hosts/*.yaml list. Called
+// both at startup and from applyHosts on every SIGHUP/rename reload, so a
+// host's ingress_managed flag or caddy_admin_addr takes effect on the
+// already-running controller without a process restart.
+func deriveIngressHostConfig(hosts []config.Host) (hostAdmins map[string]string, unmanagedHosts map[string]bool) {
+	hostAdmins = make(map[string]string)
+	unmanagedHosts = make(map[string]bool)
+	for _, h := range hosts {
+		switch {
+		case h.CaddyAdminAddr != "":
+			hostAdmins[h.ID] = h.CaddyAdminAddr
+		case h.Addr != "unix" && h.Addr != "":
+			// Derive from SSH addr "user@host" → "host:2019" so operators
+			// don't need to set caddy_admin_addr for standard deployments.
+			// Strip "user@" prefix, then strip any SSH port, then append :2019.
+			raw := h.Addr
+			if at := strings.IndexByte(raw, '@'); at >= 0 {
+				raw = raw[at+1:]
+			}
+			hostname := raw
+			if parsed, _, err := net.SplitHostPort(raw); err == nil {
+				hostname = parsed // e.g. "host:2222" → "host"; "[::1]:22" → "::1"
+			}
+			hostAdmins[h.ID] = net.JoinHostPort(hostname, "2019")
+		}
+		// ingress_managed: false opts a host out of reconciliation entirely
+		// (issue #301) — its :443 belongs to a foreign/hand-maintained Caddy
+		// config the reconciler must never touch. Unset (nil) stays managed,
+		// so existing hosts/*.yaml files need no change.
+		if h.IngressManaged != nil && !*h.IngressManaged {
+			unmanagedHosts[h.ID] = true
+			log.Printf("ingress: host %s is unmanaged (ingress_managed: false); it will never be reconciled", h.ID)
+		}
+	}
+	return hostAdmins, unmanagedHosts
 }
 
 // diffNewlySeenHosts compares the host ids this process has tracked so far

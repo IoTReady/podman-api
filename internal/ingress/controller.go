@@ -50,6 +50,12 @@ type Config struct {
 // operator-managed Caddy instance via the admin API.
 type CaddyController struct {
 	store Store
+
+	// cfgMu guards cfg. AdminAddr never changes after construction, but
+	// HostAdmins/UnmanagedHosts are re-derived from hosts/*.yaml on every
+	// SIGHUP or host-rename reload (see SetHostConfig) while the periodic
+	// reconcile loop keeps calling Reconcile concurrently.
+	cfgMu sync.RWMutex
 	cfg   Config
 
 	// adminDo dispatches HTTP requests to the Caddy admin API. Overridden in
@@ -98,12 +104,38 @@ func (c *CaddyController) hostLock(host string) *sync.Mutex {
 // resolveAdminAddr returns the Caddy admin API addr for the given host: the
 // per-host override from cfg.HostAdmins if present, otherwise cfg.AdminAddr.
 func (c *CaddyController) resolveAdminAddr(hostID string) string {
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
 	if c.cfg.HostAdmins != nil {
 		if addr, ok := c.cfg.HostAdmins[hostID]; ok && addr != "" {
 			return addr
 		}
 	}
 	return c.cfg.AdminAddr
+}
+
+// isUnmanaged reports whether host has opted out of ingress reconciliation
+// (see Config.UnmanagedHosts).
+func (c *CaddyController) isUnmanaged(host string) bool {
+	c.cfgMu.RLock()
+	defer c.cfgMu.RUnlock()
+	return c.cfg.UnmanagedHosts[host]
+}
+
+// SetHostConfig replaces HostAdmins and UnmanagedHosts with freshly-derived
+// values. AdminAddr is never re-derived, so it is left untouched.
+//
+// The rest of Config is baked in at construction and never mutated
+// thereafter, but these two maps are re-derived from hosts/*.yaml on every
+// SIGHUP or host-rename reload (server.applyHosts) — without this, a host an
+// operator just marked ingress_managed:false keeps being reconciled by the
+// already-running periodic loop until the whole process restarts (issue
+// #301 follow-up).
+func (c *CaddyController) SetHostConfig(hostAdmins map[string]string, unmanagedHosts map[string]bool) {
+	c.cfgMu.Lock()
+	defer c.cfgMu.Unlock()
+	c.cfg.HostAdmins = hostAdmins
+	c.cfg.UnmanagedHosts = unmanagedHosts
 }
 
 // logCleanupTransition reports the outcome of a best-effort cleanup, but only

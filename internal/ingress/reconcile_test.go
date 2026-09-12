@@ -356,3 +356,49 @@ func TestReconcileManagedHostStillReconciles(t *testing.T) {
 	putCall := findPut(calls, "/config/apps/http/servers/podman_api")
 	require.NotNil(t, putCall, "h1 is not opted out and must still be reconciled")
 }
+
+// SetHostConfig must take effect on the very next Reconcile call — this is
+// what lets a SIGHUP/host-rename reload flip a host's managed status on an
+// already-running controller without a process restart (issue #301
+// follow-up: server.applyHosts used to update client/svc/hostsHolder but
+// never pushed the recomputed config into ingressCtl).
+func TestSetHostConfigTakesEffectOnNextReconcile(t *testing.T) {
+	stub, calls := adminRecorder(http.StatusOK)
+	c := NewCaddyController(webSpecStore(t), Config{})
+	c.adminDo = stub
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.NotEmpty(t, *calls, "h1 starts out managed and must be reconciled")
+
+	*calls = nil
+	c.SetHostConfig(nil, map[string]bool{"h1": true})
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.Empty(t, *calls, "h1 was just marked unmanaged; the running controller must honor it immediately")
+
+	*calls = nil
+	c.SetHostConfig(nil, map[string]bool{"h1": false})
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.NotEmpty(t, *calls, "h1 was marked managed again and must resume being reconciled")
+}
+
+// SetHostConfig must also take effect for resolveAdminAddr, not just the
+// unmanaged check — a host_admins.yaml edit reloaded via SIGHUP should retarget
+// the controller's admin API call without a restart.
+func TestSetHostConfigUpdatesHostAdmins(t *testing.T) {
+	stub, calls := adminRecorder(http.StatusOK)
+	c := NewCaddyController(webSpecStore(t), Config{AdminAddr: "default:2019"})
+	c.adminDo = stub
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.NotEmpty(t, *calls)
+	require.Equal(t, "default:2019", (*calls)[0].addr)
+
+	*calls = nil
+	c.SetHostConfig(map[string]string{"h1": "override:2019"}, nil)
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+	require.NotEmpty(t, *calls)
+	require.Equal(t, "override:2019", (*calls)[0].addr)
+}
