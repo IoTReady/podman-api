@@ -344,6 +344,16 @@ func (s *Service) validateIngress(ctx context.Context, host string, req ApplyReq
 	if tmpl.Meta.Ingress == nil {
 		return fmt.Errorf("instance %s/%s declares domains but template %q has no ingress", req.Template, req.Slug, req.Template)
 	}
+	// A host with ingress_managed: false is never reconciled at all (#301) --
+	// the reconciler silently no-ops rather than touching a foreign/hand-
+	// maintained Caddy config it doesn't own. Without this check the domain
+	// would still be accepted and persisted here, and GET .../instances/...
+	// would show it as configured, while the instance is never actually
+	// routed and nothing anywhere says so. Reject it up front instead,
+	// consistent with every other ingress precondition this function checks.
+	if hc, ok := s.host(host); ok && hc.IngressManaged != nil && !*hc.IngressManaged {
+		return fmt.Errorf("instance %s/%s declares domains but host %s is not ingress-managed (ingress_managed: false) -- its :443 belongs to a foreign Caddy config that will never route this domain", req.Template, req.Slug, host)
+	}
 	keys, err := s.store.ListSpecKeys(ctx, host)
 	if err != nil {
 		return fmt.Errorf("ingress: check domain uniqueness on %s: %w", host, err)

@@ -85,6 +85,41 @@ func webApply(slug string) ApplyRequest {
 	}
 }
 
+// An apply carrying domains against a host with ingress_managed: false must
+// be rejected up front, not silently accepted and persisted. Without this,
+// GET .../instances/... shows the domain as configured while
+// CaddyController.Reconcile permanently no-ops for that host (#301) --
+// nothing anywhere says the domain is never actually routed. Found in review
+// of #301's own PR.
+func TestApplyRejectsDomainsOnUnmanagedHost(t *testing.T) {
+	managed := false
+	hosts := []config.Host{{ID: "h1", Addr: "unix", Socket: "/x", IngressManaged: &managed}}
+	f := fake.New()
+	svc, _ := newSvcWith(t, f, hosts, webTemplate())
+	svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
+
+	err := svc.Apply(context.Background(), "h1", webApply("demo"), ApplyOptions{Replace: true})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "not ingress-managed")
+	assert.Empty(t, f.PlayCalls, "no pod should be played for a rejected request")
+}
+
+// A nil IngressManaged (the default, "unset means managed") and an explicit
+// true must both still allow a domain-carrying apply -- only an explicit
+// false rejects.
+func TestApplyAllowsDomainsWhenIngressManagedUnsetOrTrue(t *testing.T) {
+	managedTrue := true
+	for _, hosts := range [][]config.Host{
+		{{ID: "h1", Addr: "unix", Socket: "/x"}},                               // unset
+		{{ID: "h1", Addr: "unix", Socket: "/x", IngressManaged: &managedTrue}}, // explicit true
+	} {
+		svc, _ := newSvcWith(t, fake.New(), hosts, webTemplate())
+		svc.SetIngress(&recordingCtl{}, "podman-api-ingress")
+		err := svc.Apply(context.Background(), "h1", webApply("demo"), ApplyOptions{Replace: true})
+		require.NoError(t, err)
+	}
+}
+
 func TestApplyRejectsDomainsWhenIngressDisabled(t *testing.T) {
 	svc, _ := newWebSvc(t) // default Disabled controller, ingress not enabled
 	err := svc.Apply(context.Background(), "h1", webApply("demo"), ApplyOptions{Replace: true})
