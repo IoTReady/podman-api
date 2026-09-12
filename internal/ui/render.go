@@ -130,6 +130,12 @@ func errorStatus(err error) int {
 		return http.StatusUnprocessableEntity
 	case errors.Is(err, instance.ErrImagePull):
 		return http.StatusBadGateway
+	case errors.Is(err, instance.ErrIngressReconcileFailed):
+		// Mirrors classify()'s treatment (#301): the pod itself already
+		// applied/deleted/renamed successfully by the time this fires, so
+		// this is deliberately not the default 500 -- something downstream
+		// (Caddy) failed, not this process.
+		return http.StatusBadGateway
 	case errors.Is(err, instance.ErrStoreDisabled):
 		return http.StatusNotImplemented
 	case errors.Is(err, render.ErrInvalidParameters),

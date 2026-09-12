@@ -47,6 +47,27 @@ func TestLoadHosts_DuplicateID(t *testing.T) {
 	assert.Contains(t, err.Error(), "duplicate")
 }
 
+func TestLoadHostsIngressManaged(t *testing.T) {
+	dir := t.TempDir()
+	writeHost(t, dir, "unmanaged.yaml", "id: unmanaged\naddr: unix\nsocket: /tmp/x\ningress_managed: false\n")
+	writeHost(t, dir, "managed.yaml", "id: managed\naddr: unix\nsocket: /tmp/y\ningress_managed: true\n")
+	writeHost(t, dir, "default.yaml", "id: default\naddr: unix\nsocket: /tmp/z\n")
+	hosts, err := LoadHosts(dir)
+	require.NoError(t, err)
+	byID := map[string]Host{}
+	for _, h := range hosts {
+		byID[h.ID] = h
+	}
+
+	require.NotNil(t, byID["unmanaged"].IngressManaged)
+	assert.False(t, *byID["unmanaged"].IngressManaged)
+
+	require.NotNil(t, byID["managed"].IngressManaged)
+	assert.True(t, *byID["managed"].IngressManaged)
+
+	assert.Nil(t, byID["default"].IngressManaged, "unset must stay nil, not default to false")
+}
+
 func writeFile(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0644)
 }

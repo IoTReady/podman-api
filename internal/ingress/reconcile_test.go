@@ -310,3 +310,49 @@ func TestReconcileCleanupStateIsPerHost(t *testing.T) {
 	require.NoError(t, c.Reconcile(context.Background(), "h1"))
 	require.Equal(t, 2, countLines(logs(), "cleanup on h1"), logs())
 }
+
+// An unmanaged host (ingress_managed: false) must never be touched, even
+// though it has a domain-carrying spec that would otherwise produce routes —
+// the whole point is that its :443 belongs to a foreign Caddy config (#301).
+func TestReconcileSkipsUnmanagedHost(t *testing.T) {
+	stub, calls := adminRecorder(http.StatusOK)
+	c := NewCaddyController(webSpecStore(t), Config{
+		UnmanagedHosts: map[string]bool{"h1": true},
+	})
+	c.adminDo = stub
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+
+	require.Empty(t, *calls, "unmanaged host must never see an admin API call")
+}
+
+// The zero-routes best-effort cleanup path must also be skipped for an
+// unmanaged host — it would otherwise DELETE a server namespace out of a
+// Caddy config podman-api never owned.
+func TestReconcileSkipsUnmanagedHostCleanupPath(t *testing.T) {
+	stub, calls := adminRecorder(http.StatusOK)
+	c := NewCaddyController(newMemStore(t, nil), Config{
+		UnmanagedHosts: map[string]bool{"h1": true},
+	})
+	c.adminDo = stub
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+
+	require.Empty(t, *calls)
+}
+
+// A host present in UnmanagedHosts with an explicit false, or absent
+// entirely, is reconciled normally — the zero value of the map preserves
+// today's behaviour.
+func TestReconcileManagedHostStillReconciles(t *testing.T) {
+	stub, calls := adminRecorder(http.StatusOK)
+	c := NewCaddyController(webSpecStore(t), Config{
+		UnmanagedHosts: map[string]bool{"h1": false, "other-host": true},
+	})
+	c.adminDo = stub
+
+	require.NoError(t, c.Reconcile(context.Background(), "h1"))
+
+	putCall := findPut(calls, "/config/apps/http/servers/podman_api")
+	require.NotNil(t, putCall, "h1 is not opted out and must still be reconciled")
+}

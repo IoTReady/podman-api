@@ -36,6 +36,14 @@ type Config struct {
 	// HostAdmins maps hostID to a per-host Caddy admin API address. Takes
 	// precedence over AdminAddr when set for the host being reconciled.
 	HostAdmins map[string]string
+	// UnmanagedHosts lists hosts (by ID) that opted out of ingress
+	// reconciliation (hosts/<id>.yaml: ingress_managed: false). Reconcile is a
+	// no-op for any host present here with a true value — it never touches
+	// that host's Caddy admin API, so a foreign/hand-maintained Caddy config
+	// there is left alone (issue #301). A host absent from this map, or
+	// present with false, is reconciled normally: the zero value keeps
+	// today's behaviour, every host managed.
+	UnmanagedHosts map[string]bool
 }
 
 // CaddyController is the production Controller. It drives routes on an
