@@ -109,7 +109,14 @@ func Normalize(p podman.Pod, template, slug string, vols []podman.Volume, secret
 			})
 		}
 		out.Containers = append(out.Containers, oc)
-		if c.Health != "" && c.Health != "healthy" {
+		// A container that isn't running is never ready, regardless of its
+		// (possibly empty) Health — an absent healthcheck must not be read as
+		// "nothing to check" for a stopped container. This is the only signal
+		// available on a host that can't run healthchecks at all (dev, vedanta:
+		// see CLAUDE.md), where every container's Health is permanently "", so
+		// Status is the sole thing standing between a fully-stopped pod and a
+		// false ready:true (#262).
+		if !strings.EqualFold(c.Status, "running") || (c.Health != "" && c.Health != "healthy") {
 			ready = false
 		}
 	}
