@@ -116,6 +116,32 @@ func TestNormalize_ReadyAggregation(t *testing.T) {
 			},
 			true,
 		},
+		{
+			// #262: a probe-less template (dev/vedanta can't run healthchecks)
+			// leaves Health permanently "" even when the pod is fully stopped.
+			// Status is the only remaining signal — a stopped container with no
+			// healthcheck declared must never read as ready.
+			"stopped container, no healthcheck declared — never ready",
+			[]podman.Container{
+				{Status: "Exited"},
+			},
+			false,
+		},
+		{
+			"one stopped, one healthy — not ready",
+			[]podman.Container{
+				{Status: "Running", Health: "healthy"},
+				{Status: "Exited"},
+			},
+			false,
+		},
+		{
+			"status is case-insensitive",
+			[]podman.Container{
+				{Status: "running"},
+			},
+			true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
