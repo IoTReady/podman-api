@@ -76,12 +76,16 @@ func TestReal_ContainerExec_LocalOnly(t *testing.T) {
 // connection on the way out and what must be true of it afterwards.
 // newUpgradeRequest builds its own *http.Transport and assigns it to
 // conn.Client.Transport permanently (podman v5.8.2 attach.go:611), never
-// restoring the original. Since #278 that connection is dialed per exec and
-// closed by the exec, so two things have to hold: the transport
-// wireInvalidation installed is back in place by the time the connection is
-// released (otherwise the close reaches podman's throwaway and strands ours,
-// keep-alive sockets and their goroutines included), and no exec ever touches
-// the shared connection every other operation uses.
+// restoring the original. Since #278 an exec's connection is separate from
+// the one every other operation uses, so it cannot touch that connection's
+// transport; since #307 (execPool) that connection may be REUSED by a later
+// exec on the same host rather than dialed fresh every time, so what must
+// hold on release is not "each exec gets its own" but "whichever connection
+// an exec used has wireInvalidation's transport back in place before the
+// next exec (or anything else) can see it" — otherwise a reused connection
+// would hand the next exec podman's throwaway transport, and closing it as
+// the exec after that releases it would strand ours, keep-alive sockets and
+// their goroutines included.
 func TestReal_ContainerExec_LeavesNothingOnTheHost(t *testing.T) {
 	sock := localSocket(t)
 	c, err := NewReal([]config.Host{{ID: "local", Addr: "unix", Socket: sock}})
@@ -116,16 +120,16 @@ func TestReal_ContainerExec_LeavesNothingOnTheHost(t *testing.T) {
 
 	mu.Lock()
 	defer mu.Unlock()
-	require.Len(t, execConns, 3, "each exec must dial a connection of its own")
-	seen := map[*connEntry]bool{}
-	for i, e := range execConns {
-		assert.False(t, seen[e], "exec %d reused an earlier exec's connection", i)
-		seen[e] = true
-		conn, err := bindings.GetClient(e.ctx)
-		require.NoError(t, err)
-		assert.Same(t, e.hooked, conn.Client.Transport,
-			"exec %d left podman's transport in place, so its close reached the wrong one", i)
-	}
+	// Sequential, seconds apart, on an otherwise idle host: execPool's slot
+	// is free every time, so this pins reuse actually happening rather than
+	// merely being harmless if it did — three execs, one dial.
+	require.Len(t, execConns, 1,
+		"three sequential execs on an idle host must reuse one connection, not dial three")
+	e := execConns[0]
+	conn, err := bindings.GetClient(e.ctx)
+	require.NoError(t, err)
+	assert.Same(t, e.hooked, conn.Client.Transport,
+		"the reused connection must have wireInvalidation's transport back in place after the last exec")
 }
 
 func execOK(c *Real, ctx context.Context, pod string) error {
