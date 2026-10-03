@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -142,6 +143,17 @@ func (s *testSSHServer) handle(nc net.Conn, cfg *ssh.ServerConfig) {
 		if drop {
 			nc.Close()
 			return
+		}
+		if nch.ChannelType() == "direct-streamlocal@openssh.com" {
+			// What bindings' ssh.DialNet opens to reach the remote podman
+			// socket: answer it with a stub libpod that only knows /_ping.
+			ch, chReqs, err := nch.Accept()
+			if err != nil {
+				return
+			}
+			go ssh.DiscardRequests(chReqs)
+			go serveStubLibpod(ch)
+			continue
 		}
 		if nch.ChannelType() != "session" {
 			nch.Reject(ssh.UnknownChannelType, "only sessions here")
@@ -1101,3 +1113,43 @@ func TestHostBoundPorts_RedispatchesLocallyWhenTheHostBecomesLocal(t *testing.T)
 		t.Errorf("port %d not among %v; the local read did not happen", want, got)
 	}
 }
+
+// serveStubLibpod answers HTTP on one SSH channel as a minimal libpod: enough
+// for bindings.NewConnection's /_ping handshake (it needs the version header).
+func serveStubLibpod(ch ssh.Channel) {
+	defer ch.Close()
+	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Libpod-API-Version", "5.8.0")
+		w.Header().Set("Api-Version", "1.41")
+		io.WriteString(w, "OK")
+	})}
+	l := &oneConnListener{c: chanConn{ch}, done: make(chan struct{})}
+	srv.Serve(l)
+}
+
+type chanConn struct{ ssh.Channel }
+
+func (chanConn) LocalAddr() net.Addr              { return &net.UnixAddr{Name: "ssh", Net: "unix"} }
+func (chanConn) RemoteAddr() net.Addr             { return &net.UnixAddr{Name: "ssh", Net: "unix"} }
+func (chanConn) SetDeadline(time.Time) error      { return nil }
+func (chanConn) SetReadDeadline(time.Time) error  { return nil }
+func (chanConn) SetWriteDeadline(time.Time) error { return nil }
+
+// oneConnListener hands out its single conn, then blocks until closed.
+type oneConnListener struct {
+	c    net.Conn
+	once sync.Once
+	done chan struct{}
+}
+
+func (l *oneConnListener) Accept() (net.Conn, error) {
+	var c net.Conn
+	l.once.Do(func() { c = l.c })
+	if c != nil {
+		return c, nil
+	}
+	<-l.done
+	return nil, net.ErrClosed
+}
+func (l *oneConnListener) Close() error   { return nil }
+func (l *oneConnListener) Addr() net.Addr { return &net.UnixAddr{Name: "ssh", Net: "unix"} }

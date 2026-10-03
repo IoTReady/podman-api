@@ -112,6 +112,10 @@ type Real struct {
 type connEntry struct {
 	ctx    context.Context
 	hooked *http.Transport
+	// tunnel owns the SSH client under an ssh:// connection that has a key
+	// file configured; nil for unix hosts and the agent-auth fallback. Closed
+	// by closeIdleConns — the only thing that ends that SSH session (#311).
+	tunnel *sshTunnel
 	// execDialedAt is when this connection's underlying SSH client was
 	// established — set only for a connection that came from execConnFor,
 	// used solely by the exec reuse pool (exec_pool.go) to bound how long a
@@ -471,12 +475,12 @@ func (d *execDial) abandon() (surplus *connEntry) {
 // runExecDial performs one per-exec dial and resolves its execDial. Always
 // called on its own goroutine.
 func (r *Real) runExecDial(id string, h config.Host, uri string, d *execDial) {
-	cc, err := dialConn(h, uri)
+	cc, tun, err := dialConn(h, uri)
 	var e *connEntry
 	if err != nil {
 		err = fmt.Errorf("connect to host %q: %w", id, err)
 	} else {
-		e = &connEntry{ctx: cc, execDialedAt: r.now()}
+		e = &connEntry{ctx: cc, tunnel: tun, execDialedAt: r.now()}
 		// Wired for what it leaves on the entry, not for eviction: there is no
 		// cache to evict from, and noExecInvalidation says so. wireInvalidation
 		// is still what records e.hooked (which restoreTransport puts back and
@@ -643,25 +647,38 @@ func awaitDial(parent context.Context, id string, d *dialCall) (*connEntry, erro
 // Individual operations still honour per-call cancellation because DoRequest
 // creates http.NewRequestWithContext(ctx, ...) from the per-call context
 // passed into each method (PodInspect, PodList, etc.).
-func dialConn(h config.Host, uri string) (context.Context, error) {
+func dialConn(h config.Host, uri string) (context.Context, *sshTunnel, error) {
 	base := context.Background()
 	if h.Addr != "unix" && h.SSHKey != "" {
-		// SSH host with explicit key file. The fourth arg (`machine`) is false
-		// for non-machine connections per the bindings API.
-		return bindings.NewConnectionWithIdentity(base, uri, h.SSHKey, false)
+		// We own the SSH client (see sshTunnel): bindings cannot close the one
+		// it builds, which leaked a live session per connection (#311). The
+		// bindings connection is pointed at the tunnel's local socket instead.
+		t, err := openSSHTunnel(base, h)
+		if err != nil {
+			return nil, nil, err
+		}
+		cc, err := bindings.NewConnection(base, t.uri())
+		if err != nil {
+			t.Close()
+			return nil, nil, err
+		}
+		return cc, t, nil
 	}
-	return bindings.NewConnection(base, uri)
+	// No key file configured (ssh-agent / default identities, or a local unix
+	// socket): bindings' own dial, as before.
+	cc, err := bindings.NewConnection(base, uri)
+	return cc, nil, err
 }
 
 // runDial performs one reserved dial and resolves its dialCall. Always called
 // on its own goroutine, and always the only thing that removes the
 // reservation it resolves.
 func (r *Real) runDial(id string, h config.Host, uri string, d *dialCall, c connCache) {
-	cc, err := dialConn(h, uri)
+	cc, tun, err := dialConn(h, uri)
 
 	var e *connEntry
 	if err == nil {
-		e = &connEntry{ctx: cc}
+		e = &connEntry{ctx: cc, tunnel: tun}
 		// Wired before publishing, and off the lock: wireInvalidation touches
 		// only this connection and this entry, and it closes the transport
 		// bindings built, which is I/O.
@@ -1061,13 +1078,14 @@ func (r *Real) invalidateConn(id string, dead *connEntry) {
 	}
 }
 
-// closeIdleConns releases the pooled sockets of a connection nobody will use
-// again. The SSH client underneath an ssh:// connection is not reachable
-// through the bindings API and is left to the garbage collector.
+// closeIdleConns releases a connection nobody will use again: its pooled
+// sockets, and — when we own it — the SSH client underneath, which nothing else
+// would ever close (#311).
 func (e *connEntry) closeIdleConns() {
 	if e.hooked != nil {
 		e.hooked.CloseIdleConnections()
 	}
+	e.tunnel.Close()
 }
 
 // probeVersion fetches the podman version over an established connection ctx.
